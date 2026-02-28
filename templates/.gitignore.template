@@ -1,0 +1,44 @@
+# Generated recompiled code
+src/game/recomp/gen/
+
+# Build artifacts
+build/
+out/
+cmake-build-*/
+*.obj
+*.o
+*.lib
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.exp
+
+# IDE
+.vs/
+.vscode/
+*.user
+*.suo
+CMakeSettings.json
+CMakeUserPresets.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Game data (user-supplied)
+game_data/
+*.xbe
+*.iso
+
+# Analysis output (large, regeneratable)
+tools/output/
+*.json.bak
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store

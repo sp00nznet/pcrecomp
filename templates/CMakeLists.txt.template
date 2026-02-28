@@ -1,0 +1,156 @@
+# =============================================================================
+# PCRecomp Project Template — CMakeLists.txt
+#
+# Template for static recompilation projects built with the pcrecomp toolchain.
+# Copy this file into your project root and customize the marked sections.
+#
+# Key patterns preserved from proven recomp builds:
+#   - No ASLR (fixed-base memory mapping for address-dependent code)
+#   - Large stack (deep call chains from mechanically-translated code)
+#   - Relaxed warnings (generated code triggers many benign warnings)
+#   - Generated code auto-discovery via file(GLOB)
+#   - Custom codegen target to regenerate recompiled sources
+# =============================================================================
+
+cmake_minimum_required(VERSION 3.20)
+
+# >>> CUSTOMIZE: Set your project name and version <<<
+project(MyRecomp VERSION 0.1.0 LANGUAGES C)
+
+set(CMAKE_C_STANDARD 17)
+
+# =============================================================================
+# Compiler / Linker Settings
+#
+# Static recompilation produces code that depends on fixed virtual addresses.
+# The recompiled binary must NOT use ASLR, and needs a large stack because
+# the mechanically-translated call graph can be very deep.
+# =============================================================================
+
+if(MSVC)
+    # Disable ASLR — recompiled code uses fixed VAs for data section access.
+    # The original binary's data sections are mapped at their original addresses
+    # (e.g., via VirtualAlloc at a fixed base), so the recompiled exe must also
+    # load at a predictable address.
+    add_link_options(/DYNAMICBASE:NO)
+
+    # Large native stack — recompiled functions preserve the original call graph,
+    # which can produce very deep recursion (especially with inlined helpers).
+    # 8 MB is a safe default; increase if you hit stack overflows.
+    add_link_options(/STACK:8388608)  # 8 MB
+
+    # Suppress warnings that are noisy in generated code.
+    # The code generator produces correct-but-ugly C that triggers many
+    # warnings about implicit conversions, unreferenced labels, etc.
+    add_compile_options(/W1)
+    add_compile_options(/wd4996)  # deprecated functions (POSIX names)
+    add_compile_options(/wd4244)  # implicit narrowing conversions
+    add_compile_options(/wd4146)  # unary minus on unsigned type
+    add_compile_options(/wd4102)  # unreferenced label
+    add_compile_options(/wd4013)  # undefined function (forward refs in generated code)
+    add_compile_options(/wd4101)  # unreferenced local variable
+    add_compile_options(/wd4267)  # size_t to int conversion
+    add_compile_options(/wd4018)  # signed/unsigned mismatch
+
+    # Release optimization — use whole-program optimization for best
+    # performance of the large generated translation units.
+    set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} /O2 /Oi /GL")
+    set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${CMAKE_EXE_LINKER_FLAGS_RELEASE} /LTCG")
+endif()
+
+# =============================================================================
+# Source Files
+# =============================================================================
+
+# >>> CUSTOMIZE: List your hand-written runtime/support sources <<<
+set(RUNTIME_SOURCES
+    src/main.c
+    # src/imports.c
+    # src/manual_overrides.c
+)
+
+# Generated recompiled code — auto-discovered via glob.
+# The code generator (tools/generate.py) produces recomp_XXXX.c files
+# in the gen/ directory, one per split chunk. This glob picks them all up
+# automatically so you don't need to list hundreds of files by hand.
+file(GLOB GENERATED_SOURCES "src/recomp/gen/recomp_*.c")
+
+# The dispatch table maps original VAs to recompiled function pointers.
+# It's generated separately and must exist for indirect calls to work.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/recomp/gen/recomp_dispatch.c")
+    list(APPEND GENERATED_SOURCES
+        "src/recomp/gen/recomp_dispatch.c"
+    )
+endif()
+
+# =============================================================================
+# Executable Target
+# =============================================================================
+
+# >>> CUSTOMIZE: Set your executable name <<<
+add_executable(my_recomp
+    ${RUNTIME_SOURCES}
+    ${GENERATED_SOURCES}
+)
+
+# >>> CUSTOMIZE: Set include paths to match your project layout <<<
+target_include_directories(my_recomp PRIVATE
+    src
+    src/recomp
+    src/recomp/gen
+)
+
+# =============================================================================
+# Libraries
+# =============================================================================
+
+# >>> CUSTOMIZE: Link the libraries your target needs <<<
+target_link_libraries(my_recomp PRIVATE
+    # Windows system libraries (common for Win32 recomp targets)
+    kernel32
+    user32
+    gdi32
+    advapi32
+    shell32
+    ole32
+    winmm
+    dbghelp
+
+    # SDL2 (if using SDL2 for display/input/audio)
+    # SDL2::SDL2
+    # SDL2::SDL2main
+)
+
+# =============================================================================
+# Architecture Check
+#
+# If the original binary is 32-bit, the recompiled version must also be 32-bit
+# so that pointer sizes match and VirtualAlloc can map at the original VAs
+# (which are below 4 GB). Build with: cmake -A Win32
+# =============================================================================
+
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    message(WARNING "Building as 64-bit! Recomp target should be 32-bit (-A Win32).")
+    message(WARNING "Use: cmake -B build -G \"Visual Studio 17 2022\" -A Win32")
+endif()
+
+# =============================================================================
+# Code Generation Target
+#
+# Run the pcrecomp toolchain to (re)generate the recompiled C sources from
+# the original binary. This is a manual step, not part of the normal build.
+#
+# Usage:  cmake --build build --target codegen
+# =============================================================================
+
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_FOUND)
+    add_custom_target(codegen
+        COMMAND ${Python3_EXECUTABLE} -m tools --all
+            "$ENV{ORIGINAL_EXE_PATH}"
+            -o "${CMAKE_CURRENT_SOURCE_DIR}/src/recomp/gen"
+            --split 1000
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        COMMENT "Generating recompiled code from original binary"
+    )
+endif()

@@ -1,0 +1,44 @@
+# Build output
+build/
+out/
+*.exe
+*.dll
+*.obj
+*.o
+*.pdb
+*.ilk
+*.lib
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.vs/
+.vscode/
+*.suo
+*.user
+.idea/
+
+# Generated recomp output
+src/game/recomp/gen/
+RecompiledFuncs/
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Original binaries (never commit these)
+*.iso
+*.bin
+*.cue
+*.dat
+*.pak
+*.pk3
+
+# Claude
+.claude/
