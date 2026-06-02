@@ -400,11 +400,38 @@ class Lifter:
                        f'{_write(op1, f"(uint{sz}_t)_r")} }}', orig)
 
         elif m in ('rol', 'ror', 'rcl', 'rcr'):
-            # Rotate instructions - emit as helper call
             r = _read(op1)
             cnt = _read(op2)
-            sz = '8' if (op1.size == 1 or op1.type == OpType.REG8) else '16'
-            self._emit(f'/* TODO: {m} {r}, {cnt} */', orig)
+            is8 = (op1.size == 1 or op1.type == OpType.REG8)
+            w = 8 if is8 else 16
+            ut = f'uint{w}_t'
+            if m in ('rol', 'ror'):
+                # Plain rotate; CF = bit rotated out (lsb for rol, msb for ror).
+                if m == 'rol':
+                    rot = f'(_c ? ({ut})((_v << _c) | (_v >> ({w} - _c))) : _v)'
+                    cfbit = '(_r & 1)'
+                else:
+                    rot = f'(_c ? ({ut})((_v >> _c) | (_v << ({w} - _c))) : _v)'
+                    cfbit = f'((_r >> ({w} - 1)) & 1)'
+                self._emit(
+                    f'{{ {ut} _v = ({ut}){r}; uint8_t _n = ({cnt}) & 0x1F; '
+                    f'if (_n) {{ uint8_t _c = _n % {w}; {ut} _r = {rot}; '
+                    f'cpu->flags = (cpu->flags & ~FLAG_CF) | ({cfbit} ? FLAG_CF : 0); '
+                    f'{_write(op1, "_r")} }} }}', orig)
+            else:
+                # Rotate through carry; modulus is width+1 (the CF bit).
+                m1 = w + 1
+                full = (1 << m1) - 1
+                cbit = 1 << w
+                rotexpr = (f'((_val << _c) | (_val >> ({m1} - _c)))' if m == 'rcl'
+                           else f'((_val >> _c) | (_val << ({m1} - _c)))')
+                self._emit(
+                    f'{{ {ut} _v = ({ut}){r}; uint8_t _n = ({cnt}) & 0x1F; '
+                    f'if (_n) {{ uint8_t _c = _n % {m1}; '
+                    f'uint32_t _val = (uint32_t)_v | (cf(cpu) ? {cbit}u : 0u); '
+                    f'uint32_t _r = ({rotexpr}) & {full}u; '
+                    f'cpu->flags = (cpu->flags & ~FLAG_CF) | (((_r >> {w}) & 1) ? FLAG_CF : 0); '
+                    f'{_write(op1, f"({ut})_r")} }} }}', orig)
 
         # ─── Control flow ───
 
