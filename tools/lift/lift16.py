@@ -133,8 +133,9 @@ class Lifter:
         self.output.append(line)
 
     def _emit_label(self, addr: int):
-        """Emit a label if it's referenced."""
-        if addr in self.labels_needed:
+        """Emit a label if it's referenced (idempotent within a function)."""
+        if addr in self.labels_needed and addr not in self.labels_emitted:
+            self.labels_emitted.add(addr)
             self.output.append(f'{_label(addr, self.func_name)}:;')
 
     def lift_instruction(self, inst: Instruction, func_start: int):
@@ -683,6 +684,7 @@ class Lifter:
         """Lift an entire function to C code."""
         self.output = []
         self.labels_needed = set()
+        self.labels_emitted = set()
         self.func_calls = set()
         self.ovl_calls = set()
         self.func_name = name
