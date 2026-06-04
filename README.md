@@ -21,13 +21,18 @@ This repo collects every tool, runtime, and hard-won trick from our PC static re
 ```
 pcrecomp/
   tools/           Reusable analysis & transformation tools
-    pe/            PE binary analysis (imports, exports, sections, hashes)
-    disasm/        Disassemblers (32-bit recursive descent, 16-bit table-driven)
+    pe/            PE analysis (imports, exports, sections, hashes, delay-imports,
+                   protection/DRM detection, recursive binary catalog)
+    ne/            NE (16-bit New Executable) parse / disasm / call-graph
+    disasm/        Disassemblers (32-bit recursive descent, 16-bit table-driven,
+                   x87 FPU decoder, direct call-graph scanner)
     lift/          Code lifters (x86-32 and x86-16 to readable C)
     classify/      Function classifiers (SDK vs custom, multi-signal, string refs)
-    ghidra/        Ghidra headless scripts (batch decompile, export, stats)
+    ghidra/        Ghidra headless scripts (decompile, export, stats, xrefs,
+                   range disasm, function bounds)
+    ida/           IDA headless scripts (code-map export, segment probe)
     drm/           DRM analysis (SafeDisc memory dumping, DLL injection)
-    assets/        Asset extraction (InstallShield, PK3/ZIP, BIN/ISO, CAB)
+    assets/        Asset extraction (InstallShield, Wise, PK3/ZIP, BIN/ISO, CAB)
     cpp/           C++ RE helpers (MSVC/MWerks name mangling, vtable parsing)
     formats/       Format decoders (FIF fractal images, M20/MVB, SPAM, DAT)
   runtime/         Drop-in runtime support for recompiled code
@@ -50,6 +55,7 @@ Every tool here was forged in the fires of an actual recompilation project. Thes
 | **[gunman](https://github.com/sp00nznet/gunman)** | Gunman Chronicles | 2000 | GoldSrc (Half-Life) | Phase 2 - 3,990 functions classified |
 | **[bw](https://github.com/sp00nznet/bw)** | Black & White | 2001 | Lionhead custom | Active - 309/569 types done |
 | **[civ](https://github.com/sp00nznet/civ)** | Civilization (1991) | 1991 | 16-bit DOS / MSC 5.x | Compiles! 482 functions, 132K lines |
+| **[elfish](https://github.com/sp00nznet/elfish)** | El-Fish | 1993 | 16-bit NE + TSXLIB extender | NE toolchain, 121 code segments |
 | **[encarta](https://github.com/sp00nznet/encarta)** | Encarta 97 Encyclopedia | 1996 | MFC 4.0 + proprietary | Format RE phase |
 | **[fallout1-re](https://github.com/sp00nznet/fallout1-re)** | Fallout | 1997 | Custom (Interplay) | Fork + multiplayer ecosystem |
 | **[fallout2-re](https://github.com/sp00nznet/fallout2-re)** | Fallout 2 | 1998 | Custom (Interplay) | Upstream tracking |
@@ -62,8 +68,15 @@ Every tool here was forged in the fires of an actual recompilation project. Thes
 # What are we dealing with?
 python tools/pe/pe_analyze.py mystery.exe --json > analysis.json
 
-# What DLLs does it import?
+# What DLLs does it import? (including delay-loaded ones)
 python tools/pe/extract_imports.py mystery.exe
+python tools/pe/delay_imports.py mystery.exe
+
+# Is it packed or copy-protected? (SafeDisc/SecuROM/UPX/...)
+python tools/pe/analyze_sections.py mystery.exe
+
+# Catalog every binary in the install folder at once
+python tools/pe/catalog.py /path/to/install --json > catalog.json
 
 # Got Ghidra? Decompile everything in one shot
 # (run in Ghidra's headless analyzer)
@@ -96,11 +109,56 @@ python tools/disasm/analyze.py decoded.json --output functions.json
 python tools/lift/lift16.py functions.json --output RecompiledFuncs/
 ```
 
+### "It's a 16-bit Windows / OS-2 program (NE format)"
+
+```bash
+# Structure: segments, relocations, imports, entry points
+python tools/ne/ne_parse.py GAME.EXE
+
+# NE-aware disassembly (resolves cross-segment far calls + imports)
+python tools/ne/ne_decode.py GAME.EXE --summary
+python tools/ne/ne_decode.py GAME.EXE --seg 3
+
+# Segment call graph / clusters / import usage
+python tools/ne/ne_xref.py GAME.EXE --clusters
+python tools/ne/ne_xref.py GAME.EXE --imports
+```
+
 ### "The exe has SafeDisc DRM"
 
 ```bash
+# Confirm it statically first (entry point inside a high-entropy section?)
+python tools/pe/analyze_sections.py game.exe
+
 # Dump decrypted code from a running process (Steam/CD version)
 python tools/drm/safedisc_dump.py --exe game.exe --output decrypted.exe
+```
+
+### "It's a Wise installer and I want the files out"
+
+```bash
+# Find the overlay, inflate the install script, list embedded files
+python tools/assets/extract_wise.py setup.exe out_dir/
+```
+
+### "Who calls this function? What does it call?"
+
+```bash
+# Direct callers (no Ghidra/IDA needed) + most-referenced functions
+python tools/disasm/callgraph.py game.exe --callers 0x401D10
+python tools/disasm/callgraph.py game.exe --hot 25
+
+# Function-level graph + leaf detection (pair with DumpBounds.java output)
+analyzeHeadless proj P -process game.exe -postScript tools/ghidra/DumpBounds.java bounds.csv
+python tools/disasm/callgraph.py game.exe --bounds bounds.csv --leaves
+```
+
+### "I have IDA and want its analysis to drive the lifters"
+
+```bash
+# Export IDA's verified code map (functions + instruction heads), then feed it in
+py -3 tools/ida/ida_export.py GAME.EXE code_map.json --key ne
+python tools/ne/ne_decode.py GAME.EXE --ida-json code_map.json
 ```
 
 ## Requirements
@@ -127,6 +185,7 @@ pip install capstone pefile lief
 3. Pick your pipeline:
    - **32-bit PE**: `disasm32` -> `lift32` -> `translator` (fully automated)
    - **16-bit DOS**: `decode16` -> `analyze` -> `lift16` (with DOS compat runtime)
+   - **16-bit Windows/OS-2 (NE)**: `ne/ne_parse` -> `ne/ne_decode` -> `lift16` (see `tools/ne/README.md`)
    - **GoldSrc/SDK game**: `DecompileAll.java` -> `combined_classify.py` (SDK separation)
    - **C++ heavy**: `GhidraStats.java` + `msvc_mangler.py` + `parse_vtables.js`
 4. Drop in the appropriate `runtime/` files

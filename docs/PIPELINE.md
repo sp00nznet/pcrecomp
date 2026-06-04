@@ -11,6 +11,9 @@ Detailed documentation of each phase, what tools to use, and what to expect.
 **Tools**:
 - `tools/pe/pe_analyze.py` -- PE header analysis, sections, imports, exports, hashes
 - `tools/pe/extract_imports.py` -- Detailed import table extraction across modules
+- `tools/pe/delay_imports.py` -- Delay-loaded import table (the easy-to-miss deps)
+- `tools/pe/analyze_sections.py` -- Per-section entropy + SafeDisc/SecuROM/packer detection
+- `tools/pe/catalog.py` -- Recursively catalog/categorize every PE in an install tree
 
 **What you learn**:
 
@@ -56,6 +59,28 @@ Two-step process because 16-bit code has complications:
 2. **analyze.py** -- Function boundary detection using MSC prologue/epilogue patterns, near/far call resolution, overlay segment mapping.
 
 **Output**: Symbol table (TOML) + decoded instruction stream.
+
+### 16-bit Windows / OS-2 (NE)
+
+**Tools**: `tools/ne/ne_parse.py` -> `tools/ne/ne_decode.py` -> `tools/ne/ne_xref.py`
+
+The "New Executable" format is segmented and relocatable, unlike flat DOS MZ
+images, so it needs its own front end:
+1. **ne_parse.py** -- segment table, per-segment relocations, entry table, import/name tables.
+2. **ne_decode.py** -- NE-aware 16-bit disassembly; resolves relocations so far calls and imports are annotated inline (builds on `decode16.py` + `disasm/fpu_decode.py`).
+3. **ne_xref.py** -- segment-level call graph, clustering, and per-segment import usage.
+
+For data-in-code accuracy, export a code map from IDA (`tools/ida/ida_export.py`)
+and pass it via `ne_decode.py --ida-json`. See `tools/ne/README.md`.
+
+**Output**: Annotated per-segment disassembly + segment call graph.
+
+### Helper: lightweight call graph
+
+`tools/disasm/callgraph.py` scans a 32-bit PE for direct `E8`/`E9` edges with no
+Ghidra/IDA needed -- answers "who calls X" / "what's hot", and (with a
+`ghidra/DumpBounds.java` CSV) builds a function-level graph and finds leaf
+functions for differential testing.
 
 ---
 
@@ -220,9 +245,17 @@ The output is a standard native executable that runs on modern Windows (or Linux
 |------|------|-------|--------|
 | PE analysis | `pe/pe_analyze.py` | `.exe`/`.dll` | JSON metadata |
 | Import extraction | `pe/extract_imports.py` | `.exe`/`.dll` | Import table text |
+| Delay imports | `pe/delay_imports.py` | `.exe`/`.dll` | Delay-load import list |
+| Section/DRM analysis | `pe/analyze_sections.py` | `.exe`/`.dll` | Entropy + protection report |
+| Binary catalog | `pe/catalog.py` | Install dir | Per-PE catalog (text/JSON) |
+| NE parse | `ne/ne_parse.py` | NE binary | Segments/relocs/imports |
+| NE disassembly | `ne/ne_decode.py` | NE binary | Annotated disasm |
+| NE call graph | `ne/ne_xref.py` | NE binary | Segment graph / clusters |
 | 32-bit disassembly | `disasm/disasm32.py` | PE binary | Function JSON |
 | 16-bit decoding | `disasm/decode16.py` | MZ binary | Instruction stream |
 | 16-bit analysis | `disasm/analyze.py` | Instruction stream | Symbol table |
+| x87 FPU decode | `disasm/fpu_decode.py` | ESC opcode + ModR/M | FPU mnemonic (library) |
+| Call-graph scan | `disasm/callgraph.py` | PE (+bounds CSV) | Callers/callees/leaves |
 | 32-bit lifting | `lift/lift32.py` | Function JSON | C source files |
 | 16-bit lifting | `lift/lift16.py` | Symbol table | C source files |
 | Full pipeline | `lift/translator.py` | PE binary | Complete C project |
@@ -234,8 +267,15 @@ The output is a standard native executable that runs on modern Windows (or Linux
 | Batch decompile | `ghidra/DecompileAll.java` | Any binary | C pseudocode |
 | Function export | `ghidra/ExportFunctions.java` | Any binary | Function metadata |
 | Binary stats | `ghidra/GhidraStats.java` | Any binary | Analysis statistics |
+| Decompile by address | `ghidra/DecompAddrs.java` | Addresses / `@file` | C pseudocode |
+| Find references | `ghidra/FindRefs.java` | Addresses | Caller/writer sites |
+| Range disassembly | `ghidra/DisasmRange.java` | Start/end addr | Listing |
+| Function bounds CSV | `ghidra/DumpBounds.java` | Any binary | `start,end` CSV |
+| IDA code-map export | `ida/ida_export.py` | Any binary (in IDA) | Code map JSON |
+| IDA segment probe | `ida/ida_probe_segs.py` | Any binary (in IDA) | Segment layout |
 | SafeDisc dump | `drm/safedisc_dump.py` | Protected PE | Clean PE |
 | DLL injection | `drm/inject_and_run.c` | DRM'd process | Memory dump |
+| Wise installer extract | `assets/extract_wise.py` | Wise setup `.exe` | Script + file list |
 | InstallShield extract | `assets/isextract.py` | .hdr/.cab | Extracted files |
 | PK3/ZIP inspect | `assets/pk3_inspect.py` | .pk3/.zip | Content listing |
 | BIN->ISO convert | `assets/bin2iso.js` | .bin/.cue | .iso |

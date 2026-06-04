@@ -12,7 +12,7 @@ public class GhidraStats extends GhidraScript {
         SymbolTable st = currentProgram.getSymbolTable();
 
         int funcCount = fm.getFunctionCount();
-        println("=== Black & White Analysis Stats ===");
+        println("=== " + currentProgram.getName() + " Analysis Stats ===");
         println("Total functions found: " + funcCount);
 
         int named = 0;

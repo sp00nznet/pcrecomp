@@ -17,7 +17,16 @@ public class ExportFunctions extends GhidraScript {
 
     @Override
     public void run() throws Exception {
-        String outputDir = "D:/recomp/pc/gunman/disasm";
+        // Output directory: first script arg, else next to the analyzed binary.
+        String[] args = getScriptArgs();
+        String outputDir;
+        if (args.length >= 1 && !args[0].isEmpty()) {
+            outputDir = args[0];
+        } else {
+            String exe = currentProgram.getExecutablePath();
+            File dir = (exe != null) ? new File(exe).getParentFile() : new File(".");
+            outputDir = dir.getPath();
+        }
         String progName = currentProgram.getName().replace(".dll", "").replace(".exe", "");
         String outputPath = outputDir + "/" + progName + "_functions.txt";
 
