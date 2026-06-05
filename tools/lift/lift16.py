@@ -46,9 +46,20 @@ def _wsz(op: Operand) -> str:
         return '32'
     return '16'
 
+# The code segment of the function currently being lifted. CS-relative memory
+# operands (jump/switch tables, embedded read-only data) must read from THIS
+# fixed segment, not the runtime cpu->cs — the lifter does not track cpu->cs
+# across calls, so it goes stale and reads the wrong segment's data.
+_CODE_SEG = None
+
 def _mem_addr(op: Operand) -> tuple:
     """Generate (seg_expr, off_expr) for memory operand."""
-    seg = f'cpu->{op.seg}' if op.seg else 'cpu->ds'
+    if op.seg == 'cs' and _CODE_SEG is not None:
+        seg = f'SEG_{_CODE_SEG}'        # this function's code segment (constant)
+    elif op.seg:
+        seg = f'cpu->{op.seg}'
+    else:
+        seg = 'cpu->ds'
 
     parts = []
     if op.base:
