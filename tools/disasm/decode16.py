@@ -32,7 +32,7 @@ class OpType(Enum):
 REG8_NAMES  = ['al', 'cl', 'dl', 'bl', 'ah', 'ch', 'dh', 'bh']
 REG16_NAMES = ['ax', 'cx', 'dx', 'bx', 'sp', 'bp', 'si', 'di']
 REG32_NAMES = ['eax', 'ecx', 'edx', 'ebx', 'esp', 'ebp', 'esi', 'edi']
-SREG_NAMES  = ['es', 'cs', 'ss', 'ds']
+SREG_NAMES  = ['es', 'cs', 'ss', 'ds', 'fs', 'gs']
 
 # 16-bit ModR/M effective address components
 EA_BASES = [
@@ -828,6 +828,13 @@ class Decoder:
                 inst.op1 = rm; inst.op2 = reg
                 if op2b in (0xA4, 0xAC):
                     self._u8()                # imm8 count (lifter emits TODO)
+            elif op2b in (0x02, 0x03):        # LAR / LSL r16, r/m16 (selector validity)
+                reg, rm, _ = self._decode_modrm(True, seg_override)
+                inst.mnemonic = 'lar' if op2b == 0x02 else 'lsl'
+                inst.op1 = reg; inst.op2 = rm
+            elif op2b in (0xA0, 0xA1, 0xA8, 0xA9):   # PUSH/POP FS/GS
+                inst.mnemonic = 'push' if op2b in (0xA0, 0xA8) else 'pop'
+                inst.op1 = Operand(type=OpType.SREG, reg=(4 if op2b in (0xA0, 0xA1) else 5), size=2)
             elif op2b == 0x1F:                # multi-byte NOP
                 self._decode_modrm(True, seg_override)
                 inst.mnemonic = 'nop'

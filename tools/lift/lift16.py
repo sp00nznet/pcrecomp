@@ -734,6 +734,13 @@ class Lifter:
             body += '}'
             self._emit(body, orig)
 
+        elif m in ('lar', 'lsl'):                       # load access rights / segment limit
+            helper = 'cpu_lar' if m == 'lar' else 'cpu_lsl'
+            body = (f'{{ uint16_t _ar; if ({helper}(cpu, (uint16_t)({_read(op2)}), &_ar)) '
+                    f'{{ {_write(op1, "_ar")} cpu->flags |= FLAG_ZF; }} '
+                    f'else cpu->flags &= ~FLAG_ZF; }}')
+            self._emit(body, orig)
+
         elif m in ('shld', 'shrd'):
             self._emit(f'/* TODO {m} (double-precision shift): {orig} */', orig)
 
