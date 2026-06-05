@@ -191,15 +191,16 @@ class Lifter:
             _, off = _mem_addr(op2)
             self._emit(_write(op1, off), orig)
 
-        elif m == 'lds':
+        elif m in ('lds', 'les'):
+            # Load far pointer: reg = [mem], (DS|ES) = [mem+2]. The destination
+            # register is often also part of the address (e.g. `les di,[di]` for
+            # linked-list walks), so both words must be read into temps using the
+            # ORIGINAL address before either register is written.
+            sreg = 'cpu->ds' if m == 'lds' else 'cpu->es'
             seg, off = _mem_addr(op2)
-            self._emit(f'{_reg16(op1)} = mem_read16(cpu, {seg}, {off});', orig)
-            self._emit(f'cpu->ds = mem_read16(cpu, {seg}, (uint16_t)({off} + 2));')
-
-        elif m == 'les':
-            seg, off = _mem_addr(op2)
-            self._emit(f'{_reg16(op1)} = mem_read16(cpu, {seg}, {off});', orig)
-            self._emit(f'cpu->es = mem_read16(cpu, {seg}, (uint16_t)({off} + 2));')
+            self._emit(f'{{ uint16_t _o = mem_read16(cpu, {seg}, {off}); '
+                       f'uint16_t _s = mem_read16(cpu, {seg}, (uint16_t)({off} + 2)); '
+                       f'{_reg16(op1)} = _o; {sreg} = _s; }}', orig)
 
         elif m == 'cbw':
             self._emit('cpu->ax = (uint16_t)(int16_t)(int8_t)cpu->al;', orig)
