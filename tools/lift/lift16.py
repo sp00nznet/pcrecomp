@@ -16,7 +16,8 @@ Generated code style:
 Part of the Civ Recomp project (sp00nznet/civ)
 """
 
-from decode16 import Decoder, Instruction, OpType, Operand, REG8_NAMES, REG16_NAMES, SREG_NAMES
+from decode16 import (Decoder, Instruction, OpType, Operand,
+                      REG8_NAMES, REG16_NAMES, REG32_NAMES, SREG_NAMES)
 
 
 def _reg8(op: Operand) -> str:
@@ -27,9 +28,23 @@ def _reg16(op: Operand) -> str:
     """Generate C expression for 16-bit register access."""
     return f'cpu->{REG16_NAMES[op.reg]}'
 
+def _reg32(op: Operand) -> str:
+    """Generate C expression for 32-bit register access."""
+    return f'cpu->{REG32_NAMES[op.reg]}'
+
 def _sreg(op: Operand) -> str:
     """Generate C expression for segment register access."""
     return f'cpu->{SREG_NAMES[op.reg]}'
+
+def _wsz(op: Operand) -> str:
+    """Operand width suffix for flag/temp helpers: '8' | '16' | '32'."""
+    if op is None:
+        return '16'
+    if op.type == OpType.REG8 or op.size == 1:
+        return '8'
+    if op.type == OpType.REG32 or op.size == 4:
+        return '32'
+    return '16'
 
 def _mem_addr(op: Operand) -> tuple:
     """Generate (seg_expr, off_expr) for memory operand."""
@@ -66,14 +81,20 @@ def _read(op: Operand) -> str:
         return _reg8(op)
     elif op.type == OpType.REG16:
         return _reg16(op)
+    elif op.type == OpType.REG32:
+        return _reg32(op)
     elif op.type == OpType.SREG:
         return _sreg(op)
+    elif op.type == OpType.IMM32:
+        return f'0x{op.disp & 0xFFFFFFFF:X}u'
     elif op.type in (OpType.IMM8, OpType.IMM16):
         return f'0x{op.disp & 0xFFFF:X}'
     elif op.type == OpType.MEM or op.type == OpType.MOFFS:
         seg, off = _mem_addr(op)
         if op.size == 1:
             return f'mem_read8(cpu, {seg}, {off})'
+        elif op.size == 4:
+            return f'mem_read32(cpu, {seg}, {off})'
         else:
             return f'mem_read16(cpu, {seg}, {off})'
     return '/* ??? */'
@@ -84,12 +105,16 @@ def _write(op: Operand, val: str) -> str:
         return f'{_reg8(op)} = (uint8_t)({val});'
     elif op.type == OpType.REG16:
         return f'{_reg16(op)} = (uint16_t)({val});'
+    elif op.type == OpType.REG32:
+        return f'{_reg32(op)} = (uint32_t)({val});'
     elif op.type == OpType.SREG:
         return f'{_sreg(op)} = (uint16_t)({val});'
     elif op.type == OpType.MEM or op.type == OpType.MOFFS:
         seg, off = _mem_addr(op)
         if op.size == 1:
             return f'mem_write8(cpu, {seg}, {off}, (uint8_t)({val}));'
+        elif op.size == 4:
+            return f'mem_write32(cpu, {seg}, {off}, (uint32_t)({val}));'
         else:
             return f'mem_write16(cpu, {seg}, {off}, (uint16_t)({val}));'
     return f'/* write ??? = {val} */;'
@@ -182,19 +207,50 @@ class Lifter:
         elif m == 'cwd':
             self._emit('cpu->dx = (cpu->ax & 0x8000) ? 0xFFFF : 0x0000;', orig)
 
+        elif m == 'cwde':   # sign-extend AX -> EAX
+            self._emit('cpu->eax = (uint32_t)(int32_t)(int16_t)cpu->ax;', orig)
+
+        elif m == 'cdq':    # sign-extend EAX -> EDX:EAX
+            self._emit('cpu->edx = (cpu->eax & 0x80000000u) ? 0xFFFFFFFFu : 0;', orig)
+
         # ─── Stack ───
 
         elif m == 'push':
-            self._emit(f'push16(cpu, {_read(op1)});', orig)
+            if _wsz(op1) == '32':
+                self._emit(f'push32(cpu, {_read(op1)});', orig)
+            else:
+                self._emit(f'push16(cpu, {_read(op1)});', orig)
 
         elif m == 'pop':
-            self._emit(_write(op1, 'pop16(cpu)'), orig)
+            if _wsz(op1) == '32':
+                self._emit(_write(op1, 'pop32(cpu)'), orig)
+            else:
+                self._emit(_write(op1, 'pop16(cpu)'), orig)
 
         elif m == 'pushf':
             self._emit('push16(cpu, cpu->flags);', orig)
 
         elif m == 'popf':
             self._emit('cpu->flags = pop16(cpu);', orig)
+
+        elif m == 'pushfd':
+            self._emit('push32(cpu, cpu->flags);', orig)
+
+        elif m == 'popfd':
+            self._emit('cpu->flags = (uint16_t)pop32(cpu);', orig)
+
+        elif m == 'pushad':
+            self._emit('{ uint16_t _sp = cpu->sp; '
+                       'push32(cpu, cpu->eax); push32(cpu, cpu->ecx); '
+                       'push32(cpu, cpu->edx); push32(cpu, cpu->ebx); '
+                       'push32(cpu, _sp); push32(cpu, cpu->ebp); '
+                       'push32(cpu, cpu->esi); push32(cpu, cpu->edi); }', orig)
+
+        elif m == 'popad':
+            self._emit('cpu->edi = pop32(cpu); cpu->esi = pop32(cpu); '
+                       'cpu->ebp = pop32(cpu); (void)pop32(cpu); /* skip ESP */ '
+                       'cpu->ebx = pop32(cpu); cpu->edx = pop32(cpu); '
+                       'cpu->ecx = pop32(cpu); cpu->eax = pop32(cpu);', orig)
 
         elif m == 'pusha':
             self._emit('{ uint16_t _sp = cpu->sp; '
@@ -212,72 +268,46 @@ class Lifter:
         # ─── Arithmetic ───
 
         elif m == 'add':
-            if op1.size == 1 or op1.type == OpType.REG8:
-                self._emit(_write(op1,
-                    f'flags_add8(cpu, {_read(op1)}, {_read(op2)})'), orig)
-            else:
-                self._emit(_write(op1,
-                    f'flags_add16(cpu, {_read(op1)}, {_read(op2)})'), orig)
+            sz = _wsz(op1)
+            self._emit(_write(op1,
+                f'flags_add{sz}(cpu, {_read(op1)}, {_read(op2)})'), orig)
 
         elif m == 'adc':
-            if op1.size == 1 or op1.type == OpType.REG8:
-                self._emit(_write(op1,
-                    f'flags_add8(cpu, {_read(op1)}, {_read(op2)} + cf(cpu))'), orig)
-            else:
-                self._emit(_write(op1,
-                    f'flags_add16(cpu, {_read(op1)}, {_read(op2)} + cf(cpu))'), orig)
+            sz = _wsz(op1)
+            self._emit(_write(op1,
+                f'flags_add{sz}(cpu, {_read(op1)}, {_read(op2)} + cf(cpu))'), orig)
 
         elif m == 'sub':
-            if op1.size == 1 or op1.type == OpType.REG8:
-                self._emit(_write(op1,
-                    f'flags_sub8(cpu, {_read(op1)}, {_read(op2)})'), orig)
-            else:
-                self._emit(_write(op1,
-                    f'flags_sub16(cpu, {_read(op1)}, {_read(op2)})'), orig)
+            sz = _wsz(op1)
+            self._emit(_write(op1,
+                f'flags_sub{sz}(cpu, {_read(op1)}, {_read(op2)})'), orig)
 
         elif m == 'sbb':
-            if op1.size == 1 or op1.type == OpType.REG8:
-                self._emit(_write(op1,
-                    f'flags_sub8(cpu, {_read(op1)}, {_read(op2)} + cf(cpu))'), orig)
-            else:
-                self._emit(_write(op1,
-                    f'flags_sub16(cpu, {_read(op1)}, {_read(op2)} + cf(cpu))'), orig)
+            sz = _wsz(op1)
+            self._emit(_write(op1,
+                f'flags_sub{sz}(cpu, {_read(op1)}, {_read(op2)} + cf(cpu))'), orig)
 
         elif m == 'cmp':
-            if op1.size == 1 or op1.type == OpType.REG8:
-                self._emit(f'flags_cmp8(cpu, {_read(op1)}, {_read(op2)});', orig)
-            else:
-                self._emit(f'flags_cmp16(cpu, {_read(op1)}, {_read(op2)});', orig)
+            sz = _wsz(op1)
+            self._emit(f'flags_cmp{sz}(cpu, {_read(op1)}, {_read(op2)});', orig)
 
         elif m == 'inc':
-            if op1.size == 1 or op1.type == OpType.REG8:
-                self._emit(f'{{ int _cf = cf(cpu); '
-                           f'{_write(op1, f"flags_add8(cpu, {_read(op1)}, 1)")} '
-                           f'if (_cf) cpu->flags |= FLAG_CF; '
-                           f'else cpu->flags &= ~FLAG_CF; }}', orig)
-            else:
-                self._emit(f'{{ int _cf = cf(cpu); '
-                           f'{_write(op1, f"flags_add16(cpu, {_read(op1)}, 1)")} '
-                           f'if (_cf) cpu->flags |= FLAG_CF; '
-                           f'else cpu->flags &= ~FLAG_CF; }}', orig)
+            sz = _wsz(op1)
+            self._emit(f'{{ int _cf = cf(cpu); '
+                       f'{_write(op1, f"flags_add{sz}(cpu, {_read(op1)}, 1)")} '
+                       f'if (_cf) cpu->flags |= FLAG_CF; '
+                       f'else cpu->flags &= ~FLAG_CF; }}', orig)
 
         elif m == 'dec':
-            if op1.size == 1 or op1.type == OpType.REG8:
-                self._emit(f'{{ int _cf = cf(cpu); '
-                           f'{_write(op1, f"flags_sub8(cpu, {_read(op1)}, 1)")} '
-                           f'if (_cf) cpu->flags |= FLAG_CF; '
-                           f'else cpu->flags &= ~FLAG_CF; }}', orig)
-            else:
-                self._emit(f'{{ int _cf = cf(cpu); '
-                           f'{_write(op1, f"flags_sub16(cpu, {_read(op1)}, 1)")} '
-                           f'if (_cf) cpu->flags |= FLAG_CF; '
-                           f'else cpu->flags &= ~FLAG_CF; }}', orig)
+            sz = _wsz(op1)
+            self._emit(f'{{ int _cf = cf(cpu); '
+                       f'{_write(op1, f"flags_sub{sz}(cpu, {_read(op1)}, 1)")} '
+                       f'if (_cf) cpu->flags |= FLAG_CF; '
+                       f'else cpu->flags &= ~FLAG_CF; }}', orig)
 
         elif m == 'neg':
-            if op1.size == 1 or op1.type == OpType.REG8:
-                self._emit(_write(op1, f'flags_sub8(cpu, 0, {_read(op1)})'), orig)
-            else:
-                self._emit(_write(op1, f'flags_sub16(cpu, 0, {_read(op1)})'), orig)
+            sz = _wsz(op1)
+            self._emit(_write(op1, f'flags_sub{sz}(cpu, 0, {_read(op1)})'), orig)
 
         elif m == 'mul':
             if op1.size == 1 or op1.type == OpType.REG8:
@@ -290,6 +320,16 @@ class Lifter:
                            f'cpu->ax = (uint16_t)_r; cpu->dx = (uint16_t)(_r >> 16); '
                            f'cpu->flags = (cpu->flags & ~(FLAG_CF|FLAG_OF)) | '
                            f'(cpu->dx ? FLAG_CF|FLAG_OF : 0); }}', orig)
+
+        elif m == 'imul' and op2 is not None:
+            # Two-operand imul: op1 = op1 * op2 (truncated, signed); CF/OF on overflow.
+            sz = _wsz(op1)
+            st = {'8': 'int8_t', '16': 'int16_t', '32': 'int32_t'}[sz]
+            self._emit(f'{{ long long _r = (long long)({st})({_read(op1)}) * '
+                       f'({st})({_read(op2)}); '
+                       f'{_write(op1, f"(uint{sz}_t)_r")} '
+                       f'cpu->flags = (cpu->flags & ~(FLAG_CF|FLAG_OF)) | '
+                       f'((_r != ({st})_r) ? (FLAG_CF|FLAG_OF) : 0); }}', orig)
 
         elif m == 'imul':
             if op1.size == 1 or op1.type == OpType.REG8:
@@ -335,28 +375,28 @@ class Lifter:
 
         elif m == 'and':
             val = f'{_read(op1)} & {_read(op2)}'
-            sz = '8' if (op1.size == 1 or op1.type == OpType.REG8) else '16'
+            sz = _wsz(op1)
             self._emit(f'{{ uint{sz}_t _r = {val}; '
                        f'flags_logic{sz}(cpu, _r); '
                        f'{_write(op1, "_r")} }}', orig)
 
         elif m == 'or':
             val = f'{_read(op1)} | {_read(op2)}'
-            sz = '8' if (op1.size == 1 or op1.type == OpType.REG8) else '16'
+            sz = _wsz(op1)
             self._emit(f'{{ uint{sz}_t _r = {val}; '
                        f'flags_logic{sz}(cpu, _r); '
                        f'{_write(op1, "_r")} }}', orig)
 
         elif m == 'xor':
             val = f'{_read(op1)} ^ {_read(op2)}'
-            sz = '8' if (op1.size == 1 or op1.type == OpType.REG8) else '16'
+            sz = _wsz(op1)
             self._emit(f'{{ uint{sz}_t _r = {val}; '
                        f'flags_logic{sz}(cpu, _r); '
                        f'{_write(op1, "_r")} }}', orig)
 
         elif m == 'test':
             val = f'{_read(op1)} & {_read(op2)}'
-            sz = '8' if (op1.size == 1 or op1.type == OpType.REG8) else '16'
+            sz = _wsz(op1)
             self._emit(f'flags_logic{sz}(cpu, {val});', orig)
 
         elif m == 'not':
@@ -367,8 +407,8 @@ class Lifter:
         elif m in ('shl', 'sal'):
             r = _read(op1)
             cnt = _read(op2)
-            sz = '8' if (op1.size == 1 or op1.type == OpType.REG8) else '16'
-            bits = 8 if sz == '8' else 16
+            sz = _wsz(op1)
+            bits = int(sz)
             self._emit(f'{{ uint{sz}_t _v = {r}; uint8_t _c = {cnt}; '
                        f'uint{sz}_t _r = _v << _c; '
                        f'cpu->flags = (cpu->flags & ~FLAG_CF) | '
@@ -379,7 +419,7 @@ class Lifter:
         elif m == 'shr':
             r = _read(op1)
             cnt = _read(op2)
-            sz = '8' if (op1.size == 1 or op1.type == OpType.REG8) else '16'
+            sz = _wsz(op1)
             self._emit(f'{{ uint{sz}_t _v = {r}; uint8_t _c = {cnt}; '
                        f'uint{sz}_t _r = _v >> _c; '
                        f'cpu->flags = (cpu->flags & ~FLAG_CF) | '
@@ -390,8 +430,8 @@ class Lifter:
         elif m == 'sar':
             r = _read(op1)
             cnt = _read(op2)
-            sz = '8' if (op1.size == 1 or op1.type == OpType.REG8) else '16'
-            stype = 'int8_t' if sz == '8' else 'int16_t'
+            sz = _wsz(op1)
+            stype = {'8': 'int8_t', '16': 'int16_t', '32': 'int32_t'}[sz]
             self._emit(f'{{ {stype} _v = ({stype}){r}; uint8_t _c = {cnt}; '
                        f'{stype} _r = _v >> _c; '
                        f'cpu->flags = (cpu->flags & ~FLAG_CF) | '
@@ -402,8 +442,7 @@ class Lifter:
         elif m in ('rol', 'ror', 'rcl', 'rcr'):
             r = _read(op1)
             cnt = _read(op2)
-            is8 = (op1.size == 1 or op1.type == OpType.REG8)
-            w = 8 if is8 else 16
+            w = int(_wsz(op1))
             ut = f'uint{w}_t'
             if m in ('rol', 'ror'):
                 # Plain rotate; CF = bit rotated out (lsb for rol, msb for ror).
@@ -635,6 +674,57 @@ class Lifter:
                        f'cpu->si += df(cpu) ? -2 : 2; '
                        f'cpu->di += df(cpu) ? -2 : 2;', orig)
 
+        # ─── 32-bit string ops (0x66 prefix) ───
+
+        elif m == 'movsd':
+            self._emit(f'mem_write32(cpu, cpu->es, cpu->di, '
+                       f'mem_read32(cpu, cpu->ds, cpu->si)); '
+                       f'cpu->si += df(cpu) ? -4 : 4; cpu->di += df(cpu) ? -4 : 4;', orig)
+        elif m == 'stosd':
+            self._emit(f'mem_write32(cpu, cpu->es, cpu->di, cpu->eax); '
+                       f'cpu->di += df(cpu) ? -4 : 4;', orig)
+        elif m == 'lodsd':
+            self._emit(f'cpu->eax = mem_read32(cpu, cpu->ds, cpu->si); '
+                       f'cpu->si += df(cpu) ? -4 : 4;', orig)
+        elif m == 'scasd':
+            self._emit(f'flags_cmp32(cpu, cpu->eax, mem_read32(cpu, cpu->es, cpu->di)); '
+                       f'cpu->di += df(cpu) ? -4 : 4;', orig)
+        elif m == 'cmpsd':
+            self._emit(f'flags_cmp32(cpu, mem_read32(cpu, cpu->ds, cpu->si), '
+                       f'mem_read32(cpu, cpu->es, cpu->di)); '
+                       f'cpu->si += df(cpu) ? -4 : 4; cpu->di += df(cpu) ? -4 : 4;', orig)
+
+        # ─── 386 two-byte ops ───
+
+        elif m == 'movzx':
+            self._emit(_write(op1, _read(op2)), orig)   # _write zero-extends to dest width
+
+        elif m == 'movsx':
+            sbits = 8 if op2.size == 1 else 16
+            self._emit(_write(op1, f'(int{int(_wsz(op1))}_t)(int{sbits}_t)({_read(op2)})'), orig)
+
+        elif m.startswith('set'):                       # SETcc r/m8
+            cc = 'cc_' + m[3:]
+            self._emit(_write(op1, f'({cc}(cpu) ? 1 : 0)'), orig)
+
+        elif m in ('bt', 'bts', 'btr', 'btc'):
+            w = _wsz(op1)
+            val = _read(op1)
+            bitcnt = _read(op2)
+            setexpr = {'bt': None,
+                       'bts': f'_v | ((uint{w}_t)1 << _b)',
+                       'btr': f'_v & ~((uint{w}_t)1 << _b)',
+                       'btc': f'_v ^ ((uint{w}_t)1 << _b)'}[m]
+            body = (f'{{ uint{w}_t _v = {val}; uint8_t _b = ({bitcnt}) & {int(w)-1}; '
+                    f'cpu->flags = (cpu->flags & ~FLAG_CF) | (((_v >> _b) & 1) ? FLAG_CF : 0); ')
+            if setexpr:
+                body += f'{_write(op1, setexpr)} '
+            body += '}'
+            self._emit(body, orig)
+
+        elif m in ('shld', 'shrd'):
+            self._emit(f'/* TODO {m} (double-precision shift): {orig} */', orig)
+
         # ─── Flags ───
 
         elif m == 'clc': self._emit('cpu->flags &= ~FLAG_CF;', orig)
@@ -736,7 +826,7 @@ class Lifter:
         self.output.append('{')
 
         for inst in instructions:
-            if inst.prefix == 'rep' and inst.mnemonic in ('movsb','movsw','stosb','stosw'):
+            if inst.prefix == 'rep' and inst.mnemonic in ('movsb','movsw','movsd','stosb','stosw','stosd'):
                 self._emit_label(inst.address)
                 self._emit(f'while (cpu->cx != 0) {{ cpu->cx--;', f'rep {inst.mnemonic}')
                 self.indent += 1
@@ -748,7 +838,7 @@ class Lifter:
                 self.lift_instruction(stripped, func_start)
                 self.indent -= 1
                 self._emit('}')
-            elif inst.prefix == 'rep' and inst.mnemonic in ('scasb','scasw','cmpsb','cmpsw'):
+            elif inst.prefix == 'rep' and inst.mnemonic in ('scasb','scasw','scasd','cmpsb','cmpsw','cmpsd'):
                 self._emit_label(inst.address)
                 self._emit(f'while (cpu->cx != 0) {{ cpu->cx--;', f'repz {inst.mnemonic}')
                 self.indent += 1
@@ -760,7 +850,7 @@ class Lifter:
                 self._emit('if (!zf(cpu)) break;')
                 self.indent -= 1
                 self._emit('}')
-            elif inst.prefix == 'repnz' and inst.mnemonic in ('scasb','scasw','cmpsb','cmpsw'):
+            elif inst.prefix == 'repnz' and inst.mnemonic in ('scasb','scasw','scasd','cmpsb','cmpsw','cmpsd'):
                 self._emit_label(inst.address)
                 self._emit(f'while (cpu->cx != 0) {{ cpu->cx--;', f'repnz {inst.mnemonic}')
                 self.indent += 1
