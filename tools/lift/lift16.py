@@ -33,7 +33,12 @@ def _reg32(op: Operand) -> str:
     return f'cpu->{REG32_NAMES[op.reg]}'
 
 def _sreg(op: Operand) -> str:
-    """Generate C expression for segment register access."""
+    """Generate C expression for segment register access. CS is constant per
+    function (the code segment) and cpu->cs is not maintained across the C-call
+    dispatch, so reads of CS (push cs, mov r,cs, cs: far pointers) must use the
+    segment constant — otherwise cs:-relative data pointers carry a stale seg."""
+    if SREG_NAMES[op.reg] == 'cs':
+        return _cseg()
     return f'cpu->{SREG_NAMES[op.reg]}'
 
 def _wsz(op: Operand) -> str:
@@ -85,6 +90,12 @@ def _mem_addr(op: Operand) -> tuple:
         off = '0'
 
     return seg, off
+
+def _cseg() -> str:
+    """This function's code segment as a C expression (constant when known).
+    Near indirect call/jmp targets live in CS, which is constant per function;
+    cpu->cs is not maintained across far calls, so prefer the constant."""
+    return f'SEG_{_CODE_SEG}' if _CODE_SEG is not None else 'cpu->cs'
 
 def _read(op: Operand) -> str:
     """Generate C expression to read an operand value."""
@@ -495,9 +506,21 @@ class Lifter:
                 else:
                     self._emit(f'/* jmp out of function to 0x{target:06X} */', orig)
             elif op1 and op1.type == OpType.MEM:
-                self._emit(f'/* indirect jmp via {_read(op1)} - needs dispatch */', orig)
+                if getattr(self, 'dispatch', False):
+                    seg, off = _mem_addr(op1)
+                    if op1.size == 4:
+                        self._emit(f'{{ uint16_t _o={off}; uint16_t _s={seg}; '
+                                   f'recomp_dispatch(cpu, mem_read16(cpu,_s,(uint16_t)(_o+2)), '
+                                   f'mem_read16(cpu,_s,_o)); return; }}', orig)
+                    else:
+                        self._emit(f'recomp_dispatch(cpu, {_cseg()}, {_read(op1)}); return;', orig)
+                else:
+                    self._emit(f'/* indirect jmp via {_read(op1)} - needs dispatch */', orig)
             else:
-                self._emit(f'/* jmp {repr(op1)} */', orig)
+                if getattr(self, 'dispatch', False) and op1 and op1.type == OpType.REG16:
+                    self._emit(f'recomp_dispatch(cpu, {_cseg()}, {_read(op1)}); return;', orig)
+                else:
+                    self._emit(f'/* jmp {repr(op1)} */', orig)
 
         elif m in ('jo','jno','jb','jae','je','jne','jbe','ja',
                     'js','jns','jp','jnp','jl','jge','jle','jg'):
@@ -589,7 +612,44 @@ class Lifter:
                 self._emit(f'push16(cpu, cpu->cs); push16(cpu, 0);', f'far call return addr')
                 self._emit(f'{func_name}(cpu);', orig)
             else:
-                self._emit(f'/* indirect call {repr(op1)} - needs dispatch */', orig)
+                if getattr(self, 'dispatch', False) and op1:
+                    if op1.type == OpType.MEM and op1.size == 4:
+                        seg, off = _mem_addr(op1)
+                        self._emit(f'{{ uint16_t _o={off}; uint16_t _s={seg}; '
+                                   f'push16(cpu,cpu->cs); push16(cpu,0); '
+                                   f'recomp_dispatch(cpu, mem_read16(cpu,_s,(uint16_t)(_o+2)), '
+                                   f'mem_read16(cpu,_s,_o)); }}', orig)
+                    else:  # near indirect (word mem or register)
+                        self._emit(f'push16(cpu,0); recomp_dispatch(cpu, {_cseg()}, {_read(op1)});', orig)
+                else:
+                    self._emit(f'/* indirect call {repr(op1)} - needs dispatch */', orig)
+
+        elif m == 'call far':
+            # FF /3: indirect far call through a memory dword (seg:off). Read the
+            # far pointer and dispatch. (Direct far calls decode as 'call'/FAR.)
+            if getattr(self, 'dispatch', False) and op1 and op1.type == OpType.MEM:
+                seg, off = _mem_addr(op1)
+                self._emit(f'{{ uint16_t _o={off}; uint16_t _s={seg}; '
+                           f'push16(cpu,cpu->cs); push16(cpu,0); '
+                           f'recomp_dispatch(cpu, mem_read16(cpu,_s,(uint16_t)(_o+2)), '
+                           f'mem_read16(cpu,_s,_o)); }}', orig)
+            elif getattr(self, 'dispatch', False) and op1 and op1.type == OpType.FAR:
+                self._emit(f'push16(cpu,cpu->cs); push16(cpu,0); '
+                           f'recomp_dispatch(cpu, 0x{op1.far_seg:X}, 0x{op1.disp:X});', orig)
+            else:
+                self._emit(f'/* UNHANDLED: {orig} */', orig)
+
+        elif m == 'jmp far':
+            # FF /5: indirect far jmp through memory; EA: direct far jmp seg:off.
+            if getattr(self, 'dispatch', False) and op1 and op1.type == OpType.MEM:
+                seg, off = _mem_addr(op1)
+                self._emit(f'{{ uint16_t _o={off}; uint16_t _s={seg}; '
+                           f'recomp_dispatch(cpu, mem_read16(cpu,_s,(uint16_t)(_o+2)), '
+                           f'mem_read16(cpu,_s,_o)); return; }}', orig)
+            elif getattr(self, 'dispatch', False) and op1 and op1.type == OpType.FAR:
+                self._emit(f'recomp_dispatch(cpu, 0x{op1.far_seg:X}, 0x{op1.disp:X}); return;', orig)
+            else:
+                self._emit(f'/* UNHANDLED: {orig} */', orig)
 
         elif m == 'ret':
             # Simulate NEAR RET: pop 2-byte return IP + optional extra bytes
@@ -600,8 +660,15 @@ class Lifter:
                 self._emit('cpu->sp += 2; return;', orig)
 
         elif m == 'retf':
-            # Simulate FAR RETF: pop 4-byte return CS:IP + optional extra bytes
-            if op1:
+            # Simulate FAR RETF: pop 4-byte return CS:IP + optional extra bytes.
+            # With dispatch on, follow it as a computed jump when the popped
+            # CS:IP resolves to a known function (retf-as-trampoline); a normal
+            # far return resolves to nothing and just returns to the C caller.
+            if getattr(self, 'dispatch', False):
+                extra = f' cpu->sp += 0x{op1.disp:X};' if op1 else ''
+                self._emit(f'{{ uint16_t _ip=pop16(cpu); uint16_t _cs=pop16(cpu);{extra} '
+                           f'recomp_dispatch(cpu,_cs,_ip); return; }}', orig)
+            elif op1:
                 total = op1.disp + 4
                 self._emit(f'cpu->sp += 0x{total:X}; return;', orig)
             else:
