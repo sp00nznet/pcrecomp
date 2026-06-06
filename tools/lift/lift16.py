@@ -190,6 +190,7 @@ class Lifter:
         m = inst.mnemonic
         op1 = inst.op1
         op2 = inst.op2
+        op3 = inst.op3
 
         # Emit label if this address is a jump target
         self._emit_label(inst.address)
@@ -809,7 +810,22 @@ class Lifter:
             self._emit(body, orig)
 
         elif m in ('shld', 'shrd'):
-            self._emit(f'/* TODO {m} (double-precision shift): {orig} */', orig)
+            # Double-precision shift: shift op1 by count, feeding bits from op2.
+            # Count is masked to 5 bits; only the defined range [1, width-1] is
+            # emitted (Borland never generates the undefined count>=width form).
+            w = int(_wsz(op1))
+            dst, src, cnt = _read(op1), _read(op2), (_read(op3) if op3 else '1')
+            if m == 'shld':
+                res = f'(uint{w}_t)(((uint{w}_t)(_d << _c)) | (uint{w}_t)(_s >> ({w} - _c)))'
+                cf  = f'((_d >> ({w} - _c)) & 1)'
+            else:  # shrd
+                res = f'(uint{w}_t)((_d >> _c) | (uint{w}_t)(_s << ({w} - _c)))'
+                cf  = f'((_d >> (_c - 1)) & 1)'
+            body = (f'{{ uint{w}_t _d = {dst}, _s = {src}; uint8_t _c = ({cnt}) & 0x1F; '
+                    f'if (_c && _c < {w}) {{ uint{w}_t _r = {res}; '
+                    f'cpu->flags = (cpu->flags & ~FLAG_CF) | (({cf}) ? FLAG_CF : 0); '
+                    f'flags_shift{w}(cpu, _r); {_write(op1, "_r")} }} }}')
+            self._emit(body, orig)
 
         # ─── Flags ───
 
