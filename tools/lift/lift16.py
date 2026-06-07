@@ -522,6 +522,16 @@ class Lifter:
                     # Tail jump to another function (or shared continuation).
                     abs_t = func_start + target
                     self._emit(f'{self._tail_jump(abs_t)} /* tail-jmp 0x{abs_t:06X} */', orig)
+            elif op1 and op1.type == OpType.FAR:
+                # Direct far jmp seg:off (EA) — a tail jump. Resolve to the known
+                # function at that linear address, else dispatch by address.
+                abs_t = op1.far_seg * 16 + op1.disp
+                if abs_t in self.known_funcs:
+                    fn = self.known_funcs[abs_t]; self.func_calls.add(fn)
+                    self._emit(f'{fn}(cpu); return; /* far-jmp {op1.far_seg:04X}:{op1.disp:04X} */', orig)
+                else:
+                    self._emit(f'recomp_dispatch(cpu, 0x{op1.far_seg:X}, 0x{op1.disp:X}); return; '
+                               f'/* far-jmp {op1.far_seg:04X}:{op1.disp:04X} */', orig)
             elif op1 and op1.type == OpType.MEM:
                 if getattr(self, 'dispatch', False):
                     seg, off = _mem_addr(op1)
