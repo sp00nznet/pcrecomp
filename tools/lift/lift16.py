@@ -130,7 +130,11 @@ def _write(op: Operand, val: str) -> str:
     elif op.type == OpType.REG32:
         return f'{_reg32(op)} = (uint32_t)({val});'
     elif op.type == OpType.SREG:
-        return f'{_sreg(op)} = (uint16_t)({val});'
+        # Reads of CS use the per-function segment constant, but a WRITE to a
+        # segment register must hit the live register. (SEG_xxxx is a #define and
+        # cannot be assigned.) `mov cs,*` is rare/odd but must at least compile.
+        dst = f'cpu->{SREG_NAMES[op.reg]}'
+        return f'{dst} = (uint16_t)({val});'
     elif op.type == OpType.MEM or op.type == OpType.MOFFS:
         seg, off = _mem_addr(op)
         if op.size == 1:
@@ -184,6 +188,16 @@ class Lifter:
         if addr in self.labels_needed and addr not in self.labels_emitted:
             self.labels_emitted.add(addr)
             self.output.append(f'{_label(addr, self.func_name)}:;')
+
+    def _tail_jump(self, abs_t: int) -> str:
+        """C statement for a jump that leaves the current function: tail-call the
+        target function (if known) or dispatch by address, then return."""
+        if abs_t in self.known_funcs:
+            fn = self.known_funcs[abs_t]
+            self.func_calls.add(fn)
+            return f'{fn}(cpu); return;'
+        return (f'recomp_dispatch(cpu, 0x{(abs_t >> 4) & 0xFFFF:X}, '
+                f'0x{abs_t & 0xF:X}); return;')
 
     def lift_instruction(self, inst: Instruction, func_start: int):
         """Lift a single instruction to C code."""
@@ -505,7 +519,9 @@ class Lifter:
                     self.labels_needed.add(target)
                     self._emit(f'goto {_label(target, self.func_name)};', orig)
                 else:
-                    self._emit(f'/* jmp out of function to 0x{target:06X} */', orig)
+                    # Tail jump to another function (or shared continuation).
+                    abs_t = func_start + target
+                    self._emit(f'{self._tail_jump(abs_t)} /* tail-jmp 0x{abs_t:06X} */', orig)
             elif op1 and op1.type == OpType.MEM:
                 if getattr(self, 'dispatch', False):
                     seg, off = _mem_addr(op1)
@@ -537,7 +553,10 @@ class Lifter:
                 self.labels_needed.add(target)
                 self._emit(f'if ({cc}(cpu)) goto {_label(target, self.func_name)};', orig)
             else:
-                self._emit(f'/* {m} out of function to 0x{target:06X} */', orig)
+                # Conditional tail jump to another function.
+                abs_t = func_start + target
+                self._emit(f'if ({cc}(cpu)) {{ {self._tail_jump(abs_t)} }} '
+                           f'/* tail-jcc 0x{abs_t:06X} */', orig)
 
         elif m == 'loop':
             target = op1.disp
@@ -545,7 +564,8 @@ class Lifter:
                 self.labels_needed.add(target)
                 self._emit(f'cpu->cx--; if (cpu->cx != 0) goto {_label(target, self.func_name)};', orig)
             else:
-                self._emit(f'/* loop out of function to 0x{target:06X} */', orig)
+                abs_t = func_start + target; tail = self._tail_jump(abs_t)
+                self._emit(f'cpu->cx--; if (cpu->cx != 0) {{ {tail} }} /* loop tail 0x{abs_t:06X} */', orig)
 
         elif m == 'loopz':
             target = op1.disp
@@ -554,7 +574,8 @@ class Lifter:
                 self._emit(f'cpu->cx--; if (cpu->cx != 0 && zf(cpu)) '
                            f'goto {_label(target, self.func_name)};', orig)
             else:
-                self._emit(f'/* loopz out of function to 0x{target:06X} */', orig)
+                abs_t = func_start + target; tail = self._tail_jump(abs_t)
+                self._emit(f'cpu->cx--; if (cpu->cx != 0 && zf(cpu)) {{ {tail} }} /* loopz tail 0x{abs_t:06X} */', orig)
 
         elif m == 'loopnz':
             target = op1.disp
@@ -563,7 +584,8 @@ class Lifter:
                 self._emit(f'cpu->cx--; if (cpu->cx != 0 && !zf(cpu)) '
                            f'goto {_label(target, self.func_name)};', orig)
             else:
-                self._emit(f'/* loopnz out of function to 0x{target:06X} */', orig)
+                abs_t = func_start + target; tail = self._tail_jump(abs_t)
+                self._emit(f'cpu->cx--; if (cpu->cx != 0 && !zf(cpu)) {{ {tail} }} /* loopnz tail 0x{abs_t:06X} */', orig)
 
         elif m == 'jcxz':
             target = op1.disp
@@ -571,7 +593,8 @@ class Lifter:
                 self.labels_needed.add(target)
                 self._emit(f'if (cpu->cx == 0) goto {_label(target, self.func_name)};', orig)
             else:
-                self._emit(f'/* jcxz out of function to 0x{target:06X} */', orig)
+                abs_t = func_start + target; tail = self._tail_jump(abs_t)
+                self._emit(f'if (cpu->cx == 0) {{ {tail} }} /* jcxz tail 0x{abs_t:06X} */', orig)
 
         elif m == 'call':
             if op1 and op1.type == OpType.REL16:
@@ -966,6 +989,16 @@ class Lifter:
                 self._emit('}')
             else:
                 self.lift_instruction(inst, func_start)
+
+        # Fallthrough: if the last instruction doesn't end control flow, the CPU
+        # would continue into the following function. Emit an explicit tail-call
+        # so we don't silently `return` and skip that code -- the QB runtime has
+        # many routines that share a common tail by falling through.
+        TERMINATORS = {'ret', 'retf', 'iret', 'jmp', 'jmp far', 'hlt'}
+        if instructions and instructions[-1].mnemonic not in TERMINATORS:
+            last = instructions[-1]
+            abs_t = func_start + last.address + last.length
+            self._emit(f'{self._tail_jump(abs_t)}', f'fallthrough 0x{abs_t:06X}')
 
         self.output.append('}')
 
