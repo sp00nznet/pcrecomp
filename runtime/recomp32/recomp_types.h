@@ -137,6 +137,11 @@ static inline uint32_t _pop32(uint32_t* sp) {
 #define POP32_VAL(sp) _pop32(&(sp))
 #endif
 
+/* Two-arg pop: store the popped value into an lvalue destination (register or
+ * MEM32(...)). The lifter emits this form for `pop r/m32`. Defined via POP32_VAL
+ * so it picks up the GCC statement-expr / MSVC inline-function variant above. */
+#define POP32(sp, dest) do { (dest) = POP32_VAL(sp); } while(0)
+
 #define PUSHAD() do { \
     uint32_t _tmp_esp = esp; \
     PUSH32(esp, eax); PUSH32(esp, ecx); PUSH32(esp, edx); PUSH32(esp, ebx); \
