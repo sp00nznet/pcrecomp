@@ -17,6 +17,7 @@ from capstone.x86 import (
     X86_REG_SP, X86_REG_BP, X86_REG_SI, X86_REG_DI,
     X86_REG_AL, X86_REG_CL, X86_REG_DL, X86_REG_BL,
     X86_REG_AH, X86_REG_CH, X86_REG_DH, X86_REG_BH,
+    X86_REG_FS, X86_REG_GS,
 )
 
 
@@ -181,7 +182,17 @@ class Lifter:
                 parts.append(f"(-0x{-mem.disp:X})")
         if not parts:
             parts.append("0")
-        return ' + '.join(parts)
+        addr = ' + '.join(parts)
+        # Segment override: fs/gs are thread-relative (TIB/TEB) and must NOT be
+        # treated as flat. Route them through a runtime base so e.g. `fs:[0]`
+        # (the SEH chain head) reads the simulated TIB instead of VA 0.
+        # cs/ds/es/ss are flat in Win32 and need no base.
+        seg = getattr(mem, 'segment', 0)
+        if seg == X86_REG_FS:
+            return f"FS_BASE + ({addr})"
+        if seg == X86_REG_GS:
+            return f"GS_BASE + ({addr})"
+        return addr
 
     def _fmt_mem_read(self, mem, size: int) -> str:
         """Format a memory read."""
@@ -595,11 +606,15 @@ class Lifter:
                     lines.append(f"RECOMP_ICALL(0); /* unresolved */ {comment}")
 
         elif m == 'ret' or m == 'retn':
+            # Pop the return address that RECOMP_CALL/ICALL pushed (esp += 4), plus
+            # any stdcall callee-cleanup bytes (ret N -> esp += 4 + N). Without the
+            # +4 the simulated ESP drifts down 4 bytes per call and eventually the
+            # 0xDEAD0000 dummy return address gets read as a function argument.
             if ops and ops[0].type == X86_OP_IMM:
                 n = ops[0].imm
-                lines.append(f"esp += {n}; return; {comment}")
+                lines.append(f"esp += {4 + n}; return; {comment}")
             else:
-                lines.append(f"return; {comment}")
+                lines.append(f"esp += 4; return; {comment}")
 
         elif m == 'retf':
             lines.append(f"return; /* far return */ {comment}")

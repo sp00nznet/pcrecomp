@@ -98,6 +98,14 @@ extern ptrdiff_t g_mem_base;
 
 #define ADDR(va)     ((uintptr_t)(uint32_t)(va) + g_mem_base)
 
+/* Thread-relative segment bases. In Win32, fs: points at the TIB/TEB; gs is
+ * unused on x86. The lifter emits fs:/gs: accesses as FS_BASE/GS_BASE + addr,
+ * so the runtime points g_fs_base at a simulated TIB (VA). cs/ds/es/ss are flat. */
+extern uint32_t g_fs_base;
+extern uint32_t g_gs_base;
+#define FS_BASE  g_fs_base
+#define GS_BASE  g_gs_base
+
 #define MEM8(addr)   (*(volatile uint8_t  *)ADDR(addr))
 #define MEM16(addr)  (*(volatile uint16_t *)ADDR(addr))
 #define MEM32(addr)  (*(volatile uint32_t *)ADDR(addr))
@@ -249,9 +257,18 @@ recomp_func_t recomp_lookup(uint32_t va);          /* binary search in dispatch 
 recomp_func_t recomp_lookup_manual(uint32_t va);    /* manual overrides */
 recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
 
+/* The dummy return address pushed before a recompiled call. The callee's lifted
+ * `ret` pops it. 0xDEAD0000 is a recognizable marker, but if a stack imbalance
+ * ever leaks it into a value (e.g. a size argument) the high bits are destructive.
+ * Projects that have hit such a leak can define RECOMP_RETADDR=0u so a leak is
+ * benign while it's tracked down. */
+#ifndef RECOMP_RETADDR
+#define RECOMP_RETADDR 0xDEAD0000u
+#endif
+
 /* Direct call to a known recompiled function */
 #define RECOMP_CALL(func) do { \
-    PUSH32(esp, 0xDEAD0000u); /* dummy return address */ \
+    PUSH32(esp, RECOMP_RETADDR); /* dummy return address */ \
     func(); \
 } while(0)
 
@@ -265,7 +282,7 @@ recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_import(_va); \
     if (_fn) { \
-        PUSH32(esp, 0xDEAD0000u); \
+        PUSH32(esp, RECOMP_RETADDR); \
         _fn(); \
     } else { \
         fprintf(stderr, "ICALL: unresolved VA 0x%08X\n", _va); \
