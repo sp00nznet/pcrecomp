@@ -304,6 +304,25 @@ recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
     else { fprintf(stderr, "ITAIL: unresolved VA 0x%08X\n", _va); } \
 } while(0)
 
+/* ============================================================
+ * Optional function-entry tracer (enable with -DRECOMP_TRACE).
+ *
+ * Each lifted function records its VA into a ring buffer on entry, so a crash
+ * or unexpected exit can dump the last N functions that ran -- a poor-man's
+ * backtrace when no debugger is available. Zero cost unless RECOMP_TRACE is set.
+ * ============================================================ */
+#ifdef RECOMP_TRACE
+#define RECOMP_ENTER_SIZE 1024
+extern uint32_t g_enter_trace[RECOMP_ENTER_SIZE];
+extern uint32_t g_enter_idx;
+void recomp_trace_enter(uint32_t va);
+#define RECOMP_ENTER(va) recomp_trace_enter(va)
+#else
+#define RECOMP_ENTER(va) ((void)0)
+#endif
+/* Always-callable trace dump (no-op unless RECOMP_TRACE). */
+void recomp_dump_trace(const char* why);
+
 /* Stub macro for unimplemented imports */
 #define STUB(name) do { \
     static int _warned = 0; \

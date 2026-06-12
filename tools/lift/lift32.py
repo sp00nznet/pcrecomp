@@ -224,6 +224,18 @@ class Lifter:
         """Format LEA (just the address calculation, no memory access)."""
         return self._fmt_mem_addr(mem)
 
+    def _flag_capture(self, a, b):
+        """Snapshot flag operands into temps and record the flag state to use them.
+
+        A jcc reads the flags set by an earlier cmp/test/sub/... The old code
+        stored the operand *expressions* and re-evaluated them at the jcc, so any
+        instruction in between that wrote the operand (e.g. `test eax,eax; mov
+        eax,0; jne`, or `sub eax,ebx; jl` where eax is the destination) corrupted
+        the condition. Capturing the values at the flag-setter fixes that.
+        Returns the C snapshot statement to append; sets self._flag_state to temps.
+        """
+        return f"_flag_a = (uint32_t)({a}); _flag_b = (uint32_t)({b});"
+
     def _make_condition(self, jcc_mnemonic: str) -> str:
         """
         Generate a C condition expression by pattern-matching the flag-setter
@@ -360,33 +372,38 @@ class Lifter:
             if len(ops) == 2:
                 a = self._fmt_read(ops[0])
                 b = self._fmt_read(ops[1])
+                lines.append(self._flag_capture(a, b))
                 lines.append(f"{self._fmt_write(ops[0], f'{a} + {b}')}; {comment}")
-                self._flag_state = ('add', f"{a}, {b}")
+                self._flag_state = ('add', "_flag_a, _flag_b")
 
         elif m == 'sub':
             if len(ops) == 2:
                 a = self._fmt_read(ops[0])
                 b = self._fmt_read(ops[1])
+                lines.append(self._flag_capture(a, b))
                 lines.append(f"{self._fmt_write(ops[0], f'{a} - {b}')}; {comment}")
-                self._flag_state = ('sub', f"{a}, {b}")
+                self._flag_state = ('sub', "_flag_a, _flag_b")
 
         elif m == 'inc':
             if len(ops) == 1:
                 a = self._fmt_read(ops[0])
+                lines.append(self._flag_capture(a, "1"))
                 lines.append(f"{self._fmt_write(ops[0], f'{a} + 1')}; {comment}")
-                self._flag_state = ('inc', f"{a}, 1")
+                self._flag_state = ('inc', "_flag_a, _flag_b")
 
         elif m == 'dec':
             if len(ops) == 1:
                 a = self._fmt_read(ops[0])
+                lines.append(self._flag_capture(a, "1"))
                 lines.append(f"{self._fmt_write(ops[0], f'{a} - 1')}; {comment}")
-                self._flag_state = ('dec', f"{a}, 1")
+                self._flag_state = ('dec', "_flag_a, _flag_b")
 
         elif m == 'neg':
             if len(ops) == 1:
                 a = self._fmt_read(ops[0])
+                lines.append(self._flag_capture("0", a))
                 lines.append(f"{self._fmt_write(ops[0], f'(uint32_t)(-(int32_t){a})')}; {comment}")
-                self._flag_state = ('sub', f"0, {a}")
+                self._flag_state = ('sub', "_flag_a, _flag_b")
 
         elif m == 'not':
             if len(ops) == 1:
@@ -431,15 +448,17 @@ class Lifter:
             if len(ops) == 2:
                 a = self._fmt_read(ops[0])
                 b = self._fmt_read(ops[1])
+                lines.append(self._flag_capture(a, b))
                 lines.append(f"{self._fmt_write(ops[0], f'{a} & {b}')}; {comment}")
-                self._flag_state = ('and', f"{a}, {b}")
+                self._flag_state = ('and', "_flag_a, _flag_b")
 
         elif m == 'or':
             if len(ops) == 2:
                 a = self._fmt_read(ops[0])
                 b = self._fmt_read(ops[1])
+                lines.append(self._flag_capture(f"({a} | {b})", f"({a} | {b})"))
                 lines.append(f"{self._fmt_write(ops[0], f'{a} | {b}')}; {comment}")
-                self._flag_state = ('or', f"{a}, {b}")
+                self._flag_state = ('or', "_flag_a, _flag_b")
 
         elif m == 'xor':
             if len(ops) == 2:
@@ -447,10 +466,12 @@ class Lifter:
                 b = self._fmt_read(ops[1])
                 # Detect xor reg, reg (zero idiom)
                 if ops[0].type == X86_OP_REG and ops[1].type == X86_OP_REG and ops[0].reg == ops[1].reg:
+                    lines.append(self._flag_capture("0", "0"))
                     lines.append(f"{self._fmt_write(ops[0], '0')}; {comment}")
                 else:
+                    lines.append(self._flag_capture(f"({a} ^ {b})", f"({a} ^ {b})"))
                     lines.append(f"{self._fmt_write(ops[0], f'{a} ^ {b}')}; {comment}")
-                self._flag_state = ('xor', f"{a}, {b}")
+                self._flag_state = ('xor', "_flag_a, _flag_b")
 
         # --- Shifts ---
         elif m == 'shl' or m == 'sal':
@@ -489,21 +510,24 @@ class Lifter:
                 a = self._fmt_read(ops[0])
                 b = self._fmt_read(ops[1])
                 lines.append(f"/* cmp {a}, {b} */ {comment}")
-                self._flag_state = ('cmp', f"{a}, {b}")
+                lines.append(self._flag_capture(a, b))
+                self._flag_state = ('cmp', "_flag_a, _flag_b")
 
         elif m == 'test':
             if len(ops) == 2:
                 a = self._fmt_read(ops[0])
                 b = self._fmt_read(ops[1])
                 lines.append(f"/* test {a}, {b} */ {comment}")
-                self._flag_state = ('test', f"{a}, {b}")
+                lines.append(self._flag_capture(a, b))
+                self._flag_state = ('test', "_flag_a, _flag_b")
 
         elif m == 'bt':
             if len(ops) == 2:
                 a = self._fmt_read(ops[0])
                 b = self._fmt_read(ops[1])
                 lines.append(f"/* bt {a}, {b} */ {comment}")
-                self._flag_state = ('bt', f"{a}, {b}")
+                lines.append(self._flag_capture(a, b))
+                self._flag_state = ('bt', "_flag_a, _flag_b")
 
         # --- Setcc ---
         elif m in SETCC_MAP:
@@ -938,6 +962,7 @@ class Lifter:
         lines.append(f"    uint32_t _cf = 0;  /* carry flag */")
         lines.append(f"    int _df = 1;  /* direction flag (1=forward, -1=backward) */")
         lines.append(f"    uint16_t _fpu_cw = 0x037F;  /* FPU control word */")
+        lines.append(f"    uint32_t _flag_a = 0, _flag_b = 0;  /* flag-operand snapshots */")
         lines.append(f"")
 
         # Emit blocks in address order
