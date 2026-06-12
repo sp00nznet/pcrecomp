@@ -25,7 +25,8 @@ pcrecomp/
                    protection/DRM detection, recursive binary catalog)
     ne/            NE (16-bit New Executable) parse / disasm / call-graph
     disasm/        Disassemblers (32-bit recursive descent, 16-bit table-driven,
-                   x87 FPU decoder, direct call-graph scanner)
+                   x87 FPU decoder, direct call-graph scanner, large-model
+                   far-call + code/data-boundary call-graph completion)
     lift/          Code lifters (x86-32 and x86-16 to readable C)
     classify/      Function classifiers (SDK vs custom, multi-signal, string refs)
     ghidra/        Ghidra headless scripts (decompile, export, stats, xrefs,
@@ -50,6 +51,7 @@ Every tool here was forged in the fires of an actual recompilation project. Thes
 | Project | What | Era | Engine/Tech | Status |
 |---------|------|-----|-------------|--------|
 | **[civ](https://github.com/sp00nznet/civ)** | Civilization | 1991 | 16-bit DOS / MSC 5.x | Runs! 672 functions, interactive boot/menu, 164K lines |
+| **[dinopark](https://github.com/sp00nznet/dinopark)** | DinoPark Tycoon | 1993 | 16-bit DOS / Borland large model | Phase 1 - decoded & mapped, 693 functions, 99.9% far-calls resolved, actor script VM found |
 | **[elfish](https://github.com/sp00nznet/elfish)** | El-Fish | 1993 | 16-bit NE + TSXLIB extender | Lifted & links - 2,236 functions, 121 segments, startup executes |
 | **[encarta](https://github.com/sp00nznet/encarta)** | Encarta 97 Encyclopedia | 1996 | MFC 4.0 + proprietary | Format RE - FIF/M20/SPAM decoders, 16-bit thunk analysis |
 | **[gta](https://github.com/sp00nznet/gta)** | Grand Theft Auto | 1997 | DMA "Race'n'Chase" | Builds & runs - 4,094 functions, 444K lines, runtime bringup |
