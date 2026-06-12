@@ -375,3 +375,137 @@ class Disassembler:
 
         print(f"[*] Successfully disassembled {len(functions)} functions")
         return functions
+
+
+# ---------------------------------------------------------------------------
+# Command-line interface
+#
+# Usage:
+#   python disasm32.py GAME.EXE --output functions.json
+#   python disasm32.py GAME.EXE --pe-json pe_analysis.json --output functions.json
+#
+# Recursive-descent disassembly of every code section. Recovers function
+# boundaries from CALL targets + standard prologues, builds per-function basic
+# blocks and a direct call graph, and writes a JSON catalog for the next phase
+# (classification / lifting). Part of the pcrecomp toolbox.
+# ---------------------------------------------------------------------------
+def _func_to_dict(func, full: bool = False) -> dict:
+    """Serialize a Function to a plain dict for JSON output."""
+    d = {
+        "address": func.address,
+        "address_hex": f"0x{func.address:08X}",
+        "name": func.name,
+        "end": func.end,
+        "size": func.size,
+        "num_blocks": len(func.blocks),
+        "num_instructions": func.num_instructions,
+        "is_thunk": func.is_thunk,
+        "calls_to": sorted(func.calls_to),
+    }
+    if full:
+        d["blocks"] = [
+            {
+                "start": b.start,
+                "end": b.end,
+                "is_exit": b.is_exit,
+                "successors": sorted(set(b.successors)),
+                "instructions": [
+                    {"address": i.address, "mnemonic": i.mnemonic, "op_str": i.op_str,
+                     "bytes": i.bytes.hex()}
+                    for i in b.instructions
+                ],
+            }
+            for b in sorted(func.blocks.values(), key=lambda x: x.start)
+        ]
+    return d
+
+
+def main(argv=None):
+    import argparse, json, os, sys
+
+    # Allow running both as `python -m tools.disasm.disasm32` and as a loose script.
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "pe"))
+    from pe_analyze import analyze_pe, build_iat_map  # noqa: E402
+
+    ap = argparse.ArgumentParser(
+        description="Recursive-descent x86-32 disassembler + function recovery (pcrecomp).")
+    ap.add_argument("exe", help="Path to the 32-bit PE executable")
+    ap.add_argument("--output", "-o", help="Write function catalog as JSON to this path")
+    ap.add_argument("--pe-json", help="(optional) reserved: path to a pe_analyze JSON; "
+                                      "analysis is recomputed from the exe regardless")
+    ap.add_argument("--full", action="store_true",
+                    help="Include per-instruction detail in the JSON (large output)")
+    ap.add_argument("--min-size", type=int, default=0,
+                    help="Drop recovered functions smaller than N bytes from the catalog")
+    args = ap.parse_args(argv)
+
+    info = analyze_pe(args.exe)
+    iat = build_iat_map(info)
+    with open(args.exe, "rb") as f:
+        pe_data = f.read()
+
+    print(f"[*] {os.path.basename(args.exe)}: base=0x{info.image_base:08X} "
+          f"code=0x{info.code_start:08X}-0x{info.code_end:08X} "
+          f"imports(IAT)={len(iat)}")
+
+    dis = Disassembler(pe_data, info.image_base, info.sections)
+    functions = dis.find_functions(info.code_start, info.code_end, iat)
+
+    funcs = [f for f in functions.values() if f.size >= args.min_size]
+    funcs.sort(key=lambda x: x.address)
+
+    thunks = sum(1 for f in funcs if f.is_thunk)
+    leaves = sum(1 for f in funcs if not f.calls_to)
+    total_insns = sum(f.num_instructions for f in funcs)
+    code_bytes = info.code_end - info.code_start
+
+    # Honest byte coverage: union of per-function [address, end) intervals,
+    # each clamped to the code range. Recursive descent can follow a far jump
+    # and inflate an individual func.end, and functions can overlap shared tail
+    # code, so summing func.size would multi-count. Union + clamp avoids both.
+    intervals = sorted((f.address, min(f.end, info.code_end)) for f in funcs
+                       if f.end > f.address)
+    covered = 0
+    cur_lo = cur_hi = None
+    for lo, hi in intervals:
+        if cur_hi is None or lo > cur_hi:
+            if cur_hi is not None:
+                covered += cur_hi - cur_lo
+            cur_lo, cur_hi = lo, hi
+        else:
+            cur_hi = max(cur_hi, hi)
+    if cur_hi is not None:
+        covered += cur_hi - cur_lo
+
+    print(f"[*] Functions: {len(funcs)}  (thunks={thunks}, leaves={leaves})")
+    print(f"[*] Instructions: {total_insns:,}")
+    print(f"[*] Byte coverage: {covered:,} / {code_bytes:,} "
+          f"({100.0 * covered / code_bytes:.1f}% of code range)")
+
+    if args.output:
+        out = {
+            "exe": os.path.basename(args.exe),
+            "image_base": info.image_base,
+            "code_start": info.code_start,
+            "code_end": info.code_end,
+            "iat_count": len(iat),
+            "stats": {
+                "functions": len(funcs),
+                "thunks": thunks,
+                "leaves": leaves,
+                "instructions": total_insns,
+                "covered_bytes": covered,
+                "code_bytes": code_bytes,
+                "coverage_pct": round(100.0 * covered / code_bytes, 2),
+            },
+            "functions": [_func_to_dict(f, full=args.full) for f in funcs],
+        }
+        with open(args.output, "w") as f:
+            json.dump(out, f, indent=1)
+        print(f"[*] Wrote {args.output} ({os.path.getsize(args.output):,} bytes)")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
