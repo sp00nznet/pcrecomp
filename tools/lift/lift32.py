@@ -18,6 +18,7 @@ from capstone.x86 import (
     X86_REG_AL, X86_REG_CL, X86_REG_DL, X86_REG_BL,
     X86_REG_AH, X86_REG_CH, X86_REG_DH, X86_REG_BH,
     X86_REG_FS, X86_REG_GS,
+    X86_REG_ST0, X86_REG_ST7,
 )
 
 
@@ -82,9 +83,9 @@ def reg_name(reg_id: int) -> str:
         return REG_NAMES_8L[reg_id]
     if reg_id in REG_NAMES_8H:
         return REG_NAMES_8H[reg_id]
-    # FPU ST(i) registers: Capstone uses IDs 224-231 for st(0)-st(7)
-    if 224 <= reg_id <= 231:
-        return f"_st[{reg_id - 224}]"
+    # FPU ST(i) registers -> _st[i] (the model keeps st(0) at _st[0]).
+    if X86_REG_ST0 <= reg_id <= X86_REG_ST7:
+        return f"_st[{reg_id - X86_REG_ST0}]"
     # Segment registers (flat mode - effectively no-ops)
     # CS=11, DS=17, ES=28, FS=29, GS=30, SS=49
     seg_names = {11: '_seg_cs', 17: '_seg_ds', 28: '_seg_es', 29: '_seg_fs', 30: '_seg_gs', 49: '_seg_ss'}
@@ -153,9 +154,9 @@ class Lifter:
                 return f"SET_LO8({REG_NAMES_8L[r]}, {value})"
             if r in REG_NAMES_8H:
                 return f"SET_HI8({REG_NAMES_8H[r]}, {value})"
-            # Segment registers and FPU ST(i) - use as comment
-            if 224 <= r <= 231:
-                return f"_st[{r - 224}] = {value}"
+            # FPU ST(i) registers -> _st[i]
+            if X86_REG_ST0 <= r <= X86_REG_ST7:
+                return f"_st[{r - X86_REG_ST0}] = {value}"
             # Segment registers - no-op in flat mode
             if r in (11, 17, 28, 29, 30, 49):
                 return f"(void)({value}) /* seg reg write */"
@@ -695,7 +696,7 @@ class Lifter:
                     else:
                         lines.append(f"fp_push(0.0); /* fld size={ops[0].size} */ {comment}")
                 else:
-                    lines.append(f"fp_push(_st[{ops[0].reg - 224}]); {comment}")  # ST(i) hack
+                    lines.append(f"fp_push(_st[{ops[0].reg - X86_REG_ST0}]); {comment}")  # fld st(i)
 
         elif m == 'fild':
             if ops and ops[0].type == X86_OP_MEM:
@@ -720,7 +721,7 @@ class Lifter:
                     else:
                         lines.append(f"fp_pop(); /* fstp size={ops[0].size} */ {comment}")
                 else:
-                    lines.append(f"_st[{ops[0].reg - 224}] = fp_pop(); {comment}")
+                    lines.append(f"_st[{ops[0].reg - X86_REG_ST0}] = fp_pop(); {comment}")
 
         elif m == 'fst':
             if ops and ops[0].type == X86_OP_MEM:
@@ -801,7 +802,7 @@ class Lifter:
 
         elif m == 'fxch':
             if ops:
-                lines.append(f"{{ double _t = _st[0]; _st[0] = _st[{ops[0].reg - 224}]; _st[{ops[0].reg - 224}] = _t; }} {comment}")
+                lines.append(f"{{ double _t = _st[0]; _st[0] = _st[{ops[0].reg - X86_REG_ST0}]; _st[{ops[0].reg - X86_REG_ST0}] = _t; }} {comment}")
             else:
                 lines.append(f"{{ double _t = _st[0]; _st[0] = _st[1]; _st[1] = _t; }} {comment}")
 
@@ -950,7 +951,7 @@ class Lifter:
             return f"(double)MEM32({addr})"
         elif op.type == X86_OP_REG:
             # ST(i) register
-            return f"_st[{op.reg - 224}]"
+            return f"_st[{op.reg - X86_REG_ST0}]"
         return "_st[1]"
 
     def lift_basic_block(self, block) -> list:

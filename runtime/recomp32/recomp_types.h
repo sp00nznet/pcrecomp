@@ -323,14 +323,19 @@ recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
  * or unexpected exit can dump the last N functions that ran -- a poor-man's
  * backtrace when no debugger is available. Zero cost unless RECOMP_TRACE is set.
  * ============================================================ */
+/* Always-on: the VA of the function currently executing. A plain global store
+ * (no call), so unlike the ring tracer below it doesn't force register reloads --
+ * useful for pinning a crash to a function without perturbing codegen. */
+extern uint32_t g_cur_func;
+
 #ifdef RECOMP_TRACE
 #define RECOMP_ENTER_SIZE 1024
 extern uint32_t g_enter_trace[RECOMP_ENTER_SIZE];
 extern uint32_t g_enter_idx;
 void recomp_trace_enter(uint32_t va);
-#define RECOMP_ENTER(va) recomp_trace_enter(va)
+#define RECOMP_ENTER(va) do { g_cur_func = (va); recomp_trace_enter(va); } while (0)
 #else
-#define RECOMP_ENTER(va) ((void)0)
+#define RECOMP_ENTER(va) (g_cur_func = (va))
 #endif
 /* Always-callable trace dump (no-op unless RECOMP_TRACE). */
 void recomp_dump_trace(const char* why);
