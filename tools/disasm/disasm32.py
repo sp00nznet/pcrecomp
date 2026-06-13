@@ -354,26 +354,67 @@ class Disassembler:
         all_targets = {t for t in all_targets if code_start <= t < code_end}
         print(f"[*] Total unique function candidates: {len(all_targets)}")
 
-        # Disassemble each function
+        # Disassemble each function. Then iterate to a fixpoint, following
+        # unconditional-jmp and call targets that land on code not yet covered by
+        # any discovered function (tail calls and jmp-thunk chains reach functions
+        # that no direct CALL targets and that lack a standard prologue, e.g. a
+        # thunk `jmp X` -> X, where X starts with `cmp`/`test`). Without this they
+        # are silently missing and show up at runtime as unresolved ITAIL/ICALL.
         functions = {}
-        sorted_targets = sorted(all_targets)
-        total = len(sorted_targets)
+        covered = set()          # every instruction start address across all funcs
+        queue = list(all_targets)
+        queued = set(all_targets)
 
-        for i, addr in enumerate(sorted_targets):
-            if i % 1000 == 0 and i > 0:
-                print(f"[*] Disassembling function {i}/{total}...")
-
+        def _add_func(addr):
             func = self.disassemble_function(addr, iat_map)
-            if func and func.blocks:
-                functions[addr] = func
+            if not (func and func.blocks):
+                return None
+            functions[addr] = func
+            if len(func.blocks) == 1:
+                block = next(iter(func.blocks.values()))
+                if len(block.instructions) == 1 and block.instructions[0].is_uncond_jump:
+                    func.is_thunk = True
+            for b in func.blocks.values():
+                for ins in b.instructions:
+                    covered.add(ins.address)
+            return func
 
-                # Check for thunks (single jmp instruction)
-                if len(func.blocks) == 1:
-                    block = list(func.blocks.values())[0]
-                    if len(block.instructions) == 1 and block.instructions[0].is_uncond_jump:
-                        func.is_thunk = True
+        round_no = 0
+        while queue:
+            round_no += 1
+            sorted_targets = sorted(queue)
+            queue = []
+            total = len(sorted_targets)
+            if round_no == 1:
+                print(f"[*] Disassembling {total} initial candidates...")
+            else:
+                print(f"[*] Discovery round {round_no}: {total} new jmp/call targets...")
+            for i, addr in enumerate(sorted_targets):
+                if round_no == 1 and i % 1000 == 0 and i > 0:
+                    print(f"[*] Disassembling function {i}/{total}...")
+                if addr in functions:
+                    continue
+                _add_func(addr)
 
-        print(f"[*] Successfully disassembled {len(functions)} functions")
+            # Harvest jmp/call immediate targets from everything decoded so far,
+            # enqueue any that don't start an already-decoded instruction.
+            for func in list(functions.values()):
+                for b in func.blocks.values():
+                    for ins in b.instructions:
+                        if not (ins.is_uncond_jump or ins.is_call):
+                            continue
+                        tgt = ins.get_branch_target()
+                        if tgt is None or tgt in queued:
+                            continue
+                        if not self.is_code_address(tgt):
+                            continue
+                        if tgt in covered:          # intra-function / known entry
+                            continue
+                        queued.add(tgt)
+                        queue.append(tgt)
+
+        print(f"[*] Successfully disassembled {len(functions)} functions"
+              f" ({round_no} discovery rounds)")
         return functions
 
 
