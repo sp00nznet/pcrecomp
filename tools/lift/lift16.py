@@ -654,7 +654,10 @@ class Lifter:
                                    f'recomp_dispatch(cpu, mem_read16(cpu,_s,(uint16_t)(_o+2)), '
                                    f'mem_read16(cpu,_s,_o)); }}', orig)
                     else:  # near indirect (word mem or register)
-                        self._emit(f'push16(cpu,0); recomp_dispatch(cpu, {_cseg()}, {_read(op1)});', orig)
+                        # dispatch_near cleans up the pushed near-return word on a
+                        # miss (sp+=2); recomp_dispatch does not, which corrupts
+                        # the stack when the target isn't a known function.
+                        self._emit(f'push16(cpu,0); dispatch_near(cpu, {_cseg()}, {_read(op1)});', orig)
                 else:
                     self._emit(f'/* indirect call {repr(op1)} - needs dispatch */', orig)
 

@@ -33,6 +33,14 @@ extern uint32_t g_eax, g_ecx, g_edx, g_esp;
 /* Callee-saved registers (also global for implicit parameter passing) */
 extern uint32_t g_ebx, g_esi, g_edi;
 
+/* The x87 FPU stack is GLOBAL (8 shared registers), not per-function: helpers
+ * like __ftol receive their argument on the FPU stack from the caller, and the
+ * control word persists across calls. A per-function local stack would make every
+ * cross-call FPU value read as 0. */
+extern double   g_st[8];
+extern int      g_fp_top;
+extern uint16_t g_fpu_cw;
+
 /* Segment registers (flat mode Win32 - effectively unused) */
 extern uint16_t g_seg_cs, g_seg_ds, g_seg_es, g_seg_fs, g_seg_gs, g_seg_ss;
 
@@ -61,6 +69,10 @@ extern const uint32_t recomp_dispatch_count;
 #define esp g_esp
 #define esi g_esi
 #define edi g_edi
+/* x87 FPU stack is global; _fpu_cmp stays per-function (set+used within one fn) */
+#define _st g_st
+#define _fp_top g_fp_top
+#define _fpu_cw g_fpu_cw
 /* ebp is declared local in each function */
 #define _seg_cs g_seg_cs
 #define _seg_ds g_seg_ds

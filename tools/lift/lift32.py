@@ -596,14 +596,30 @@ class Lifter:
             lines.append(f"eax = MEM32(esi); esi += _df * 4; {comment}")
 
         elif m == 'scasb':
-            lines.append(f"/* scasb */ _cf = (LO8(eax) < MEM8(edi)); edi += _df; {comment}")
-            self._flag_state = ('cmp', f"LO8(eax), MEM8(edi)")
+            # Compare AL with [EDI] (capture flags BEFORE advancing EDI).
+            lines.append(f"_flag_a = LO8(eax); _flag_b = MEM8(edi); edi += _df; {comment}")
+            self._flag_state = ('cmp', "_flag_a, _flag_b")
 
         elif m in ('repne scasb', 'repnz scasb'):
-            lines.append(f"{{ while (ecx && LO8(eax) != MEM8(edi)) {{ edi += _df; ecx--; }} }} {comment}")
+            # repne scasb: scan [EDI] for AL. Real x86 decrements ECX and advances
+            # EDI for EACH byte processed (incl. the match) and stops on match --
+            # a do-while, not a pre-test. (A pre-test loop miscomputes the strlen
+            # idiom `repne scasb; not ecx; dec ecx` for an empty string as -1.)
+            # ZF=1 iff a match was found, for a following je/jne.
+            lines.append(f"{{ uint32_t _t = LO8(eax); "
+                         f"while (ecx) {{ _t = MEM8(edi); edi += _df; ecx--; "
+                         f"if (LO8(eax) == _t) break; }} "
+                         f"_flag_a = LO8(eax); _flag_b = _t; }} {comment}")
+            self._flag_state = ('cmp', "_flag_a, _flag_b")
 
         elif m in ('repe cmpsb', 'repz cmpsb'):
-            lines.append(f"{{ while (ecx && MEM8(esi) == MEM8(edi)) {{ esi += _df; edi += _df; ecx--; }} }} {comment}")
+            # repe cmpsb: compare [ESI] vs [EDI] while equal; stop on first mismatch
+            # or ECX==0. Flags reflect the last byte pair (for strcmp's jcc).
+            lines.append(f"{{ uint32_t _a = 0, _b = 0; "
+                         f"while (ecx) {{ _a = MEM8(esi); _b = MEM8(edi); "
+                         f"esi += _df; edi += _df; ecx--; if (_a != _b) break; }} "
+                         f"_flag_a = _a; _flag_b = _b; }} {comment}")
+            self._flag_state = ('cmp', "_flag_a, _flag_b")
 
         # --- Control Flow ---
         elif m == 'call':
@@ -956,13 +972,11 @@ class Lifter:
 
         lines.append(f"void {name}(void) {{")
         lines.append(f"    uint32_t ebp = 0;  /* local frame pointer */")
-        lines.append(f"    double _st[8] = {{0}};  /* FPU stack */")
-        lines.append(f"    int _fp_top = 0;")
         lines.append(f"    int _fpu_cmp = 0;")
         lines.append(f"    uint32_t _cf = 0;  /* carry flag */")
         lines.append(f"    int _df = 1;  /* direction flag (1=forward, -1=backward) */")
-        lines.append(f"    uint16_t _fpu_cw = 0x037F;  /* FPU control word */")
         lines.append(f"    uint32_t _flag_a = 0, _flag_b = 0;  /* flag-operand snapshots */")
+        lines.append(f"    /* _st[8]/_fp_top/_fpu_cw are GLOBAL (shared x87 stack) */")
         lines.append(f"")
 
         # Emit blocks in address order
