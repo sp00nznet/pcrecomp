@@ -448,14 +448,20 @@ class Lifter:
         elif m in ('div', 'idiv'):
             if len(ops) == 1:
                 divisor = self._fmt_read(ops[0])
+                # Evaluate the divisor once (it may be a memory read with side effects)
+                # and guard against divide-by-zero. On real x86 a zero divisor raises
+                # #DE; the original relied on never hitting it (or caught it via SEH),
+                # so producing 0 and continuing is the safe recomp behaviour instead of
+                # crashing the host process (e.g. degenerate spans / z=0 in the
+                # perspective-divide texture mappers).
                 if m == 'div':
-                    lines.append(f"{{ uint64_t _dividend = ((uint64_t)edx << 32) | eax; {comment}")
-                    lines.append(f"  eax = (uint32_t)(_dividend / (uint32_t){divisor});")
-                    lines.append(f"  edx = (uint32_t)(_dividend % (uint32_t){divisor}); }}")
+                    lines.append(f"{{ uint64_t _dividend = ((uint64_t)edx << 32) | eax; uint32_t _dv = (uint32_t){divisor}; {comment}")
+                    lines.append(f"  if (_dv) {{ eax = (uint32_t)(_dividend / _dv); edx = (uint32_t)(_dividend % _dv); }}")
+                    lines.append(f"  else {{ eax = 0; edx = 0; }} }}")
                 else:
-                    lines.append(f"{{ int64_t _dividend = ((int64_t)(int32_t)edx << 32) | eax; {comment}")
-                    lines.append(f"  eax = (uint32_t)((int32_t)(_dividend / (int32_t){divisor}));")
-                    lines.append(f"  edx = (uint32_t)((int32_t)(_dividend % (int32_t){divisor})); }}")
+                    lines.append(f"{{ int64_t _dividend = ((int64_t)(int32_t)edx << 32) | eax; int32_t _dv = (int32_t){divisor}; {comment}")
+                    lines.append(f"  if (_dv) {{ eax = (uint32_t)((int32_t)(_dividend / _dv)); edx = (uint32_t)((int32_t)(_dividend % _dv)); }}")
+                    lines.append(f"  else {{ eax = 0; edx = 0; }} }}")
 
         # --- Logical ---
         elif m == 'and':
