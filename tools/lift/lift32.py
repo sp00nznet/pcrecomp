@@ -721,7 +721,12 @@ class Lifter:
                     else:
                         lines.append(f"fp_pop(); /* fstp size={ops[0].size} */ {comment}")
                 else:
-                    lines.append(f"_st[{ops[0].reg - X86_REG_ST0}] = fp_pop(); {comment}")
+                    # fstp st(i): ST(i) <- ST(0) THEN pop. The copy uses the
+                    # pre-pop numbering, so after the pop the written value lands at
+                    # st(i-1). Writing `_st[i] = fp_pop()` (pop first, then store) is
+                    # off by one -- and for fstp st(0) it wrongly keeps the popped top.
+                    i = ops[0].reg - X86_REG_ST0
+                    lines.append(f"{{ _st[{i}] = _st[0]; fp_pop(); }} {comment}")
 
         elif m == 'fst':
             if ops and ops[0].type == X86_OP_MEM:
