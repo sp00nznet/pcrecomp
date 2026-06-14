@@ -204,6 +204,8 @@ static inline uint32_t _pop32(uint32_t* sp) {
 #define TEST_NZ(a, b)  (((uint32_t)(a) & (uint32_t)(b)) != 0)
 #define TEST_S(a, b)   ((int32_t)((uint32_t)(a) & (uint32_t)(b)) < 0)
 #define TEST_NS(a, b)  ((int32_t)((uint32_t)(a) & (uint32_t)(b)) >= 0)
+#define TEST_G(a, b)   ((int32_t)((uint32_t)(a) & (uint32_t)(b)) > 0)
+#define TEST_LE(a, b)  ((int32_t)((uint32_t)(a) & (uint32_t)(b)) <= 0)
 
 /* Bit test (from bt) */
 #define BT_CF(base, bit) (((uint32_t)(base) >> ((uint32_t)(bit) & 31)) & 1)

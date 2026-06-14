@@ -18,7 +18,8 @@ from capstone.x86 import (
     X86_REG_AL, X86_REG_CL, X86_REG_DL, X86_REG_BL,
     X86_REG_AH, X86_REG_CH, X86_REG_DH, X86_REG_BH,
     X86_REG_FS, X86_REG_GS,
-    X86_REG_ST0, X86_REG_ST7,
+    X86_REG_CS, X86_REG_DS, X86_REG_ES, X86_REG_SS,
+    X86_REG_ST0,
 )
 
 
@@ -83,12 +84,15 @@ def reg_name(reg_id: int) -> str:
         return REG_NAMES_8L[reg_id]
     if reg_id in REG_NAMES_8H:
         return REG_NAMES_8H[reg_id]
-    # FPU ST(i) registers -> _st[i] (the model keeps st(0) at _st[0]).
-    if X86_REG_ST0 <= reg_id <= X86_REG_ST7:
+    # FPU ST(i) registers: Capstone uses IDs 224-231 for st(0)-st(7)
+    if X86_REG_ST0 <= reg_id <= X86_REG_ST0 + 7:
         return f"_st[{reg_id - X86_REG_ST0}]"
     # Segment registers (flat mode - effectively no-ops)
     # CS=11, DS=17, ES=28, FS=29, GS=30, SS=49
-    seg_names = {11: '_seg_cs', 17: '_seg_ds', 28: '_seg_es', 29: '_seg_fs', 30: '_seg_gs', 49: '_seg_ss'}
+    # Use capstone's symbolic register constants rather than hardcoded IDs:
+    # the numeric IDs vary across capstone versions (fs/gs surfaced as 32/33 here).
+    seg_names = {X86_REG_CS: '_seg_cs', X86_REG_DS: '_seg_ds', X86_REG_ES: '_seg_es',
+                 X86_REG_FS: '_seg_fs', X86_REG_GS: '_seg_gs', X86_REG_SS: '_seg_ss'}
     if reg_id in seg_names:
         return seg_names[reg_id]
     return f"0 /* unknown reg {reg_id} */"
@@ -154,8 +158,8 @@ class Lifter:
                 return f"SET_LO8({REG_NAMES_8L[r]}, {value})"
             if r in REG_NAMES_8H:
                 return f"SET_HI8({REG_NAMES_8H[r]}, {value})"
-            # FPU ST(i) registers -> _st[i]
-            if X86_REG_ST0 <= r <= X86_REG_ST7:
+            # Segment registers and FPU ST(i) - use as comment
+            if X86_REG_ST0 <= r <= X86_REG_ST0 + 7:
                 return f"_st[{r - X86_REG_ST0}] = {value}"
             # Segment registers - no-op in flat mode
             if r in (11, 17, 28, 29, 30, 49):
@@ -268,11 +272,20 @@ class Lifter:
         if setter == 'cmp':
             return f"{cmp_macro}({ops})"
         elif setter == 'test':
+            # After `test`, CF=0 and OF=0, so the unsigned/signed-ordering jccs
+            # reduce to ZF/SF tests against the AND result -- NOT cmp(a,b) (which
+            # would compare the two operands as if subtracted). Map them directly.
+            test_only = {
+                'jbe': f"TEST_Z({ops})",  'ja':  f"TEST_NZ({ops})",   # CF=0: jbe==je, ja==jne
+                'jb':  "0",               'jae': "1",                 # CF=0: jb never, jae always
+                'jg':  f"TEST_G({ops})",  'jle': f"TEST_LE({ops})",
+                'jge': f"TEST_NS({ops})", 'jl':  f"TEST_S({ops})",
+            }
+            if jcc_mnemonic in test_only:
+                return test_only[jcc_mnemonic]
             if test_macro:
                 return f"{test_macro}({ops})"
-            else:
-                # Fall back to cmp-style for conditions that test doesn't directly support
-                return f"{cmp_macro}({ops})"
+            return f"{cmp_macro}({ops})"
         elif setter in ('sub', 'add'):
             # Result-based condition
             return f"/* {setter} result */ {cmp_macro}({ops})"
@@ -475,23 +488,36 @@ class Lifter:
                 self._flag_state = ('xor', "_flag_a, _flag_b")
 
         # --- Shifts ---
+        # shl/shr/sar set ZF/SF/PF from the result (when the count != 0). Capture
+        # the result so a following jcc tests it -- otherwise it reads the prior
+        # instruction's stale flags (e.g. `shr ecx,2; je` wrongly using a dec's ZF,
+        # which sent the Watcom memset's count off into a multi-GB overrun).
         elif m == 'shl' or m == 'sal':
             if len(ops) == 2:
                 a = self._fmt_read(ops[0])
                 b = self._fmt_read(ops[1])
+                res = f"({a} << {b})"
+                lines.append(self._flag_capture(res, res))
                 lines.append(f"{self._fmt_write(ops[0], f'{a} << {b}')}; {comment}")
+                self._flag_state = ('or', "_flag_a, _flag_b")
 
         elif m == 'shr':
             if len(ops) == 2:
                 a = self._fmt_read(ops[0])
                 b = self._fmt_read(ops[1])
+                res = f"({a} >> {b})"
+                lines.append(self._flag_capture(res, res))
                 lines.append(f"{self._fmt_write(ops[0], f'{a} >> {b}')}; {comment}")
+                self._flag_state = ('or', "_flag_a, _flag_b")
 
         elif m == 'sar':
             if len(ops) == 2:
                 a = self._fmt_read(ops[0])
                 b = self._fmt_read(ops[1])
+                res = f"((uint32_t)((int32_t){a} >> {b}))"
+                lines.append(self._flag_capture(res, res))
                 lines.append(f"{self._fmt_write(ops[0], f'(uint32_t)((int32_t){a} >> {b})')}; {comment}")
+                self._flag_state = ('or', "_flag_a, _flag_b")
 
         elif m == 'rol':
             if len(ops) == 2:
@@ -562,39 +588,49 @@ class Lifter:
                     lines.append(f"{self._fmt_write(ops[0], f'{a} - {b} - _cf')}; {comment}")
 
         # --- String Operations ---
-        elif m == 'rep movsb':
-            lines.append(f"memcpy((void*)ADDR(edi), (void*)ADDR(esi), ecx); {comment}")
-            lines.append(f"esi += ecx; edi += ecx; ecx = 0;")
-
-        elif m == 'rep movsd':
-            lines.append(f"memcpy((void*)ADDR(edi), (void*)ADDR(esi), ecx * 4); {comment}")
-            lines.append(f"esi += ecx * 4; edi += ecx * 4; ecx = 0;")
-
-        elif m == 'rep stosb':
-            lines.append(f"memset((void*)ADDR(edi), LO8(eax), ecx); {comment}")
-            lines.append(f"edi += ecx; ecx = 0;")
-
-        elif m == 'rep stosd':
-            lines.append(f"MEMSET32((void*)ADDR(edi), eax, ecx); {comment}")
-            lines.append(f"edi += ecx * 4; ecx = 0;")
-
-        elif m == 'movsb':
-            lines.append(f"MEM8(edi) = MEM8(esi); esi += _df; edi += _df; {comment}")
-
-        elif m == 'movsd':
-            lines.append(f"MEM32(edi) = MEM32(esi); esi += _df * 4; edi += _df * 4; {comment}")
-
-        elif m == 'stosb':
-            lines.append(f"MEM8(edi) = LO8(eax); edi += _df; {comment}")
-
-        elif m == 'stosd':
-            lines.append(f"MEM32(edi) = eax; edi += _df * 4; {comment}")
-
-        elif m == 'lodsb':
-            lines.append(f"SET_LO8(eax, MEM8(esi)); esi += _df; {comment}")
-
-        elif m == 'lodsd':
-            lines.append(f"eax = MEM32(esi); esi += _df * 4; {comment}")
+        # The rep/repne prefix (F3/F2) on movs/stos/lods means "repeat ECX times".
+        # For these ops F2 and F3 are EQUIVALENT (the E/NE distinction only matters
+        # for cmps/scas). Detect the prefix from the raw bytes so Watcom's
+        # F2-prefixed memcpy (repne movsd/movsb) is handled, not just the F3 spelling.
+        # capstone is inconsistent: it may fold the prefix into the mnemonic
+        # ("repne movsb") or leave a bare "movsd" with the prefix in the bytes.
+        # Direction is assumed forward (DF clear), as in any compiled memcpy/memset.
+        elif (m.split()[-1] in ('movsb', 'movsd', 'movsw', 'stosb', 'stosd', 'lodsb', 'lodsd')
+              and insn.bytes
+              and next((b for b in insn.bytes
+                        if b not in (0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65, 0x66, 0x67, 0xF0, 0xF2, 0xF3)), 0)
+                  in (0xA4, 0xA5, 0xAA, 0xAB, 0xAC, 0xAD)):
+            # (the opcode guard excludes SSE movsd/movss, which share the mnemonic
+            #  but are 0x0F-escaped, not single-byte string opcodes)
+            base = m.split()[-1]
+            rep = (' ' in m) or any(b in (0xF2, 0xF3) for b in (insn.bytes[:4] if insn.bytes else ()))
+            esz = {'movsb': 1, 'movsd': 4, 'movsw': 2, 'stosb': 1, 'stosd': 4, 'lodsb': 1, 'lodsd': 4}[base]
+            if base.startswith('movs'):
+                if rep:
+                    lines.append(f"memcpy((void*)ADDR(edi), (void*)ADDR(esi), ecx * {esz}u); {comment}")
+                    lines.append(f"esi += ecx * {esz}u; edi += ecx * {esz}u; ecx = 0;")
+                elif esz == 1:
+                    lines.append(f"MEM8(edi) = MEM8(esi); esi += _df; edi += _df; {comment}")
+                elif esz == 2:
+                    lines.append(f"MEM16(edi) = MEM16(esi); esi += _df * 2; edi += _df * 2; {comment}")
+                else:
+                    lines.append(f"MEM32(edi) = MEM32(esi); esi += _df * 4; edi += _df * 4; {comment}")
+            elif base.startswith('stos'):
+                if rep and esz == 1:
+                    lines.append(f"memset((void*)ADDR(edi), LO8(eax), ecx); {comment}")
+                    lines.append(f"edi += ecx; ecx = 0;")
+                elif rep:
+                    lines.append(f"MEMSET32((void*)ADDR(edi), eax, ecx); {comment}")
+                    lines.append(f"edi += ecx * 4; ecx = 0;")
+                elif esz == 1:
+                    lines.append(f"MEM8(edi) = LO8(eax); edi += _df; {comment}")
+                else:
+                    lines.append(f"MEM32(edi) = eax; edi += _df * 4; {comment}")
+            else:  # lodsb/lodsd
+                if esz == 1:
+                    lines.append(f"SET_LO8(eax, MEM8(esi)); esi += _df; {comment}")
+                else:
+                    lines.append(f"eax = MEM32(esi); esi += _df * 4; {comment}")
 
         elif m == 'scasb':
             # Compare AL with [EDI] (capture flags BEFORE advancing EDI).
@@ -696,7 +732,7 @@ class Lifter:
                     else:
                         lines.append(f"fp_push(0.0); /* fld size={ops[0].size} */ {comment}")
                 else:
-                    lines.append(f"fp_push(_st[{ops[0].reg - X86_REG_ST0}]); {comment}")  # fld st(i)
+                    lines.append(f"fp_push(_st[{ops[0].reg - X86_REG_ST0}]); {comment}")  # ST(i) hack
 
         elif m == 'fild':
             if ops and ops[0].type == X86_OP_MEM:
@@ -748,7 +784,7 @@ class Lifter:
 
         elif m == 'fadd':
             if ops:
-                lines.append(f"_st[0] += {self._fmt_fpu_src(ops)}; {comment}")
+                lines.append(f"{self._fpu_dst(ops)} += {self._fmt_fpu_src(ops)}; {comment}")
             else:
                 lines.append(f"_st[0] += _st[1]; {comment}")
 
@@ -757,7 +793,7 @@ class Lifter:
 
         elif m == 'fsub':
             if ops:
-                lines.append(f"_st[0] -= {self._fmt_fpu_src(ops)}; {comment}")
+                lines.append(f"{self._fpu_dst(ops)} -= {self._fmt_fpu_src(ops)}; {comment}")
             else:
                 lines.append(f"_st[0] -= _st[1]; {comment}")
 
@@ -766,14 +802,14 @@ class Lifter:
 
         elif m == 'fsubr':
             if ops:
-                lines.append(f"_st[0] = {self._fmt_fpu_src(ops)} - _st[0]; {comment}")
+                lines.append(f"{self._fpu_dst(ops)} = {self._fmt_fpu_src(ops)} - {self._fpu_dst(ops)}; {comment}")
 
         elif m == 'fsubrp':
             lines.append(f"{{ double _v = fp_pop(); _st[0] -= _v; }} {comment}")
 
         elif m == 'fmul':
             if ops:
-                lines.append(f"_st[0] *= {self._fmt_fpu_src(ops)}; {comment}")
+                lines.append(f"{self._fpu_dst(ops)} *= {self._fmt_fpu_src(ops)}; {comment}")
             else:
                 lines.append(f"_st[0] *= _st[1]; {comment}")
 
@@ -782,7 +818,7 @@ class Lifter:
 
         elif m == 'fdiv':
             if ops:
-                lines.append(f"_st[0] /= {self._fmt_fpu_src(ops)}; {comment}")
+                lines.append(f"{self._fpu_dst(ops)} /= {self._fmt_fpu_src(ops)}; {comment}")
             else:
                 lines.append(f"_st[0] /= _st[1]; {comment}")
 
@@ -791,7 +827,7 @@ class Lifter:
 
         elif m == 'fdivr':
             if ops:
-                lines.append(f"_st[0] = {self._fmt_fpu_src(ops)} / _st[0]; {comment}")
+                lines.append(f"{self._fpu_dst(ops)} = {self._fmt_fpu_src(ops)} / {self._fpu_dst(ops)}; {comment}")
 
         elif m == 'fdivrp':
             lines.append(f"{{ double _v = fp_pop(); _st[0] /= _v; }} {comment}")
@@ -806,10 +842,24 @@ class Lifter:
             lines.append(f"_st[0] = sqrt(_st[0]); {comment}")
 
         elif m == 'fxch':
+            # capstone reports fxch st(N) as [st(0), st(N)]; swap st(0) with the
+            # OTHER operand (the last one), not st(0) with itself.
             if ops:
-                lines.append(f"{{ double _t = _st[0]; _st[0] = _st[{ops[0].reg - X86_REG_ST0}]; _st[{ops[0].reg - X86_REG_ST0}] = _t; }} {comment}")
+                i = ops[-1].reg - X86_REG_ST0
+                lines.append(f"{{ double _t = _st[0]; _st[0] = _st[{i}]; _st[{i}] = _t; }} {comment}")
             else:
                 lines.append(f"{{ double _t = _st[0]; _st[0] = _st[1]; _st[1] = _t; }} {comment}")
+
+        # FPU stack-pointer ops. In our fixed-window stack (st[0] is always top),
+        # `fincstp; ffree st(7)` is the standard "pop without storing" idiom, so we
+        # model fincstp as a discarding pop and ffree as a no-op. fdecstp pushes a
+        # slot (rare).
+        elif m == 'fincstp':
+            lines.append(f"(void)fp_pop(); {comment}")
+        elif m == 'fdecstp':
+            lines.append(f"fp_push(0.0); {comment}")
+        elif m in ('ffree', 'ffreep'):
+            lines.append(f"/* {m} (no-op in fixed-window FPU stack) */ {comment}")
 
         elif m in ('fcomip', 'fucomip', 'fcompp'):
             lines.append(f"_fpu_cmp = (_st[0] < _st[1]) ? -1 : (_st[0] > _st[1]) ? 1 : 0; {comment}")
@@ -958,6 +1008,14 @@ class Lifter:
             # ST(i) register
             return f"_st[{op.reg - X86_REG_ST0}]"
         return "_st[1]"
+
+    def _fpu_dst(self, ops) -> str:
+        """Destination lvalue for an FPU arithmetic insn. For `OP st(i), st(0)`
+        (capstone gives [st(i), st(0)]) the destination is st(i), NOT st(0); for
+        `OP st(i)` / `OP mem` it is the implicit st(0)."""
+        if len(ops) >= 2 and ops[0].type == X86_OP_REG:
+            return f"_st[{ops[0].reg - X86_REG_ST0}]"
+        return "_st[0]"
 
     def lift_basic_block(self, block) -> list:
         """Lift an entire basic block to C code."""
