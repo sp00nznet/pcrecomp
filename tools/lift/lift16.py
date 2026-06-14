@@ -616,7 +616,7 @@ class Lifter:
                     func_name = f'res_{target:06X}'
                 self.func_calls.add(func_name)
                 # Simulate NEAR CALL: push 2-byte return IP on CPU stack
-                self._emit(f'push16(cpu, 0);', f'near call return addr')
+                self._emit(f'push16(cpu, 0xFFFF);', f'near call return addr')
                 self._emit(f'{func_name}(cpu);', orig)
             elif op1 and op1.type == OpType.FAR:
                 # Resolve far call segment:offset to a known function.
@@ -643,21 +643,21 @@ class Lifter:
                     func_name = f'far_{seg:04X}_{off:04X}'
                 self.func_calls.add(func_name)
                 # Simulate FAR CALL: push 4-byte return CS:IP on CPU stack
-                self._emit(f'push16(cpu, cpu->cs); push16(cpu, 0);', f'far call return addr')
+                self._emit(f'push16(cpu, cpu->cs); push16(cpu, 0xFFFF);', f'far call return addr')
                 self._emit(f'{func_name}(cpu);', orig)
             else:
                 if getattr(self, 'dispatch', False) and op1:
                     if op1.type == OpType.MEM and op1.size == 4:
                         seg, off = _mem_addr(op1)
                         self._emit(f'{{ uint16_t _o={off}; uint16_t _s={seg}; '
-                                   f'push16(cpu,cpu->cs); push16(cpu,0); '
+                                   f'push16(cpu,cpu->cs); push16(cpu,0xFFFF); '
                                    f'recomp_dispatch(cpu, mem_read16(cpu,_s,(uint16_t)(_o+2)), '
                                    f'mem_read16(cpu,_s,_o)); }}', orig)
                     else:  # near indirect (word mem or register)
                         # dispatch_near cleans up the pushed near-return word on a
                         # miss (sp+=2); recomp_dispatch does not, which corrupts
                         # the stack when the target isn't a known function.
-                        self._emit(f'push16(cpu,0); dispatch_near(cpu, {_cseg()}, {_read(op1)});', orig)
+                        self._emit(f'push16(cpu,0xFFFF); dispatch_near(cpu, {_cseg()}, {_read(op1)});', orig)
                 else:
                     self._emit(f'/* indirect call {repr(op1)} - needs dispatch */', orig)
 
@@ -667,11 +667,11 @@ class Lifter:
             if getattr(self, 'dispatch', False) and op1 and op1.type == OpType.MEM:
                 seg, off = _mem_addr(op1)
                 self._emit(f'{{ uint16_t _o={off}; uint16_t _s={seg}; '
-                           f'push16(cpu,cpu->cs); push16(cpu,0); '
+                           f'push16(cpu,cpu->cs); push16(cpu,0xFFFF); '
                            f'recomp_dispatch(cpu, mem_read16(cpu,_s,(uint16_t)(_o+2)), '
                            f'mem_read16(cpu,_s,_o)); }}', orig)
             elif getattr(self, 'dispatch', False) and op1 and op1.type == OpType.FAR:
-                self._emit(f'push16(cpu,cpu->cs); push16(cpu,0); '
+                self._emit(f'push16(cpu,cpu->cs); push16(cpu,0xFFFF); '
                            f'recomp_dispatch(cpu, 0x{op1.far_seg:X}, 0x{op1.disp:X});', orig)
             else:
                 self._emit(f'/* UNHANDLED: {orig} */', orig)
@@ -725,7 +725,7 @@ class Lifter:
                     func_name = f'ovl{ovl_num:02d}_{ovl_off:04X}'
                 self.ovl_calls.add(func_name)
                 # Simulate FAR CALL for overlay dispatch
-                self._emit(f'push16(cpu, cpu->cs); push16(cpu, 0);',
+                self._emit(f'push16(cpu, cpu->cs); push16(cpu, 0xFFFF);',
                            f'overlay far call return addr')
                 self._emit(f'{func_name}(cpu);',
                            f'INT 3Fh -> OVL {ovl_num:02X}:{ovl_off:04X}')
