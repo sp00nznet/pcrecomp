@@ -369,10 +369,10 @@ class Lifter:
                     r = reg_name(ops[0].reg)
                     lines[-1] = f"{r} = POP32_VAL(esp); {comment}"
 
-        elif m == 'pushad':
+        elif m in ('pushad', 'pushal'):   # Capstone spells PUSHAD as 'pushal' in 32-bit
             lines.append(f"PUSHAD(); {comment}")
 
-        elif m == 'popad':
+        elif m in ('popad', 'popal'):      # Capstone spells POPAD as 'popal' in 32-bit
             lines.append(f"POPAD(); {comment}")
 
         elif m == 'pushfd':
