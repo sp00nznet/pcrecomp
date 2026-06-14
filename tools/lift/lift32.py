@@ -515,8 +515,31 @@ class Lifter:
                 a = self._fmt_read(ops[0])
                 b = self._fmt_read(ops[1])
                 res = f"((uint32_t)((int32_t){a} >> {b}))"
+                # sar must publish CF for a following rcr (the clip's `sar;rcr` lerp).
+                lines.append(f"if ({b}) _cf = ((({a}) >> (({b}) - 1)) & 1u); {comment}")
                 lines.append(self._flag_capture(res, res))
-                lines.append(f"{self._fmt_write(ops[0], f'(uint32_t)((int32_t){a} >> {b})')}; {comment}")
+                lines.append(f"{self._fmt_write(ops[0], f'(uint32_t)((int32_t){a} >> {b})')};")
+                self._flag_state = ('or', "_flag_a, _flag_b")
+
+        # shld/shrd: double-precision shift (64-bit window across dst:src). Used pervasively
+        # for 64-bit / fixed-point math; leaving them unimplemented silently dropped the
+        # write -> garbage 3D vertex/clip math. CF = last bit shifted out of dst.
+        elif m == 'shrd':
+            if len(ops) == 3:
+                d = self._fmt_read(ops[0]); s = self._fmt_read(ops[1]); c = self._fmt_read(ops[2])
+                expr = f"(({c}) ? ((({d}) >> ({c})) | ((uint32_t)({s}) << (32 - ({c})))) : ({d}))"
+                lines.append(f"if ({c}) _cf = ((({d}) >> (({c}) - 1)) & 1u); {comment}")
+                lines.append(self._flag_capture(expr, expr))
+                lines.append(f"{self._fmt_write(ops[0], expr)};")
+                self._flag_state = ('or', "_flag_a, _flag_b")
+
+        elif m == 'shld':
+            if len(ops) == 3:
+                d = self._fmt_read(ops[0]); s = self._fmt_read(ops[1]); c = self._fmt_read(ops[2])
+                expr = f"(({c}) ? ((({d}) << ({c})) | ((uint32_t)({s}) >> (32 - ({c})))) : ({d}))"
+                lines.append(f"if ({c}) _cf = ((({d}) >> (32 - ({c}))) & 1u); {comment}")
+                lines.append(self._flag_capture(expr, expr))
+                lines.append(f"{self._fmt_write(ops[0], expr)};")
                 self._flag_state = ('or', "_flag_a, _flag_b")
 
         elif m == 'rol':
@@ -530,6 +553,23 @@ class Lifter:
                 a = self._fmt_read(ops[0])
                 b = self._fmt_read(ops[1])
                 lines.append(f"{self._fmt_write(ops[0], f'ROR32({a}, {b})')}; {comment}")
+
+        # rcr/rcl: rotate-through-carry (33-bit rotate of CF:operand). The clip-intersection
+        # forms its 64-bit lerp dividend with `sar edx,1; rcr eax,1`; without rcr the carry
+        # bit was dropped -> garbage clip vertices -> the flight rasterizer hung on huge spans.
+        elif m == 'rcr':
+            if len(ops) == 2:
+                a = self._fmt_read(ops[0]); b = self._fmt_read(ops[1])
+                wr = self._fmt_write(ops[0], '_rv')
+                lines.append(f"{{ uint32_t _rv = {a}, _rn = ({b}) & 31; for (uint32_t _i=0;_i<_rn;_i++){{ "
+                             f"uint32_t _rb = _rv & 1u; _rv = (_rv >> 1) | (_cf << 31); _cf = _rb; }} {wr}; }} {comment}")
+
+        elif m == 'rcl':
+            if len(ops) == 2:
+                a = self._fmt_read(ops[0]); b = self._fmt_read(ops[1])
+                wr = self._fmt_write(ops[0], '_rv')
+                lines.append(f"{{ uint32_t _rv = {a}, _rn = ({b}) & 31; for (uint32_t _i=0;_i<_rn;_i++){{ "
+                             f"uint32_t _rb = _rv >> 31; _rv = (_rv << 1) | _cf; _cf = _rb; }} {wr}; }} {comment}")
 
         # --- Compare / Test (flag setters only, no writeback) ---
         elif m == 'cmp':
