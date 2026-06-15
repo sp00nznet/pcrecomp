@@ -627,7 +627,17 @@ class Lifter:
             if len(ops) == 2:
                 a = self._fmt_read(ops[0])
                 b = self._fmt_read(ops[1])
-                # sbb reg, reg -> _cf ? 0xFFFFFFFF : 0
+                # sbb reg, reg -> CF ? 0xFFFFFFFF : 0  (common `cmp; sbb r,r` idiom)
+                # NOTE: CF here reads the running `_cf` variable, NOT the carry of an
+                # immediately-preceding cmp/sub. That is technically imprecise (a real
+                # `cmp X,Y; sbb r,r` would see CF=(X<Y)). Synthesizing the precise carry
+                # was tried (global, adjacent-only, and sbb-r,r-only variants) and every
+                # variant DETERMINISTICALLY broke Fury3's new-game->briefing transition
+                # while baseline reaches flight reliably -- a downstream path depends on
+                # the current behavior (a compensating imprecision elsewhere). Until a
+                # per-site differential trace isolates that path, keep the conservative
+                # `_cf`. The one gameplay-affecting case (the cheat reader sub_43BFB0) is
+                # handled by a targeted host shim instead. See fury3-target.md Phase 8.
                 if ops[0].type == X86_OP_REG and ops[1].type == X86_OP_REG and ops[0].reg == ops[1].reg:
                     lines.append(f"{self._fmt_write(ops[0], '_cf ? 0xFFFFFFFFu : 0')}; {comment}")
                 else:

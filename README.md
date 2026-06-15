@@ -53,6 +53,7 @@ Every tool here was forged in the fires of an actual recompilation project. Thes
 | **[civ](https://github.com/sp00nznet/civ)** | Civilization | 1991 | 16-bit DOS / MSC 5.x | Runs! 672 functions, interactive boot/menu, 164K lines |
 | **[dinopark](https://github.com/sp00nznet/dinopark)** | DinoPark Tycoon | 1993 | 16-bit DOS / Borland large model | Phase 1 - decoded & mapped, 693 functions, 99.9% far-calls resolved, actor script VM found |
 | **[elfish](https://github.com/sp00nznet/elfish)** | El-Fish | 1993 | 16-bit NE + TSXLIB extender | Lifted & links - 2,236 functions, 121 segments, startup executes |
+| **[fury3](https://github.com/sp00nznet/fury3)** | Fury³ | 1995 | Terminal Reality voxel engine (Win32/MSVC) | **Playable!** Flies the canyon - 1,945 functions, SDL2+imgui frontend, real joystick |
 | **[encarta](https://github.com/sp00nznet/encarta)** | Encarta 97 Encyclopedia | 1996 | MFC 4.0 + proprietary | Format RE - FIF/M20/SPAM decoders, 16-bit thunk analysis |
 | **[gta](https://github.com/sp00nznet/gta)** | Grand Theft Auto | 1997 | DMA "Race'n'Chase" | Builds & runs - 4,094 functions, 444K lines, runtime bringup |
 | **[fallout1-re](https://github.com/sp00nznet/fallout1-re)** | Fallout | 1997 | Custom (Interplay) | Fork - native + HTML5 web port, multiplayer |
