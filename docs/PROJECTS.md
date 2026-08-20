@@ -133,8 +133,8 @@ A reference card for every PC static recompilation project, what tools they cont
 **Engine**: MFC 4.0 + proprietary multimedia stack
 **Original**: `ENC97.EXE` (1.7 MB) + 5 DLLs + 6 legacy 16-bit components + 14 .M20 data files
 **Compiler**: MSVC 4.x
-**Approach**: Format-first reverse engineering (decode proprietary multimedia formats before tackling application code)
-**Status**: Phase 1. Format decoders for FIF, M20/MVB, SPAM, DAT, STR complete.
+**Approach**: Format-first reverse engineering (decode the proprietary multimedia formats before tackling application code), then whole-binary mechanical lifting with a hybrid lifted/real boundary
+**Status**: **Runs.** DECO_32.DLL (the fractal image codec) is fully recompiled and byte-exact with no DLL present. All 7,326 functions of ENC97.EXE lift to compilable C; the recompiled code drives the real application on Windows 11 -- CRT and MFC startup, `InitInstance`, the app's `Run()` loop, the Encarta UI library, article rendering. 83,051 dispatched calls per session, **10,242 of them real MFC virtual dispatches landing in recompiled code**.
 
 **Contributed to pcrecomp**:
 - `tools/formats/fifdecode/` (Iterated Systems FIF fractal image format)
@@ -143,8 +143,13 @@ A reference card for every PC static recompilation project, what tools they cont
 - `tools/formats/spamdump/` (SPAM multimedia format)
 - `tools/formats/datdump/` (Encarta DAT file parser)
 - `tools/formats/strdump/` (String table extractor)
+- `runtime/hybrid/` (**the lifted <-> real boundary**: import trampoline,
+  real->lifted `__thiscall` trampoline, vtable routing, bisect knobs)
+- `runtime/recomp32_cpu/` + `tools/lift/lift32_cpu.py` (reentrant CPU-struct
+  lifting model, `.reloc`-driven relocation, `fs:`/SEH support)
+- `docs/HYBRID.md` (the three correctness rules and the bisect method)
 
-**Notable**: Not a game -- a multimedia encyclopedia. Shows the approach works on any kind of application. EEUIL10.DLL exports 1,868 symbols. DECO_32.DLL is a third-party fractal image codec (Iterated Systems).
+**Notable**: Not a game -- a multimedia encyclopedia, which is the point: the approach works on any kind of application. This is the project that forced the *real -> lifted* direction of the boundary to exist, because an MFC app is mostly framework calling back into application code; without it "the recompiled app runs" would have meant the entry point runs and MFC does everything else. EEUIL10.DLL exports 1,868 symbols. DECO_32.DLL is a third-party fractal image codec (Iterated Systems).
 
 ---
 

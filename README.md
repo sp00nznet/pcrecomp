@@ -27,7 +27,8 @@ pcrecomp/
     disasm/        Disassemblers (32-bit recursive descent, 16-bit table-driven,
                    x87 FPU decoder, direct call-graph scanner, large-model
                    far-call + code/data-boundary call-graph completion)
-    lift/          Code lifters (x86-32 and x86-16 to readable C)
+    lift/          Code lifters (x86-32 and x86-16 to readable C; lift32_cpu.py
+                   is the reentrant CPU-struct model needed for hybrid builds)
     classify/      Function classifiers (SDK vs custom, multi-signal, string refs)
     ghidra/        Ghidra headless scripts (decompile, export, stats, xrefs,
                    range disasm, function bounds)
@@ -38,8 +39,13 @@ pcrecomp/
     formats/       Format decoders (FIF fractal images, M20/MVB, SPAM, DAT)
   runtime/         Drop-in runtime support for recompiled code
     recomp32/      32-bit x86 runtime (global registers, memory model, dispatch)
+    recomp32_cpu/  32-bit x86 runtime, explicit CPU struct (reentrant; pairs
+                   with lift32_cpu.py, required for hybrid builds)
     recomp16/      16-bit DOS runtime (CPU state, INT handlers, HAL, SDL2)
     compat/        Win32 API compatibility layers (Win32 -> SDL2 mapping)
+    hybrid/        The lifted <-> real boundary: import trampoline, real->lifted
+                   __thiscall trampoline, vtable routing. Lets a framework
+                   (MFC, the CRT) stay real while the app body runs recompiled
   templates/       Starter files for new projects (CMake, .gitignore)
   docs/            Deep dives and philosophy
 ```
@@ -55,7 +61,7 @@ Every tool here was forged in the fires of an actual recompilation project. Thes
 | **[elfish](https://github.com/sp00nznet/elfish)** | El-Fish | 1993 | 16-bit NE + TSXLIB extender | Lifted & links - 2,236 functions, 121 segments, startup executes |
 | **[fury3](https://github.com/sp00nznet/fury3)** | Fury³ | 1995 | Terminal Reality voxel engine (Win32/MSVC) | **Playable!** Flies the canyon - 1,945 functions, SDL2+imgui frontend, real joystick |
 | **[hellbender](https://github.com/sp00nznet/hellbender)** | Hellbender | 1996 | Terminal Reality voxel engine (Win32/MSVC) | Bring-up - lifts clean (5,262 functions, 513K lines, 0 errors), 507 import bridges; same toolchain as Fury³ |
-| **[encarta](https://github.com/sp00nznet/encarta)** | Encarta 97 Encyclopedia | 1996 | MFC 4.0 + proprietary | Format RE - FIF/M20/SPAM decoders, 16-bit thunk analysis |
+| **[encarta](https://github.com/sp00nznet/encarta)** | Encarta 97 Encyclopedia | 1996 | MFC 4.0 + proprietary | **Runs!** Whole app lifted (7,326 fns); hybrid boundary puts the app body in recompiled code - 10,242 real MFC virtual dispatches land lifted per session, UI and articles on screen |
 | **[gta](https://github.com/sp00nznet/gta)** | Grand Theft Auto | 1997 | DMA "Race'n'Chase" | Builds & runs - 4,094 functions, 444K lines, runtime bringup |
 | **[fallout1-re](https://github.com/sp00nznet/fallout1-re)** | Fallout | 1997 | Custom (Interplay) | Fork - native + HTML5 web port, multiplayer |
 | **[fallout2-re](https://github.com/sp00nznet/fallout2-re)** | Fallout 2 | 1998 | Custom (Interplay) | Fork - decompilation ~complete (alexbatalov upstream) |
@@ -199,7 +205,11 @@ pip install capstone pefile lief
 4. Drop in the appropriate `runtime/` files
 5. Build with CMake, fix, repeat
 
-See [docs/PHILOSOPHY.md](docs/PHILOSOPHY.md) for the full approach, and [docs/PIPELINE.md](docs/PIPELINE.md) for detailed pipeline docs.
+See [docs/PHILOSOPHY.md](docs/PHILOSOPHY.md) for the full approach,
+[docs/PIPELINE.md](docs/PIPELINE.md) for detailed pipeline docs, and
+[docs/HYBRID.md](docs/HYBRID.md) for running lifted code *inside* a real
+program - the lifted/real boundary, its three non-obvious correctness rules,
+and how to bisect a hybrid build when it breaks 30,000 calls deep.
 
 ## Philosophy (the short version)
 
