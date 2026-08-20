@@ -219,9 +219,31 @@ We've proven this across DOS, Win16, Win32, MFC, Quake-family engines, GoldSrc, 
 
 Read the full philosophy in [docs/PHILOSOPHY.md](docs/PHILOSOPHY.md).
 
+## Credits
+
+Built on other people's tools, and on published reverse-engineering work:
+
+- **[capstone](https://www.capstone-engine.org/)** (BSD-3-Clause) — the
+  disassembly engine under every lifter here.
+- **[pefile](https://github.com/erocarrera/pefile)** (MIT) — PE parsing,
+  including the `.reloc` walk the 32-bit lifters rely on.
+- **[Ghidra](https://ghidra-sre.org/)** (Apache-2.0) and **IDA Pro** — hosts for
+  the headless scripts in `tools/ghidra/` and `tools/ida/`; function boundaries
+  and decompilation.
+- **Kostya Shishkov** and **Alyssa Milburn** — their published work on the
+  FVF/IFS fractal codec family underpins `tools/formats/ftcdecode/`.
+
+All of the above are used as libraries or hosts under their own licences. None
+of them are vendored here.
+
 ## License
 
-MIT. Use these tools to bring back whatever software you love.
+**MIT** — see [LICENSE](LICENSE). Use these tools to bring back whatever
+software you love.
+
+One thing the licence cannot give you: rights to the software you point these
+tools at. Lifting a binary produces a derivative work of that binary, so the
+output carries whatever licence the original does. Own what you take apart.
 
 ---
 
