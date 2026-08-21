@@ -235,6 +235,36 @@ class Lifter:
             d = ops[0]; cnt = self.src(insn, ops[1]) if len(ops) > 1 else "1"
             fn = {"shl":"op_shl","sal":"op_shl","shr":"op_shr","sar":"op_sar"}[m]
             return [self.dst_write(insn, d, f"{fn}(c, {self._read_dst(insn,d)}, {cnt}, {d.size})")]
+        if m in ("rol", "ror"):
+            d = ops[0]; cnt = self.src(insn, ops[1]) if len(ops) > 1 else "1"
+            fn = "op_rol" if m == "rol" else "op_ror"
+            return [self.dst_write(insn, d,
+                                   f"{fn}(c, {self._read_dst(insn,d)}, {cnt}, {d.size})")]
+        if m in ("shld", "shrd"):
+            d, s2 = ops[0], ops[1]
+            cnt = self.src(insn, ops[2]) if len(ops) > 2 else "R8L(c->ecx)"
+            fn = "op_shld" if m == "shld" else "op_shrd"
+            return [self.dst_write(insn, d,
+                                   f"{fn}(c, {self._read_dst(insn,d)}, "
+                                   f"{self.src(insn,s2)}, {cnt}, {d.size})")]
+        if m in ("lds", "les", "lfs", "lgs", "lss"):
+            # Load a far pointer: the offset into the register, the selector
+            # into a segment register. A flat PE never does this; segmented
+            # 32-bit code does it constantly. See the CPU struct: the selector
+            # is stored and does not affect any later access, so this is right
+            # only while every segment shares one address space.
+            d, src = ops[0], ops[1]
+            seg = m[1:]
+            sz = d.size
+            return ["{ uint32_t _a = %s; %s c->%s = rd16(_a + %d); }"
+                    % (self.addr_expr(insn, src),
+                       self.dst_write(insn, d, "rd%d(_a)" % (sz * 8)),
+                       seg, sz)]
+        if m == "retf":
+            # The far frame belongs to whoever called across the segment
+            # boundary, and in a lifted build that is the runtime, not us.
+            n = (ops[0].imm if ops and ops[0].type == X86_OP_IMM else 0)
+            return ["/* retf %d: far frame unwound by the caller */ return;" % n]
         if m == "movzx":
             d, s = two(); return [self.dst_write(insn, d, f"({self.src(insn,s)})")]
         if m == "movsx":

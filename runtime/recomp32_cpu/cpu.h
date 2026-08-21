@@ -182,6 +182,46 @@ static inline uint32_t op_sar(CPU *c, uint32_t v, uint32_t cnt, int sz) {
     c->zf = (r == 0); c->sf = (r & s) != 0; c->pf = parity8((uint8_t)r); return r;
 }
 
+/* ---- rotates. Unlike the shifts these leave ZF/SF/PF alone, which is not an
+   omission: x86 does not touch them here, and code that rotates then branches
+   on the zero flag is reading the flag the PREVIOUS instruction set. ---- */
+static inline uint32_t op_rol(CPU *c, uint32_t v, uint32_t cnt, int sz) {
+    uint32_t m = mask_sz(sz); int w = sz * 8; v &= m;
+    cnt &= 31; cnt %= (uint32_t)w; if (!cnt) return v;
+    uint32_t r = ((v << cnt) | (v >> (w - cnt))) & m;
+    c->cf = r & 1;
+    c->of = (((r >> (w - 1)) & 1) ^ (c->cf & 1));
+    return r;
+}
+static inline uint32_t op_ror(CPU *c, uint32_t v, uint32_t cnt, int sz) {
+    uint32_t m = mask_sz(sz); int w = sz * 8; v &= m;
+    cnt &= 31; cnt %= (uint32_t)w; if (!cnt) return v;
+    uint32_t r = ((v >> cnt) | (v << (w - cnt))) & m;
+    c->cf = (r >> (w - 1)) & 1;
+    c->of = (((r >> (w - 1)) & 1) ^ ((r >> (w - 2)) & 1));
+    return r;
+}
+
+/* ---- double-precision shifts: shift `d`, feeding in bits from `s` ---- */
+static inline uint32_t op_shld(CPU *c, uint32_t d, uint32_t s, uint32_t cnt, int sz) {
+    uint32_t m = mask_sz(sz); int w = sz * 8;
+    d &= m; s &= m; cnt &= 31;
+    if (!cnt || cnt > (uint32_t)w) return d;      /* count > width is undefined */
+    uint32_t r = ((d << cnt) | (s >> (w - cnt))) & m;
+    c->cf = (d >> (w - cnt)) & 1;
+    c->zf = (r == 0); c->sf = (r & sign_sz(sz)) != 0; c->pf = parity8((uint8_t)r);
+    return r;
+}
+static inline uint32_t op_shrd(CPU *c, uint32_t d, uint32_t s, uint32_t cnt, int sz) {
+    uint32_t m = mask_sz(sz); int w = sz * 8;
+    d &= m; s &= m; cnt &= 31;
+    if (!cnt || cnt > (uint32_t)w) return d;
+    uint32_t r = ((d >> cnt) | (s << (w - cnt))) & m;
+    c->cf = (d >> (cnt - 1)) & 1;
+    c->zf = (r == 0); c->sf = (r & sign_sz(sz)) != 0; c->pf = parity8((uint8_t)r);
+    return r;
+}
+
 /* ---- shifts (set flags like x86; count masked to 5 bits) ---- */
 static inline uint32_t shr32(CPU *c, uint32_t v, uint32_t cnt) {
     cnt &= 31; if (!cnt) return v;
