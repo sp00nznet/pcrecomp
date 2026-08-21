@@ -260,6 +260,10 @@ static inline void CPUID(uint32_t eax_val, uint32_t ebx_val, uint32_t ecx_val, u
  * Indirect Call Dispatch
  * ============================================================ */
 
+/* The VA of the function currently executing (see RECOMP_ENTER below); an
+ * unresolved dispatch is far more useful with its caller named. */
+extern uint32_t g_cur_func;
+
 /* ICALL trace ring buffer for crash diagnostics */
 #define ICALL_TRACE_SIZE 32
 extern uint32_t g_icall_trace[ICALL_TRACE_SIZE];
@@ -282,8 +286,10 @@ recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
 
 /* Direct call to a known recompiled function */
 #define RECOMP_CALL(func) do { \
+    uint32_t _caller = g_cur_func; \
     PUSH32(esp, RECOMP_RETADDR); /* dummy return address */ \
     func(); \
+    g_cur_func = _caller;  /* the callee RECOMP_ENTER clobbered it */ \
 } while(0)
 
 /* Indirect call through dispatch */
@@ -296,10 +302,12 @@ recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_import(_va); \
     if (_fn) { \
+        uint32_t _caller = g_cur_func; \
         PUSH32(esp, RECOMP_RETADDR); \
         _fn(); \
+        g_cur_func = _caller;  /* the callee RECOMP_ENTER clobbered it */ \
     } else { \
-        fprintf(stderr, "ICALL: unresolved VA 0x%08X\n", _va); \
+        fprintf(stderr, "ICALL: unresolved VA 0x%08X from 0x%08X\n", _va, g_cur_func); \
         esp += 4; /* pop dummy ret addr */ \
         eax = 0; \
     } \
@@ -315,7 +323,7 @@ recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_import(_va); \
     if (_fn) { _fn(); } \
-    else { fprintf(stderr, "ITAIL: unresolved VA 0x%08X\n", _va); } \
+    else { fprintf(stderr, "ITAIL: unresolved VA 0x%08X from 0x%08X\n", _va, g_cur_func); } \
 } while(0)
 
 /* ============================================================

@@ -324,6 +324,37 @@ class Disassembler:
 
         return targets
 
+    def find_data_code_pointers(self, code_start: int, code_end: int,
+                                covered: set, queued: set) -> set:
+        """Function pointers that exist only in data.
+
+        A vtable slot, a callback table or a message-handler array can hold the
+        only reference to a function: no CALL names it, so recursive descent
+        never reaches it and it surfaces at runtime as an unresolved ICALL.
+        Scan every byte offset of each non-code section for values landing in
+        the code range and not already part of decoded code. Unaligned on
+        purpose: packed struct arrays put function pointers at odd addresses
+        (GTA1's handler table starts at 0x4B4AD1), and an aligned-only scan
+        misses them entirely. False positives just become dead functions --
+        harmless now that out-of-function branches tail-dispatch.
+        """
+        found = set()
+        for s in self.sections:
+            if s.is_code:
+                continue
+            base = self.image_base + s.virtual_address
+            data = self.read_bytes(base, s.raw_size)
+            if not data:
+                continue
+            for off in range(len(data) - 3):
+                va = int.from_bytes(data[off:off + 4], 'little')
+                if not (code_start <= va < code_end):
+                    continue
+                if va in covered or va in queued:
+                    continue
+                found.add(va)
+        return found
+
     def find_functions(self, code_start: int, code_end: int, iat_map: dict = None) -> dict:
         """
         Find all functions in the code section.
@@ -380,38 +411,49 @@ class Disassembler:
             return func
 
         round_no = 0
-        while queue:
-            round_no += 1
-            sorted_targets = sorted(queue)
-            queue = []
-            total = len(sorted_targets)
-            if round_no == 1:
-                print(f"[*] Disassembling {total} initial candidates...")
-            else:
-                print(f"[*] Discovery round {round_no}: {total} new jmp/call targets...")
-            for i, addr in enumerate(sorted_targets):
-                if round_no == 1 and i % 1000 == 0 and i > 0:
-                    print(f"[*] Disassembling function {i}/{total}...")
-                if addr in functions:
-                    continue
-                _add_func(addr)
+        data_scanned = False
+        while True:
+          while queue:
+              round_no += 1
+              sorted_targets = sorted(queue)
+              queue = []
+              total = len(sorted_targets)
+              if round_no == 1:
+                  print(f"[*] Disassembling {total} initial candidates...")
+              else:
+                  print(f"[*] Discovery round {round_no}: {total} new jmp/call targets...")
+              for i, addr in enumerate(sorted_targets):
+                  if round_no == 1 and i % 1000 == 0 and i > 0:
+                      print(f"[*] Disassembling function {i}/{total}...")
+                  if addr in functions:
+                      continue
+                  _add_func(addr)
 
-            # Harvest jmp/call immediate targets from everything decoded so far,
-            # enqueue any that don't start an already-decoded instruction.
-            for func in list(functions.values()):
-                for b in func.blocks.values():
-                    for ins in b.instructions:
-                        if not (ins.is_uncond_jump or ins.is_call):
-                            continue
-                        tgt = ins.get_branch_target()
-                        if tgt is None or tgt in queued:
-                            continue
-                        if not self.is_code_address(tgt):
-                            continue
-                        if tgt in covered:          # intra-function / known entry
-                            continue
-                        queued.add(tgt)
-                        queue.append(tgt)
+              # Harvest jmp/call immediate targets from everything decoded so far,
+              # enqueue any that don't start an already-decoded instruction.
+              for func in list(functions.values()):
+                  for b in func.blocks.values():
+                      for ins in b.instructions:
+                          if not (ins.is_uncond_jump or ins.is_call):
+                              continue
+                          tgt = ins.get_branch_target()
+                          if tgt is None or tgt in queued:
+                              continue
+                          if not self.is_code_address(tgt):
+                              continue
+                          if tgt in covered:          # intra-function / known entry
+                              continue
+                          queued.add(tgt)
+                          queue.append(tgt)
+          if data_scanned:
+              break
+          data_scanned = True
+          ptrs = self.find_data_code_pointers(code_start, code_end, covered, queued)
+          if not ptrs:
+              break
+          print(f"[*] Data scan: {len(ptrs)} functions reachable only via data pointers...")
+          queued |= ptrs
+          queue = sorted(ptrs)
 
         print(f"[*] Successfully disassembled {len(functions)} functions"
               f" ({round_no} discovery rounds)")

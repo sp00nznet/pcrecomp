@@ -111,13 +111,20 @@ def is_8bit_hi(reg_id: int) -> bool:
 class Lifter:
     """Lifts x86 instructions to C code using a global register model."""
 
-    def __init__(self, iat_map: dict = None, func_names: dict = None):
+    def __init__(self, iat_map: dict = None, func_names: dict = None,
+                 lifted: set = None):
         """
         iat_map: VA -> (dll, func_name) for import resolution
         func_names: VA -> name for known function names
         """
         self.iat_map = iat_map or {}
         self.func_names = func_names or {}
+        # VAs that will actually be emitted. Direct calls to anything else
+        # (garbage targets from data decoded as code) degrade to RECOMP_ICALL,
+        # which logs at runtime instead of failing the link on a symbol nobody
+        # will ever define. None = trust every target, as before.
+        self.lifted = lifted
+        self._labels = None   # block starts of the function being lifted
         self._flag_state = None  # (setter_mnemonic, operands_str)
         self._fp_depth = 0  # FPU stack depth tracking
 
@@ -296,6 +303,18 @@ class Lifter:
             return f"/* {setter} result */ {cmp_macro}({ops})"
         elif setter in ('dec', 'inc'):
             return f"/* {setter} result */ {cmp_macro}({ops})"
+        elif setter == 'fcom':
+            # fcom/fcomp + fnstsw + sahf loads C0->CF and C3->ZF, so MSVC tests the
+            # FPU comparison with the UNSIGNED jccs. `ops` is the -1/0/1 result.
+            fpu_cond = {
+                'jb': '<', 'jbe': '<=', 'ja': '>', 'jae': '>=',
+                'jl': '<', 'jle': '<=', 'jg': '>', 'jge': '>=',
+                'je': '==', 'jz': '==', 'jne': '!=', 'jnz': '!=',
+            }
+            op = fpu_cond.get(jcc_mnemonic.replace('set', 'j').replace('cmov', 'j'))
+            if op:
+                return f"({ops} {op} 0)"
+            return f"/* fcom: unmapped {jcc_mnemonic} */ ({ops} != 0)"
         elif setter == 'bt':
             # BT sets CF = bit tested
             if cmp_macro in ('CMP_B', 'CMP_AE'):  # jb/jae test CF
@@ -725,6 +744,8 @@ class Lifter:
                     lines.append(f"RECOMP_ICALL(0x{target:08X}u); {comment}")
                 elif target in self.func_names:
                     lines.append(f"RECOMP_CALL(recomp_{self.func_names[target]}); {comment}")
+                elif self.lifted is not None and target not in self.lifted:
+                    lines.append(f"RECOMP_ICALL(0x{target:08X}u); {comment} /* not lifted */")
                 else:
                     lines.append(f"RECOMP_CALL(sub_{target:08X}); {comment}")
             else:
@@ -754,7 +775,12 @@ class Lifter:
 
         elif m == 'jmp':
             target = insn.get_branch_target()
-            if target:
+            if target and self._labels is not None and target not in self._labels:
+                # Branch leaves the function: a tail call, or a run of bytes that
+                # was never really code. Either way there is no label to jump to,
+                # so dispatch and return instead of emitting an undefined goto.
+                lines.append(f"RECOMP_ITAIL(0x{target:08X}u); return; {comment}")
+            elif target:
                 lines.append(f"goto L_{target:08X}; {comment}")
             else:
                 # Indirect jump (switch table or vtable)
@@ -770,7 +796,9 @@ class Lifter:
         elif m in COND_MAP:
             target = insn.get_branch_target()
             cond = self._make_condition(m)
-            if target:
+            if target and self._labels is not None and target not in self._labels:
+                lines.append(f"if ({cond}) {{ RECOMP_ITAIL(0x{target:08X}u); return; }} {comment}")
+            elif target:
                 lines.append(f"if ({cond}) goto L_{target:08X}; {comment}")
             else:
                 lines.append(f"if ({cond}) {{ /* indirect jcc */ }} {comment}")
@@ -1044,7 +1072,9 @@ class Lifter:
             lines.append(f"/* finit */ {comment}")
 
         else:
-            lines.append(f"/* UNIMPLEMENTED: {insn.mnemonic} {insn.op_str} */ {comment}")
+            # A null statement, not a bare comment: this may be the only thing
+            # after a label, and C requires a label to be followed by a statement.
+            lines.append(f"; /* UNIMPLEMENTED: {insn.mnemonic} {insn.op_str} */ {comment}")
 
         return lines
 
@@ -1097,9 +1127,13 @@ class Lifter:
         lines.append(f"    int _df = 1;  /* direction flag (1=forward, -1=backward) */")
         lines.append(f"    uint32_t _flag_a = 0, _flag_b = 0;  /* flag-operand snapshots */")
         lines.append(f"    /* _st[8]/_fp_top/_fpu_cw are GLOBAL (shared x87 stack) */")
+        # Records the VA of the function currently running, so a crash names it.
+        # A plain global store; the ring-buffer half only exists under -DRECOMP_TRACE.
+        lines.append(f"    RECOMP_ENTER(0x{func.address:08X}u);")
         lines.append(f"")
 
         # Emit blocks in address order
+        self._labels = set(func.blocks.keys())
         sorted_addrs = sorted(func.blocks.keys())
         for addr in sorted_addrs:
             block = func.blocks[addr]

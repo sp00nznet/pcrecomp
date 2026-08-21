@@ -54,6 +54,13 @@ uint32_t recomp_load_image(const char* path, uint32_t image_base) {
     void* view = VirtualAlloc((void*)(uintptr_t)image_base, span,
                               MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
     if (!view) {
+        /* Already reserved for us -- a launcher that held the range through
+         * loader init (see the MSVC-host case) leaves it reserved, and
+         * MEM_RESERVE over an existing reservation fails. Commit into it. */
+        view = VirtualAlloc((void*)(uintptr_t)image_base, span,
+                            MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    }
+    if (!view) {
         fprintf(stderr, "[loader] VirtualAlloc fixed @ 0x%08X failed (link host at a high base)\n",
                 image_base);
         free(buf);
