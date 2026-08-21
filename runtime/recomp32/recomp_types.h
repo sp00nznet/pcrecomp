@@ -135,9 +135,15 @@ static inline void MEMSET32(void* dst, uint32_t val, uint32_t count) {
  * Stack Operations
  * ============================================================ */
 
+/* Evaluate the operand BEFORE moving esp. x86 reads the source of
+ * push dword ptr [esp+N] at the OLD esp; decrementing first makes every
+ * esp-relative push read one slot too low -- which lands on the return
+ * address the caller pushed, so the callee sees RECOMP_RETADDR as an
+ * argument. */
 #define PUSH32(sp, val) do { \
+    uint32_t _pv = (uint32_t)(val); \
     (sp) -= 4; \
-    MEM32(sp) = (uint32_t)(val); \
+    MEM32(sp) = _pv; \
 } while(0)
 
 #define POP32_VAL(sp) ({ \

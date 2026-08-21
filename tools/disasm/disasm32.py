@@ -445,6 +445,27 @@ class Disassembler:
                               continue
                           queued.add(tgt)
                           queue.append(tgt)
+
+              # Callbacks: a function passed as an argument is named only by the
+              # immediate that pushes its address (`push 0x48d4e0` ahead of a
+              # DirectDraw EnumDisplayModes). Nothing CALLs it and it sits in no
+              # data table, so neither the call scan nor the data scan finds it;
+              # it surfaces at runtime as a callback that cannot be dispatched.
+              for func in list(functions.values()):
+                  for b in func.blocks.values():
+                      for ins in b.instructions:
+                          if ins.is_call or ins.is_jump or not ins.operands:
+                              continue
+                          for op in ins.operands:
+                              if op.type != X86_OP_IMM:
+                                  continue
+                              tgt = op.imm & 0xFFFFFFFF
+                              if tgt in queued or tgt in covered:
+                                  continue
+                              if not self.is_code_address(tgt):
+                                  continue
+                              queued.add(tgt)
+                              queue.append(tgt)
           if data_scanned:
               break
           data_scanned = True
