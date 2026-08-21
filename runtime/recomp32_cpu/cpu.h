@@ -71,9 +71,18 @@ static inline void eflags_unpack(CPU *c, uint32_t v) {
     c->zf = (v >> 6) & 1; c->sf = (v >> 7) & 1; c->of = (v >> 11) & 1;
 }
 
-/* ---- stack ---- */
-static inline void push32(CPU *c, uint32_t v) { c->esp -= 4; wr32(c->esp, v); }
-static inline uint32_t pop32(CPU *c) { uint32_t v = rd32(c->esp); c->esp += 4; return v; }
+/* ---- stack ----
+ *
+ * ESP is an address in a flat build, so the base is zero and these compile to
+ * exactly what they did before. A segmented build defines STACK_BASE to its
+ * SS base instead, because there ESP is an OFFSET: 16-bit code reaching its
+ * arguments does `mov bp, sp` and then `[bp+6]`, and truncating a host address
+ * to 16 bits produces a pointer to nothing. */
+#ifndef STACK_BASE
+#define STACK_BASE(c) 0u
+#endif
+static inline void push32(CPU *c, uint32_t v) { c->esp -= 4; wr32(STACK_BASE(c) + c->esp, v); }
+static inline uint32_t pop32(CPU *c) { uint32_t v = rd32(STACK_BASE(c) + c->esp); c->esp += 4; return v; }
 
 /* ---- absolute image references: abs VA at preferred base -> live address ---- */
 extern uint32_t g_image_delta;   /* live_base - PE ImageBase (0 if loaded where it wanted) */

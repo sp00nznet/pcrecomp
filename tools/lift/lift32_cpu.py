@@ -118,14 +118,27 @@ class Lifter:
         return self.in_image(d)
 
     # ---- operand rendering ----
+    def areg(self, name):
+        """A register used to form an address.
+
+        `c->bp` does not exist: the CPU struct holds 32-bit registers and the
+        16-bit ones are windows onto them. Emitting the raw name works for
+        eax..edi and produces uncompilable C the moment an address-size prefix
+        puts a 16-bit register in the operand, which segmented code does."""
+        if name in R32: return "c->%s" % name
+        if name in R16: return "R16(c->%s)" % R16[name]
+        if name in R8L: return "R8L(c->%s)" % R8L[name]
+        if name in R8H: return "R8H(c->%s)" % R8H[name]
+        return "c->%s" % name
+
     def addr_expr(self, insn, op):
         m = op.mem
         terms = []
         base = self.md.reg_name(m.base) if m.base else None
         index = self.md.reg_name(m.index) if m.index else None
         d = m.disp & 0xffffffff
-        if base: terms.append(f"c->{base}")
-        if index: terms.append(f"c->{index}*{m.scale}")
+        if base: terms.append(self.areg(base))
+        if index: terms.append(f"{self.areg(index)}*{m.scale}")
         if d or not terms:
             terms.append(f"GVA(0x{d:08X})" if self.disp_is_addr(insn, d) else f"0x{d:08X}u")
         return "(" + " + ".join(terms) + ")"
@@ -138,8 +151,9 @@ class Lifter:
         """raw segment offset (base+index+disp, NOT image-relative / no GVA)"""
         m = op.mem
         terms = []
-        if m.base:  terms.append(f"c->{self.md.reg_name(m.base)}")
-        if m.index: terms.append(f"c->{self.md.reg_name(m.index)}*{m.scale}")
+        if m.base:  terms.append(self.areg(self.md.reg_name(m.base)))
+        if m.index: terms.append("%s*%d" % (self.areg(self.md.reg_name(m.index)),
+                                            m.scale))
         d = m.disp & 0xffffffff
         if d or not terms: terms.append(f"0x{d:08X}u")
         return "(" + " + ".join(terms) + ")"
@@ -540,6 +554,11 @@ class Lifter:
         }.get(m)
 
     def lift_function(self, code, start):
+        # Per function, not per Lifter. Two lifted functions can cover the same
+        # `jmp [table]` - carving by descent produces overlapping extents - and
+        # a stale entry here makes the second one emit `goto` to labels that
+        # only exist in the first, which the C compiler rejects outright.
+        self.jumptables = {}
         insns = list(self.md.disasm(code, start))
         # collect intra-function branch targets
         end = start + len(code)
