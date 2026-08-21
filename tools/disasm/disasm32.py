@@ -324,6 +324,43 @@ class Disassembler:
 
         return targets
 
+    def find_jump_tables(self, code_start: int, code_end: int,
+                         functions: dict, queued: set) -> set:
+        """Switch arms, reachable only through a jump table.
+
+        A switch compiles to `jmp dword ptr [table + idx*4]` and MSVC puts the
+        table in .text beside the function. Nothing names the arms except that
+        one instruction, so recursive descent never reaches them and the data
+        scan skips them (it deliberately ignores code sections). At runtime each
+        arm is an unresolved ITAIL -- which is what crashed every GTA1 shutdown.
+
+        Arms usually sit inside the switching function, so they are already
+        decoded; they still have to become entry points, because the lifter
+        tail-dispatches to them rather than emitting a goto.
+        """
+        found = set()
+        for func in list(functions.values()):
+            for b in func.blocks.values():
+                for ins in b.instructions:
+                    if not ins.is_uncond_jump or not ins.operands:
+                        continue
+                    op = ins.operands[0]
+                    if op.type != X86_OP_MEM or op.mem.scale != 4 or not op.mem.index:
+                        continue
+                    table = op.mem.disp & 0xFFFFFFFF
+                    if not self.is_data_address(table) and not self.is_code_address(table):
+                        continue
+                    for k in range(256):          # stop at the first non-code entry
+                        raw = self.read_bytes(table + k * 4, 4)
+                        if not raw or len(raw) < 4:
+                            break
+                        tgt = int.from_bytes(raw, 'little')
+                        if not (code_start <= tgt < code_end):
+                            break
+                        if tgt not in functions and tgt not in queued:
+                            found.add(tgt)
+        return found
+
     def find_data_code_pointers(self, code_start: int, code_end: int,
                                 covered: set, queued: set) -> set:
         """Function pointers that exist only in data.
@@ -393,6 +430,7 @@ class Disassembler:
         # are silently missing and show up at runtime as unresolved ITAIL/ICALL.
         functions = {}
         covered = set()          # every instruction start address across all funcs
+        owner = {}               # instruction address -> the function that decoded it
         queue = list(all_targets)
         queued = set(all_targets)
 
@@ -408,10 +446,12 @@ class Disassembler:
             for b in func.blocks.values():
                 for ins in b.instructions:
                     covered.add(ins.address)
+                    owner.setdefault(ins.address, addr)
             return func
 
         round_no = 0
         data_scanned = False
+        tables_scanned = False
         while True:
           while queue:
               round_no += 1
@@ -441,8 +481,16 @@ class Disassembler:
                               continue
                           if not self.is_code_address(tgt):
                               continue
-                          if tgt in covered:          # intra-function / known entry
-                              continue
+                          if tgt in covered:
+                              # A jump INTO another function's body -- a shared
+                              # epilogue, or a switch arm the table scan reached
+                              # first. It has no label in the jumping function, so
+                              # the lifter tail-dispatches to it; make it a real
+                              # entry point or that dispatch is unresolved at
+                              # runtime. Safe now that ebp is a global register:
+                              # the caller's frame carries through.
+                              if tgt in functions or owner.get(tgt) == func.address:
+                                  continue
                           queued.add(tgt)
                           queue.append(tgt)
 
@@ -466,6 +514,14 @@ class Disassembler:
                                   continue
                               queued.add(tgt)
                               queue.append(tgt)
+          if not tables_scanned:
+              tables_scanned = True
+              arms = self.find_jump_tables(code_start, code_end, functions, queued)
+              if arms:
+                  print(f"[*] Jump tables: {len(arms)} switch arms reachable only via a table...")
+                  queued |= arms
+                  queue = sorted(arms)
+                  continue
           if data_scanned:
               break
           data_scanned = True

@@ -1121,7 +1121,6 @@ class Lifter:
         name = func.name
 
         lines.append(f"void {name}(void) {{")
-        lines.append(f"    uint32_t ebp = 0;  /* local frame pointer */")
         lines.append(f"    int _fpu_cmp = 0;")
         lines.append(f"    uint32_t _cf = 0;  /* carry flag */")
         lines.append(f"    int _df = 1;  /* direction flag (1=forward, -1=backward) */")

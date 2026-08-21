@@ -30,8 +30,13 @@
 /* Volatile (caller-saved) registers */
 extern uint32_t g_eax, g_ecx, g_edx, g_esp;
 
-/* Callee-saved registers (also global for implicit parameter passing) */
-extern uint32_t g_ebx, g_esi, g_edi;
+/* Callee-saved registers (also global for implicit parameter passing).
+ * ebp is global too, not a per-function local: MSVC's __EH_prolog sets its
+ * CALLER's frame pointer (lea ebp, [esp+0xC]) and returns, so a local ebp
+ * would discard it and every C++ EH function would then address off zero.
+ * Real x86 has one ebp; FPO functions that never touch it simply pass the
+ * caller's through, which is exactly the behaviour we want. */
+extern uint32_t g_ebx, g_esi, g_edi, g_ebp;
 
 /* The x87 FPU stack is GLOBAL (8 shared registers), not per-function: helpers
  * like __ftol receive their argument on the FPU stack from the caller, and the
@@ -69,11 +74,11 @@ extern const uint32_t recomp_dispatch_count;
 #define esp g_esp
 #define esi g_esi
 #define edi g_edi
+#define ebp g_ebp
 /* x87 FPU stack is global; _fpu_cmp stays per-function (set+used within one fn) */
 #define _st g_st
 #define _fp_top g_fp_top
 #define _fpu_cw g_fpu_cw
-/* ebp is declared local in each function */
 #define _seg_cs g_seg_cs
 #define _seg_ds g_seg_ds
 #define _seg_es g_seg_es
