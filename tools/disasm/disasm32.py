@@ -108,6 +108,7 @@ class Function:
     called_from: set = field(default_factory=set)  # addresses that call this function
     is_thunk: bool = False  # single-jmp wrapper
     size: int = 0
+    jump_targets: set = field(default_factory=set)
 
     @property
     def num_instructions(self) -> int:
@@ -187,6 +188,31 @@ class Disassembler:
             ))
         return instructions
 
+    def jump_table_targets(self, insn, limit: int = 256) -> list:
+        """Entries of the jump table an indirect `jmp` dispatches through.
+
+        MSVC puts the table in .text beside the function. Nothing names the arms
+        but this one instruction, so recursive descent cannot reach them and they
+        surface at runtime as unresolved dispatches. Stop at the first entry that
+        is not a code address -- that is where the table ends.
+        """
+        if not insn.operands:
+            return []
+        op = insn.operands[0]
+        if op.type != X86_OP_MEM or op.mem.scale != 4 or not op.mem.index:
+            return []
+        table = op.mem.disp & 0xFFFFFFFF
+        out = []
+        for k in range(limit):
+            raw = self.read_bytes(table + k * 4, 4)
+            if not raw or len(raw) < 4:
+                break
+            tgt = int.from_bytes(raw, 'little')
+            if not self.is_code_address(tgt):
+                break
+            out.append(tgt)
+        return out
+
     def disassemble_function(self, start_va: int, iat_map: dict = None) -> Optional[Function]:
         """
         Disassemble a complete function using recursive descent from start_va.
@@ -239,6 +265,17 @@ class Disassembler:
                             block_leaders.add(target)
                             if target not in visited:
                                 work.append(target)
+                    elif target is None:
+                        func.jump_targets.update(self.jump_table_targets(insn))
+                        # `jmp dword ptr [table + idx*4]` -- a switch. The arms
+                        # belong to THIS function: they are its loop body, not
+                        # tail calls, so they have to become blocks here. Lift
+                        # them as separate functions and a `continue` inside the
+                        # switch turns into mutual recursion that never ends.
+                        for arm in func.jump_targets:
+                            block_leaders.add(arm)
+                            if arm not in visited:
+                                work.append(arm)
                     break  # end this linear scan
 
                 if insn.is_ret:
@@ -323,43 +360,6 @@ class Disassembler:
                 offset += 1
 
         return targets
-
-    def find_jump_tables(self, code_start: int, code_end: int,
-                         functions: dict, queued: set) -> set:
-        """Switch arms, reachable only through a jump table.
-
-        A switch compiles to `jmp dword ptr [table + idx*4]` and MSVC puts the
-        table in .text beside the function. Nothing names the arms except that
-        one instruction, so recursive descent never reaches them and the data
-        scan skips them (it deliberately ignores code sections). At runtime each
-        arm is an unresolved ITAIL -- which is what crashed every GTA1 shutdown.
-
-        Arms usually sit inside the switching function, so they are already
-        decoded; they still have to become entry points, because the lifter
-        tail-dispatches to them rather than emitting a goto.
-        """
-        found = set()
-        for func in list(functions.values()):
-            for b in func.blocks.values():
-                for ins in b.instructions:
-                    if not ins.is_uncond_jump or not ins.operands:
-                        continue
-                    op = ins.operands[0]
-                    if op.type != X86_OP_MEM or op.mem.scale != 4 or not op.mem.index:
-                        continue
-                    table = op.mem.disp & 0xFFFFFFFF
-                    if not self.is_data_address(table) and not self.is_code_address(table):
-                        continue
-                    for k in range(256):          # stop at the first non-code entry
-                        raw = self.read_bytes(table + k * 4, 4)
-                        if not raw or len(raw) < 4:
-                            break
-                        tgt = int.from_bytes(raw, 'little')
-                        if not (code_start <= tgt < code_end):
-                            break
-                        if tgt not in functions and tgt not in queued:
-                            found.add(tgt)
-        return found
 
     def find_data_code_pointers(self, code_start: int, code_end: int,
                                 covered: set, queued: set) -> set:
@@ -451,7 +451,6 @@ class Disassembler:
 
         round_no = 0
         data_scanned = False
-        tables_scanned = False
         while True:
           while queue:
               round_no += 1
@@ -514,14 +513,6 @@ class Disassembler:
                                   continue
                               queued.add(tgt)
                               queue.append(tgt)
-          if not tables_scanned:
-              tables_scanned = True
-              arms = self.find_jump_tables(code_start, code_end, functions, queued)
-              if arms:
-                  print(f"[*] Jump tables: {len(arms)} switch arms reachable only via a table...")
-                  queued |= arms
-                  queue = sorted(arms)
-                  continue
           if data_scanned:
               break
           data_scanned = True

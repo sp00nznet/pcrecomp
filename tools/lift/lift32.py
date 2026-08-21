@@ -124,7 +124,8 @@ class Lifter:
         # which logs at runtime instead of failing the link on a symbol nobody
         # will ever define. None = trust every target, as before.
         self.lifted = lifted
-        self._labels = None   # block starts of the function being lifted
+        self._labels = None        # block starts of the function being lifted
+        self._jump_targets = None  # arms its switch tables dispatch to
         self._flag_state = None  # (setter_mnemonic, operands_str)
         self._fp_depth = 0  # FPU stack depth tracking
 
@@ -783,13 +784,15 @@ class Lifter:
             elif target:
                 lines.append(f"goto L_{target:08X}; {comment}")
             else:
-                # Indirect jump (switch table or vtable)
+                # Indirect jump: a switch dispatch, or a tail call through a
+                # pointer. C has no computed goto, so branch on the address --
+                # arms of a switch land back inside this function and MUST stay
+                # here; dispatching them as calls turns a loop into recursion.
                 if ops and ops[0].type == X86_OP_MEM:
-                    addr = self._fmt_mem_addr(ops[0].mem)
-                    lines.append(f"RECOMP_ITAIL(MEM32({addr})); return; {comment}")
+                    lines.extend(self._computed_jump(
+                        f"MEM32({self._fmt_mem_addr(ops[0].mem)})", comment))
                 elif ops and ops[0].type == X86_OP_REG:
-                    r = self._fmt_read(ops[0])
-                    lines.append(f"RECOMP_ITAIL({r}); return; {comment}")
+                    lines.extend(self._computed_jump(self._fmt_read(ops[0]), comment))
                 else:
                     lines.append(f"RECOMP_ITAIL(0); return; /* unresolved */ {comment}")
 
@@ -1115,6 +1118,22 @@ class Lifter:
 
         return lines
 
+    def _computed_jump(self, expr: str, comment: str) -> list:
+        """Emit an indirect jump: goto for targets inside this function, tail
+        dispatch for anything else."""
+        # Only the arms this function's switches actually dispatch to. Listing
+        # every label instead is correct but quadratic: one 500-function file
+        # went from 5 MB to 20 MB and crashed the compiler outright.
+        arms = sorted((self._jump_targets or set()) & (self._labels or set()))
+        if not arms:
+            return [f"RECOMP_ITAIL({expr}); return; {comment}"]
+        lines = [f"{{ uint32_t _jt = {expr}; {comment}", "switch (_jt) {"]
+        for label in arms:
+            lines.append(f"case 0x{label:08X}u: goto L_{label:08X};")
+        lines.append("default: RECOMP_ITAIL(_jt); return;")
+        lines.append("} }")
+        return lines
+
     def lift_function(self, func) -> str:
         """Lift an entire function to C code."""
         lines = []
@@ -1133,6 +1152,7 @@ class Lifter:
 
         # Emit blocks in address order
         self._labels = set(func.blocks.keys())
+        self._jump_targets = set(getattr(func, 'jump_targets', ()) or ())
         sorted_addrs = sorted(func.blocks.keys())
         for addr in sorted_addrs:
             block = func.blocks[addr]
