@@ -34,6 +34,15 @@ typedef struct {
     double   st[8];
     int      fpu_top;
     uint32_t fpu_sw;   /* status word: only C0/C1/C2/C3 condition bits modelled */
+    /* Segment registers: stored, but NOT used in address computation. The
+     * memory model below is flat - a register holds a real 32-bit address - so
+     * `mov ds, ax` records the selector and does nothing else. That is right
+     * for code that only saves and restores them, which is the common case even
+     * in segmented 32-bit code, and wrong for code that switches DS to reach
+     * another segment's data. The latter needs a selector -> base mapping the
+     * runtime does not have; such code should be caught rather than lifted
+     * silently. */
+    uint16_t cs, ds, es, fs, gs, ss;
 } CPU;
 
 /* ---- partial register access (preserve unaffected bits, like x86) ---- */

@@ -44,12 +44,18 @@ R32 = {"eax","ecx","edx","ebx","esp","ebp","esi","edi"}
 R16 = {"ax":"eax","cx":"ecx","dx":"edx","bx":"ebx","sp":"esp","bp":"ebp","si":"esi","di":"edi"}
 R8L = {"al":"eax","cl":"ecx","dl":"edx","bl":"ebx"}
 R8H = {"ah":"eax","ch":"ecx","dh":"edx","bh":"ebx"}
+# Segment registers. A flat PE never touches these, but segmented 32-bit code
+# does - IR32.DLL's decode core loads DS and ES constantly - and without them
+# every function containing one fails to lift at all. See cpu.h: they are
+# storage only, and do not take part in addressing.
+SEG = {"cs","ds","es","fs","gs","ss"}
 
 def reg_read(name):
     if name in R32: return f"c->{name}"
     if name in R16: return f"R16(c->{R16[name]})"
     if name in R8L: return f"R8L(c->{R8L[name]})"
     if name in R8H: return f"R8H(c->{R8H[name]})"
+    if name in SEG: return f"c->{name}"
     raise NotImplementedError(f"reg_read {name}")
 
 def reg_write(name, val):
@@ -57,11 +63,12 @@ def reg_write(name, val):
     if name in R16: return f"SET16(c->{R16[name]}, {val});"
     if name in R8L: return f"SET8L(c->{R8L[name]}, {val});"
     if name in R8H: return f"SET8H(c->{R8H[name]}, {val});"
+    if name in SEG: return f"c->{name} = (uint16_t)({val});"
     raise NotImplementedError(f"reg_write {name}")
 
 def reg_size(name):
     if name in R32: return 4
-    if name in R16: return 2
+    if name in R16 or name in SEG: return 2
     return 1
 
 class Lifter:
