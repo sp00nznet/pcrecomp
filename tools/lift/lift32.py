@@ -436,6 +436,15 @@ class Lifter:
             if len(ops) == 1:
                 a = self._fmt_read(ops[0])
                 lines.append(self._flag_capture("0", a))
+                # NEG sets CF = (operand != 0), and MSVC leans on it for a
+                # branchless null check:
+                #     neg ecx / sbb ecx, ecx / and ecx, esi / add ecx, 8
+                # i.e. `ecx = (ecx ? esi : 0) + 8`. Without this, sbb reads a
+                # stale _cf, the select always yields 0, and the callee gets 8
+                # as its `this` -- which is how it presents: a __thiscall
+                # method dereferencing address 8. Unlike the cmp/sbb case
+                # below, NEG's carry is unambiguous and purely local.
+                lines.append(f"_cf = ({a}) != 0;")
                 lines.append(f"{self._fmt_write(ops[0], f'(uint32_t)(-(int32_t){a})')}; {comment}")
                 self._flag_state = ('sub', "_flag_a, _flag_b")
 

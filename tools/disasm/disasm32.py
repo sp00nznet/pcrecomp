@@ -203,14 +203,28 @@ class Disassembler:
             return []
         table = op.mem.disp & 0xFFFFFFFF
         out = []
+        misses = 0
         for k in range(limit):
             raw = self.read_bytes(table + k * 4, 4)
             if not raw or len(raw) < 4:
                 break
             tgt = int.from_bytes(raw, 'little')
-            if not self.is_code_address(tgt):
+            if self.is_code_address(tgt):
+                out.append(tgt)
+                misses = 0
+                continue
+            # The entries do not always begin exactly at the displacement: the
+            # index can be biased, or alignment padding sits in front of the
+            # table (memcpy's [eax*4 + 0x49E140] really starts at 0x49E144, and
+            # slot 0 reads as the tail of the preceding instruction). Stopping
+            # at the first non-code slot therefore finds nothing at all for such
+            # a table. Tolerate a couple, and end the table only once entries
+            # have actually been seen.
+            misses += 1
+            if out and misses >= 2:
                 break
-            out.append(tgt)
+            if not out and misses >= 4:
+                break
         return out
 
     def disassemble_function(self, start_va: int, iat_map: dict = None) -> Optional[Function]:

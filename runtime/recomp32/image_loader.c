@@ -68,6 +68,17 @@ uint32_t recomp_load_image(const char* path, uint32_t image_base) {
     }
     memset(view, 0, span);  /* zeroes .bss */
 
+    /* The headers, too. Windows maps SizeOfHeaders bytes at the image base, and
+     * code does read them back -- walking your own import directory to find an
+     * IAT slot by name needs e_lfanew to be there. Copying only sections leaves
+     * that whole region zeroed. */
+    {
+        uint32_t hdr = *(uint32_t*)(nt + 24 + 60);   /* OptionalHeader.SizeOfHeaders */
+        if (hdr > (uint32_t)sz) hdr = (uint32_t)sz;
+        if (hdr > span) hdr = span;
+        memcpy(view, buf, hdr);
+    }
+
     for (int i = 0; i < nsec; i++) {
         if (sec[i].rsize == 0) continue;  /* uninitialized (.bss) */
         uint32_t va = image_base + sec[i].vaddr;

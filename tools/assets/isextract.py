@@ -16,6 +16,7 @@ Supports:
 """
 
 import struct
+import re
 import sys
 import os
 import zlib
@@ -34,6 +35,58 @@ FILE_SPLIT = 1
 FILE_OBFUSCATED = 2
 FILE_COMPRESSED = 4
 FILE_INVALID = 8
+
+
+def _volume_handle(handles, path):
+    """Open each volume once and keep it; a set can have several."""
+    h = handles.get(path)
+    if h is None:
+        h = handles[path] = open(path, 'rb')
+    return h
+
+
+class Volume:
+    """One .cab volume, and the range of file indices it holds.
+
+    An InstallShield set can span data1.cab, data2.cab, ... Each volume repeats
+    the 20-byte common header and then states which file indices live in it, and
+    the offsets recorded in the directory are relative to the volume the file is
+    in -- not to data1. Reading everything from data1 works until the first file
+    of volume 2 and then produces garbage that fails as "invalid distance code",
+    which looks like a decompression bug rather than a wrong file.
+    """
+    def __init__(self, path):
+        self.path = path
+        with open(path, 'rb') as f:
+            head = f.read(64)
+        self.signature, self.version = struct.unpack_from('<II', head, 0)
+        # Volume header follows the common header; the file-index range sits at
+        # +8/+12 within it (after data_offset and its high dword).
+        self.first_file_index, self.last_file_index = struct.unpack_from('<II', head, 20 + 8)
+
+    def __repr__(self):
+        return '%s [%d..%d]' % (os.path.basename(self.path),
+                                self.first_file_index, self.last_file_index)
+
+
+def discover_volumes(cab_path):
+    """data1.cab, data2.cab, ... alongside the one we were given."""
+    directory = os.path.dirname(cab_path) or '.'
+    base = os.path.basename(cab_path)
+    m = re.match(r'(.*?)([0-9]+)([.]cab)$', base, re.IGNORECASE)
+    if not m:
+        return [Volume(cab_path)]
+    stem, _, ext = m.groups()
+    volumes = []
+    for n in range(1, 100):
+        candidate = os.path.join(directory, '%s%d%s' % (stem, n, ext))
+        if not os.path.exists(candidate):
+            break
+        try:
+            volumes.append(Volume(candidate))
+        except Exception:
+            break
+    return volumes or [Volume(cab_path)]
 
 
 class CommonHeader:
@@ -153,6 +206,10 @@ class ISCabinet:
 
         # Parse cab descriptor
         self.cab_desc = CabDescriptor(self.hdr_data, self.common.cab_descriptor_offset)
+
+        self.volumes = discover_volumes(cab_path)
+        if len(self.volumes) > 1:
+            print("Volumes: " + ", ".join(repr(v) for v in self.volumes))
         print(f"Directories: {self.cab_desc.directory_count}")
         print(f"Files: {self.cab_desc.file_count}")
 
@@ -191,6 +248,19 @@ class ISCabinet:
 
         # Parse file groups
         self.file_groups = self._parse_file_groups()
+
+    def volume_for(self, index):
+        """Which volume file holds this file index.
+
+        Volumes state a first/last index range and consecutive volumes overlap on
+        the boundary file, so take the last volume that starts at or before the
+        index we want.
+        """
+        chosen = self.volumes[0]
+        for v in self.volumes:
+            if v.first_file_index <= index:
+                chosen = v
+        return chosen.path
 
     def _read_string(self, ft_relative_offset):
         """Read a null-terminated string from the file table area."""
@@ -282,8 +352,10 @@ class ISCabinet:
 
         start_time = time.time()
 
-        with open(self.cab_path, 'rb') as cab:
-            for fd in self.files:
+        handles = {}
+        try:
+            for index, fd in enumerate(self.files):
+                cab = _volume_handle(handles, self.volume_for(index))
                 if fd.is_invalid:
                     skipped += 1
                     continue
@@ -324,6 +396,8 @@ class ISCabinet:
                     else:
                         skipped += 1
 
+        finally:
+            for h in handles.values(): h.close()
         elapsed = time.time() - start_time
         print(f"\n\nExtraction complete in {elapsed:.1f}s:")
         print(f"  Extracted from cab: {extracted}")
@@ -346,8 +420,10 @@ class ISCabinet:
 
         start_time = time.time()
 
-        with open(self.cab_path, 'rb') as cab:
+        handles = {}
+        try:
             for i, fd in enumerate(cab_files):
+                cab = _volume_handle(handles, self.volume_for(self.files.index(fd)))
                 if fd.directory:
                     rel_path = os.path.join(fd.directory.replace('\\', os.sep), fd.name)
                 else:
@@ -364,6 +440,8 @@ class ISCabinet:
                     errors += 1
                     print(f"\n  ERROR extracting {rel_path}: {e}")
 
+        finally:
+            for h in handles.values(): h.close()
         elapsed = time.time() - start_time
         print(f"\n\nExtraction complete in {elapsed:.1f}s:")
         print(f"  Extracted: {extracted}/{total}")
