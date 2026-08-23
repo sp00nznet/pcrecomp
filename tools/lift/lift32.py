@@ -67,6 +67,27 @@ COND_MAP = {
     'jnp':  ('CMP_NP',  None,      'not parity'),
 }
 
+# Which runtime flag kind each setter corresponds to; see recomp_cond().
+FLAG_KIND = {
+    'cmp': 'FK_CMP', 'sub': 'FK_CMP', 'dec': 'FK_CMP',
+    'add': 'FK_ADD', 'inc': 'FK_ADD',
+    'and': 'FK_TEST', 'or': 'FK_TEST', 'xor': 'FK_TEST', 'test': 'FK_TEST',
+    'bt': 'FK_BT', 'fcom': 'FK_FCOM',
+}
+
+# jcc -> runtime condition code, for the sites where the setter is not known
+# statically (a branch reached from blocks with different flag-setters).
+COND_CODE = {
+    'je': 'CC_E', 'jz': 'CC_E', 'jne': 'CC_NE', 'jnz': 'CC_NE',
+    'js': 'CC_S', 'jns': 'CC_NS',
+    'jg': 'CC_G', 'jnle': 'CC_G', 'jge': 'CC_GE', 'jnl': 'CC_GE',
+    'jl': 'CC_L', 'jnge': 'CC_L', 'jle': 'CC_LE', 'jng': 'CC_LE',
+    'ja': 'CC_A', 'jnbe': 'CC_A', 'jae': 'CC_AE', 'jnb': 'CC_AE', 'jnc': 'CC_AE',
+    'jb': 'CC_B', 'jnae': 'CC_B', 'jc': 'CC_B', 'jbe': 'CC_BE', 'jna': 'CC_BE',
+    'jo': 'CC_O', 'jno': 'CC_NO',
+}
+
+
 # Setcc follows same pattern
 SETCC_MAP = {f'set{k[1:]}': v for k, v in COND_MAP.items()}
 
@@ -128,6 +149,7 @@ class Lifter:
         self._labels = None        # block starts of the function being lifted
         self._jump_targets = None  # arms its switch tables dispatch to
         self._flag_state = None  # (setter_mnemonic, operands_str)
+        self._flag_seq = 0       # bumped whenever the flags are written
         self._fp_depth = 0  # FPU stack depth tracking
 
     def _fmt_read(self, op) -> str:
@@ -248,6 +270,7 @@ class Lifter:
         the condition. Capturing the values at the flag-setter fixes that.
         Returns the C snapshot statement to append; sets self._flag_state to temps.
         """
+        self._flag_seq += 1
         return f"_flag_a = (uint32_t)({a}); _flag_b = (uint32_t)({b});"
 
     def _make_condition(self, jcc_mnemonic: str) -> str:
@@ -274,6 +297,11 @@ class Lifter:
         cmp_macro, test_macro, desc = entry
 
         if self._flag_state is None:
+            # Reached from blocks with different flag-setters: decide at runtime.
+            jcc = mnem.replace('cmov', 'j', 1) if mnem.startswith('cmov') else                   ('j' + mnem[3:] if mnem.startswith('set') else mnem)
+            cc = COND_CODE.get(jcc)
+            if cc:
+                return f"recomp_cond(_flag_k, _flag_a, _flag_b, {cc})"
             return f"/* no flag state for {mnem} */ _cf"
 
         setter, ops = self._flag_state
@@ -326,6 +354,14 @@ class Lifter:
             return f"/* flag from {setter} */ {cmp_macro}({ops})"
 
     def lift_instruction(self, insn) -> list:
+        """Lift one instruction, recording the runtime flag kind if it wrote flags."""
+        seq0 = self._flag_seq
+        lines = self._lift_instruction(insn)
+        if self._flag_seq != seq0 and self._flag_state is not None:
+            lines.append(f"_flag_k = {FLAG_KIND.get(self._flag_state[0], 'FK_CMP')};")
+        return lines
+
+    def _lift_instruction(self, insn) -> list:
         """
         Lift a single x86 instruction to C statement(s).
         Returns a list of C code strings.
@@ -615,6 +651,7 @@ class Lifter:
                 lines.append(f"/* cmp {a}, {b} */ {comment}")
                 lines.append(self._flag_capture(a, b))
                 self._flag_state = ('cmp', "_flag_a, _flag_b")
+            self._flag_seq += 1
 
         elif m == 'test':
             if len(ops) == 2:
@@ -734,6 +771,7 @@ class Lifter:
             # Compare AL with [EDI] (capture flags BEFORE advancing EDI).
             lines.append(f"_flag_a = LO8(eax); _flag_b = MEM8(edi); edi += _df; {comment}")
             self._flag_state = ('cmp', "_flag_a, _flag_b")
+            self._flag_seq += 1
 
         elif m in ('repne scasb', 'repnz scasb'):
             # repne scasb: scan [EDI] for AL. Real x86 decrements ECX and advances
@@ -746,6 +784,7 @@ class Lifter:
                          f"if (LO8(eax) == _t) break; }} "
                          f"_flag_a = LO8(eax); _flag_b = _t; }} {comment}")
             self._flag_state = ('cmp', "_flag_a, _flag_b")
+            self._flag_seq += 1
 
         elif m in ('repe cmpsb', 'repz cmpsb'):
             # repe cmpsb: compare [ESI] vs [EDI] while equal; stop on first mismatch
@@ -755,6 +794,7 @@ class Lifter:
                          f"esi += _df; edi += _df; ecx--; if (_a != _b) break; }} "
                          f"_flag_a = _a; _flag_b = _b; }} {comment}")
             self._flag_state = ('cmp', "_flag_a, _flag_b")
+            self._flag_seq += 1
 
         # --- Control Flow ---
         elif m == 'call':
@@ -976,7 +1016,9 @@ class Lifter:
                 lines.append(f"fp_pop(); fp_pop();")
             else:
                 lines.append(f"fp_pop();")
+            lines.append("_flag_a = (uint32_t)_fpu_cmp; _flag_b = 0;")
             self._flag_state = ('fcom', '_fpu_cmp')
+            self._flag_seq += 1
 
         elif m in ('fcom', 'fcomp', 'fucom', 'fucomp'):
             if ops:
@@ -986,7 +1028,9 @@ class Lifter:
                 lines.append(f"_fpu_cmp = (_st[0] < _st[1]) ? -1 : (_st[0] > _st[1]) ? 1 : 0; {comment}")
             if m in ('fcomp', 'fucomp'):
                 lines.append(f"fp_pop();")
+            lines.append("_flag_a = (uint32_t)_fpu_cmp; _flag_b = 0;")
             self._flag_state = ('fcom', '_fpu_cmp')
+            self._flag_seq += 1
 
         elif m == 'fnstsw' or m == 'fstsw':
             lines.append(f"/* fnstsw - FPU status to ax */ {comment}")
@@ -1166,6 +1210,7 @@ class Lifter:
         lines.append(f"    uint32_t _cf = 0;  /* carry flag */")
         lines.append(f"    int _df = 1;  /* direction flag (1=forward, -1=backward) */")
         lines.append(f"    uint32_t _flag_a = 0, _flag_b = 0;  /* flag-operand snapshots */")
+        lines.append(f"    uint32_t _flag_k = FK_NONE;  /* which instruction wrote them */")
         lines.append(f"    /* _st[8]/_fp_top/_fpu_cw are GLOBAL (shared x87 stack) */")
         # Records the VA of the function currently running, so a crash names it.
         # A plain global store; the ring-buffer half only exists under -DRECOMP_TRACE.
@@ -1176,9 +1221,40 @@ class Lifter:
         self._labels = set(func.blocks.keys())
         self._jump_targets = set(getattr(func, 'jump_targets', ()) or ())
         sorted_addrs = sorted(func.blocks.keys())
+        # Blocks are emitted lowest-address-first, but the entry is not always
+        # the lowest: a function sharing a body with one below it (a jump-table
+        # arm, a shared tail) would otherwise start executing in the wrong
+        # block and run code that was never called.
+        if sorted_addrs and sorted_addrs[0] != func.address and func.address in self._labels:
+            lines.append(f"    goto L_{func.address:08X};")
+            lines.append("")
+        # A block reached only by falling through a conditional jump still has
+        # the flags the compare set -- a jcc does not touch them. MSVC leans on
+        # this constantly (jg/jl/jae chains off one `test` for 64-bit compares),
+        # and resetting at every block start turned the second jcc of every such
+        # chain into a read of a stale _cf.
+        targeted = set()
+        for b in func.blocks.values():
+            for insn in b.instructions:
+                if insn.mnemonic.startswith('j') or insn.mnemonic.startswith('loop'):
+                    op = insn.op_str.strip()
+                    if op.startswith('0x'):
+                        try:
+                            targeted.add(int(op, 16))
+                        except ValueError:
+                            pass
+
+        prev_end = None
+        prev_was_jcc = False
         for addr in sorted_addrs:
             block = func.blocks[addr]
-            self._flag_state = None
+            carry = (prev_was_jcc and prev_end == addr and addr not in targeted)
+            if not carry:
+                self._flag_state = None
+            last = block.instructions[-1] if block.instructions else None
+            prev_was_jcc = bool(last and last.mnemonic.startswith('j')
+                                and last.mnemonic not in ('jmp',))
+            prev_end = (last.address + last.size) if last else None
             block_lines = self.lift_basic_block(block)
             lines.extend(block_lines)
             lines.append("")

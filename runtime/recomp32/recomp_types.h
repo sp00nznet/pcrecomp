@@ -221,6 +221,95 @@ static inline uint32_t _pop32(uint32_t* sp) {
 /* Bit test (from bt) */
 #define BT_CF(base, bit) (((uint32_t)(base) >> ((uint32_t)(bit) & 31)) & 1)
 
+/*
+ * Runtime flag kind.
+ *
+ * A jcc is normally paired with its flag-setter at lift time, but the setter
+ * is not always statically known: MSVC routinely branches into a block whose
+ * predecessors set the flags with different instructions (the signed-modulo
+ * idiom `and/jns/dec/or/inc/je` is one join, 64-bit compares another). The
+ * lifter used to fall back to a stale _cf at those sites, which made the
+ * branch read whatever carry happened to be lying around.
+ *
+ * _flag_a/_flag_b already survive across blocks -- they are plain function
+ * locals -- so recording which *kind* of instruction wrote them is enough to
+ * evaluate any condition exactly, wherever the branch turns up.
+ */
+enum {
+    FK_NONE = 0,
+    FK_CMP,     /* cmp, sub, dec  -- a - b            */
+    FK_ADD,     /* add, inc       -- a + b            */
+    FK_TEST,    /* and/or/xor/test -- a & b, CF=OF=0  */
+    FK_BT,      /* bt             -- CF = bit b of a  */
+    FK_FCOM     /* fcom           -- a is -1/0/1      */
+};
+
+enum {
+    CC_E = 0, CC_NE, CC_S, CC_NS, CC_G, CC_GE, CC_L, CC_LE,
+    CC_A, CC_AE, CC_B, CC_BE, CC_O, CC_NO
+};
+
+static inline int recomp_cond(uint32_t kind, uint32_t a, uint32_t b, int cc) {
+    uint32_t r;
+    int zf, sf, cf, of;
+
+    if (kind == FK_FCOM) {
+        int32_t v = (int32_t)a;          /* -1 less, 0 equal, 1 greater */
+        switch (cc) {
+        case CC_E:                return v == 0;
+        case CC_NE:               return v != 0;
+        case CC_B:  case CC_L:    return v <  0;
+        case CC_BE: case CC_LE:   return v <= 0;
+        case CC_A:  case CC_G:    return v >  0;
+        case CC_AE: case CC_GE:   return v >= 0;
+        default:                  return 0;
+        }
+    }
+
+    switch (kind) {
+    case FK_ADD:
+        r  = a + b;
+        cf = (r < a);
+        of = (int)((~(a ^ b) & (a ^ r)) >> 31);
+        break;
+    case FK_TEST:
+        r  = a & b;
+        cf = 0;
+        of = 0;
+        break;
+    case FK_BT:
+        r  = 0;
+        cf = (int)((a >> (b & 31)) & 1u);
+        of = 0;
+        break;
+    default:                              /* FK_CMP and FK_NONE */
+        r  = a - b;
+        cf = (a < b);
+        of = (int)(((a ^ b) & (a ^ r)) >> 31);
+        break;
+    }
+    zf = (r == 0);
+    sf = (int)(r >> 31);
+
+    switch (cc) {
+    case CC_E:   return zf;
+    case CC_NE:  return !zf;
+    case CC_S:   return sf;
+    case CC_NS:  return !sf;
+    case CC_G:   return !zf && (sf == of);
+    case CC_GE:  return sf == of;
+    case CC_L:   return sf != of;
+    case CC_LE:  return zf || (sf != of);
+    case CC_A:   return !cf && !zf;
+    case CC_AE:  return !cf;
+    case CC_B:   return cf;
+    case CC_BE:  return cf || zf;
+    case CC_O:   return of;
+    case CC_NO:  return !of;
+    }
+    return 0;
+}
+
 /* ============================================================
  * Bit Manipulation
  * ============================================================ */
