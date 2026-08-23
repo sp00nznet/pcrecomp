@@ -112,7 +112,7 @@ class Lifter:
     """Lifts x86 instructions to C code using a global register model."""
 
     def __init__(self, iat_map: dict = None, func_names: dict = None,
-                 lifted: set = None):
+                 lifted: set = None, precise_sbb: bool = False):
         """
         iat_map: VA -> (dll, func_name) for import resolution
         func_names: VA -> name for known function names
@@ -124,6 +124,7 @@ class Lifter:
         # which logs at runtime instead of failing the link on a symbol nobody
         # will ever define. None = trust every target, as before.
         self.lifted = lifted
+        self.precise_sbb = precise_sbb
         self._labels = None        # block starts of the function being lifted
         self._jump_targets = None  # arms its switch tables dispatch to
         self._flag_state = None  # (setter_mnemonic, operands_str)
@@ -668,7 +669,19 @@ class Lifter:
                 # `_cf`. The one gameplay-affecting case (the cheat reader sub_43BFB0) is
                 # handled by a targeted host shim instead. See fury3-target.md Phase 8.
                 if ops[0].type == X86_OP_REG and ops[1].type == X86_OP_REG and ops[0].reg == ops[1].reg:
-                    lines.append(f"{self._fmt_write(ops[0], '_cf ? 0xFFFFFFFFu : 0')}; {comment}")
+                    # With precise_sbb, take the carry from the comparison that
+                    # actually set it rather than the running `_cf`. `cmp X, 1;
+                    # sbb r, r; neg r` is how compilers write `r = (X == 0)`,
+                    # and MGL returns success that way everywhere -- read from a
+                    # stale `_cf` the result is arbitrary, so GTA1's display
+                    # initialisation reported failure after doing its work
+                    # correctly. Off by default: see the note above.
+                    if (self.precise_sbb and self._flag_state
+                            and self._flag_state[0] in ('cmp', 'sub')):
+                        cf = f"CMP_B({self._flag_state[1]})"
+                        lines.append(f"{self._fmt_write(ops[0], f'{cf} ? 0xFFFFFFFFu : 0')}; {comment}")
+                    else:
+                        lines.append(f"{self._fmt_write(ops[0], '_cf ? 0xFFFFFFFFu : 0')}; {comment}")
                 else:
                     lines.append(f"{self._fmt_write(ops[0], f'{a} - {b} - _cf')}; {comment}")
 
