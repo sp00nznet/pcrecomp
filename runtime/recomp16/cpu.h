@@ -77,9 +77,19 @@ typedef struct CPU {
 } CPU;
 
 /* ---------- Segment:offset → flat address ---------- */
+/* Real mode multiplies the segment by 16, which is what a DOS binary means
+ * and what this defaults to. Protected mode does not: a selector is an index
+ * into a descriptor table and its base has nothing to do with its numeric
+ * value, so a Windows NE needs a lookup instead. Defining SEG_OFF before
+ * including this header replaces the rule and nothing else - the accessors
+ * below, and every lifted `mem_read16(cpu, cpu->ds, off)`, are unchanged. */
+#ifndef SEG_OFF
+#define SEG_OFF(seg, off) ((((uint32_t)(uint16_t)(seg)) << 4) + (uint32_t)(uint16_t)(off))
+#endif
+
 static inline uint32_t seg_off(uint16_t seg, uint16_t off)
 {
-    return ((uint32_t)seg << 4) + off;
+    return SEG_OFF(seg, off);
 }
 
 /* ---------- Memory access ---------- */
@@ -104,6 +114,23 @@ static inline void mem_write16(CPU *cpu, uint16_t seg, uint16_t off, uint16_t va
     uint32_t addr = seg_off(seg, off);
     cpu->mem[addr] = (uint8_t)(val & 0xFF);
     cpu->mem[addr + 1] = (uint8_t)(val >> 8);
+}
+
+/* 32-bit memory access from a 16-bit segment. A 386 in 16-bit code reads
+ * and writes dwords with an operand-size prefix, and code that handles
+ * far pointers or 32-bit fields does it constantly. The offset still wraps
+ * at 16 bits, so it is computed as uint16_t on purpose. */
+static inline uint32_t mem_read32(CPU *cpu, uint16_t seg, uint16_t off)
+{
+    uint32_t lo = mem_read16(cpu, seg, off);
+    uint32_t hi = mem_read16(cpu, seg, (uint16_t)(off + 2));
+    return lo | (hi << 16);
+}
+
+static inline void mem_write32(CPU *cpu, uint16_t seg, uint16_t off, uint32_t val)
+{
+    mem_write16(cpu, seg, off, (uint16_t)(val & 0xFFFF));
+    mem_write16(cpu, seg, (uint16_t)(off + 2), (uint16_t)(val >> 16));
 }
 
 /* Data segment shortcuts (most common) */
@@ -139,6 +166,28 @@ static inline uint16_t pop16(CPU *cpu)
     uint16_t val = mem_read16(cpu, cpu->ss, cpu->sp);
     cpu->sp += 2;
     return val;
+}
+
+/* 32-bit stack operations in a 16-bit segment.
+ *
+ * Not a contradiction: a 16-bit code segment on a 386 can carry an
+ * operand-size prefix and push a dword, and real code does - IR32's 16-bit
+ * half passes 32-bit arguments to its 32-bit half that way. SP is still a
+ * 16-bit offset into SS and still wraps as one, so the arithmetic is done
+ * in uint16_t deliberately. */
+static inline void push32(CPU *cpu, uint32_t val)
+{
+    cpu->sp = (uint16_t)(cpu->sp - 4);
+    mem_write16(cpu, cpu->ss, cpu->sp, (uint16_t)(val & 0xFFFF));
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->sp + 2), (uint16_t)(val >> 16));
+}
+
+static inline uint32_t pop32(CPU *cpu)
+{
+    uint32_t lo = mem_read16(cpu, cpu->ss, cpu->sp);
+    uint32_t hi = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 2));
+    cpu->sp = (uint16_t)(cpu->sp + 4);
+    return lo | (hi << 16);
 }
 
 /* ---------- Flags computation ---------- */
@@ -259,6 +308,68 @@ static inline void flags_shift16(CPU *cpu, uint16_t result)
 {
     set_szp16(cpu, result);
 }
+
+/* ---------- 32-bit arithmetic from 16-bit code ----------
+ *
+ * A 386 running a 16-bit segment does 32-bit arithmetic with an operand-size
+ * prefix, and 16-bit code that handles far pointers, file offsets or 32-bit
+ * fields does it often. Same rules as the 16-bit forms with the sign bit and
+ * the carry boundary moved: SF is bit 31, and CF for ADD is the carry out of
+ * bit 31, which needs a 64-bit intermediate to see.
+ *
+ * SZP is set from the 32-bit result, and PF - as on real hardware - is the
+ * parity of the LOW BYTE only, not of the whole result. */
+static inline void set_szp32(CPU *cpu, uint32_t v)
+{
+    cpu->flags &= ~(FLAG_SF | FLAG_ZF | FLAG_PF);
+    if (v & 0x80000000u) cpu->flags |= FLAG_SF;
+    if (v == 0)          cpu->flags |= FLAG_ZF;
+    uint8_t low = (uint8_t)v;
+    low ^= (uint8_t)(low >> 4);
+    low ^= (uint8_t)(low >> 2);
+    low ^= (uint8_t)(low >> 1);
+    if (!(low & 1)) cpu->flags |= FLAG_PF;
+}
+
+static inline uint32_t flags_add32(CPU *cpu, uint32_t a, uint32_t b)
+{
+    uint64_t r = (uint64_t)a + b;
+    uint32_t result = (uint32_t)r;
+    cpu->flags &= ~(FLAG_CF | FLAG_OF | FLAG_AF | FLAG_SF | FLAG_ZF | FLAG_PF);
+    if (r > 0xFFFFFFFFu)                                cpu->flags |= FLAG_CF;
+    if (((~(a ^ b)) & (a ^ result)) & 0x80000000u)      cpu->flags |= FLAG_OF;
+    if ((a ^ b ^ result) & 0x10)                        cpu->flags |= FLAG_AF;
+    set_szp32(cpu, result);
+    return result;
+}
+
+static inline uint32_t flags_sub32(CPU *cpu, uint32_t a, uint32_t b)
+{
+    uint32_t result = a - b;
+    cpu->flags &= ~(FLAG_CF | FLAG_OF | FLAG_AF | FLAG_SF | FLAG_ZF | FLAG_PF);
+    if (a < b)                                       cpu->flags |= FLAG_CF;
+    if (((a ^ b) & (a ^ result)) & 0x80000000u)      cpu->flags |= FLAG_OF;
+    if ((a ^ b ^ result) & 0x10)                     cpu->flags |= FLAG_AF;
+    set_szp32(cpu, result);
+    return result;
+}
+
+static inline void flags_cmp32(CPU *cpu, uint32_t a, uint32_t b)
+{
+    flags_sub32(cpu, a, b);
+}
+
+static inline void flags_logic32(CPU *cpu, uint32_t result)
+{
+    cpu->flags &= ~(FLAG_CF | FLAG_OF);
+    set_szp32(cpu, result);
+}
+
+static inline void flags_shift32(CPU *cpu, uint32_t result)
+{
+    set_szp32(cpu, result);
+}
+
 
 /* ---------- Flag test helpers ---------- */
 static inline int cf(CPU *cpu) { return (cpu->flags & FLAG_CF) != 0; }
