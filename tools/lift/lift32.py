@@ -1177,10 +1177,21 @@ class Lifter:
         lines = []
         lines.append(f"L_{block.start:08X}:")
 
+        emitted = 0
         for insn in block.instructions:
             lifted = self.lift_instruction(insn)
             for line in lifted:
                 lines.append(f"    {line}")
+                if not line.lstrip().startswith('/*'):
+                    emitted += 1
+
+        # A C label has to be followed by a statement, and some instructions
+        # lift to nothing but a comment -- `int3` is the common one. A function
+        # that is only padding then generates `L_x: /* int3 */ }`, which does
+        # not compile. GTA1 never hit this; London has int3 padding that the
+        # data scan picks up as function starts.
+        if not emitted:
+            lines.append("    ;")
 
         return lines
 
