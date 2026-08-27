@@ -541,6 +541,14 @@ class Decoder:
             inst.op1 = Operand(type=OpType.MOFFS, disp=self._u16(), seg=seg_override or 'ds', size=self._wbytes())
             inst.op2 = self._wreg(0)
 
+        # Port string ops (386). INS/OUTS move between DX and ES:DI / DS:SI.
+        # A 256-colour palette upload is `mov dx,3C9h; rep outsb`, so without
+        # these the whole palette silently never reaches the DAC.
+        elif opcode == 0x6C: inst.mnemonic = 'insb'
+        elif opcode == 0x6D: inst.mnemonic = 'insd' if self.op32 else 'insw'
+        elif opcode == 0x6E: inst.mnemonic = 'outsb'
+        elif opcode == 0x6F: inst.mnemonic = 'outsd' if self.op32 else 'outsw'
+
         # String ops (word form -> dword with 0x66)
         elif opcode == 0xA4: inst.mnemonic = 'movsb'
         elif opcode == 0xA5: inst.mnemonic = 'movsd' if self.op32 else 'movsw'

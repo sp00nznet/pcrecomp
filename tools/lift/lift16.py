@@ -827,6 +827,25 @@ class Lifter:
                        f'cpu->si += df(cpu) ? -2 : 2; '
                        f'cpu->di += df(cpu) ? -2 : 2;', orig)
 
+        # Port string ops. OUTS reads DS:SI and writes port DX; INS the reverse
+        # through ES:DI. `mov dx,3C9h; rep outsb` is how a 256-colour palette
+        # gets uploaded, so dropping these loses the whole palette.
+        elif m == 'outsb':
+            self._emit(f'port_out8(cpu, cpu->dx, mem_read8(cpu, {_ssg}, cpu->si)); '
+                       f'cpu->si += df(cpu) ? -1 : 1;', orig)
+
+        elif m == 'outsw':
+            self._emit(f'port_out16(cpu, cpu->dx, mem_read16(cpu, {_ssg}, cpu->si)); '
+                       f'cpu->si += df(cpu) ? -2 : 2;', orig)
+
+        elif m == 'insb':
+            self._emit('mem_write8(cpu, cpu->es, cpu->di, port_in8(cpu, cpu->dx)); '
+                       'cpu->di += df(cpu) ? -1 : 1;', orig)
+
+        elif m == 'insw':
+            self._emit('mem_write16(cpu, cpu->es, cpu->di, port_in16(cpu, cpu->dx)); '
+                       'cpu->di += df(cpu) ? -2 : 2;', orig)
+
         elif m == 'stosb':
             self._emit(f'mem_write8(cpu, cpu->es, cpu->di, cpu->al); '
                        f'cpu->di += df(cpu) ? -1 : 1;', orig)
@@ -1058,7 +1077,7 @@ class Lifter:
         self.output.append('{')
 
         for inst in instructions:
-            if inst.prefix == 'rep' and inst.mnemonic in ('movsb','movsw','movsd','stosb','stosw','stosd'):
+            if inst.prefix == 'rep' and inst.mnemonic in ('movsb','movsw','movsd','stosb','stosw','stosd','outsb','outsw','insb','insw'):
                 self._emit_label(inst.address)
                 self._emit(f'while (cpu->cx != 0) {{ cpu->cx--;', f'rep {inst.mnemonic}')
                 self.indent += 1
