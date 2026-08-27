@@ -381,10 +381,13 @@ class Lifter:
                            f'(cpu->dx ? FLAG_CF|FLAG_OF : 0); }}', orig)
 
         elif m == 'imul' and op2 is not None:
-            # Two-operand imul: op1 = op1 * op2 (truncated, signed); CF/OF on overflow.
+            # Two-operand imul: op1 = op1 * op2 (truncated, signed); CF/OF on
+            # overflow. The 0x69/0x6B forms carry a third operand -- the real
+            # source -- in op3, and there the destination is write-only.
+            src = op3 if op3 is not None else op1
             sz = _wsz(op1)
             st = {'8': 'int8_t', '16': 'int16_t', '32': 'int32_t'}[sz]
-            self._emit(f'{{ long long _r = (long long)({st})({_read(op1)}) * '
+            self._emit(f'{{ long long _r = (long long)({st})({_read(src)}) * '
                        f'({st})({_read(op2)}); '
                        f'{_write(op1, f"(uint{sz}_t)_r")} '
                        f'cpu->flags = (cpu->flags & ~(FLAG_CF|FLAG_OF)) | '

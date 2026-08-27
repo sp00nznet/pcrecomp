@@ -390,12 +390,18 @@ class Decoder:
             inst.mnemonic = 'push'
             inst.op1 = self._wimm()
 
-        # IMUL r16/32, r/m, imm16/32 (80186+)
+        # IMUL r16/32, r/m, imm16/32 (80186+). THREE operands: the
+        # destination register is not also the source -- `imul bx, [bp-2],
+        # 19Eh` reads a local and writes bx. Dropping the r/m operand makes
+        # it read the destination instead, which is silently wrong whenever
+        # the two differ. Kept in op3 so the immediate stays in op2 and the
+        # two-operand form is unaffected.
         elif opcode == 0x69:
             reg, rm, rn = self._decode_modrm(True, seg_override)
             inst.mnemonic = 'imul'
             inst.op1 = reg
             inst.op2 = self._wimm()
+            inst.op3 = rm
 
         # PUSH imm8 (sign-extended to operand size) (80186+)
         elif opcode == 0x6A:
@@ -405,12 +411,13 @@ class Decoder:
             else:
                 inst.op1 = Operand(type=OpType.IMM8, disp=self._s8() & 0xFFFF, size=2)
 
-        # IMUL r16, r/m16, imm8 (80186+)
+        # IMUL r16, r/m16, imm8 (80186+) -- three operands, see 0x69.
         elif opcode == 0x6B:
             reg, rm, rn = self._decode_modrm(True, seg_override)
             inst.mnemonic = 'imul'
             inst.op1 = reg
             inst.op2 = Operand(type=OpType.IMM8, disp=self._s8() & 0xFFFF, size=2)
+            inst.op3 = rm
 
         # Jcc short (0x70-0x7F)
         elif 0x70 <= opcode <= 0x7F:
