@@ -423,6 +423,8 @@ recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_import(_va); \
     if (_fn) { _fn(); } \
+    else if (_va == RECOMP_RETADDR) { /* setjmp and friends return by jumping \
+        to the saved return address; that is a return, not a missing target. */ } \
     else { fprintf(stderr, "ITAIL: unresolved VA 0x%08X from 0x%08X\n", _va, g_cur_func); } \
 } while(0)
 
