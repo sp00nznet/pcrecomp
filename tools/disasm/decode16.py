@@ -124,6 +124,13 @@ class Instruction:
 
 # ─── Decoder ─────────────────────────────────────────────────────
 
+
+class EndOfSegment(IndexError):
+    """A read ran past the end of the segment being decoded.
+
+    Subclasses IndexError so the existing `except IndexError` recovery paths --
+    which turn a truncated instruction into a `db` byte -- keep working."""
+
 class Decoder:
     """16-bit x86 instruction decoder."""
 
@@ -132,20 +139,27 @@ class Decoder:
         self.base = base_offset
         self.pos = 0
 
+    # A segment can end mid-instruction -- the tail is usually padding or data the
+    # linker never filled. Reading past it raised IndexError and aborted the whole
+    # decode (Dogz's THINK.DLL does this on its first code segment). Raise a
+    # private end-of-segment signal instead, so the caller can drop the partial
+    # instruction and stop the walk. Fabricating zero bytes would be worse: the
+    # padding decodes as `add [bx+si], al` and invents instructions that are not
+    # there.
     def _u8(self) -> int:
+        if self.pos >= len(self.data):
+            raise EndOfSegment()
         b = self.data[self.pos]
         self.pos += 1
         return b
 
     def _s8(self) -> int:
-        b = self.data[self.pos]
-        self.pos += 1
+        b = self._u8()
         return b if b < 128 else b - 256
 
     def _u16(self) -> int:
-        lo = self.data[self.pos]
-        hi = self.data[self.pos + 1]
-        self.pos += 2
+        lo = self._u8()
+        hi = self._u8()
         return lo | (hi << 8)
 
     def _s16(self) -> int:
@@ -153,10 +167,7 @@ class Decoder:
         return v if v < 32768 else v - 65536
 
     def _u32(self) -> int:
-        v = (self.data[self.pos] | (self.data[self.pos + 1] << 8) |
-             (self.data[self.pos + 2] << 16) | (self.data[self.pos + 3] << 24))
-        self.pos += 4
-        return v
+        return self._u16() | (self._u16() << 16)
 
     def _s32(self) -> int:
         v = self._u32()
@@ -262,10 +273,31 @@ class Decoder:
                 seg_override = 'ss'; self.pos += 1
             elif b == 0x3E:
                 seg_override = 'ds'; self.pos += 1
+            elif b == 0x64:
+                seg_override = 'fs'; self.pos += 1
+            elif b == 0x65:
+                # FS/GS are 386 additions, so 16-bit code is not "supposed" to
+                # use them -- but performance-minded 16-bit code does. Indeo 3's
+                # IR32.DLL keeps decoder state in an FS-addressed block and
+                # reaches it with `64 89 2E ..` / `67 64 89 ..`. Without these
+                # two prefixes the 0x64 byte decodes as an unknown opcode, the
+                # sweep resyncs one byte in, and the misalignment then blames
+                # perfectly ordinary movs that follow it.
+                seg_override = 'gs'; self.pos += 1
             elif b == 0x66:
                 self.op32 = True; self.pos += 1   # operand-size override
             elif b == 0x67:
                 self.addr32 = True; self.pos += 1  # address-size override
+            elif b == 0x9B and self.pos + 1 < len(self.data)                     and 0xD8 <= self.data[self.pos + 1] <= 0xDF:
+                # FWAIT immediately before an ESC opcode is part of that x87
+                # instruction, and IDA marks the head on the 0x9B. Decoding it
+                # as a standalone `wait` swallowed the head and the real opcode
+                # was never decoded at all -- `9B DD 7E E0` (fstsw m16) vanished,
+                # so Borland's compare idiom
+                #   fcomp ...; fstsw [bp-N]; mov ax,[bp-N]; sahf; jbe
+                # loaded a stale stack local and every float comparison in the
+                # engine branched on garbage. Treat it as a prefix.
+                self.pos += 1
             elif b == 0xF2:
                 rep_prefix = 'repnz'; self.pos += 1
             elif b == 0xF3:
@@ -834,6 +866,10 @@ class Decoder:
             elif op2b in (0x02, 0x03):        # LAR / LSL r16, r/m16 (selector validity)
                 reg, rm, _ = self._decode_modrm(True, seg_override)
                 inst.mnemonic = 'lar' if op2b == 0x02 else 'lsl'
+                inst.op1 = reg; inst.op2 = rm
+            elif op2b in (0xB2, 0xB4, 0xB5):  # LSS / LFS / LGS r16, m16:16 (load far ptr)
+                reg, rm, _ = self._decode_modrm(True, seg_override)
+                inst.mnemonic = {0xB2: 'lss', 0xB4: 'lfs', 0xB5: 'lgs'}[op2b]
                 inst.op1 = reg; inst.op2 = rm
             elif op2b in (0xA0, 0xA1, 0xA8, 0xA9):   # PUSH/POP FS/GS
                 inst.mnemonic = 'push' if op2b in (0xA0, 0xA8) else 'pop'

@@ -58,6 +58,11 @@ typedef struct CPU {
     uint16_t ds;
     uint16_t es;
     uint16_t ss;
+    /* A 386 in a 16-bit segment can carry an FS/GS override, and the
+     * decoder emits one wherever it reads a 0x64/0x65 byte -- including
+     * in the data the linear scan walks through between functions. */
+    uint16_t fs;
+    uint16_t gs;
 
     /* Instruction pointer (for debugging/tracing) */
     uint16_t ip;
@@ -92,28 +97,58 @@ static inline uint32_t seg_off(uint16_t seg, uint16_t off)
     return SEG_OFF(seg, off);
 }
 
+/* Not all of the address space is plain memory. A planar VGA in an unchained
+ * mode turns one byte address into four pixels, one per plane, chosen by the
+ * Map Mask -- so a write there cannot be a store and a read cannot be a load.
+ * Defining RECOMP_MEM_HOOK before including this header routes byte accesses
+ * through a pair the project supplies; returning 0 from the write hook means
+ * `not mine, store it normally`. Everything else, including every lifted
+ * mem_read16, is unchanged. Costs one predictable branch per byte access, and
+ * only when a project asks for it. */
+#ifdef RECOMP_MEM_HOOK
+int recomp_mem_write8(CPU *cpu, uint32_t addr, uint8_t val);   /* 1 = handled */
+int recomp_mem_read8(CPU *cpu, uint32_t addr, uint8_t *out);   /* 1 = handled */
+#endif
+
 /* ---------- Memory access ---------- */
 static inline uint8_t mem_read8(CPU *cpu, uint16_t seg, uint16_t off)
 {
+#ifdef RECOMP_MEM_HOOK
+    uint8_t v;
+    if (recomp_mem_read8(cpu, seg_off(seg, off), &v)) return v;
+#endif
     return cpu->mem[seg_off(seg, off)];
 }
 
 static inline uint16_t mem_read16(CPU *cpu, uint16_t seg, uint16_t off)
 {
+#ifdef RECOMP_MEM_HOOK
+    return (uint16_t)mem_read8(cpu, seg, off) |
+           ((uint16_t)mem_read8(cpu, seg, (uint16_t)(off + 1)) << 8);
+#else
     uint32_t addr = seg_off(seg, off);
     return (uint16_t)cpu->mem[addr] | ((uint16_t)cpu->mem[addr + 1] << 8);
+#endif
 }
 
 static inline void mem_write8(CPU *cpu, uint16_t seg, uint16_t off, uint8_t val)
 {
+#ifdef RECOMP_MEM_HOOK
+    if (recomp_mem_write8(cpu, seg_off(seg, off), val)) return;
+#endif
     cpu->mem[seg_off(seg, off)] = val;
 }
 
 static inline void mem_write16(CPU *cpu, uint16_t seg, uint16_t off, uint16_t val)
 {
+#ifdef RECOMP_MEM_HOOK
+    mem_write8(cpu, seg, off, (uint8_t)(val & 0xFF));
+    mem_write8(cpu, seg, (uint16_t)(off + 1), (uint8_t)(val >> 8));
+#else
     uint32_t addr = seg_off(seg, off);
     cpu->mem[addr] = (uint8_t)(val & 0xFF);
     cpu->mem[addr + 1] = (uint8_t)(val >> 8);
+#endif
 }
 
 /* 32-bit memory access from a 16-bit segment. A 386 in 16-bit code reads

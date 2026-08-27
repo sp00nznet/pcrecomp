@@ -131,6 +131,17 @@ class Lifter:
         if name in R8H: return "R8H(c->%s)" % R8H[name]
         return "c->%s" % name
 
+    def mem_addr(self, insn, op):
+        """The address of a memory operand, for instructions that need it
+        directly rather than through rd/wr - `lds`/`les` and friends.
+
+        Flat builds want exactly addr_expr. A segmented one needs the segment
+        base added, the same as every other access, and overriding rd/wr does
+        not cover this because the far-pointer load computes its own address.
+        Getting it wrong reads the pointer from a near-null address and yields
+        a plausible-looking selector:offset pair made of whatever was there."""
+        return self.addr_expr(insn, op)
+
     def addr_expr(self, insn, op):
         m = op.mem
         terms = []
@@ -271,7 +282,7 @@ class Lifter:
             seg = m[1:]
             sz = d.size
             return ["{ uint32_t _a = %s; %s c->%s = rd16(_a + %d); }"
-                    % (self.addr_expr(insn, src),
+                    % (self.mem_addr(insn, src),
                        self.dst_write(insn, d, "rd%d(_a)" % (sz * 8)),
                        seg, sz)]
         if m == "retf":

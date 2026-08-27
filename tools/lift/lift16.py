@@ -206,6 +206,18 @@ class Lifter:
         op2 = inst.op2
         op3 = inst.op3
 
+        # The source operand of a string instruction is DS:SI *by default* and
+        # takes a segment override like any other memory reference; the ES:DI
+        # destination cannot be overridden. Ignoring the prefix turns `es lodsb`
+        # into a read from the data segment -- DinoPark's text-mode read strips
+        # carriage returns with exactly that instruction, so every buffered read
+        # through a text stream came back holding the first bytes of DGROUP
+        # instead of the file.
+        _ssg = 'cpu->ds'
+        if inst.seg_override:
+            _ssg = (f'SEG_{_CODE_SEG}' if inst.seg_override == 'cs' and _CODE_SEG
+                    else f'cpu->{inst.seg_override}')
+
         # Emit label if this address is a jump target
         self._emit_label(inst.address)
 
@@ -228,12 +240,15 @@ class Lifter:
             _, off = _mem_addr(op2)
             self._emit(_write(op1, off), orig)
 
-        elif m in ('lds', 'les'):
-            # Load far pointer: reg = [mem], (DS|ES) = [mem+2]. The destination
+        elif m in ('lds', 'les', 'lss', 'lfs', 'lgs'):
+            # Load far pointer: reg = [mem], SREG = [mem+2]. The destination
             # register is often also part of the address (e.g. `les di,[di]` for
             # linked-list walks), so both words must be read into temps using the
-            # ORIGINAL address before either register is written.
-            sreg = 'cpu->ds' if m == 'lds' else 'cpu->es'
+            # ORIGINAL address before either register is written. lss/lfs/lgs are
+            # the 386 forms loading SS/FS/GS — e.g. the Jet stack-switch thunk's
+            # `lss sp, ss:[2]` that restores the caller's stack after the call.
+            sreg = {'lds': 'cpu->ds', 'les': 'cpu->es', 'lss': 'cpu->ss',
+                    'lfs': 'cpu->fs', 'lgs': 'cpu->gs'}[m]
             seg, off = _mem_addr(op2)
             self._emit(f'{{ uint16_t _o = mem_read16(cpu, {seg}, {off}); '
                        f'uint16_t _s = mem_read16(cpu, {seg}, (uint16_t)({off} + 2)); '
@@ -348,7 +363,13 @@ class Lifter:
             self._emit(_write(op1, f'flags_sub{sz}(cpu, 0, {_read(op1)})'), orig)
 
         elif m == 'mul':
-            if op1.size == 1 or op1.type == OpType.REG8:
+            if _wsz(op1) == '32':
+                self._emit(f'{{ uint64_t _r = (uint64_t)cpu->eax * '
+                           f'(uint32_t){_read(op1)}; '
+                           f'cpu->eax = (uint32_t)_r; cpu->edx = (uint32_t)(_r >> 32); '
+                           f'cpu->flags = (cpu->flags & ~(FLAG_CF|FLAG_OF)) | '
+                           f'(cpu->edx ? FLAG_CF|FLAG_OF : 0); }}', orig)
+            elif op1.size == 1 or op1.type == OpType.REG8:
                 self._emit(f'{{ uint16_t _r = (uint16_t)cpu->al * {_read(op1)}; '
                            f'cpu->ax = _r; '
                            f'cpu->flags = (cpu->flags & ~(FLAG_CF|FLAG_OF)) | '
@@ -370,7 +391,17 @@ class Lifter:
                        f'((_r != ({st})_r) ? (FLAG_CF|FLAG_OF) : 0); }}', orig)
 
         elif m == 'imul':
-            if op1.size == 1 or op1.type == OpType.REG8:
+            if _wsz(op1) == '32':
+                # EDX:EAX = EAX * src. Without this the 0x66-prefixed form fell
+                # through to the 16-bit case, which reads AX and writes DX:AX --
+                # silently wrong by a factor of 2^16 on every 32-bit multiply.
+                self._emit(f'{{ long long _r = (long long)(int32_t)cpu->eax * '
+                           f'(int32_t){_read(op1)}; '
+                           f'cpu->eax = (uint32_t)(uint64_t)_r; '
+                           f'cpu->edx = (uint32_t)((uint64_t)_r >> 32); '
+                           f'cpu->flags = (cpu->flags & ~(FLAG_CF|FLAG_OF)) | '
+                           f'((_r != (int32_t)_r) ? FLAG_CF|FLAG_OF : 0); }}', orig)
+            elif op1.size == 1 or op1.type == OpType.REG8:
                 self._emit(f'{{ int16_t _r = (int16_t)(int8_t)cpu->al * '
                            f'(int8_t){_read(op1)}; '
                            f'cpu->ax = (uint16_t)_r; '
@@ -387,27 +418,41 @@ class Lifter:
                            f'FLAG_CF|FLAG_OF : 0); }}', orig)
 
         elif m == 'div':
-            if op1.size == 1 or op1.type == OpType.REG8:
+            if _wsz(op1) == '32':
+                self._emit(f'{{ uint64_t _n = ((uint64_t)cpu->edx << 32) | cpu->eax; '
+                           f'uint32_t _d = (uint32_t){_read(op1)}; '
+                           f'if (_d) {{ cpu->eax = (uint32_t)(_n / _d); '
+                           f'cpu->edx = (uint32_t)(_n % _d); }} else catz_div0("div32"); }}', orig)
+            elif op1.size == 1 or op1.type == OpType.REG8:
                 self._emit(f'{{ uint16_t _n = cpu->ax; uint8_t _d = {_read(op1)}; '
-                           f'cpu->al = (uint8_t)(_n / _d); '
-                           f'cpu->ah = (uint8_t)(_n % _d); }}', orig)
+                           f'if (_d) {{ cpu->al = (uint8_t)(_n / _d); '
+                           f'cpu->ah = (uint8_t)(_n % _d); }} else catz_div0("div8"); }}', orig)
             else:
                 self._emit(f'{{ uint32_t _n = ((uint32_t)cpu->dx << 16) | cpu->ax; '
                            f'uint16_t _d = {_read(op1)}; '
-                           f'cpu->ax = (uint16_t)(_n / _d); '
-                           f'cpu->dx = (uint16_t)(_n % _d); }}', orig)
+                           f'if (_d) {{ cpu->ax = (uint16_t)(_n / _d); '
+                           f'cpu->dx = (uint16_t)(_n % _d); }} else catz_div0("div16"); }}', orig)
 
         elif m == 'idiv':
-            if op1.size == 1 or op1.type == OpType.REG8:
+            if _wsz(op1) == '32':
+                # `cdq; idiv dword` is the standard 32-bit scale-then-divide.
+                # The 16-bit fallback built the dividend from DX:AX and truncated
+                # the divisor to int16, so a divisor of 0x10000 became 0 and the
+                # host took a #DE the guest would never have raised.
+                self._emit(f'{{ long long _n = (long long)(((uint64_t)cpu->edx << 32) '
+                           f'| cpu->eax); int32_t _d = (int32_t){_read(op1)}; '
+                           f'if (_d) {{ cpu->eax = (uint32_t)(int32_t)(_n / _d); '
+                           f'cpu->edx = (uint32_t)(int32_t)(_n % _d); }} else catz_div0("idiv32"); }}', orig)
+            elif op1.size == 1 or op1.type == OpType.REG8:
                 self._emit(f'{{ int16_t _n = (int16_t)cpu->ax; '
                            f'int8_t _d = (int8_t){_read(op1)}; '
-                           f'cpu->al = (uint8_t)(int8_t)(_n / _d); '
-                           f'cpu->ah = (uint8_t)(int8_t)(_n % _d); }}', orig)
+                           f'if (_d) {{ cpu->al = (uint8_t)(int8_t)(_n / _d); '
+                           f'cpu->ah = (uint8_t)(int8_t)(_n % _d); }} else catz_div0("idiv8"); }}', orig)
             else:
                 self._emit(f'{{ int32_t _n = (int32_t)(((uint32_t)cpu->dx << 16) '
                            f'| cpu->ax); int16_t _d = (int16_t){_read(op1)}; '
-                           f'cpu->ax = (uint16_t)(int16_t)(_n / _d); '
-                           f'cpu->dx = (uint16_t)(int16_t)(_n % _d); }}', orig)
+                           f'if (_d) {{ cpu->ax = (uint16_t)(int16_t)(_n / _d); '
+                           f'cpu->dx = (uint16_t)(int16_t)(_n % _d); }} else catz_div0("idiv16"); }}', orig)
 
         # ─── Logic ───
 
@@ -540,7 +585,21 @@ class Lifter:
                                    f'recomp_dispatch(cpu, mem_read16(cpu,_s,(uint16_t)(_o+2)), '
                                    f'mem_read16(cpu,_s,_o)); return; }}', orig)
                     else:
-                        self._emit(f'recomp_dispatch(cpu, {_cseg()}, {_read(op1)}); return;', orig)
+                        arms = getattr(self, 'jump_tables', {}).get(inst.address)
+                        if arms:
+                            seg16 = int(_CODE_SEG, 16) * 16 if _CODE_SEG else 0
+                            self._emit('{ uint16_t _t = ' + _read(op1) + ';', orig)
+                            self._emit('  switch (_t) {')
+                            for _t in dict.fromkeys(arms):
+                                _rel = _t - func_start
+                                if _rel in self.valid_addrs:
+                                    self._emit('    case 0x%04X: goto %s;'
+                                               % (_t - seg16, _label(_rel, self.func_name)))
+                            self._emit('    default: recomp_dispatch(cpu, '
+                                       + _cseg() + ', _t); return;')
+                            self._emit('  } }')
+                        else:
+                            self._emit(f'recomp_dispatch(cpu, {_cseg()}, {_read(op1)}); return;', orig)
                 else:
                     self._emit(f'/* indirect jmp via {_read(op1)} - needs dispatch */', orig)
             else:
@@ -629,16 +688,25 @@ class Lifter:
                 func_name = None
                 seg = op1.far_seg
                 off = op1.disp
-                # Try corrected formula (seg-specific adjustment)
-                corr = 0x1A if seg == 0x205A else 0x14
-                far_file_off = seg * 16 + off - corr
-                if far_file_off in self.known_funcs:
-                    func_name = self.known_funcs[far_file_off]
+                # A project whose known_funcs are keyed so that a far seg:off
+                # maps straight onto far_base + seg*16 + off -- an image-offset
+                # lift of a relocated MZ -- says so, and gets an exact lookup.
+                far_base = getattr(self, 'far_base', None)
+                if far_base is not None:
+                    t = far_base + seg * 16 + off
+                    if t in self.known_funcs:
+                        func_name = self.known_funcs[t]
                 else:
-                    # Try original formula (hdr_size + seg*16 + off)
-                    far_file_off2 = self.hdr_size + seg * 16 + off
-                    if far_file_off2 in self.known_funcs:
-                        func_name = self.known_funcs[far_file_off2]
+                    # Try corrected formula (seg-specific adjustment)
+                    corr = 0x1A if seg == 0x205A else 0x14
+                    far_file_off = seg * 16 + off - corr
+                    if far_file_off in self.known_funcs:
+                        func_name = self.known_funcs[far_file_off]
+                    else:
+                        # Try original formula (hdr_size + seg*16 + off)
+                        far_file_off2 = self.hdr_size + seg * 16 + off
+                        if far_file_off2 in self.known_funcs:
+                            func_name = self.known_funcs[far_file_off2]
                 if not func_name:
                     func_name = f'far_{seg:04X}_{off:04X}'
                 self.func_calls.add(func_name)
@@ -651,12 +719,13 @@ class Lifter:
                         seg, off = _mem_addr(op1)
                         self._emit(f'{{ uint16_t _o={off}; uint16_t _s={seg}; '
                                    f'push16(cpu,cpu->cs); push16(cpu,0xFFFF); '
-                                   f'recomp_dispatch(cpu, mem_read16(cpu,_s,(uint16_t)(_o+2)), '
+                                   f'dispatch_far(cpu, mem_read16(cpu,_s,(uint16_t)(_o+2)), '
                                    f'mem_read16(cpu,_s,_o)); }}', orig)
                     else:  # near indirect (word mem or register)
-                        # dispatch_near cleans up the pushed near-return word on a
-                        # miss (sp+=2); recomp_dispatch does not, which corrupts
-                        # the stack when the target isn't a known function.
+                        # dispatch_near/_far clean up the return frame the call site
+                        # pushed when the target turns out to be unknown;
+                        # recomp_dispatch does not, and the caller then reads
+                        # its own locals off a stack that is 2 or 4 bytes out.
                         self._emit(f'push16(cpu,0xFFFF); dispatch_near(cpu, {_cseg()}, {_read(op1)});', orig)
                 else:
                     self._emit(f'/* indirect call {repr(op1)} - needs dispatch */', orig)
@@ -668,11 +737,11 @@ class Lifter:
                 seg, off = _mem_addr(op1)
                 self._emit(f'{{ uint16_t _o={off}; uint16_t _s={seg}; '
                            f'push16(cpu,cpu->cs); push16(cpu,0xFFFF); '
-                           f'recomp_dispatch(cpu, mem_read16(cpu,_s,(uint16_t)(_o+2)), '
+                           f'dispatch_far(cpu, mem_read16(cpu,_s,(uint16_t)(_o+2)), '
                            f'mem_read16(cpu,_s,_o)); }}', orig)
             elif getattr(self, 'dispatch', False) and op1 and op1.type == OpType.FAR:
                 self._emit(f'push16(cpu,cpu->cs); push16(cpu,0xFFFF); '
-                           f'recomp_dispatch(cpu, 0x{op1.far_seg:X}, 0x{op1.disp:X});', orig)
+                           f'dispatch_far(cpu, 0x{op1.far_seg:X}, 0x{op1.disp:X});', orig)
             else:
                 self._emit(f'/* UNHANDLED: {orig} */', orig)
 
@@ -703,8 +772,12 @@ class Lifter:
             # far return resolves to nothing and just returns to the C caller.
             if getattr(self, 'dispatch', False):
                 extra = f' cpu->sp += 0x{op1.disp:X};' if op1 else ''
+                # 0xFFFF is the return offset a lifted call site pushes, so a
+                # popped IP of 0xFFFF is an ordinary return to the C caller --
+                # not a trampoline. Dispatching it anyway logs a miss for every
+                # far return in the program and buries the real ones.
                 self._emit(f'{{ uint16_t _ip=pop16(cpu); uint16_t _cs=pop16(cpu);{extra} '
-                           f'recomp_dispatch(cpu,_cs,_ip); return; }}', orig)
+                           f'if (_ip != 0xFFFF) recomp_dispatch(cpu,_cs,_ip); return; }}', orig)
             elif op1:
                 total = op1.disp + 4
                 self._emit(f'cpu->sp += 0x{total:X}; return;', orig)
@@ -744,13 +817,13 @@ class Lifter:
 
         elif m == 'movsb':
             self._emit(f'mem_write8(cpu, cpu->es, cpu->di, '
-                       f'mem_read8(cpu, cpu->ds, cpu->si)); '
+                       f'mem_read8(cpu, {_ssg}, cpu->si)); '
                        f'cpu->si += df(cpu) ? -1 : 1; '
                        f'cpu->di += df(cpu) ? -1 : 1;', orig)
 
         elif m == 'movsw':
             self._emit(f'mem_write16(cpu, cpu->es, cpu->di, '
-                       f'mem_read16(cpu, cpu->ds, cpu->si)); '
+                       f'mem_read16(cpu, {_ssg}, cpu->si)); '
                        f'cpu->si += df(cpu) ? -2 : 2; '
                        f'cpu->di += df(cpu) ? -2 : 2;', orig)
 
@@ -763,11 +836,11 @@ class Lifter:
                        f'cpu->di += df(cpu) ? -2 : 2;', orig)
 
         elif m == 'lodsb':
-            self._emit(f'cpu->al = mem_read8(cpu, cpu->ds, cpu->si); '
+            self._emit(f'cpu->al = mem_read8(cpu, {_ssg}, cpu->si); '
                        f'cpu->si += df(cpu) ? -1 : 1;', orig)
 
         elif m == 'lodsw':
-            self._emit(f'cpu->ax = mem_read16(cpu, cpu->ds, cpu->si); '
+            self._emit(f'cpu->ax = mem_read16(cpu, {_ssg}, cpu->si); '
                        f'cpu->si += df(cpu) ? -2 : 2;', orig)
 
         elif m == 'scasb':
@@ -779,13 +852,13 @@ class Lifter:
                        f'cpu->di += df(cpu) ? -2 : 2;', orig)
 
         elif m == 'cmpsb':
-            self._emit(f'flags_cmp8(cpu, mem_read8(cpu, cpu->ds, cpu->si), '
+            self._emit(f'flags_cmp8(cpu, mem_read8(cpu, {_ssg}, cpu->si), '
                        f'mem_read8(cpu, cpu->es, cpu->di)); '
                        f'cpu->si += df(cpu) ? -1 : 1; '
                        f'cpu->di += df(cpu) ? -1 : 1;', orig)
 
         elif m == 'cmpsw':
-            self._emit(f'flags_cmp16(cpu, mem_read16(cpu, cpu->ds, cpu->si), '
+            self._emit(f'flags_cmp16(cpu, mem_read16(cpu, {_ssg}, cpu->si), '
                        f'mem_read16(cpu, cpu->es, cpu->di)); '
                        f'cpu->si += df(cpu) ? -2 : 2; '
                        f'cpu->di += df(cpu) ? -2 : 2;', orig)
@@ -794,7 +867,7 @@ class Lifter:
 
         elif m == 'movsd':
             self._emit(f'mem_write32(cpu, cpu->es, cpu->di, '
-                       f'mem_read32(cpu, cpu->ds, cpu->si)); '
+                       f'mem_read32(cpu, {_ssg}, cpu->si)); '
                        f'cpu->si += df(cpu) ? -4 : 4; cpu->di += df(cpu) ? -4 : 4;', orig)
         elif m == 'stosd':
             self._emit(f'mem_write32(cpu, cpu->es, cpu->di, cpu->eax); '
@@ -907,7 +980,10 @@ class Lifter:
                 port_expr = f'0x{op2.disp & 0xFF:02X}'
             else:
                 port_expr = _read(op2) if op2 else 'cpu->dx'
-            self._emit(_write(op1, f'port_in8(cpu, {port_expr})'), orig)
+            # `in ax, dx` reads port and port+1, not port twice truncated.
+            w16 = op1 is not None and op1.type == OpType.REG16
+            fn = 'port_in16' if w16 else 'port_in8'
+            self._emit(_write(op1, f'{fn}(cpu, {port_expr})'), orig)
 
         elif m == 'out':
             if op1 and op1.type == OpType.IMM8:
@@ -915,7 +991,13 @@ class Lifter:
             else:
                 port_expr = _read(op1) if op1 else 'cpu->dx'
             val_expr = _read(op2) if op2 else 'cpu->al'
-            self._emit(f'port_out8(cpu, {port_expr}, {val_expr});', orig)
+            # A word OUT writes AL to the port and AH to port+1. Lowering it to
+            # port_out8 drops AH, which silently breaks every VGA index/data
+            # pair written the usual way -- `mov ax,(val<<8)|idx; out dx,ax`
+            # sets the index and loses the value.
+            w16 = op2 is not None and op2.type == OpType.REG16
+            fn = 'port_out16' if w16 else 'port_out8'
+            self._emit(f'{fn}(cpu, {port_expr}, {val_expr});', orig)
 
         elif m == 'wait':
             self._emit('/* wait */', orig)
@@ -947,6 +1029,18 @@ class Lifter:
 
         # Build set of valid instruction addresses for this function
         self.valid_addrs = set(inst.address for inst in instructions)
+
+        # Switch arms are leaders in THIS function. C has no computed goto, so
+        # an indirect jmp becomes a branch on the target address: goto for
+        # anything inside this function, dispatch only for the rest. Lifting an
+        # arm as its own function instead returns from the enclosing one with
+        # its epilogue unrun -- and for a switch inside a loop it is worse,
+        # turning the loop into mutual recursion.
+        for _a, _arms in getattr(self, 'jump_tables', {}).items():
+            for _t in _arms:
+                _rel = _t - func_start
+                if _rel in self.valid_addrs:
+                    self.labels_needed.add(_rel)
 
         # First pass: collect jump targets for labels (only within function)
         for inst in instructions:
