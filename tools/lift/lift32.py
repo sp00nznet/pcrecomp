@@ -20,7 +20,47 @@ from capstone.x86 import (
     X86_REG_FS, X86_REG_GS,
     X86_REG_CS, X86_REG_DS, X86_REG_ES, X86_REG_SS,
     X86_REG_ST0,
+    X86_REG_MM0,
 )
+
+
+# MMX: mm0..mm7 are eight 64-bit registers. Their C home is _mm[0..7].
+MMX_REGS = {X86_REG_MM0 + i: i for i in range(8)}
+
+# Packed operations, as C expressions over two uint64_t. The bitwise ones need no
+# helper; everything element-wise lives beside the register file in the runtime.
+MMX_BINOPS = {
+    'pand':      '({a} & {b})',
+    'pandn':     '(~{a} & {b})',
+    'por':       '({a} | {b})',
+    'pxor':      '({a} ^ {b})',
+    'paddw':     'mmx_paddw({a}, {b})',
+    'paddd':     'mmx_paddd({a}, {b})',
+    'paddsw':    'mmx_paddsw({a}, {b})',
+    'psubw':     'mmx_psubw({a}, {b})',
+    'psubd':     'mmx_psubd({a}, {b})',
+    'psubsw':    'mmx_psubsw({a}, {b})',
+    'pmulhw':    'mmx_pmulhw({a}, {b})',
+    'pmullw':    'mmx_pmullw({a}, {b})',
+    'pmaddwd':   'mmx_pmaddwd({a}, {b})',
+    'punpcklwd': 'mmx_punpcklwd({a}, {b})',
+    'punpckhwd': 'mmx_punpckhwd({a}, {b})',
+    'punpcklbw': 'mmx_punpcklbw({a}, {b})',
+    'punpckhbw': 'mmx_punpckhbw({a}, {b})',
+    'punpckldq': 'mmx_punpckldq({a}, {b})',
+    'punpckhdq': 'mmx_punpckhdq({a}, {b})',
+    'packssdw':  'mmx_packssdw({a}, {b})',
+    'packuswb':  'mmx_packuswb({a}, {b})',
+    'pcmpeqw':   'mmx_pcmpeqw({a}, {b})',
+    'pcmpgtw':   'mmx_pcmpgtw({a}, {b})',
+}
+
+# Shifts take their count from an immediate or from another MMX register.
+MMX_SHIFTS = {
+    'psllq': 'mmx_psllq', 'psrlq': 'mmx_psrlq',
+    'psllw': 'mmx_psllw', 'psrlw': 'mmx_psrlw', 'psraw': 'mmx_psraw',
+    'pslld': 'mmx_pslld', 'psrld': 'mmx_psrld', 'psrad': 'mmx_psrad',
+}
 
 
 # Register name mappings (Capstone ID -> C name)
@@ -133,7 +173,8 @@ class Lifter:
     """Lifts x86 instructions to C code using a global register model."""
 
     def __init__(self, iat_map: dict = None, func_names: dict = None,
-                 lifted: set = None, precise_sbb: bool = False):
+                 lifted: set = None, precise_sbb: bool = False,
+                 patch_sites: set = None):
         """
         iat_map: VA -> (dll, func_name) for import resolution
         func_names: VA -> name for known function names
@@ -146,11 +187,40 @@ class Lifter:
         # will ever define. None = trust every target, as before.
         self.lifted = lifted
         self.precise_sbb = precise_sbb
+        # Code addresses the program writes a dword to (see _patched_imm). An
+        # instruction whose trailing imm32 sits on one of these is patched at
+        # runtime, so its constant in the file is a placeholder.
+        self.patch_sites = patch_sites or set()
+        self._patched_imm = None
         self._labels = None        # block starts of the function being lifted
         self._jump_targets = None  # arms its switch tables dispatch to
         self._flag_state = None  # (setter_mnemonic, operands_str)
         self._flag_seq = 0       # bumped whenever the flags are written
         self._fp_depth = 0  # FPU stack depth tracking
+
+    def _mm_read(self, op) -> str:
+        """Read an operand as a 64-bit MMX value."""
+        if op.type == X86_OP_REG and op.reg in MMX_REGS:
+            return f"_mm[{MMX_REGS[op.reg]}]"
+        if op.type == X86_OP_MEM:
+            return f"MEM64({self._fmt_mem_addr(op.mem)})"
+        return f"(uint64_t)({self._fmt_read(op)})"
+
+    def _mm_write(self, op, value: str) -> str:
+        """Assign a 64-bit MMX value to an operand."""
+        if op.type == X86_OP_REG and op.reg in MMX_REGS:
+            return f"_mm[{MMX_REGS[op.reg]}] = {value}"
+        if op.type == X86_OP_MEM:
+            return f"MEM64({self._fmt_mem_addr(op.mem)}) = {value}"
+        return self._fmt_write(op, f"(uint32_t)({value})")
+
+    def _mm_count(self, op) -> str:
+        """Shift count: an immediate, or the whole of another MMX register."""
+        if op.type == X86_OP_IMM:
+            return str(op.imm & 0xFF)
+        if op.type == X86_OP_REG and op.reg in MMX_REGS:
+            return f"(_mm[{MMX_REGS[op.reg]}] > 63 ? 64 : (uint32_t)_mm[{MMX_REGS[op.reg]}])"
+        return f"(uint32_t)({self._fmt_read(op)})"
 
     def _fmt_read(self, op) -> str:
         """Format an operand for reading (rvalue)."""
@@ -166,6 +236,9 @@ class Lifter:
                 return f"HI8({REG_NAMES_8H[r]})"
             return reg_name(r)
         elif op.type == X86_OP_IMM:
+            if self._patched_imm:
+                expr, self._patched_imm = self._patched_imm, None
+                return expr
             val = op.imm & 0xFFFFFFFF
             if val > 0xFFFF:
                 return f"0x{val:08X}u"
@@ -366,6 +439,11 @@ class Lifter:
         Lift a single x86 instruction to C statement(s).
         Returns a list of C code strings.
         """
+        # Self-modifying code: if the program stores a dword onto this
+        # instruction's trailing imm32, read the immediate from memory rather
+        # than emitting the placeholder that happens to be in the file.
+        site = insn.address + insn.size - 4
+        self._patched_imm = f"MEM32(0x{site:08X})" if site in self.patch_sites else None
         m = insn.mnemonic
         ops = insn.operands if insn.operands else []
         lines = []
@@ -987,6 +1065,20 @@ class Lifter:
         elif m == 'fabs':
             lines.append(f"_st[0] = fabs(_st[0]); {comment}")
 
+        elif m in ('fimul', 'fiadd', 'fisub', 'fisubr', 'fidiv', 'fidivr'):
+            # The memory operand is a 16- or 32-bit INTEGER, not a float.
+            if ops and ops[0].type == X86_OP_MEM:
+                addr = self._fmt_mem_addr(ops[0].mem)
+                src = (f"(double)(int16_t)MEM16({addr})" if ops[0].size == 2
+                       else f"(double)(int32_t)MEM32({addr})")
+                op = {'fimul': '*', 'fiadd': '+', 'fisub': '-', 'fidiv': '/'}.get(m)
+                if op:
+                    lines.append(f"_st[0] = _st[0] {op} {src}; {comment}")
+                elif m == 'fisubr':
+                    lines.append(f"_st[0] = {src} - _st[0]; {comment}")
+                else:
+                    lines.append(f"_st[0] = {src} / _st[0]; {comment}")
+
         elif m == 'fsqrt':
             lines.append(f"_st[0] = sqrt(_st[0]); {comment}")
 
@@ -1039,6 +1131,58 @@ class Lifter:
         elif m == 'sahf':
             lines.append(f"/* sahf - load flags from ah */ {comment}")
             # Often follows fnstsw ax; sahf; jcc pattern
+
+        elif m == 'ftst':
+            # Compare ST(0) with 0.0. Same -1/0/1 convention as fcom, which is
+            # what the flag-consumer path already reads.
+            lines.append(f"_fpu_cmp = (_st[0] > 0.0) - (_st[0] < 0.0); {comment}")
+            self._flag_state = ('fcom', '_fpu_cmp')
+            self._flag_seq += 1
+
+        elif m == 'fldl2e':
+            lines.append(f"fp_push(1.4426950408889634); /* log2(e) */ {comment}")
+
+        elif m == 'fldl2t':
+            lines.append(f"fp_push(3.321928094887362); /* log2(10) */ {comment}")
+
+        elif m == 'fldln2':
+            lines.append(f"fp_push(0.6931471805599453); /* ln(2) */ {comment}")
+
+        elif m == 'fldlg2':
+            lines.append(f"fp_push(0.30102999566398120); /* log10(2) */ {comment}")
+
+        elif m == 'fyl2x':
+            # st(1) = st(1) * log2(st(0)), then pop. The pair with fldl2e/f2xm1
+            # is how an x87 build computes pow().
+            lines.append(f"{{ double _x = fp_pop(); _st[0] *= log(_x) / 0.6931471805599453; }} {comment}")
+
+        elif m == 'fyl2xp1':
+            lines.append(f"{{ double _x = fp_pop(); _st[0] *= log(_x + 1.0) / 0.6931471805599453; }} {comment}")
+
+        elif m == 'f2xm1':
+            lines.append(f"_st[0] = pow(2.0, _st[0]) - 1.0; {comment}")
+
+        elif m == 'fptan':
+            # tan into ST(0), then push 1.0 -- the 8087 leaves a ratio behind.
+            lines.append(f"_st[0] = tan(_st[0]); fp_push(1.0); {comment}")
+
+        elif m == 'fpatan':
+            lines.append(f"{{ double _x = fp_pop(); _st[0] = atan2(_st[0], _x); }} {comment}")
+
+        elif m == 'fprem' or m == 'fprem1':
+            lines.append(f"_st[0] = fmod(_st[0], _st[1]); {comment}")
+
+        elif m == 'fscale':
+            lines.append(f"_st[0] *= pow(2.0, (double)(int)_st[1]); {comment}")
+
+        elif m == 'fnclex' or m == 'fclex':
+            lines.append(f"/* fclex: no exception state modelled */ {comment}")
+
+        elif m == 'fnsave' or m == 'fsave' or m == 'frstor':
+            # The register file is ours, not a 108-byte x87 image; a save/restore
+            # pair round-trips through memory we never interpret, so as long as
+            # both sides are no-ops the stack is exactly where it was.
+            lines.append(f"/* {m}: FPU state is not a memory image here */ {comment}")
 
         elif m == 'fld1':
             lines.append(f"fp_push(1.0); {comment}")
@@ -1124,6 +1268,35 @@ class Lifter:
         elif m == 'rdtsc':
             lines.append(f"{{ uint64_t _t = __rdtsc(); eax = (uint32_t)_t; edx = (uint32_t)(_t >> 32); }} {comment}")
 
+        elif m in ('jecxz', 'jcxz'):
+            t = ops[0].imm if ops and ops[0].type == X86_OP_IMM else None
+            reg = 'ecx' if m == 'jecxz' else 'LO16(ecx)'
+            if t is not None:
+                lines.append(f"if ({reg} == 0) goto L_{t:08X}; {comment}")
+
+        elif m in ('loop', 'loope', 'loopne'):
+            t = ops[0].imm if ops and ops[0].type == X86_OP_IMM else None
+            extra = {'loop': '', 'loope': ' && _cf == 0', 'loopne': ' && _cf == 0'}[m]
+            if t is not None:
+                lines.append(f"if (--ecx != 0{extra}) goto L_{t:08X}; {comment}")
+
+        elif m == 'scasd':
+            lines.append(f"_flag_a = eax; _flag_b = MEM32(edi); _flag_k = FK_CMP; "
+                         f"edi += _df * 4; {comment}")
+            self._flag_state = ('cmp', '_flag_a, _flag_b')
+            self._flag_seq += 1
+
+        elif m in ('les', 'lds', 'lfs', 'lgs', 'lss'):
+            # Flat model: the offset is the whole address; the selector is kept
+            # only so code that saves and restores it round-trips.
+            if len(ops) >= 2 and ops[1].type == X86_OP_MEM:
+                addr = self._fmt_mem_addr(ops[1].mem)
+                lines.append(f"{self._fmt_write(ops[0], f'MEM32({addr})')}; "
+                             f"_seg_{m[1:]} = MEM16({addr} + 4); {comment}")
+
+        elif m == 'out' or m == 'outsb' or m == 'outsd' or m == 'in':
+            lines.append(f"/* {m}: no port I/O under Win32 */ {comment}")
+
         elif m == 'wait' or m == 'fwait':
             lines.append(f"/* fwait */ {comment}")
 
@@ -1139,6 +1312,31 @@ class Lifter:
 
         elif m == 'fninit' or m == 'finit':
             lines.append(f"/* finit */ {comment}")
+
+        elif m in MMX_BINOPS:
+            expr = MMX_BINOPS[m].format(a=self._mm_read(ops[0]), b=self._mm_read(ops[1]))
+            lines.append(f"{self._mm_write(ops[0], expr)}; {comment}")
+
+        elif m in MMX_SHIFTS:
+            expr = f"{MMX_SHIFTS[m]}({self._mm_read(ops[0])}, {self._mm_count(ops[1])})"
+            lines.append(f"{self._mm_write(ops[0], expr)}; {comment}")
+
+        elif m == 'movq':
+            lines.append(f"{self._mm_write(ops[0], self._mm_read(ops[1]))}; {comment}")
+
+        elif m == 'movd':
+            # 32 bits between an MMX register and a GPR or memory, zero-extended
+            # on the way in and truncated on the way out.
+            if ops[0].type == X86_OP_REG and ops[0].reg in MMX_REGS:
+                src = self._fmt_read(ops[1])
+                lines.append(f"_mm[{MMX_REGS[ops[0].reg]}] = (uint64_t)(uint32_t)({src}); {comment}")
+            else:
+                lines.append(f"{self._fmt_write(ops[0], f'(uint32_t){self._mm_read(ops[1])}')}; {comment}")
+
+        elif m == 'emms':
+            # We keep the MMX registers separate from the x87 stack, so there is
+            # no aliasing to undo. See the register file in the runtime header.
+            lines.append(f"/* emms */ {comment}")
 
         else:
             # A null statement, not a bare comment: this may be the only thing
