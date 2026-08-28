@@ -1016,7 +1016,7 @@ class Lifter:
                 lines.append(f"_st[0] += _st[1]; {comment}")
 
         elif m == 'faddp':
-            lines.append(f"{{ double _v = fp_pop(); _st[0] += _v; }} {comment}")
+            lines.append(f"{{ double _v = fp_pop(); {self._fpu_popdst(ops)} += _v; }} {comment}")
 
         elif m == 'fsub':
             if ops:
@@ -1025,14 +1025,16 @@ class Lifter:
                 lines.append(f"_st[0] -= _st[1]; {comment}")
 
         elif m == 'fsubp':
-            lines.append(f"{{ double _v = fp_pop(); _st[0] = _v - _st[0]; }} {comment}")
+            d = self._fpu_popdst(ops)
+            lines.append(f"{{ double _v = fp_pop(); {d} -= _v; }} {comment}")
 
         elif m == 'fsubr':
             if ops:
                 lines.append(f"{self._fpu_dst(ops)} = {self._fmt_fpu_src(ops)} - {self._fpu_dst(ops)}; {comment}")
 
         elif m == 'fsubrp':
-            lines.append(f"{{ double _v = fp_pop(); _st[0] -= _v; }} {comment}")
+            d = self._fpu_popdst(ops)
+            lines.append(f"{{ double _v = fp_pop(); {d} = _v - {d}; }} {comment}")
 
         elif m == 'fmul':
             if ops:
@@ -1041,7 +1043,7 @@ class Lifter:
                 lines.append(f"_st[0] *= _st[1]; {comment}")
 
         elif m == 'fmulp':
-            lines.append(f"{{ double _v = fp_pop(); _st[0] *= _v; }} {comment}")
+            lines.append(f"{{ double _v = fp_pop(); {self._fpu_popdst(ops)} *= _v; }} {comment}")
 
         elif m == 'fdiv':
             if ops:
@@ -1050,14 +1052,16 @@ class Lifter:
                 lines.append(f"_st[0] /= _st[1]; {comment}")
 
         elif m == 'fdivp':
-            lines.append(f"{{ double _v = fp_pop(); _st[0] = _v / _st[0]; }} {comment}")
+            d = self._fpu_popdst(ops)
+            lines.append(f"{{ double _v = fp_pop(); {d} = _v == 0.0 ? {d} : {d} / _v; }} {comment}")
 
         elif m == 'fdivr':
             if ops:
                 lines.append(f"{self._fpu_dst(ops)} = {self._fmt_fpu_src(ops)} / {self._fpu_dst(ops)}; {comment}")
 
         elif m == 'fdivrp':
-            lines.append(f"{{ double _v = fp_pop(); _st[0] /= _v; }} {comment}")
+            d = self._fpu_popdst(ops)
+            lines.append(f"{{ double _v = fp_pop(); {d} = {d} == 0.0 ? _v : _v / {d}; }} {comment}")
 
         elif m == 'fchs':
             lines.append(f"_st[0] = -_st[0]; {comment}")
@@ -1361,6 +1365,20 @@ class Lifter:
             # ST(i) register
             return f"_st[{op.reg - X86_REG_ST0}]"
         return "_st[1]"
+
+    def _fpu_popdst(self, ops) -> str:
+        """Destination of `fOPp st(i), st(0)`.
+
+        These compute into ST(i) and then pop, so the result ends up in st(i-1)
+        once the stack has shifted. The index is not decoration: POD's hand
+        written fixed-point helpers use `fmulp st(5)` and `fsubp st(3)`, and
+        treating every one of them as st(1) silently computes with the wrong
+        registers. Capstone gives the destination as the single operand.
+        """
+        i = 1
+        if ops and ops[0].type == X86_OP_REG and X86_REG_ST0 <= ops[0].reg <= X86_REG_ST0 + 7:
+            i = ops[0].reg - X86_REG_ST0
+        return f"_st[{i - 1 if i else 0}]"
 
     def _fpu_dst(self, ops) -> str:
         """Destination lvalue for an FPU arithmetic insn. For `OP st(i), st(0)`

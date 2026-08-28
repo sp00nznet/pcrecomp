@@ -320,6 +320,167 @@ static inline int recomp_cond(uint32_t kind, uint32_t a, uint32_t b, int cc) {
                         (((val) >> 8) & 0xFF00) | (((val) >> 24) & 0xFF) )
 
 /* ============================================================
+ * MMX
+ *
+ * Eight 64-bit registers holding packed bytes/words/dwords. On real hardware
+ * they alias the x87 stack, which is why MMX code must `emms` before touching
+ * the FPU again; we keep the two apart, so `emms` is a no-op here and code that
+ * deliberately interleaved them would behave differently. POD does not: it is
+ * the MMX build, and its rasterizer is a well-formed MMX block per span.
+ *
+ * Global, like the rest of the register file here; a multi-threaded target
+ * wants them thread-local instead.
+ * ============================================================ */
+
+extern uint64_t g_mm[8];
+
+#define MM_W(v, i)  ((int16_t)((uint64_t)(v) >> ((i) * 16)))
+#define MM_D(v, i)  ((int32_t)((uint64_t)(v) >> ((i) * 32)))
+#define MM_PUT_W(i, x) ((uint64_t)(uint16_t)(x) << ((i) * 16))
+#define MM_PUT_D(i, x) ((uint64_t)(uint32_t)(x) << ((i) * 32))
+
+static inline int16_t mmx_sat16(int32_t v) {
+    return (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
+}
+
+static inline uint64_t mmx_paddw(uint64_t a, uint64_t b) {
+    uint64_t r = 0;
+    for (int i = 0; i < 4; i++) r |= MM_PUT_W(i, MM_W(a, i) + MM_W(b, i));
+    return r;
+}
+static inline uint64_t mmx_psubw(uint64_t a, uint64_t b) {
+    uint64_t r = 0;
+    for (int i = 0; i < 4; i++) r |= MM_PUT_W(i, MM_W(a, i) - MM_W(b, i));
+    return r;
+}
+static inline uint64_t mmx_paddd(uint64_t a, uint64_t b) {
+    return MM_PUT_D(0, MM_D(a, 0) + MM_D(b, 0)) | MM_PUT_D(1, MM_D(a, 1) + MM_D(b, 1));
+}
+static inline uint64_t mmx_psubd(uint64_t a, uint64_t b) {
+    return MM_PUT_D(0, MM_D(a, 0) - MM_D(b, 0)) | MM_PUT_D(1, MM_D(a, 1) - MM_D(b, 1));
+}
+static inline uint64_t mmx_paddsw(uint64_t a, uint64_t b) {
+    uint64_t r = 0;
+    for (int i = 0; i < 4; i++) r |= MM_PUT_W(i, mmx_sat16(MM_W(a, i) + MM_W(b, i)));
+    return r;
+}
+static inline uint64_t mmx_psubsw(uint64_t a, uint64_t b) {
+    uint64_t r = 0;
+    for (int i = 0; i < 4; i++) r |= MM_PUT_W(i, mmx_sat16(MM_W(a, i) - MM_W(b, i)));
+    return r;
+}
+/* High half of each signed 16x16 product -- the fixed-point multiply an MMX
+ * rasterizer scales colour and texture coordinates with. */
+static inline uint64_t mmx_pmulhw(uint64_t a, uint64_t b) {
+    uint64_t r = 0;
+    for (int i = 0; i < 4; i++)
+        r |= MM_PUT_W(i, (int16_t)(((int32_t)MM_W(a, i) * MM_W(b, i)) >> 16));
+    return r;
+}
+static inline uint64_t mmx_pmullw(uint64_t a, uint64_t b) {
+    uint64_t r = 0;
+    for (int i = 0; i < 4; i++) r |= MM_PUT_W(i, (int16_t)((int32_t)MM_W(a, i) * MM_W(b, i)));
+    return r;
+}
+/* Two dwords, each the sum of a neighbouring pair of 16x16 products. */
+static inline uint64_t mmx_pmaddwd(uint64_t a, uint64_t b) {
+    uint64_t r = 0;
+    for (int i = 0; i < 2; i++)
+        r |= MM_PUT_D(i, (int32_t)MM_W(a, i*2) * MM_W(b, i*2)
+                       + (int32_t)MM_W(a, i*2+1) * MM_W(b, i*2+1));
+    return r;
+}
+/* Interleave: the low (or high) halves of a and b, a's element first. */
+static inline uint64_t mmx_punpcklwd(uint64_t a, uint64_t b) {
+    return MM_PUT_W(0, MM_W(a,0)) | MM_PUT_W(1, MM_W(b,0))
+         | MM_PUT_W(2, MM_W(a,1)) | MM_PUT_W(3, MM_W(b,1));
+}
+static inline uint64_t mmx_punpckhwd(uint64_t a, uint64_t b) {
+    return MM_PUT_W(0, MM_W(a,2)) | MM_PUT_W(1, MM_W(b,2))
+         | MM_PUT_W(2, MM_W(a,3)) | MM_PUT_W(3, MM_W(b,3));
+}
+static inline uint64_t mmx_punpcklbw(uint64_t a, uint64_t b) {
+    uint64_t r = 0;
+    for (int i = 0; i < 4; i++) {
+        r |= (uint64_t)(uint8_t)(a >> (i*8)) << (i*16);
+        r |= (uint64_t)(uint8_t)(b >> (i*8)) << (i*16 + 8);
+    }
+    return r;
+}
+static inline uint64_t mmx_punpckhbw(uint64_t a, uint64_t b) {
+    uint64_t r = 0;
+    for (int i = 0; i < 4; i++) {
+        r |= (uint64_t)(uint8_t)(a >> (32 + i*8)) << (i*16);
+        r |= (uint64_t)(uint8_t)(b >> (32 + i*8)) << (i*16 + 8);
+    }
+    return r;
+}
+static inline uint64_t mmx_punpckldq(uint64_t a, uint64_t b) {
+    return (uint64_t)(uint32_t)a | ((uint64_t)(uint32_t)b << 32);
+}
+static inline uint64_t mmx_punpckhdq(uint64_t a, uint64_t b) {
+    return (uint64_t)(uint32_t)(a >> 32) | ((uint64_t)(uint32_t)(b >> 32) << 32);
+}
+/* Shifts. A count wider than the element is not a wrapped shift on x86: the
+ * logical forms produce zero and the arithmetic ones produce the sign. */
+static inline uint64_t mmx_psllq(uint64_t a, uint32_t c) { return c > 63 ? 0 : a << c; }
+static inline uint64_t mmx_psrlq(uint64_t a, uint32_t c) { return c > 63 ? 0 : a >> c; }
+static inline uint64_t mmx_psllw(uint64_t a, uint32_t c) {
+    uint64_t r = 0;
+    if (c > 15) return 0;
+    for (int i = 0; i < 4; i++) r |= MM_PUT_W(i, (uint16_t)MM_W(a, i) << c);
+    return r;
+}
+static inline uint64_t mmx_psrlw(uint64_t a, uint32_t c) {
+    uint64_t r = 0;
+    if (c > 15) return 0;
+    for (int i = 0; i < 4; i++) r |= MM_PUT_W(i, (uint16_t)MM_W(a, i) >> c);
+    return r;
+}
+static inline uint64_t mmx_psraw(uint64_t a, uint32_t c) {
+    uint64_t r = 0;
+    if (c > 15) c = 15;
+    for (int i = 0; i < 4; i++) r |= MM_PUT_W(i, (int16_t)(MM_W(a, i) >> c));
+    return r;
+}
+static inline uint64_t mmx_pslld(uint64_t a, uint32_t c) {
+    if (c > 31) return 0;
+    return MM_PUT_D(0, (uint32_t)MM_D(a,0) << c) | MM_PUT_D(1, (uint32_t)MM_D(a,1) << c);
+}
+static inline uint64_t mmx_psrld(uint64_t a, uint32_t c) {
+    if (c > 31) return 0;
+    return MM_PUT_D(0, (uint32_t)MM_D(a,0) >> c) | MM_PUT_D(1, (uint32_t)MM_D(a,1) >> c);
+}
+static inline uint64_t mmx_psrad(uint64_t a, uint32_t c) {
+    if (c > 31) c = 31;
+    return MM_PUT_D(0, MM_D(a,0) >> c) | MM_PUT_D(1, MM_D(a,1) >> c);
+}
+/* Pack with saturation, a's elements low. */
+static inline uint64_t mmx_packssdw(uint64_t a, uint64_t b) {
+    return MM_PUT_W(0, mmx_sat16(MM_D(a,0))) | MM_PUT_W(1, mmx_sat16(MM_D(a,1)))
+         | MM_PUT_W(2, mmx_sat16(MM_D(b,0))) | MM_PUT_W(3, mmx_sat16(MM_D(b,1)));
+}
+static inline uint64_t mmx_packuswb(uint64_t a, uint64_t b) {
+    uint64_t r = 0;
+    for (int i = 0; i < 4; i++) {
+        int16_t v = MM_W(a, i); uint8_t p = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+        r |= (uint64_t)p << (i * 8);
+        v = MM_W(b, i);         p = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+        r |= (uint64_t)p << (32 + i * 8);
+    }
+    return r;
+}
+static inline uint64_t mmx_pcmpeqw(uint64_t a, uint64_t b) {
+    uint64_t r = 0;
+    for (int i = 0; i < 4; i++) r |= MM_PUT_W(i, MM_W(a,i) == MM_W(b,i) ? 0xFFFF : 0);
+    return r;
+}
+static inline uint64_t mmx_pcmpgtw(uint64_t a, uint64_t b) {
+    uint64_t r = 0;
+    for (int i = 0; i < 4; i++) r |= MM_PUT_W(i, MM_W(a,i) > MM_W(b,i) ? 0xFFFF : 0);
+    return r;
+}
+/* ============================================================
  * FPU Stack Helpers
  * ============================================================ */
 
