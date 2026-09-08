@@ -693,10 +693,10 @@ class Decoder:
         # AAM, AAD
         elif opcode == 0xD4:
             inst.mnemonic = 'aam'
-            self._u8()  # base (usually 0x0A)
+            inst.op1 = Operand(type=OpType.IMM8, disp=self._u8(), size=1)
         elif opcode == 0xD5:
             inst.mnemonic = 'aad'
-            self._u8()  # base
+            inst.op1 = Operand(type=OpType.IMM8, disp=self._u8(), size=1)
 
         # XLAT
         elif opcode == 0xD7: inst.mnemonic = 'xlat'

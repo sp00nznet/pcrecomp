@@ -325,10 +325,13 @@ class Lifter:
             self._emit(_write(op1,
                 f'flags_add{sz}(cpu, {_read(op1)}, {_read(op2)})'), orig)
 
+        # The carry is a third input, not something that can be folded into the
+        # source: `flags_add16(a, b + cf)` with b = 0FFFFh and CF set adds zero
+        # and reports no carry out, so the high word of a long addition came
+        # out wrong whenever the low word was all ones.
         elif m == 'adc':
-            sz = _wsz(op1)
             self._emit(_write(op1,
-                f'flags_add{sz}(cpu, {_read(op1)}, {_read(op2)} + cf(cpu))'), orig)
+                f'flags_adc(cpu, {_read(op1)}, {_read(op2)}, {_wsz(op1)})'), orig)
 
         elif m == 'sub':
             sz = _wsz(op1)
@@ -336,9 +339,8 @@ class Lifter:
                 f'flags_sub{sz}(cpu, {_read(op1)}, {_read(op2)})'), orig)
 
         elif m == 'sbb':
-            sz = _wsz(op1)
             self._emit(_write(op1,
-                f'flags_sub{sz}(cpu, {_read(op1)}, {_read(op2)} + cf(cpu))'), orig)
+                f'flags_sbb(cpu, {_read(op1)}, {_read(op2)}, {_wsz(op1)})'), orig)
 
         elif m == 'cmp':
             sz = _wsz(op1)
@@ -1030,10 +1032,18 @@ class Lifter:
         elif m == 'db':
             self._emit(f'/* data byte: 0x{op1.disp:02X} */', orig)
 
-        elif m.startswith('daa') or m.startswith('das') or \
-             m.startswith('aaa') or m.startswith('aas') or \
-             m.startswith('aam') or m.startswith('aad'):
-            self._emit(f'/* BCD: {orig} - stub */', orig)
+        # Packed/unpacked BCD. A C compiler never emits these, but MSC's and
+        # Borland's integer-to-decimal routines are hand-written assembly and
+        # AAM is how they split a byte into digits. Stubbed out this does not
+        # crash -- the game prints the wrong numbers.
+        elif m in ('daa', 'das', 'aaa', 'aas'):
+            self._emit(f'bcd_{m}(cpu);', orig)
+
+        elif m in ('aam', 'aad'):
+            # The divisor is an operand: `aam 16` splits a byte into hex
+            # nibbles, which is how assembly prints in bases other than ten.
+            base = (op1.disp & 0xFF) if op1 is not None else 10
+            self._emit(f'bcd_{m}(cpu, {base});', orig)
 
         else:
             self._emit(f'/* UNHANDLED: {orig} */', orig)
