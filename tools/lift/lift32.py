@@ -69,8 +69,8 @@ COND_MAP = {
 
 # Which runtime flag kind each setter corresponds to; see recomp_cond().
 FLAG_KIND = {
-    'cmp': 'FK_CMP', 'sub': 'FK_CMP', 'dec': 'FK_CMP',
-    'add': 'FK_ADD', 'inc': 'FK_ADD',
+    'cmp': 'FK_CMP', 'sub': 'FK_CMP', 'dec': 'FK_DEC',
+    'add': 'FK_ADD', 'inc': 'FK_INC',
     'and': 'FK_TEST', 'or': 'FK_TEST', 'xor': 'FK_TEST', 'test': 'FK_TEST',
     'bt': 'FK_BT', 'fcom': 'FK_FCOM',
 }
@@ -433,10 +433,21 @@ class Lifter:
             lines.append(f"POPAD(); {comment}")
 
         elif m == 'pushfd':
-            lines.append(f"PUSH32(esp, 0); /* pushfd - flags not tracked */ {comment}")
+            # Pushing a constant 0 was observable: the CRT's CPU detection
+            # toggles a bit in the saved EFLAGS and reads it back to decide
+            # whether CPUID exists, and a word that never changes answers
+            # every such probe the same wrong way. The lazy tuple holds
+            # everything the arithmetic flags derive from, so hand it over.
+            lines.append(f"PUSH32(esp, recomp_eflags(_flag_k, _flag_a, _flag_b, _cf, _df)); {comment}")
 
         elif m == 'popfd':
-            lines.append(f"(void)POP32_VAL(esp); /* popfd - flags not tracked */ {comment}")
+            lines.append(f"{{ uint32_t _fl = POP32_VAL(esp); {comment}")
+            lines.append(f"  _flag_k = FK_EFLAGS; _flag_a = _fl; _flag_b = 0;")
+            lines.append(f"  _cf = _fl & 1u; _df = (_fl & 0x400u) ? -1 : 1; }}")
+            # The restored word, not whatever instruction last set the flags,
+            # is what the next jcc reads -- so drop the static pairing and let
+            # it go through recomp_cond.
+            self._flag_state = None
 
         # --- Arithmetic ---
         elif m == 'add':
@@ -536,6 +547,7 @@ class Lifter:
                 b = self._fmt_read(ops[1])
                 lines.append(self._flag_capture(a, b))
                 lines.append(f"{self._fmt_write(ops[0], f'{a} & {b}')}; {comment}")
+                lines.append("_cf = 0;")
                 self._flag_state = ('and', "_flag_a, _flag_b")
 
         elif m == 'or':
@@ -544,6 +556,7 @@ class Lifter:
                 b = self._fmt_read(ops[1])
                 lines.append(self._flag_capture(f"({a} | {b})", f"({a} | {b})"))
                 lines.append(f"{self._fmt_write(ops[0], f'{a} | {b}')}; {comment}")
+                lines.append("_cf = 0;")
                 self._flag_state = ('or', "_flag_a, _flag_b")
 
         elif m == 'xor':
@@ -551,12 +564,14 @@ class Lifter:
                 a = self._fmt_read(ops[0])
                 b = self._fmt_read(ops[1])
                 # Detect xor reg, reg (zero idiom)
+                carry = '_cf'
                 if ops[0].type == X86_OP_REG and ops[1].type == X86_OP_REG and ops[0].reg == ops[1].reg:
                     lines.append(self._flag_capture("0", "0"))
                     lines.append(f"{self._fmt_write(ops[0], '0')}; {comment}")
                 else:
                     lines.append(self._flag_capture(f"({a} ^ {b})", f"({a} ^ {b})"))
                     lines.append(f"{self._fmt_write(ops[0], f'{a} ^ {b}')}; {comment}")
+                lines.append("_cf = 0;")
                 self._flag_state = ('xor', "_flag_a, _flag_b")
 
         # --- Shifts ---
@@ -569,6 +584,7 @@ class Lifter:
                 a = self._fmt_read(ops[0])
                 b = self._fmt_read(ops[1])
                 res = f"({a} << {b})"
+                lines.append(f"if ({b}) _cf = ((({a}) >> (32 - ({b}))) & 1u); {comment}")
                 lines.append(self._flag_capture(res, res))
                 lines.append(f"{self._fmt_write(ops[0], f'{a} << {b}')}; {comment}")
                 self._flag_state = ('or', "_flag_a, _flag_b")
@@ -578,6 +594,7 @@ class Lifter:
                 a = self._fmt_read(ops[0])
                 b = self._fmt_read(ops[1])
                 res = f"({a} >> {b})"
+                lines.append(f"if ({b}) _cf = ((({a}) >> (({b}) - 1)) & 1u); {comment}")
                 lines.append(self._flag_capture(res, res))
                 lines.append(f"{self._fmt_write(ops[0], f'{a} >> {b}')}; {comment}")
                 self._flag_state = ('or', "_flag_a, _flag_b")
@@ -659,6 +676,7 @@ class Lifter:
                 b = self._fmt_read(ops[1])
                 lines.append(f"/* test {a}, {b} */ {comment}")
                 lines.append(self._flag_capture(a, b))
+                lines.append("_cf = 0;")
                 self._flag_state = ('test', "_flag_a, _flag_b")
 
         elif m == 'bt':
@@ -688,7 +706,15 @@ class Lifter:
             if len(ops) == 2:
                 a = self._fmt_read(ops[0])
                 b = self._fmt_read(ops[1])
-                lines.append(f"{self._fmt_write(ops[0], f'{a} + {b} + _cf')}; {comment}")
+                # The carry OUT matters as much as the carry in: `add; adc; adc`
+                # is how every 64- and 96-bit addition is written, and each adc
+                # reads the one before it. Snapshot the operands, write the
+                # result, then publish the whole flag word.
+                lines.append(f"{{ uint32_t _aa = {a}, _ab = {b}, _ac = _cf; {comment}")
+                lines.append(f"  {self._fmt_write(ops[0], '_aa + _ab + _ac')};")
+                lines.append(f"  _flag_a = recomp_flags_adc(_aa, _ab, _ac); _flag_b = 0;")
+                lines.append(f"  _flag_k = FK_EFLAGS; _cf = _flag_a & 1u; }}")
+                self._flag_state = None
 
         elif m == 'sbb':
             if len(ops) == 2:
@@ -705,6 +731,7 @@ class Lifter:
                 # per-site differential trace isolates that path, keep the conservative
                 # `_cf`. The one gameplay-affecting case (the cheat reader sub_43BFB0) is
                 # handled by a targeted host shim instead. See fury3-target.md Phase 8.
+                carry = '_cf'
                 if ops[0].type == X86_OP_REG and ops[1].type == X86_OP_REG and ops[0].reg == ops[1].reg:
                     # With precise_sbb, take the carry from the comparison that
                     # actually set it rather than the running `_cf`. `cmp X, 1;
@@ -715,12 +742,18 @@ class Lifter:
                     # correctly. Off by default: see the note above.
                     if (self.precise_sbb and self._flag_state
                             and self._flag_state[0] in ('cmp', 'sub')):
-                        cf = f"CMP_B({self._flag_state[1]})"
-                        lines.append(f"{self._fmt_write(ops[0], f'{cf} ? 0xFFFFFFFFu : 0')}; {comment}")
-                    else:
-                        lines.append(f"{self._fmt_write(ops[0], '_cf ? 0xFFFFFFFFu : 0')}; {comment}")
+                        carry = f"(uint32_t)CMP_B({self._flag_state[1]})"
+                    value = '_sc ? 0xFFFFFFFFu : 0'
                 else:
-                    lines.append(f"{self._fmt_write(ops[0], f'{a} - {b} - _cf')}; {comment}")
+                    value = '_sa - _sb - _sc'
+                # Like adc: the borrow out is what the next sbb of a multi-word
+                # subtraction reads, so publish the flags rather than leave the
+                # previous instruction's.
+                lines.append(f"{{ uint32_t _sa = {a}, _sb = {b}, _sc = {carry}; {comment}")
+                lines.append(f"  {self._fmt_write(ops[0], value)};")
+                lines.append(f"  _flag_a = recomp_flags_sbb(_sa, _sb, _sc); _flag_b = 0;")
+                lines.append(f"  _flag_k = FK_EFLAGS; _cf = _flag_a & 1u; }}")
+                self._flag_state = None
 
         # --- String Operations ---
         # The rep/repne prefix (F3/F2) on movs/stos/lods means "repeat ECX times".

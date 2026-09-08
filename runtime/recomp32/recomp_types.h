@@ -237,11 +237,23 @@ static inline uint32_t _pop32(uint32_t* sp) {
  */
 enum {
     FK_NONE = 0,
-    FK_CMP,     /* cmp, sub, dec  -- a - b            */
-    FK_ADD,     /* add, inc       -- a + b            */
-    FK_TEST,    /* and/or/xor/test -- a & b, CF=OF=0  */
+    FK_CMP,     /* cmp, sub       -- a - b            */
+    FK_ADD,     /* add            -- a + b            */
+    FK_TEST,    /* and/or/xor/test/shift -- a & b     */
     FK_BT,      /* bt             -- CF = bit b of a  */
-    FK_FCOM     /* fcom           -- a is -1/0/1      */
+    FK_FCOM,    /* fcom           -- a is -1/0/1      */
+    /* INC and DEC are ADD and SUB that do NOT write CF. No condition can tell
+     * them apart (a jcc reading CF after an inc is reading a flag the
+     * instruction never wrote), but PUSHFD can: it has to report the carry
+     * that was already there rather than the one the addition would have
+     * produced. */
+    FK_INC,     /* inc            -- a + b, CF preserved */
+    FK_DEC,     /* dec            -- a - b, CF preserved */
+    /* The flags as a literal word, from POPFD. Nothing is derived: every flag
+     * is read from its own bit. The lazy triple cannot express an arbitrary
+     * combination of flags, and a program that restores a saved EFLAGS is
+     * asking for exactly that. */
+    FK_EFLAGS
 };
 
 enum {
@@ -252,6 +264,14 @@ enum {
 static inline int recomp_cond(uint32_t kind, uint32_t a, uint32_t b, int cc) {
     uint32_t r;
     int zf, sf, cf, of;
+
+    if (kind == FK_EFLAGS) {
+        cf = (int)(a & 1u);
+        zf = (int)((a >> 6) & 1u);
+        sf = (int)((a >> 7) & 1u);
+        of = (int)((a >> 11) & 1u);
+        goto decide;
+    }
 
     if (kind == FK_FCOM) {
         int32_t v = (int32_t)a;          /* -1 less, 0 equal, 1 greater */
@@ -268,6 +288,8 @@ static inline int recomp_cond(uint32_t kind, uint32_t a, uint32_t b, int cc) {
 
     switch (kind) {
     case FK_ADD:
+    case FK_INC:                          /* CF is stale for INC; no condition
+                                             is entitled to read it anyway */
         r  = a + b;
         cf = (r < a);
         of = (int)((~(a ^ b) & (a ^ r)) >> 31);
@@ -282,7 +304,7 @@ static inline int recomp_cond(uint32_t kind, uint32_t a, uint32_t b, int cc) {
         cf = (int)((a >> (b & 31)) & 1u);
         of = 0;
         break;
-    default:                              /* FK_CMP and FK_NONE */
+    default:                              /* FK_CMP, FK_DEC and FK_NONE */
         r  = a - b;
         cf = (a < b);
         of = (int)(((a ^ b) & (a ^ r)) >> 31);
@@ -291,6 +313,7 @@ static inline int recomp_cond(uint32_t kind, uint32_t a, uint32_t b, int cc) {
     zf = (r == 0);
     sf = (int)(r >> 31);
 
+decide:
     switch (cc) {
     case CC_E:   return zf;
     case CC_NE:  return !zf;
@@ -308,6 +331,117 @@ static inline int recomp_cond(uint32_t kind, uint32_t a, uint32_t b, int cc) {
     case CC_NO:  return !of;
     }
     return 0;
+}
+
+/* Bit 1 reads as 1 on every x86, and IF is set in any process this runtime
+ * will ever host. A PUSHFD that omitted them differs from hardware in a way
+ * guest CPU-detection code notices. */
+#define RECOMP_EFLAGS_FIXED 0x00000202u
+
+static inline uint32_t recomp_parity8(uint8_t v) {
+    v ^= (uint8_t)(v >> 4);
+    v ^= (uint8_t)(v >> 2);
+    v ^= (uint8_t)(v >> 1);
+    return (uint32_t)((~v) & 1u);
+}
+
+/* The six arithmetic flags as a word, given a result and the three that do
+ * not come from it. */
+static inline uint32_t recomp_flags_pack(uint32_t r, uint32_t cf, uint32_t af,
+                                         uint32_t of) {
+    uint32_t e = RECOMP_EFLAGS_FIXED | (cf & 1u) | ((af & 1u) << 4) | ((of & 1u) << 11);
+    if (r == 0) e |= 0x40u;               /* ZF */
+    e |= (r >> 31) << 7;                  /* SF */
+    e |= recomp_parity8((uint8_t)r) << 2; /* PF */
+    return e;
+}
+
+/*
+ * The flags as one word: PUSHFD, and the flag oracle the differential harness
+ * compares against.
+ *
+ * The lazy tuple already holds everything the six arithmetic flags derive
+ * from, so this is that derivation done all at once instead of one flag at a
+ * time. CF is the exception: the tuple carries it for ADD/SUB/CMP, while
+ * shifts, rotates, NEG, STC/CLC/CMC and ADC/SBB maintain the running `_cf` --
+ * so every other kind takes the carry it is handed.
+ *
+ * AF exists here and nowhere else in the 32-bit model. It costs nothing --
+ * (a ^ b ^ r) bit 4 comes out of operands the tuple already stored -- and
+ * PUSHFD round-trips it, so code that saves and restores flags around a call
+ * does not silently drop a flag it never mentions. Hardware leaves AF
+ * undefined after a logic op; this reports 0 there, deterministically.
+ */
+static inline uint32_t recomp_eflags(uint32_t kind, uint32_t a, uint32_t b,
+                                     uint32_t cf_in, int df) {
+    uint32_t r, e;
+    uint32_t cf = cf_in & 1u, of = 0, af = 0;
+
+    if (kind == FK_EFLAGS) {
+        /* Already a word. DF still comes from `_df`: a CLD after the POPFD
+           moved it and the saved word did not follow. */
+        e = (a & (1u | 4u | 0x10u | 0x40u | 0x80u | 0x800u)) | RECOMP_EFLAGS_FIXED;
+        return (df < 0) ? (e | 0x400u) : e;
+    }
+
+    switch (kind) {
+    case FK_ADD: case FK_INC:
+        r  = a + b;
+        if (kind == FK_ADD) cf = (r < a);
+        of = (~(a ^ b) & (a ^ r)) >> 31;
+        af = ((a ^ b ^ r) >> 4) & 1u;
+        break;
+    case FK_TEST:
+        /* and/or/xor/test clear CF (the lifter stores that); a shift leaves
+           the bit it shifted out in `_cf`. Either way the carry is `cf_in`. */
+        r  = a & b;
+        break;
+    case FK_BT:
+        r  = 0;
+        cf = (a >> (b & 31)) & 1u;
+        break;
+    case FK_NONE: case FK_FCOM:
+        /* Nothing has written the arithmetic flags (or fcom wrote a comparison
+           this word cannot express). Report the carry we hold and leave the
+           rest clear: deriving ZF and PF from an invented zero result would
+           report two flags as set that no instruction ever set. */
+        e = RECOMP_EFLAGS_FIXED | cf;
+        return (df < 0) ? (e | 0x400u) : e;
+    default:                              /* FK_CMP, FK_DEC */
+        r  = a - b;
+        if (kind == FK_CMP) cf = (a < b);
+        of = ((a ^ b) & (a ^ r)) >> 31;
+        af = ((a ^ b ^ r) >> 4) & 1u;
+        break;
+    }
+
+    e = recomp_flags_pack(r, cf, af, of);
+    if (df < 0) e |= 0x400u;              /* DF */
+    return e;
+}
+
+/*
+ * ADC and SBB take the carry as a THIRD input, and the lazy triple cannot hold
+ * one: folding it into the source (`a + (b + c)`) loses it whenever b is all
+ * ones, and modelling `a - b - c` as a SUB of `b + c` gets the borrow wrong
+ * whenever a != b. So they compute their flags at the instruction and hand
+ * back the finished word, which the caller stores as FK_EFLAGS -- the same
+ * escape hatch POPFD uses.
+ */
+static inline uint32_t recomp_flags_adc(uint32_t a, uint32_t b, uint32_t c) {
+    uint32_t r = a + b + c;
+    return recomp_flags_pack(r,
+                             c ? (r <= a) : (r < a),
+                             ((a ^ b ^ r) >> 4) & 1u,
+                             (~(a ^ b) & (a ^ r)) >> 31);
+}
+
+static inline uint32_t recomp_flags_sbb(uint32_t a, uint32_t b, uint32_t c) {
+    uint32_t r = a - b - c;
+    return recomp_flags_pack(r,
+                             c ? (a <= b) : (a < b),
+                             ((a ^ b ^ r) >> 4) & 1u,
+                             ((a ^ b) & (a ^ r)) >> 31);
 }
 
 /* ============================================================
