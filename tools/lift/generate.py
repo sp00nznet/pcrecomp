@@ -128,6 +128,8 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start):
     lines.append(f'    int _fpu_cmp = 0;')
     lines.append(f'    uint32_t _cf = 0;')
     lines.append(f'    int _df = 1;')
+    lines.append(f'    uint32_t _flag_a = 0, _flag_b = 0;')
+    lines.append(f'    uint32_t _flag_k = FK_NONE;')
     lines.append(f'    uint16_t _fpu_cw = 0x037F;')
     lines.append(f'')
 

@@ -28,7 +28,9 @@ pcrecomp/
                    x87 FPU decoder, direct call-graph scanner, large-model
                    far-call + code/data-boundary call-graph completion)
     lift/          Code lifters (x86-32 and x86-16 to readable C; lift32_cpu.py
-                   is the reentrant CPU-struct model needed for hybrid builds)
+                   is the reentrant CPU-struct model needed for hybrid builds;
+                   difftest.py runs the lifted C against Unicorn and names
+                   every register, flag and byte the two disagree on)
     classify/      Function classifiers (SDK vs custom, multi-signal, string refs)
     ghidra/        Ghidra headless scripts (decompile, export, stats, xrefs,
                    range disasm, function bounds)
@@ -121,6 +123,18 @@ python tools/disasm/analyze.py decoded.json --output functions.json
 
 # Lift to C with DOS INT handlers
 python tools/lift/lift16.py functions.json --output RecompiledFuncs/
+```
+
+### "Did the lifter get the semantics right?"
+
+```bash
+# Run the lifted C and a real x86 (Unicorn) over the same bytes and compare
+# every register, flag and byte of memory. Needs unicorn + a C compiler.
+python tools/lift/difftest.py -v
+
+# The 16-bit CPU model's hand-written flag logic (BCD, ADC/SBB carry-in),
+# against values taken from hardware
+cc -Iruntime/recomp16 runtime/recomp16/cpu_selftest.c -o selftest && ./selftest
 ```
 
 ### "It's a 16-bit Windows / OS-2 program (NE format)"

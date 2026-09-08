@@ -1,0 +1,228 @@
+/*
+ * cpu_selftest.c -- the 16-bit CPU model's hand-written flag logic, against
+ * what the hardware actually does.
+ *
+ * BCD and the carry-in arithmetic are the two places in cpu.h where the flags
+ * are not a two-line derivation from a result: DAA and DAS read AF and CF as
+ * inputs and branch on them, AAA and AAS carry into AH, and ADC/SBB take a
+ * third operand the obvious formulation cannot hold. All four are the kind of
+ * code that is wrong in one branch out of four and never crashes -- a game
+ * with a broken DAA prints the wrong score.
+ *
+ * Every expected value below was produced by running the real instruction
+ * under Unicorn (tools/lift/difftest.py does the same thing for the 32-bit
+ * lifter, live). Each row carries the mask of flags the architecture actually
+ * defines for that instruction: comparing an undefined flag would be recording
+ * one CPU's choice as a specification.
+ *
+ *   cc -I. cpu_selftest.c -o cpu_selftest && ./cpu_selftest
+ */
+
+#include "cpu.h"
+
+#include <stdio.h>
+#include <string.h>
+
+static int failures;
+
+static void report(const char *what, const char *field, unsigned got, unsigned want)
+{
+    if (got == want) return;
+    printf("FAIL %-24s %s: got %04X want %04X\n", what, field, got, want);
+    failures++;
+}
+
+/* ---------- packed / unpacked BCD ---------- */
+
+static const struct {
+    const char *op;
+    uint16_t ax, flags_in, ax_out, flags_out, mask;
+} BCD[] = {
+    { "daa", 0x0009, 0x0000, 0x0009, 0x0004, 0x00D5 },
+    { "daa", 0x0009, 0x0001, 0x0069, 0x0005, 0x00D5 },
+    { "daa", 0x0009, 0x0010, 0x000F, 0x0014, 0x00D5 },
+    { "daa", 0x0009, 0x0011, 0x006F, 0x0015, 0x00D5 },
+    { "daa", 0x000A, 0x0000, 0x0010, 0x0010, 0x00D5 },
+    { "daa", 0x000A, 0x0001, 0x0070, 0x0011, 0x00D5 },
+    { "daa", 0x000A, 0x0010, 0x0010, 0x0010, 0x00D5 },
+    { "daa", 0x000A, 0x0011, 0x0070, 0x0011, 0x00D5 },
+    { "daa", 0x0099, 0x0000, 0x0099, 0x0084, 0x00D5 },
+    { "daa", 0x0099, 0x0001, 0x00F9, 0x0085, 0x00D5 },
+    { "daa", 0x0099, 0x0010, 0x009F, 0x0094, 0x00D5 },
+    { "daa", 0x0099, 0x0011, 0x00FF, 0x0095, 0x00D5 },
+    { "daa", 0x009A, 0x0000, 0x0000, 0x0055, 0x00D5 },
+    { "daa", 0x009A, 0x0001, 0x0000, 0x0055, 0x00D5 },
+    { "daa", 0x009A, 0x0010, 0x0000, 0x0055, 0x00D5 },
+    { "daa", 0x009A, 0x0011, 0x0000, 0x0055, 0x00D5 },
+    { "daa", 0x00FF, 0x0000, 0x0065, 0x0015, 0x00D5 },
+    { "daa", 0x00FF, 0x0001, 0x0065, 0x0015, 0x00D5 },
+    { "daa", 0x00FF, 0x0010, 0x0065, 0x0015, 0x00D5 },
+    { "daa", 0x00FF, 0x0011, 0x0065, 0x0015, 0x00D5 },
+
+    { "das", 0x0009, 0x0000, 0x0009, 0x0004, 0x00D5 },
+    { "das", 0x0009, 0x0001, 0x00A9, 0x0085, 0x00D5 },
+    { "das", 0x0009, 0x0010, 0x0003, 0x0014, 0x00D5 },
+    { "das", 0x0009, 0x0011, 0x00A3, 0x0095, 0x00D5 },
+    { "das", 0x000A, 0x0000, 0x0004, 0x0010, 0x00D5 },
+    { "das", 0x000A, 0x0001, 0x00A4, 0x0091, 0x00D5 },
+    { "das", 0x000A, 0x0010, 0x0004, 0x0010, 0x00D5 },
+    { "das", 0x000A, 0x0011, 0x00A4, 0x0091, 0x00D5 },
+    { "das", 0x0099, 0x0000, 0x0099, 0x0084, 0x00D5 },
+    { "das", 0x0099, 0x0001, 0x0039, 0x0005, 0x00D5 },
+    { "das", 0x0099, 0x0010, 0x0093, 0x0094, 0x00D5 },
+    { "das", 0x0099, 0x0011, 0x0033, 0x0015, 0x00D5 },
+    { "das", 0x009A, 0x0000, 0x0034, 0x0011, 0x00D5 },
+    { "das", 0x009A, 0x0001, 0x0034, 0x0011, 0x00D5 },
+    { "das", 0x009A, 0x0010, 0x0034, 0x0011, 0x00D5 },
+    { "das", 0x009A, 0x0011, 0x0034, 0x0011, 0x00D5 },
+    { "das", 0x00FF, 0x0000, 0x0099, 0x0095, 0x00D5 },
+    { "das", 0x00FF, 0x0001, 0x0099, 0x0095, 0x00D5 },
+    { "das", 0x00FF, 0x0010, 0x0099, 0x0095, 0x00D5 },
+    { "das", 0x00FF, 0x0011, 0x0099, 0x0095, 0x00D5 },
+
+    { "aaa", 0x0009, 0x0000, 0x0009, 0x0000, 0x0011 },
+    { "aaa", 0x0009, 0x0001, 0x0009, 0x0000, 0x0011 },
+    { "aaa", 0x0009, 0x0010, 0x010F, 0x0011, 0x0011 },
+    { "aaa", 0x0009, 0x0011, 0x010F, 0x0011, 0x0011 },
+    { "aaa", 0x000A, 0x0000, 0x0100, 0x0011, 0x0011 },
+    { "aaa", 0x000A, 0x0011, 0x0100, 0x0011, 0x0011 },
+    { "aaa", 0x0099, 0x0000, 0x0009, 0x0000, 0x0011 },
+    { "aaa", 0x0099, 0x0010, 0x010F, 0x0011, 0x0011 },
+    { "aaa", 0x009A, 0x0000, 0x0100, 0x0011, 0x0011 },
+    { "aaa", 0x00FF, 0x0000, 0x0205, 0x0011, 0x0011 },
+    { "aaa", 0x00FF, 0x0011, 0x0205, 0x0011, 0x0011 },
+
+    { "aas", 0x0009, 0x0000, 0x0009, 0x0000, 0x0011 },
+    { "aas", 0x0009, 0x0001, 0x0009, 0x0000, 0x0011 },
+    { "aas", 0x0009, 0x0010, 0xFF03, 0x0011, 0x0011 },
+    { "aas", 0x0009, 0x0011, 0xFF03, 0x0011, 0x0011 },
+    { "aas", 0x000A, 0x0000, 0xFF04, 0x0011, 0x0011 },
+    { "aas", 0x000A, 0x0011, 0xFF04, 0x0011, 0x0011 },
+    { "aas", 0x0099, 0x0000, 0x0009, 0x0000, 0x0011 },
+    { "aas", 0x0099, 0x0010, 0xFF03, 0x0011, 0x0011 },
+    { "aas", 0x009A, 0x0000, 0xFF04, 0x0011, 0x0011 },
+    { "aas", 0x00FF, 0x0000, 0xFF09, 0x0011, 0x0011 },
+    { "aas", 0x00FF, 0x0011, 0xFF09, 0x0011, 0x0011 },
+
+    /* The carry (borrow) out of AL propagates into AH: these are the rows that
+       tell AX +/- 106h apart from AL +/- 6 with a separate AH +/- 1. */
+    { "aaa", 0x0002, 0x0010, 0x0108, 0x0011, 0x0011 },
+    { "aaa", 0x0000, 0x0010, 0x0106, 0x0011, 0x0011 },
+    { "aaa", 0x00FA, 0x0000, 0x0200, 0x0011, 0x0011 },
+    { "aaa", 0x2400, 0x0010, 0x2506, 0x0011, 0x0011 },
+    { "aas", 0x0002, 0x0010, 0xFE0C, 0x0011, 0x0011 },
+    { "aas", 0x0000, 0x0010, 0xFE0A, 0x0011, 0x0011 },
+    { "aas", 0x00FA, 0x0000, 0xFF04, 0x0011, 0x0011 },
+    { "aas", 0x2400, 0x0010, 0x220A, 0x0011, 0x0011 },
+
+    /* AAM's divisor is an operand: base 10 splits into decimal digits, base 16
+       into hex nibbles, which is how assembly prints in either. */
+    { "aam",   0x0009, 0x0000, 0x0009, 0x0004, 0x00C4 },
+    { "aam",   0x0063, 0x0000, 0x0909, 0x0004, 0x00C4 },
+    { "aam",   0x00FF, 0x0000, 0x1905, 0x0004, 0x00C4 },
+    { "aam",   0x0905, 0x0000, 0x0005, 0x0004, 0x00C4 },
+    { "aam16", 0x0009, 0x0000, 0x0009, 0x0004, 0x00C4 },
+    { "aam16", 0x0063, 0x0000, 0x0603, 0x0004, 0x00C4 },
+    { "aam16", 0x00FF, 0x0000, 0x0F0F, 0x0004, 0x00C4 },
+    { "aam16", 0x0905, 0x0000, 0x0005, 0x0004, 0x00C4 },
+    { "aad",   0x0009, 0x0000, 0x0009, 0x0004, 0x00C4 },
+    { "aad",   0x0063, 0x0000, 0x0063, 0x0004, 0x00C4 },
+    { "aad",   0x00FF, 0x0000, 0x00FF, 0x0084, 0x00C4 },
+    { "aad",   0x0905, 0x0000, 0x005F, 0x0004, 0x00C4 },
+};
+
+/* ---------- ADC / SBB ----------
+ *
+ * The all-ones source with the carry set is the case that folding the carry
+ * into the operand gets wrong; the rest are the signed and zero edges either
+ * side of it.
+ */
+static const struct {
+    const char *op;
+    int bits;
+    uint32_t a, b;
+    int carry_in;
+    uint32_t result;
+    uint16_t flags_out;
+} ALU[] = {
+    { "adc",  8, 0x0001, 0x00FF, 1, 0x0001, 0x0011 },
+    { "sbb",  8, 0x0001, 0x00FF, 1, 0x0001, 0x0011 },
+    { "adc",  8, 0x0000, 0x00FF, 1, 0x0000, 0x0055 },
+    { "sbb",  8, 0x0000, 0x00FF, 1, 0x0000, 0x0055 },
+    { "adc",  8, 0x00FF, 0x00FF, 1, 0x00FF, 0x0095 },
+    { "sbb",  8, 0x00FF, 0x00FF, 1, 0x00FF, 0x0095 },
+    { "adc",  8, 0x007F, 0x0000, 1, 0x0080, 0x0890 },
+    { "sbb",  8, 0x007F, 0x0000, 1, 0x007E, 0x0004 },
+    { "adc",  8, 0x0080, 0x00FF, 0, 0x007F, 0x0801 },
+    { "sbb",  8, 0x0080, 0x00FF, 0, 0x0081, 0x0095 },
+    { "adc",  8, 0x0000, 0x0000, 1, 0x0001, 0x0000 },
+    { "sbb",  8, 0x0000, 0x0000, 1, 0x00FF, 0x0095 },
+    { "adc",  8, 0x0080, 0x0080, 0, 0x0000, 0x0845 },
+    { "sbb",  8, 0x0080, 0x0080, 0, 0x0000, 0x0044 },
+    { "adc", 16, 0x0001, 0xFFFF, 1, 0x0001, 0x0011 },
+    { "sbb", 16, 0x0001, 0xFFFF, 1, 0x0001, 0x0011 },
+    { "adc", 16, 0x0000, 0xFFFF, 1, 0x0000, 0x0055 },
+    { "sbb", 16, 0x0000, 0xFFFF, 1, 0x0000, 0x0055 },
+    { "adc", 16, 0xFFFF, 0xFFFF, 1, 0xFFFF, 0x0095 },
+    { "sbb", 16, 0xFFFF, 0xFFFF, 1, 0xFFFF, 0x0095 },
+    { "adc", 16, 0x7FFF, 0x0000, 1, 0x8000, 0x0894 },
+    { "sbb", 16, 0x7FFF, 0x0000, 1, 0x7FFE, 0x0000 },
+    { "adc", 16, 0x8000, 0xFFFF, 0, 0x7FFF, 0x0805 },
+    { "sbb", 16, 0x8000, 0xFFFF, 0, 0x8001, 0x0091 },
+    { "adc", 16, 0x1234, 0x5678, 0, 0x68AC, 0x0004 },
+    { "sbb", 16, 0x1234, 0x5678, 0, 0xBBBC, 0x0091 },
+};
+
+#define ALU_FLAGS (FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_OF)
+
+int main(void)
+{
+    CPU cpu;
+    size_t i;
+    char what[64];
+
+    for (i = 0; i < sizeof BCD / sizeof BCD[0]; i++) {
+        const char *op = BCD[i].op;
+        memset(&cpu, 0, sizeof cpu);
+        cpu.ax = BCD[i].ax;
+        cpu.flags = (uint16_t)(0x0202u | BCD[i].flags_in);
+
+        if      (!strcmp(op, "daa"))   bcd_daa(&cpu);
+        else if (!strcmp(op, "das"))   bcd_das(&cpu);
+        else if (!strcmp(op, "aaa"))   bcd_aaa(&cpu);
+        else if (!strcmp(op, "aas"))   bcd_aas(&cpu);
+        else if (!strcmp(op, "aam"))   bcd_aam(&cpu, 10);
+        else if (!strcmp(op, "aam16")) bcd_aam(&cpu, 16);
+        else if (!strcmp(op, "aad"))   bcd_aad(&cpu, 10);
+        else { printf("unknown op %s\n", op); return 2; }
+
+        snprintf(what, sizeof what, "%s ax=%04X fl=%04X", op, BCD[i].ax, BCD[i].flags_in);
+        report(what, "ax", cpu.ax, BCD[i].ax_out);
+        report(what, "flags", cpu.flags & BCD[i].mask, BCD[i].flags_out);
+    }
+
+    for (i = 0; i < sizeof ALU / sizeof ALU[0]; i++) {
+        uint32_t got;
+        memset(&cpu, 0, sizeof cpu);
+        cpu.flags = (uint16_t)(0x0202u | (ALU[i].carry_in ? FLAG_CF : 0));
+        got = !strcmp(ALU[i].op, "adc")
+                  ? flags_adc(&cpu, ALU[i].a, ALU[i].b, ALU[i].bits)
+                  : flags_sbb(&cpu, ALU[i].a, ALU[i].b, ALU[i].bits);
+
+        snprintf(what, sizeof what, "%s%d %04X,%04X c=%d",
+                 ALU[i].op, ALU[i].bits, ALU[i].a, ALU[i].b, ALU[i].carry_in);
+        report(what, "result", got, ALU[i].result);
+        report(what, "flags", cpu.flags & ALU_FLAGS, ALU[i].flags_out);
+    }
+
+    /* AAM by zero is a divide fault on hardware. The model must not divide. */
+    memset(&cpu, 0, sizeof cpu);
+    cpu.ax = 0x1234;
+    bcd_aam(&cpu, 0);
+    report("aam 0", "ax", cpu.ax, 0x1234);
+
+    printf("%s: %u checks, %d failures\n", failures ? "FAILED" : "ok",
+           (unsigned)(sizeof BCD / sizeof BCD[0] * 2 + sizeof ALU / sizeof ALU[0] * 2 + 1),
+           failures);
+    return failures != 0;
+}

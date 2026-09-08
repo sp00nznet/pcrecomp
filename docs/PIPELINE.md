@@ -152,6 +152,18 @@ Alternative linear-sweep approach when recursive descent is too slow or gets con
 - Port I/O dispatch for timer/VGA/keyboard
 - DOS INT handler integration
 
+### Differential test (`tools/lift/difftest.py`)
+
+**Goal**: catch a wrong flag before a play session does.
+
+Runs the same instruction bytes twice -- once through Unicorn, once through the
+lifter's own output compiled as C -- and reports every architectural field the
+two disagree on by name: the eight GPRs, each of the six arithmetic flags plus
+DF, and every byte of guest memory either machine wrote. Cases the model
+knowingly gets wrong carry a `known=` note explaining why, so a real regression
+still stands out. The 16-bit model's hand-written flag logic has the same check
+as a plain C file: `runtime/recomp16/cpu_selftest.c`.
+
 ---
 
 ## Phase 4: Shimming
