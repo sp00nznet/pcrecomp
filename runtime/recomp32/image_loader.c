@@ -80,10 +80,23 @@ uint32_t recomp_load_image(const char* path, uint32_t image_base) {
     }
 
     for (int i = 0; i < nsec; i++) {
-        if (sec[i].rsize == 0) continue;  /* uninitialized (.bss) */
+        /* "Uninitialized" is PointerToRawData == 0 -- no file backing -- not
+         * SizeOfRawData == 0. MSVC happens to set both to 0 for .bss, so the
+         * size test worked by coincidence; Watcom does not. It puts the *memory*
+         * size in SizeOfRawData and leaves PointerToRawData 0, so on a Watcom
+         * binary the size test treats .bss as initialized and copies
+         * SizeOfRawData bytes from file offset 0 -- for Nocturne, 42 MB read out
+         * of a 1.9 MB buffer, over a .bss that is supposed to stay zeroed. */
+        if (sec[i].roff == 0) continue;
         uint32_t va = image_base + sec[i].vaddr;
         uint32_t n  = sec[i].rsize;
         if (sec[i].vsize && sec[i].vsize < n) n = sec[i].vsize;
+        /* Never read past what the file actually holds: these headers come from
+         * disk and a truncated or hostile one must not turn into an overread. */
+        if (sec[i].roff >= (uint32_t)sz) continue;
+        if (n > (uint32_t)sz - sec[i].roff) n = (uint32_t)sz - sec[i].roff;
+        if (sec[i].vaddr >= span) continue;
+        if (n > span - sec[i].vaddr) n = span - sec[i].vaddr;
         memcpy((void*)(uintptr_t)va, buf + sec[i].roff, n);
     }
     free(buf);
