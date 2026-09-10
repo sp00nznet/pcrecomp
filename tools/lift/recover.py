@@ -42,6 +42,11 @@ _COND_J = {'je', 'jne', 'jz', 'jnz', 'ja', 'jae', 'jb', 'jbe', 'jg', 'jge',
 
 _STOP = ('ret', 'retn', 'retf', 'iret', 'int3')
 
+
+def _is_branch(m):
+    """call, jmp, or any conditional jump. No other x86 mnemonic starts 'j'."""
+    return m == 'call' or m[0] == 'j' or m in _COND_J
+
 # How far past a seed an intra-function jump may land. Beyond this we treat the
 # jump as a tail call into a different function instead of a branch within this
 # one. 16 KB is comfortably larger than any single function seen in practice.
@@ -77,36 +82,41 @@ def recover_functions(code_data, code_start, code_end, known_fns, forced=()):
     def in_code(t):
         return t is not None and code_start <= t < code_end
 
+    def is_alt_entry(ea, end, m, t):
+        """Is `t`, reached by `m` from the body [ea, end), an alternate entry?
+
+        It is one when it lands inside some listed body without being that
+        body's entry, and the CPU will therefore execute from an address no
+        lifted function starts at. A CALL always qualifies. A jump qualifies
+        when it leaves the body it came from -- a jump within the same function
+        is ordinary control flow. *Any* jump counts, conditional included:
+        Watcom shares one epilogue between adjacent routines and reaches it with
+        `je` as readily as with `jmp`, and a missed one of those is a body that
+        silently does nothing at run time.
+        """
+        return (in_code(t) and t not in entries and covered(t)
+                and (m == 'call' or not (ea <= t < end)))
+
     # Pass 1: sweep every known body for
-    #   (a) direct jmp/call targets that land outside all known functions,
+    #   (a) direct branch/call targets that land outside all known functions,
     #   (b) any code-address immediate at all (function pointers stored to a
     #       table, which have no direct call anywhere), and
-    #   (c) direct CALL targets that ARE covered but are not that body's entry --
-    #       the alternate entry points.
+    #   (c) targets that ARE covered but are not that body's entry -- the
+    #       alternate entry points.
     # Pass 2 validates every seed by decoding it, so a stray data immediate that
     # merely looks like a code address just decodes to code nobody calls.
-    # For (c) only `call` counts: a `jmp` into a covered range is ordinary
-    # intra-function control flow, not a separate routine.
     seeds = set()
     alt_entries = set()
     for ea, end in fns:
         last = None
         for ins in md.disasm(slice_at(ea, end - ea), ea):
             last = ins
-            if ins.mnemonic in ('jmp', 'call'):
+            if _is_branch(ins.mnemonic):
                 t = imm_of(ins)
-                if in_code(t) and t not in entries:
-                    if not covered(t):
-                        seeds.add(t)
-                    elif ins.mnemonic == 'call':
-                        alt_entries.add(t)
-                    elif not (ea <= t < end):
-                        # A `jmp` landing inside a *different* function's body is
-                        # an alternate entry too. Only a jump within this same
-                        # function is ordinary control flow -- that distinction
-                        # matters, because a cross-function jump is a tail call
-                        # to a mid-body address and needs its own lifted body.
-                        alt_entries.add(t)
+                if in_code(t) and t not in entries and not covered(t):
+                    seeds.add(t)
+                elif t is not None and is_alt_entry(ea, end, ins.mnemonic, t):
+                    alt_entries.add(t)
             for op in (ins.operands or []):
                 if op.type == X86_OP_IMM:
                     t = op.imm & 0xFFFFFFFF
@@ -129,6 +139,15 @@ def recover_functions(code_data, code_start, code_end, known_fns, forced=()):
     forced_set = {s for s in (set(forced) | alt_entries)
                   if code_start <= s < code_end and s not in entries}
     work = list(seeds) + list(forced_set)
+    queued = set(work)
+
+    def enqueue(t, as_alt=False):
+        if t in queued or t in recovered or t in entries:
+            return
+        queued.add(t)
+        if as_alt:
+            forced_set.add(t)   # allowed to overlap the body it lands in
+        work.append(t)
 
     while work:
         s = work.pop()
@@ -138,6 +157,7 @@ def recover_functions(code_data, code_start, code_end, known_fns, forced=()):
         visited = set()
         blocks = [s]
         maxend = s
+        branches = []
         while blocks:
             va = blocks.pop()
             if va in visited:
@@ -149,16 +169,18 @@ def recover_functions(code_data, code_start, code_end, known_fns, forced=()):
                 maxend = max(maxend, ins.address + ins.size)
                 m = ins.mnemonic
                 t = imm_of(ins)
+                if _is_branch(m) and t is not None:
+                    branches.append((m, t))
                 if m == 'call':
                     if in_code(t) and t not in entries and not covered(t):
-                        work.append(t)
+                        enqueue(t)
                     continue
                 if m == 'jmp':
                     if t is not None:
                         if s <= t < s + _INTRA_SPAN and not covered(t):
                             blocks.append(t)          # intra-function jump
                         elif in_code(t) and t not in entries and not covered(t):
-                            work.append(t)            # tail call / thunk target
+                            enqueue(t)                # tail call / thunk target
                     break
                 if m in _COND_J:
                     if t is not None and s <= t < s + _INTRA_SPAN and not covered(t):
@@ -167,6 +189,14 @@ def recover_functions(code_data, code_start, code_end, known_fns, forced=()):
                 if m in _STOP:
                     break
         recovered[s] = maxend
+
+        # A recovered body reaches alternate entries of its own -- the shared
+        # epilogue inside a listed function is the common one -- and pass 1 never
+        # saw this body to notice them. Feeding them back is why the work list is
+        # a fixpoint and not a single sweep.
+        for m, t in branches:
+            if is_alt_entry(s, maxend, m, t):
+                enqueue(t, as_alt=True)
 
     return sorted(recovered.items())
 
@@ -223,6 +253,32 @@ def _selftest():
     img4[0x1005 - BASE] = 0xC3
     got4 = dict(recover_functions(bytes(img4), BASE, END, [(0x1000, 0x1005)]))
     assert 0x1005 in got4, "fall-through target was not recovered: %r" % (got4,)
+
+    # A *conditional* jump into a different function's body is an alternate
+    # entry exactly as a plain jmp is -- Watcom reaches a shared epilogue with
+    # `je`, and treating that as ordinary control flow leaves the epilogue with
+    # no lifted body, so the tail call to it silently does nothing.
+    img6 = bytearray(b'\x90' * (END - BASE))
+    img6[0x1010 - BASE:0x1010 - BASE + 6] = (                  # je 0x1008
+        b'\x0f\x84' + ((0x1008 - 0x1016) & 0xFFFFFFFF).to_bytes(4, 'little'))
+    img6[0x1008 - BASE] = 0xC3
+    img6[0x100F - BASE] = 0xC3
+    got6 = dict(recover_functions(bytes(img6), BASE, END,
+                                  [(0x1000, 0x1010), (0x1010, 0x1020)]))
+    assert 0x1008 in got6, "cross-function jcc target was not recovered: %r" % (got6,)
+
+    # ...and a *recovered* body's own alternate entries have to be found too:
+    # pass 1 never saw that body, so recovery has to feed itself.
+    img7 = bytearray(b'\x90' * (END - BASE))
+    img7[0x1000 - BASE:0x1000 - BASE + 5] = call(0x1000, 0x2000)   # -> recovered
+    img7[0x1005 - BASE] = 0xC3
+    img7[0x2000 - BASE:0x2000 - BASE + 6] = (                  # je 0x1005, inside
+        b'\x0f\x84' + ((0x1005 - 0x2006) & 0xFFFFFFFF).to_bytes(4, 'little'))
+    img7[0x2006 - BASE] = 0xC3
+    got7 = dict(recover_functions(bytes(img7), BASE, END, [(0x1000, 0x1006)]))
+    assert 0x2000 in got7, "recovered body missing: %r" % (got7,)
+    assert 0x1005 in got7, \
+        "alternate entry reached only from a recovered body: %r" % (got7,)
 
     # Nothing to find in an image of pure returns.
     img5 = bytes(b'\xc3' * (END - BASE))

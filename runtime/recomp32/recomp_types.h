@@ -382,8 +382,17 @@ static inline uint32_t recomp_eflags(uint32_t kind, uint32_t a, uint32_t b,
 
     if (kind == FK_EFLAGS) {
         /* Already a word. DF still comes from `_df`: a CLD after the POPFD
-           moved it and the saved word did not follow. */
-        e = (a & (1u | 4u | 0x10u | 0x40u | 0x80u | 0x800u)) | RECOMP_EFLAGS_FIXED;
+           moved it and the saved word did not follow.
+
+           AC (18) and ID (21) ride along because a POPFD/PUSHFD pair is how
+           every 1990s binary asks the CPU a yes/no question about itself: write
+           the bit, read it back, see whether it stuck. ID is the CPUID probe --
+           drop it here and the readback matches the original word, the program
+           concludes there is no CPUID, and a game that needs MMX puts up "This
+           CPU does not have an MMX unit" and quits. They are the only two bits
+           user mode can actually toggle, so carrying them costs one mask. */
+        e = (a & (1u | 4u | 0x10u | 0x40u | 0x80u | 0x800u
+                  | 0x40000u | 0x200000u)) | RECOMP_EFLAGS_FIXED;
         return (df < 0) ? (e | 0x400u) : e;
     }
 

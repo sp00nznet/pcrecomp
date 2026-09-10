@@ -193,8 +193,17 @@ def op_bits(op) -> int:
 #
 # The x87 stack (_st / _fp_top / _fpu_cw) is deliberately NOT here: it is shared
 # across calls and lives as a global in recomp_types.h.
+#
+# Neither is `ebp`, and that one was learned the hard way. It looks like a local
+# -- a well-behaved function pushes it, uses it as its frame pointer and pops it,
+# so a private copy starting at 0 is indistinguishable from the real thing. But
+# an optimising compiler splits one function's blocks across the image and jumps
+# between them, and every one of those blocks addresses the *same* frame through
+# ebp. Lifted as separate bodies (which they must be -- something jumps directly
+# to them) a private ebp makes each one start with a frame pointer of 0, and the
+# first `[ebp-0x20]` reads 0xFFFFFFE0. ebp is a register like any other; it lives
+# in recomp_types.h with the rest of the file.
 FUNCTION_LOCALS = (
-    'uint32_t ebp = 0;',
     'int _fpu_cmp = 0;',
     'uint32_t _cf = 0;',
     'int _df = 1;',
