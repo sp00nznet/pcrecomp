@@ -55,8 +55,20 @@ class Section:
         return bool(self.characteristics & 0x80000000)
 
     @property
+    def effective_size(self) -> int:
+        """Section size in memory, tolerating linkers that leave VirtualSize 0.
+
+        Watcom (e.g. Nocturne, linker 2.18) writes VirtualSize = 0 in every
+        section header and puts the real size in SizeOfRawData. Trusting
+        VirtualSize there yields a zero-length code range and silently breaks
+        anything that walks sections. Every size/range computation goes through
+        here so the fallback applies once, not per caller.
+        """
+        return self.virtual_size or self.raw_size
+
+    @property
     def va_end(self) -> int:
-        return self.virtual_address + self.virtual_size
+        return self.virtual_address + self.effective_size
 
     @property
     def flags_str(self) -> str:
@@ -549,9 +561,14 @@ def print_summary(info: PEInfo):
     # Sections
     print(f"\n  Sections ({len(info.sections)}):")
     for s in info.sections:
+        # '*' marks a section whose VirtualSize was 0 and fell back to raw size.
+        mark = '*' if not s.virtual_size else ' '
         print(f"    {s.name:8s}  VA 0x{s.virtual_address:08X}  "
-              f"VSize 0x{s.virtual_size:08X}  Raw 0x{s.raw_offset:08X}  "
+              f"VSize 0x{s.effective_size:08X}{mark} Raw 0x{s.raw_offset:08X}  "
               f"RSize 0x{s.raw_size:08X}  [{s.flags_str}]")
+    if any(not s.virtual_size for s in info.sections):
+        print("    * VirtualSize was 0 in the header; size taken from "
+              "SizeOfRawData (Watcom and some old linkers do this).")
 
     # Imports
     if info.imports:
