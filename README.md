@@ -23,7 +23,9 @@ pcrecomp/
   tools/           Reusable analysis & transformation tools
     pe/            PE analysis (imports, exports, sections, hashes, delay-imports,
                    protection/DRM detection, recursive binary catalog)
-    ne/            NE (16-bit New Executable) parse / disasm / call-graph
+    ne/            NE (16-bit New Executable) parse / disasm / call-graph,
+                   Win16 import resolution (ordinal -> API name + the PASCAL
+                   stack-purge table) and C shim generation
     disasm/        Disassemblers (32-bit recursive descent, 16-bit table-driven,
                    x87 FPU decoder, direct call-graph scanner, large-model
                    far-call + code/data-boundary call-graph completion)
@@ -150,7 +152,24 @@ python tools/ne/ne_decode.py GAME.EXE --seg 3
 # Segment call graph / clusters / import usage
 python tools/ne/ne_xref.py GAME.EXE --clusters
 python tools/ne/ne_xref.py GAME.EXE --imports
+
+# The import surface as C: prototypes + a correctly-purging stub for every
+# import with no hand-written shim yet
+python tools/ne/gen_win16_stubs.py GAME.DLL     --api runtime/runtime_api.h --stubs runtime/win16/win16_stubs.c     --shims runtime/win16 --guard MYGAME
 ```
+
+**Win16 is PASCAL, and that is the thing that bites.** The callee pops the
+arguments, so a shim that pops the wrong number does not fail at the call - it
+shifts the *caller's* frame, and the caller's epilogue then restores DS (or BP,
+or a return address) from the wrong slot. The crash lands somewhere else
+entirely, in code that is fine. `tools/ne/win16.py` carries the accumulated
+purge table keyed by (MODULE, API); `gen_win16_stubs.py` fails rather than
+generating a stub for an import that has no entry in it.
+
+Names come from IDA, which ships the Win16 ordinal maps. Export them once with
+`tools/ida/ida_export.py`-style extraction into `work/win16_imports.json` and
+`win16.py` finds it by walking up from the project root; without it, imports
+resolve to `MODULE_OrdN` and the purge lookups all miss.
 
 ### "The exe has SafeDisc DRM"
 

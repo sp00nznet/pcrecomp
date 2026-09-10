@@ -19,6 +19,21 @@ Part of the Civ Recomp project (sp00nznet/civ)
 from decode16 import (Decoder, Instruction, OpType, Operand,
                       REG8_NAMES, REG16_NAMES, REG32_NAMES, SREG_NAMES)
 
+# Name of the host routine a DIV/IDIV by zero calls. On real hardware this is
+# INT 0; a lifted program cannot raise that, and killing the process on the
+# first one is the wrong trade -- a lifter that mis-sized one operand produces
+# a stream of them, and the first few are the diagnosis.
+#
+# This used to be the literal `catz_div0` at all six emission sites, so every
+# project after Catz inherited that project's prefix and had to alias it. Set
+# it before lifting if your runtime names the routine something else:
+#
+#     import lift16
+#     lift16.DIV0_FN = 'mygame_div0'
+#
+# Projects carrying the old name only need `#define catz_div0 recomp_div0`.
+DIV0_FN = 'recomp_div0'
+
 
 def _reg8(op: Operand) -> str:
     """Generate C expression for 8-bit register access."""
@@ -427,16 +442,16 @@ class Lifter:
                 self._emit(f'{{ uint64_t _n = ((uint64_t)cpu->edx << 32) | cpu->eax; '
                            f'uint32_t _d = (uint32_t){_read(op1)}; '
                            f'if (_d) {{ cpu->eax = (uint32_t)(_n / _d); '
-                           f'cpu->edx = (uint32_t)(_n % _d); }} else catz_div0("div32"); }}', orig)
+                           f'cpu->edx = (uint32_t)(_n % _d); }} else {DIV0_FN}("div32"); }}', orig)
             elif op1.size == 1 or op1.type == OpType.REG8:
                 self._emit(f'{{ uint16_t _n = cpu->ax; uint8_t _d = {_read(op1)}; '
                            f'if (_d) {{ cpu->al = (uint8_t)(_n / _d); '
-                           f'cpu->ah = (uint8_t)(_n % _d); }} else catz_div0("div8"); }}', orig)
+                           f'cpu->ah = (uint8_t)(_n % _d); }} else {DIV0_FN}("div8"); }}', orig)
             else:
                 self._emit(f'{{ uint32_t _n = ((uint32_t)cpu->dx << 16) | cpu->ax; '
                            f'uint16_t _d = {_read(op1)}; '
                            f'if (_d) {{ cpu->ax = (uint16_t)(_n / _d); '
-                           f'cpu->dx = (uint16_t)(_n % _d); }} else catz_div0("div16"); }}', orig)
+                           f'cpu->dx = (uint16_t)(_n % _d); }} else {DIV0_FN}("div16"); }}', orig)
 
         elif m == 'idiv':
             if _wsz(op1) == '32':
@@ -447,17 +462,17 @@ class Lifter:
                 self._emit(f'{{ long long _n = (long long)(((uint64_t)cpu->edx << 32) '
                            f'| cpu->eax); int32_t _d = (int32_t){_read(op1)}; '
                            f'if (_d) {{ cpu->eax = (uint32_t)(int32_t)(_n / _d); '
-                           f'cpu->edx = (uint32_t)(int32_t)(_n % _d); }} else catz_div0("idiv32"); }}', orig)
+                           f'cpu->edx = (uint32_t)(int32_t)(_n % _d); }} else {DIV0_FN}("idiv32"); }}', orig)
             elif op1.size == 1 or op1.type == OpType.REG8:
                 self._emit(f'{{ int16_t _n = (int16_t)cpu->ax; '
                            f'int8_t _d = (int8_t){_read(op1)}; '
                            f'if (_d) {{ cpu->al = (uint8_t)(int8_t)(_n / _d); '
-                           f'cpu->ah = (uint8_t)(int8_t)(_n % _d); }} else catz_div0("idiv8"); }}', orig)
+                           f'cpu->ah = (uint8_t)(int8_t)(_n % _d); }} else {DIV0_FN}("idiv8"); }}', orig)
             else:
                 self._emit(f'{{ int32_t _n = (int32_t)(((uint32_t)cpu->dx << 16) '
                            f'| cpu->ax); int16_t _d = (int16_t){_read(op1)}; '
                            f'if (_d) {{ cpu->ax = (uint16_t)(int16_t)(_n / _d); '
-                           f'cpu->dx = (uint16_t)(int16_t)(_n % _d); }} else catz_div0("idiv16"); }}', orig)
+                           f'cpu->dx = (uint16_t)(int16_t)(_n % _d); }} else {DIV0_FN}("idiv16"); }}', orig)
 
         # ─── Logic ───
 
