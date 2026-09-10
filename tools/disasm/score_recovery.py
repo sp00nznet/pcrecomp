@@ -72,9 +72,10 @@ def classify(reference, candidate):
     ranges = [(s, e) for s, e in reference if e is not None and e > s]
     range_starts = [s for s, _ in ranges]
 
+    cand_set = set(cand_starts)
     tp = [s for s in cand_starts if s in ref_set]
     fp = [s for s in cand_starts if s not in ref_set]
-    fn = [s for s in ref_starts if s not in set(cand_starts)]
+    fn = [s for s in ref_starts if s not in cand_set]
 
     split = invented = 0
     for addr in fp:
