@@ -37,4 +37,13 @@ void recomp_report_state(const char* why);
 typedef const char* (*recomp_region_fn)(uint32_t va);
 void recomp_set_region_describer(recomp_region_fn fn);
 
+/* Optional: print whatever else matters for this target -- the handful of
+ * globals whose values explain a fault in its runtime. Bring-up is mostly a
+ * hunt for one such value, and having it in the crash report turns a build-run
+ * cycle per guess into a single run. Called at the end of every report; must not
+ * allocate.
+ */
+typedef void (*recomp_extra_fn)(void);
+void recomp_set_extra_reporter(recomp_extra_fn fn);
+
 #endif /* RECOMP_CRASH_REPORT_H */

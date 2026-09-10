@@ -90,7 +90,9 @@ def recover_functions(code_data, code_start, code_end, known_fns, forced=()):
     seeds = set()
     alt_entries = set()
     for ea, end in fns:
+        last = None
         for ins in md.disasm(slice_at(ea, end - ea), ea):
+            last = ins
             if ins.mnemonic in ('jmp', 'call'):
                 t = imm_of(ins)
                 if in_code(t) and t not in entries:
@@ -98,11 +100,28 @@ def recover_functions(code_data, code_start, code_end, known_fns, forced=()):
                         seeds.add(t)
                     elif ins.mnemonic == 'call':
                         alt_entries.add(t)
+                    elif not (ea <= t < end):
+                        # A `jmp` landing inside a *different* function's body is
+                        # an alternate entry too. Only a jump within this same
+                        # function is ordinary control flow -- that distinction
+                        # matters, because a cross-function jump is a tail call
+                        # to a mid-body address and needs its own lifted body.
+                        alt_entries.add(t)
             for op in (ins.operands or []):
                 if op.type == X86_OP_IMM:
                     t = op.imm & 0xFFFFFFFF
                     if in_code(t) and t not in entries and not covered(t):
                         seeds.add(t)
+
+        # A body whose last instruction neither returns nor jumps falls through
+        # into whatever follows, so that address has to be dispatchable: the
+        # lifted body ends in a tail call to it, and the `ret` that pops the
+        # caller's return address usually lives there. Catalogs split routines
+        # this way routinely.
+        if last is not None and last.mnemonic not in _STOP and last.mnemonic != 'jmp':
+            t = last.address + last.size
+            if in_code(t) and t not in entries:
+                (seeds if not covered(t) else alt_entries).add(t)
 
     # Pass 2: recursively decode each seed, plus everything it reaches, to a
     # fixpoint, computing exact [start, end) bounds.
@@ -188,9 +207,26 @@ def _selftest():
     got2 = dict(recover_functions(bytes(img2), BASE, END, [(0x1000, 0x1010)]))
     assert 0x100F not in got2, "a jmp into a covered body must not become an entry"
 
+    # ...but a jmp into a *different* function's body is an alternate entry.
+    img3 = bytearray(b'\x90' * (END - BASE))
+    img3[0x1010 - BASE:0x1010 - BASE + 5] = (
+        b'\xe9' + ((0x1008 - 0x1015) & 0xFFFFFFFF).to_bytes(4, 'little'))
+    img3[0x1008 - BASE] = 0xC3
+    img3[0x100F - BASE] = 0xC3
+    got3 = dict(recover_functions(bytes(img3), BASE, END,
+                                  [(0x1000, 0x1010), (0x1010, 0x1020)]))
+    assert 0x1008 in got3, "cross-function jmp target was not recovered: %r" % (got3,)
+
+    # A body that neither returns nor jumps falls through, and the address it
+    # falls into must be dispatchable.
+    img4 = bytearray(b'\x90' * (END - BASE))
+    img4[0x1005 - BASE] = 0xC3
+    got4 = dict(recover_functions(bytes(img4), BASE, END, [(0x1000, 0x1005)]))
+    assert 0x1005 in got4, "fall-through target was not recovered: %r" % (got4,)
+
     # Nothing to find in an image of pure returns.
-    img3 = bytes(b'\xc3' * (END - BASE))
-    assert recover_functions(img3, BASE, END, [(0x1000, 0x1001)]) == []
+    img5 = bytes(b'\xc3' * (END - BASE))
+    assert recover_functions(img5, BASE, END, [(0x1000, 0x1001)]) == []
 
     print("recover.py self-test OK")
 

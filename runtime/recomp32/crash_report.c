@@ -10,8 +10,10 @@
 #include "crash_report.h"
 
 static recomp_region_fn g_region = NULL;
+static recomp_extra_fn  g_extra  = NULL;
 
 void recomp_set_region_describer(recomp_region_fn fn) { g_region = fn; }
+void recomp_set_extra_reporter(recomp_extra_fn fn) { g_extra = fn; }
 
 static const char* region_of(uint32_t va) {
     return g_region ? g_region(va) : "";
@@ -48,6 +50,7 @@ void recomp_report_state(const char* why) {
     dump_registers();
     dump_icall_trace();
     recomp_dump_trace(why);   /* no-op unless built with RECOMP_TRACE */
+    if (g_extra) g_extra();
     fflush(stderr);
 }
 
