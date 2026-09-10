@@ -1,5 +1,5 @@
 """
-Translator / Code Generator for XWA static recompilation.
+Translator / Code Generator for 32-bit static recompilation.
 Orchestrates the full pipeline: PE analysis -> disassembly -> lifting -> C output.
 Generates split source files, dispatch table, and function headers.
 """
@@ -10,9 +10,21 @@ import json
 import time
 from pathlib import Path
 
-from .pe_analyze import analyze_pe, build_iat_map, read_bytes_at_va, export_json
-from .disasm import Disassembler, Function
-from .lifter import Lifter
+# These three were siblings when this file was written; the tree has since been
+# split into pe/, disasm/ and lift/ and the imports never followed, so
+# `python -m tools` has been dead. Resolve them by path, the way every other
+# consumer of this toolkit does, rather than half-converting the tree to
+# packages: lift32 itself still does `from decode16 import ...`, so relative
+# imports here would only move the failure one level down.
+_TOOLS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _sub in ('pe', 'disasm', 'lift'):
+    _p = os.path.join(_TOOLS, _sub)
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from pe_analyze import analyze_pe, build_iat_map, read_bytes_at_va, export_json
+from disasm32 import Disassembler, Function
+from lift32 import Lifter
 
 
 def load_pe(filepath: str):
@@ -178,8 +190,8 @@ def generate_import_stubs(iat_map: dict, output_path: str):
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description='XWA Static Recompiler')
-    parser.add_argument('pe_file', help='Path to xwingalliance.exe')
+    parser = argparse.ArgumentParser(description='32-bit PE static recompiler')
+    parser.add_argument('pe_file', help='the 32-bit PE to lift')
     parser.add_argument('--output', '-o', default='src/game/recomp/gen',
                         help='Output directory for generated code')
     parser.add_argument('--split', type=int, default=1000,
@@ -206,7 +218,7 @@ def main():
         export_json(info, args.pe_json)
 
     if args.analyze_only:
-        from .pe_analyze import print_summary
+        from pe_analyze import print_summary
         print_summary(info)
         return
 

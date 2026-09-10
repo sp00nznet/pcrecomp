@@ -106,7 +106,7 @@ analyzeHeadless /path/to/project MyProject -import mystery.exe \
 
 ```bash
 # Full automated pipeline: analyze -> disassemble -> lift -> compile
-python -m tools --exe game.exe --all --output src/recomp/gen/
+python -m tools game.exe --all --output src/recomp/gen/
 
 # Or step by step:
 python tools/pe/pe_analyze.py game.exe --json > config/pe_analysis.json
