@@ -170,23 +170,34 @@ class Disassembler:
             return None
         return self.pe_data[offset:offset + size]
 
-    def disassemble_at(self, va: int, max_bytes: int = 4096) -> list:
-        """Disassemble instructions starting at VA."""
+    def disassemble_at(self, va: int, max_bytes: int = 4096):
+        """Yield instructions starting at VA.
+
+        A generator on purpose, and it must stay one. Every caller breaks out of
+        its loop at the first branch, ret, or known block leader -- usually
+        within a handful of instructions. Materialising the window first built
+        an Instruction, with capstone detail operands, for every one of up to
+        8 KB of decoded bytes and then threw nearly all of them away.
+
+        That was this tool's dominant cost, measured rather than guessed: ~4 ms
+        per byte of code, near-linear at O(code^1.10), which is 2.6 hours for a
+        2.4 MB image. Yielding makes each caller pay only for what it consumes.
+
+        Callers must iterate the result at most once.
+        """
         data = self.read_bytes(va, max_bytes)
         if data is None:
-            return []
+            return
 
-        instructions = []
         for insn in self.md.disasm(data, va):
-            instructions.append(Instruction(
+            yield Instruction(
                 address=insn.address,
                 size=insn.size,
                 mnemonic=insn.mnemonic,
                 op_str=insn.op_str,
                 bytes=bytes(insn.bytes),
                 operands=list(insn.operands) if insn.operands else [],
-            ))
-        return instructions
+            )
 
     def jump_table_targets(self, insn, limit: int = 256) -> list:
         """Entries of the jump table an indirect `jmp` dispatches through.

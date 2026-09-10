@@ -230,6 +230,44 @@ PURGE = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Absolute-value imports.
+#
+# A handful of KERNEL "imports" are not routines at all: the loader patches a
+# VALUE into the code stream at every site, and they arrive as OFFSET16
+# relocations rather than FAR_PTR ones. They are easy to miss, because nothing
+# calls them and a stub for them is never reached - so the immediate keeps
+# whatever was in the file, which for a chained (non-additive) fixup is the
+# offset of the NEXT site in the chain. That is a plausible-looking small
+# number, and the code using it does pointer arithmetic, so the damage is
+# silent and lands only on data big enough to need it.
+#
+# __AHINCR is the one that matters: it is how a program walks a huge pointer
+# past 64 KB. Real Win16 hands out selectors 8 apart, so __AHINCR is 8 and
+# __AHSHIFT is 3. A recomp that hands out CONSECUTIVE selectors for the tiles
+# of one allocation must report its own step instead, or every huge-pointer
+# walk lands in the wrong tile.
+SELECTOR_STEP = 1       # selector delta per 64 KB tile in the host model
+WINFLAGS = 0x0403       # WF_ENHANCED | WF_PMODE | WF_80x87, as GetWinFlags reports
+
+
+def get_value(module: str, api: str):
+    """Value for an absolute-value import, or None if it is a real routine.
+
+    Set win16.SELECTOR_STEP to the host memory model's selector step before
+    lifting; the default of 1 matches a runtime that tiles one allocation
+    across consecutive selectors.
+    """
+    key = (module or '').upper(), (api or '').upper()
+    if key == ('KERNEL', '__AHINCR'):
+        return SELECTOR_STEP
+    if key == ('KERNEL', '__AHSHIFT'):
+        return max(0, SELECTOR_STEP.bit_length() - 1)
+    if key == ('KERNEL', '__WINFLAGS'):
+        return WINFLAGS & 0xFFFF
+    return None
+
+
 def get_purge(module: str, api: str):
     """Return stack-purge bytes for a (module, api) Win16 call, or None if
     unknown (SOS/WinG and rare APIs - filled in as they are reached)."""
