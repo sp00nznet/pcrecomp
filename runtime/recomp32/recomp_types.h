@@ -79,6 +79,9 @@ extern const uint32_t recomp_dispatch_count;
 #define _st g_st
 #define _fp_top g_fp_top
 #define _fpu_cw g_fpu_cw
+/* MMX file is global too. The lifter emits _mm[n] (see lift32.MMX_REGS), so the
+ * alias has to exist alongside the others or every MMX body fails to compile. */
+#define _mm g_mm
 #define _seg_cs g_seg_cs
 #define _seg_ds g_seg_ds
 #define _seg_es g_seg_es

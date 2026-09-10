@@ -169,6 +169,41 @@ def is_8bit_hi(reg_id: int) -> bool:
     return reg_id in REG_NAMES_8H
 
 
+def op_bits(op) -> int:
+    """Operand width in bits. Capstone reports x86 operand size in bytes, for
+    registers and memory alike, so this covers both.
+
+    Shifts need it: the bit a left shift pushes into CF is bit (width - count)
+    of the original value, and the bits a double shift pulls in from its source
+    come from (width - count). Hardcoding 32 there is silently wrong on every
+    narrower operand -- `shl ax, 1` would read bit 31 of a 16-bit value and set
+    CF to 0 forever.
+    """
+    return (getattr(op, 'size', 4) or 4) * 8
+
+
+# Per-function scratch that lifted bodies assume exists. The lifter emits
+# references to these (e.g. `_flag_k = FK_CMP;` from a flag-setting instruction,
+# `recomp_cond(_flag_k, _flag_a, _flag_b, cc)` from the jcc that reads it) but it
+# cannot declare them itself -- it emits statements, not function bodies. Project
+# drivers write the function preamble, so before this existed each driver carried
+# a hand-copied list and every one of them silently went stale whenever the lifter
+# started using a new local. Declaring the contract here means the drivers ask
+# instead of remembering.
+#
+# The x87 stack (_st / _fp_top / _fpu_cw) is deliberately NOT here: it is shared
+# across calls and lives as a global in recomp_types.h.
+FUNCTION_LOCALS = (
+    'uint32_t ebp = 0;',
+    'int _fpu_cmp = 0;',
+    'uint32_t _cf = 0;',
+    'int _df = 1;',
+    'uint32_t _flag_k = FK_NONE;',
+    'uint32_t _flag_a = 0, _flag_b = 0;',
+    'uint32_t _itail_tgt = 0;',
+)
+
+
 class Lifter:
     """Lifts x86 instructions to C code using a global register model."""
 
@@ -662,7 +697,8 @@ class Lifter:
                 a = self._fmt_read(ops[0])
                 b = self._fmt_read(ops[1])
                 res = f"({a} << {b})"
-                lines.append(f"if ({b}) _cf = ((({a}) >> (32 - ({b}))) & 1u); {comment}")
+                w = op_bits(ops[0])
+                lines.append(f"if ({b}) _cf = ((({a}) >> ({w} - ({b}))) & 1u); {comment}")
                 lines.append(self._flag_capture(res, res))
                 lines.append(f"{self._fmt_write(ops[0], f'{a} << {b}')}; {comment}")
                 self._flag_state = ('or', "_flag_a, _flag_b")
@@ -694,7 +730,8 @@ class Lifter:
         elif m == 'shrd':
             if len(ops) == 3:
                 d = self._fmt_read(ops[0]); s = self._fmt_read(ops[1]); c = self._fmt_read(ops[2])
-                expr = f"(({c}) ? ((({d}) >> ({c})) | ((uint32_t)({s}) << (32 - ({c})))) : ({d}))"
+                w = op_bits(ops[0])
+                expr = f"(({c}) ? ((({d}) >> ({c})) | ((uint32_t)({s}) << ({w} - ({c})))) : ({d}))"
                 lines.append(f"if ({c}) _cf = ((({d}) >> (({c}) - 1)) & 1u); {comment}")
                 lines.append(self._flag_capture(expr, expr))
                 lines.append(f"{self._fmt_write(ops[0], expr)};")
@@ -703,8 +740,9 @@ class Lifter:
         elif m == 'shld':
             if len(ops) == 3:
                 d = self._fmt_read(ops[0]); s = self._fmt_read(ops[1]); c = self._fmt_read(ops[2])
-                expr = f"(({c}) ? ((({d}) << ({c})) | ((uint32_t)({s}) >> (32 - ({c})))) : ({d}))"
-                lines.append(f"if ({c}) _cf = ((({d}) >> (32 - ({c}))) & 1u); {comment}")
+                w = op_bits(ops[0])
+                expr = f"(({c}) ? ((({d}) << ({c})) | ((uint32_t)({s}) >> ({w} - ({c})))) : ({d}))"
+                lines.append(f"if ({c}) _cf = ((({d}) >> ({w} - ({c}))) & 1u); {comment}")
                 lines.append(self._flag_capture(expr, expr))
                 lines.append(f"{self._fmt_write(ops[0], expr)};")
                 self._flag_state = ('or', "_flag_a, _flag_b")
