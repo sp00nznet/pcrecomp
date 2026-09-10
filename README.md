@@ -28,7 +28,9 @@ pcrecomp/
                    stack-purge table) and C shim generation
     disasm/        Disassemblers (32-bit recursive descent, 16-bit table-driven,
                    x87 FPU decoder, direct call-graph scanner, large-model
-                   far-call + code/data-boundary call-graph completion)
+                   far-call + code/data-boundary call-graph completion,
+                   score_recovery.py scores a catalog against a reference and
+                   splits false positives into "split" vs "invented")
     lift/          Code lifters (x86-32 and x86-16 to readable C; lift32_cpu.py
                    is the reentrant CPU-struct model needed for hybrid builds;
                    difftest.py runs the lifted C against Unicorn and names
@@ -138,6 +140,29 @@ python tools/lift/difftest.py -v
 # against values taken from hardware
 cc -Iruntime/recomp16 runtime/recomp16/cpu_selftest.c -o selftest && ./selftest
 ```
+
+### "Did the disassembler find the real functions?"
+
+```bash
+# Score a recovered catalog against a reference -- a linker map, a PDB export,
+# or another tool's analysis. Reports precision/recall on function starts.
+python tools/disasm/score_recovery.py --reference ida_funcs.json \
+                                      --candidate functions.json
+
+# The reference can come from IDA, headless, in about a minute:
+py -3.11 tools/ida/ida_funcs.py GAME.EXE ida_funcs.json
+```
+
+A false positive is two different defects wearing one name, so when the
+reference carries function *ranges* (IDA, a PDB) the score separates them:
+**split** means the address landed inside a known function, so one function
+got entered twice -- it duplicates code in a lift. **invented** means it
+landed outside every known function, so data was probably decoded as code --
+that lifts to garbage. They need opposite fixes.
+
+A reference is only ground truth if it came from symbols. Otherwise it is a
+second opinion, and a disagreement means one of the two is wrong -- go look at
+which before quoting the number.
 
 ### "It's a 16-bit Windows / OS-2 program (NE format)"
 
