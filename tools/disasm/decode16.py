@@ -272,6 +272,23 @@ class Decoder:
         return self.pos + n <= len(self.data)
 
     def decode_one(self) -> Optional[Instruction]:
+        """Decode a single instruction, or None if none is there.
+
+        A segment does not have to end on an instruction boundary: the last
+        bytes can be padding, or data, or the tail of a jump table. Decoding
+        those reaches for operand bytes past the end and _u8 raises
+        EndOfSegment. That is the same "nothing decodable here" answer as the
+        pos >= len check below, so it is reported the same way -- callers
+        already handle None, and none of them ever caught the exception.
+        """
+        start_pos = self.pos
+        try:
+            return self._decode_one()
+        except EndOfSegment:
+            self.pos = start_pos
+            return None
+
+    def _decode_one(self) -> Optional[Instruction]:
         """Decode a single instruction at the current position."""
         if self.pos >= len(self.data):
             return None

@@ -388,6 +388,19 @@ def print_summary(ne: NEHeader):
 
     if ne.module_names:
         print(f"Imported modules: {', '.join(ne.module_names)}")
+        # ponytail: VBRUN*.DLL as the ONLY import means the segments hold VB
+        # p-code, not x86 -- an x86 lifter produces confident garbage from it.
+        # MSVBVM* (VB4/5/6) can be native, so it warns rather than concludes.
+        vb = [m for m in ne.module_names if m.upper().startswith(("VBRUN", "MSVBVM"))]
+        if vb and len(ne.module_names) == 1:
+            native = vb[0].upper().startswith("MSVBVM")
+            print(f"  !! {vb[0]} is the only imported module -- Visual Basic.")
+            print("     No KERNEL/USER/GDI means the code segments are p-code,")
+            print("     not machine code. An x86 lifter produces garbage here.")
+            print(f"     Retarget: the machine code is in {vb[0]}.DLL, which is")
+            print("     usually an ordinary NE this front end already reads.")
+            if native:
+                print("     (VB4+ can compile native -- verify before assuming.)")
         print()
 
     if ne.resident_names:

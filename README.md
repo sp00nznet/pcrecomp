@@ -27,6 +27,8 @@ pcrecomp/
                    calling them broken,
                    stdcall_argc.py derives each import's stack purge from the SDK)
     ne/            NE (16-bit New Executable) parse / disasm / call-graph,
+                   gen_segments_h.py and gen_unresolved_stubs.py close the
+                   lift -> compile -> link loop,
                    Win16 import resolution (ordinal -> API name + the PASCAL
                    stack-purge table) and C shim generation
     disasm/        Disassemblers (32-bit recursive descent, 16-bit table-driven,
@@ -34,7 +36,9 @@ pcrecomp/
                    far-call + code/data-boundary call-graph completion,
                    score_recovery.py scores a catalog against a reference and
                    splits false positives into "split" vs "invented")
-    lift/          Code lifters (x86-32 and x86-16 to readable C; lift32_cpu.py
+    lift/          Code lifters (x86-32 and x86-16 to readable C; ne_lift.py is
+                   the NE-aware 16-bit lifter -- far-call resolution, Win16
+                   import shims, x87, segment-aware memory; lift32_cpu.py
                    is the reentrant CPU-struct model needed for hybrid builds;
                    recover.py finds alternate entry points a catalog missed;
                    difftest.py / difftest16.py run the lifted C against Unicorn
@@ -54,6 +58,11 @@ pcrecomp/
     recomp32_cpu/  32-bit x86 runtime, explicit CPU struct (reentrant; pairs
                    with lift32_cpu.py, required for hybrid builds)
     recomp16/      16-bit DOS runtime (CPU state, INT handlers, HAL, SDL2)
+    win16/         16-bit Windows NE runtime: the CPU header lifted Win16 code
+                   compiles against, plus recomp_stubs.c -- the entry ring,
+                   indirect dispatch and loud-abort helpers every lifted unit
+                   references, so a fresh target LINKS on day one and stops
+                   dead at anything unimplemented
     compat/        Win32 API compatibility layers (Win32 -> SDL2 mapping)
     hybrid/        The lifted <-> real boundary: import trampoline, real->lifted
                    __thiscall trampoline, vtable routing. Lets a framework
@@ -252,6 +261,20 @@ python tools/ne/ne_xref.py GAME.EXE --imports
 # import with no hand-written shim yet
 python tools/ne/gen_win16_stubs.py GAME.DLL     --api runtime/runtime_api.h --stubs runtime/win16/win16_stubs.c     --shims runtime/win16 --guard MYGAME
 ```
+
+Then lift it. `ne_lift.py` is a library, same as the other lifters -- set
+`PREFIX` and call `lift_segment(ne, n)` per segment from your own driver:
+
+```python
+import ne_lift
+ne_lift.PREFIX = 'mygame'
+ne_lift.lift_segment(ne, seg.index)     # prints C to stdout
+```
+
+**The ordinal map is not per-project.** `KERNEL.90` is `lstrlen` in every Win16
+binary, so `win16.py` now falls back to `tools/ne/win16_imports.json` when the
+project has none of its own. Build it once with `idt_to_json.py` and every
+Win16 target sees it. It stays gitignored -- it is IDA's data, not ours.
 
 **Win16 is PASCAL, and that is the thing that bites.** The callee pops the
 arguments, so a shim that pops the wrong number does not fail at the call - it

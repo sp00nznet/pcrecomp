@@ -474,14 +474,149 @@ to `macrecomp`.
 
 ---
 
-## Not targets, and why that is worth recording
+## World Empire (1994)
 
-**World Empire (1994)** imports `VBRUN300.DLL` and nothing else, and carries 14
-relocations across 114 KB of "code". It is Visual Basic 3 p-code, not x86. An x86
-lifter produces confident garbage on it and has no way to notice. Routed to
-`vbrecomp`. The general check is cheap: **`VBRUN*.DLL` as the only imported
-module means p-code**, and one `ne_parse.py` run settles it. The same flag fires
-on the Visual Basic catalogue bundled with The Magic School Bus.
+**Repo**: sp00nznet/worldempire (private) - P0
+
+**Notable**: the first target where the x86 lives in a different file than the
+game. `EMPIRE.EXE` imports `VBRUN300.DLL` and nothing else and carries 14
+relocations across 114 KB of "code" -- Visual Basic 3 p-code, not machine code.
+The entire program is nine bytes: `call VBRUN300.100` (THUNRTMAIN) and a far
+pointer at the token stream. An x86 lifter produces confident garbage on it and
+has no way to notice.
+
+What it taught the toolbox: **VBRUN-only is a retarget signal, not a rejection.**
+`VBRUN300.DLL` is an ordinary Win16 NE -- 99 code segments, 340 KB of real x86,
+2,746 relocations, imports KERNEL/USER/GDI -- which `ne/` and `lift16` already
+read. The interpreter is the target and the p-code is its input, the same shape
+as `catz`, where the engine is a 16-bit NE DLL and the game is what it loads.
+It also means the VB3 opcode semantics never need guessing: the dispatch table
+and its handlers are x86 inside that DLL, so the interpreter is the spec.
+
+`ne_parse.py` now prints the flag and names the retarget instead of leaving it
+as folklore. It fires on the Visual Basic catalogue bundled with The Magic
+School Bus too. Later VB (4/5/6) can compile native, so `MSVBVM*` warns rather
+than concludes.
+
+**Bring-up**: `VBRUN300.DLL` lifts -- 99/99 segments, 226,480 lines of C, 14,826
+functions, 0 lift errors, 123 unhandled instructions (mostly data decoded as
+code: `? di`, `into`, `outsd`), 2,106 Win16 import call sites all resolved by
+name. It contributed three things to the toolbox:
+
+* **`decode16.decode_one` raised on a truncated instruction.** A segment does
+  not have to end on an instruction boundary, and reaching for operand bytes
+  past the end raised `EndOfSegment` -- an exception raised in one place and
+  caught in none, so it crashed the caller. `ne_decode` died on segment 1 of
+  the first real binary pointed at it. It now returns `None`, which is what the
+  `Optional[Instruction]` signature already promised and what every caller
+  already handled.
+* **`ne_lift.py` moved into `tools/lift/`.** It had been living in `catz/tools/`
+  and World Empire had no business reaching into another project's directory
+  for it. Parameterised (`PREFIX`) instead of hardcoding `catz_unreachable`.
+  catz, elfish and bangbang each still carry forks of `ne_parse`, `ne_decode`,
+  `win16` and `fpu_decode` as well; they should converge rather than drift.
+* **The Win16 ordinal map is not per-project.** Four projects each carried a
+  `win16_imports.json` and the widest was a strict superset of the other three.
+  Without one, 237 of VBRUN300's 300 imports resolved to `MODULE_OrdN` and every
+  purge lookup missed; with it, 300/300 resolve. `win16.py` now falls back to a
+  toolbox-level copy.
+
+**Builds and links.** 100 translation units compile with zero diagnostics, and
+the whole tree links into a 21 MB binary that runs. Getting from "lifts" to
+"links" cost four more toolbox fixes:
+
+* **`runtime/win16/`** -- the Win16 CPU header, upstreamed from `catz/runtime/`
+  with the project prefix neutralised to `RECOMP_`/`recomp_`, which is
+  `ne_lift.PREFIX`'s default, so lifted code compiles against it unrenamed.
+  catz's fork turned out to be a *stale* copy of `recomp16/cpu.h`: it was
+  missing `flags_adc`, `flags_sbb`, `bcd_aaa/aas/aam/aad/daa/das` and
+  `RECOMP_TICK`, all of which the lifter emits. Those are ported back from the
+  canonical header rather than rewritten -- one source of truth for the
+  semantics.
+* **`runtime/win16/recomp_stubs.c`** -- the entry ring, selector watch,
+  indirect dispatch and abort helpers that every lifted translation unit
+  references. Without them a freshly lifted target cannot link at all; with
+  them it links on day one and aborts loudly at anything unimplemented.
+* **`tools/ne/gen_segments_h.py`** and **`tools/ne/gen_unresolved_stubs.py`**,
+  both upstreamed from `catz/tools/` with the segment count and guard
+  parameterised. The stub generator was changed in one important way: catz
+  emitted `{ (void)cpu; }`, a silent return that lets the guest carry on with a
+  frame that is wrong from that point on. It now calls `recomp_unreachable`
+  and aborts, the same contract `gen_win16_stubs.py` already applies to an
+  unimplemented import. 234 of 14,731 call targets are unresolved (1.59%).
+* **A real lifter bug, found by the compiler.** `ne_lift.py` overrode the
+  shared BCD lifting with an inline expansion, and for `aam 0` it emitted
+  `_v / 0` verbatim -- undefined behaviour in C. The override dated from when
+  `lift16.py` still dropped BCD as stubs; `lift16.py` has since grown real
+  `bcd_*` helpers, and `bcd_aam` guards a zero divisor and leaves AX alone the
+  way the hardware fault does. The fix was deleting the stale override.
+
+**The purge gate is closed, and the guest runs.** The 133 missing purges were
+derived from the documented prototypes: Win16 is PASCAL, so the purge is the
+sum of the argument sizes, 2 bytes per handle/int/BOOL/UINT and 4 per
+LONG/DWORD/COLORREF/far pointer. `win16.py` now carries the argument TYPES in
+`_PROTO` and derives the byte count, so a wrong entry shows up as a wrong
+prototype instead of an unfalsifiable integer.
+
+The method was validated before it was trusted: applied to the 163 entries
+already in `PURGE`, it reproduced 162. The one disagreement was
+`USER.TRACKPOPUPMENU`, which the table gave as 14 -- **the table was wrong**.
+It takes seven arguments, not six (the fifth, `nReserved`, was missing), so the
+purge is 16; an independent scan of real call sites in VBRUN300 also read 16.
+That is exactly the drift `stdcall_argc.py`'s docstring warns about, caught
+this time because the derivation is checkable. `USER._WSPRINTF` is the one
+exception to the PASCAL rule and is set explicitly: it is `cdecl` varargs, so
+the caller cleans up and the purge is 0.
+
+With that, `gen_win16_stubs.py` exits 0 on all 300 imports.
+
+**Running it.** `gen_image.py` was upstreamed too (parameterised, and with a
+`--stack` option, because a DLL has no stack of its own -- its NE `ss:sp` is
+0:0 and the host has to map one). Note the NE header entry, seg 45:00A0, is
+`mov ax, sp; retf` -- a 4-byte helper, not LibMain. The entry that matters is
+ordinal 100, `THUNRTMAIN` at seg 45:0000, which is what EMPIRE.EXE's nine bytes
+call. From there:
+
+```
+seg045_0000  (THUNRTMAIN)
+  -> KERNEL.GLOBALHANDLE      unimplemented; stub purges, reports, returns AX=0
+seg045_002A                   init check fails
+seg045_009B
+  -> INT 21h AH=4Ch           DOS terminate -- the runtime gives up deliberately
+```
+
+Lifted 16-bit code executing a real Win16 init path and taking the documented
+failure branch because the stub told it memory setup failed. Both the trace and
+the loud-abort contract are pinned as ctest cases, so a regression in the lift,
+the image or the purge table shows up as a *different* trace rather than
+passing quietly.
+
+**Next**: a real Win16 memory manager. `GlobalAlloc`/`GlobalLock`/`GlobalHandle`
+with actual selector-backed handles is what gets past init, and that is a phase,
+not a patch -- catz's `win16_impl.c` is 106 KB for this reason.
+
+**A correction worth recording.** The first attempt at upstreaming the Win16
+runtime copied catz's `mem_layout.h` into `runtime/win16/`. That file is
+*generated* -- it had CATZ.WAD's segment bases baked in, which is both wrong for
+every other target and a section 3 violation, since it is a header reconstructed
+from a proprietary binary. It was removed and `gen_image.py` upstreamed instead.
+Generated output does not become runtime source by being copied.
+
+*Negative result, recorded so it is not retried:* the purge cannot be inferred
+from the caller's push run. Scanning back from each call site and summing
+pushes agrees with the known-purge table only ~86% of the time, and taking the
+minimum across call sites is worse (73%), not better. Contamination runs both
+ways: a nested call inside an argument list hides the earlier arguments above
+it (`call GetStockObject; push ax; call FillRect` reads as 2, not 8), while
+scanning past the start of an argument list picks up an enclosing call's
+pushes. Getting it right needs SP tracking through nested calls, which needs
+the purges being solved for. `idt_to_json.py`'s docstring already said this --
+".idt records a name per ordinal and almost never an argument size" -- and it
+is right.
+
+---
+
+## Not targets, and why that is worth recording
 
 **The OS/2 Arsenal and OS/2 Fever discs** are shareware compilations -- 10,000+
 programs, not one target. Kept as a prospecting corpus: OS/2 16-bit is NE, which
