@@ -80,11 +80,15 @@ pipeline run.
 
 | Project | What | Era | Engine/Tech | Status |
 |---------|------|-----|-------------|--------|
+| **[wholeearth](https://github.com/sp00nznet/wholeearth)** | The Electronic Whole Earth Catalog | 1988 | Macintosh HFS CD-ROM, HyperCard 1.2.2 | Format project - no PC binary on the disc; ships the classic-HFS lister, hands the stacks to `macrecomp` |
 | **[civ](https://github.com/sp00nznet/civ)** | Civilization | 1991 | 16-bit DOS / MSC 5.x | Runs! 672 functions, interactive boot/menu, 164K lines |
 | **[operationneptune](https://github.com/sp00nznet/operationneptune)** | Operation Neptune | 1991 / Win32 1998 | Borland PE32, ships its own linker map | **Plays!** CRT -> WinMain -> opening -> in the submarine |
 | **[skifree](https://github.com/sp00nznet/skifree)** | SkiFree | 1991 | Win16/Win32 (`ski32.exe`) | Playable rebuild from decompiled C, cross-platform + extras |
+| **[missileattack](https://github.com/sp00nznet/missileattack)** | Missile Attack! | 1992 | 16-bit Win16 NE, MS linker 5.14 | P0 - the 16-bit pipeline's fixture: 87 KB NE, **one** code segment, 21 KB of code, no segmentation at all |
+| **[bolo](https://github.com/sp00nznet/bolo)** | Bolo Adventures III | 1993 | 16-bit DOS, PKLITE-packed QuickBASIC | Boots & runs! 932 functions, 70K lines, EGA/DOS shimmed to SDL2; shipped `tools/unpklite.py` |
 | **[dinopark](https://github.com/sp00nznet/dinopark)** | DinoPark Tycoon | 1993 | 16-bit DOS / Borland large model | Boots! Whole game lifted (~90K lines), renders .PIC screens + .ACT dinosaurs in colour |
 | **[elfish](https://github.com/sp00nznet/elfish)** | El-Fish | 1993 | 16-bit NE + TSXLIB extender | Lifted & links - 2,236 functions, 121 segments, startup executes |
+| **[worldempire](https://github.com/sp00nznet/worldempire)** | World Empire | 1994 | Visual Basic 3 p-code over `VBRUN300.DLL` (Win16 NE) | Runs! The interpreter is the target: 99/99 segments, 14,826 functions, 226K lines, links and executes a real Win16 init path |
 | **[hellbender](https://github.com/sp00nznet/hellbender)** | Hellbender | 1996 | Terminal Reality voxel engine (Win32/MSVC) | Bring-up - lifts clean (5,262 functions, 0 errors), 507 import bridges; same toolchain as Fury³ |
 | **[fury3](https://github.com/sp00nznet/fury3)** | Fury³ | 1995 | Terminal Reality voxel engine (Win32/MSVC) | **Playable!** Flies the canyon - 1,945 functions, SDL2+imgui frontend, real joystick |
 | **[catz](https://github.com/sp00nznet/catz-recomp)** | Catz | 1996 | 16-bit NE engine DLL (PF Magic) | Runs! Win32 window, original frame loop, toys and saving work |
@@ -96,6 +100,7 @@ pipeline run.
 | **[fallout2-re](https://github.com/sp00nznet/fallout2-re)** | Fallout 2 | 1998 | Custom (Interplay) | Fork - decompilation ~complete (alexbatalov upstream) |
 | **[trespasser](https://github.com/sp00nznet/trespasser)** | Jurassic Park: Trespasser | 1998 | DreamWorks Interactive rigid-body engine (MSVC 6.0) | P0 - reconnaissance. Ships a linker map, which makes it the calibration target for function recovery |
 | **[nocturne](https://github.com/sp00nznet/nocturne)** | Nocturne | 1999 | Terminal Reality, Watcom C/C++32 | Phase 7 - 6,027 functions lift with 0 errors; real window, 42 MB image mapped, IAT dispatch, 95 of 171 imports live |
+| **[mechwarrior3-recomp](https://github.com/sp00nznet/mechwarrior3-recomp)** | MechWarrior 3 | 1999 | Zipper GOS engine (VC6 + MFC42, DirectX 6) | Compiles - 2,805 functions, 0 lift errors, 158K lines, all 7 TUs build as a static lib |
 | **[xwa](https://github.com/sp00nznet/xwa)** | X-Wing Alliance | 1999 | Custom (LucasArts) | Active - D3D11 port, concourse UI runs, 2,702 functions |
 | **[sof](https://github.com/sp00nznet/sof)** | Soldier of Fortune | 2000 | Quake II + GHOUL | Active - SDL2 port, 8 subsystems, full maps render |
 | **[gunman](https://github.com/sp00nznet/gunman)** | Gunman Chronicles | 2000 | GoldSrc (Half-Life) | Phase 2 - 3,990 functions, weapons/entities rebuilt |
@@ -110,20 +115,17 @@ including the three fixes One Must Fall: Battlegrounds forced before its
 disc would even open.
 
 **Also not public** -- same toolbox, repos still private, listed because the
-tools here carry their scars: **bolo** (Bolo Adventures III, 1993 -- shipped
-`tools/unpklite.py`, a byte-exact static PKLITE 1.15 decompressor),
-**coaster** (Roller Coaster Construction Set, 1993 -- ~560 functions, boots),
-**bob** (Microsoft Bob, 1995 -- Win16 NE + Jet/WinG, `InitInstance` runs),
-**mw3** (MechWarrior 3, 1999 -- 2,805 functions), **recoil** (1999 -- 3,490
+tools here carry their scars: **coaster** (Roller Coaster Construction Set,
+1993 -- ~560 functions, boots), **bob** (Microsoft Bob, 1995 -- Win16 NE +
+Jet/WinG, `InitInstance` runs), **recoil-recomp** (Recoil, 1999 -- 3,490
 functions) and **xvt** (X-Wing vs TIE Fighter, 1997).
 
-The first three are held back by their own generated code rather than by
+`coaster` and `bob` are held back by their own generated code rather than by
 progress: lifted C is a derivative work of the binary it came from, and every
-public repo here tracks none of it. See
+public repo here should track none of it. See
 [docs/PUBLISHING.md](docs/PUBLISHING.md) and `tools/audit_repo.py`.
 
-Still at P0, so still private: **missileattack** (Missile Attack!, 1992),
-**tim** (The Even More Incredible Machine, 1993), **msbus** (Magic School Bus:
+Still at P0, so still private: **tim** (The Even More Incredible Machine, 1993), **msbus** (Magic School Bus:
 Human Body, 1994), **tv** (Terminal Velocity, 1995), **mtm** (Monster Truck
 Madness 1+2, 1996 / 1998), **forcecommander** (Star Wars: Force Commander,
 2000), **omfbg** (One Must Fall: Battlegrounds, 2003) and **bw2** (Black &

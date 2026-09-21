@@ -121,7 +121,8 @@ segmented NE image.
 
 ## Fury³ (1995) and Hellbender (1996)
 
-**Repos**: [sp00nznet/fury3](https://github.com/sp00nznet/fury3), hellbender (private) ·
+**Repos**: [sp00nznet/fury3](https://github.com/sp00nznet/fury3),
+[sp00nznet/hellbender](https://github.com/sp00nznet/hellbender) ·
 **Engine**: Terminal Reality voxel engine, Win32/MSVC
 
 **Contributed**: `pe/stdcall_argc.py`, `runtime/recomp32/image_loader.c`, the
@@ -212,8 +213,9 @@ dumper because static unwrapping was not viable.
 
 ## Zipper GOS: Recoil (1999), MechWarrior 3 (1999), Crimson Skies (2000)
 
-**Repos**: [sp00nznet/crimsonskies](https://github.com/sp00nznet/crimsonskies);
-recoil and mw3 private ·
+**Repos**: [sp00nznet/crimsonskies](https://github.com/sp00nznet/crimsonskies),
+[sp00nznet/mechwarrior3-recomp](https://github.com/sp00nznet/mechwarrior3-recomp);
+`recoil-recomp` private ·
 **Engine**: Zipper Interactive GOS, three generations
 
 **Contributed**: `tools/ida/`, `lift/recover.py`,
@@ -291,7 +293,7 @@ toolchain in both directions and across two compilers.
 
 ## Jurassic Park: Trespasser (1998)
 
-**Repo**: private ·
+**Repo**: [sp00nznet/trespasser](https://github.com/sp00nznet/trespasser) ·
 **Original**: `setup\tpassp6.exe`, the Pentium Pro/II build. Plain MSVC 6.0 PE32, no DRM.
 
 **Contributed**: `disasm/score_recovery.py`, the E9 tail-call seeding in
@@ -309,7 +311,7 @@ before, so nobody knew.
 
 ## Nocturne (1999)
 
-**Repo**: private ·
+**Repo**: [sp00nznet/nocturne](https://github.com/sp00nznet/nocturne) ·
 **Engine**: Terminal Reality, Watcom C/C++32
 
 **Contributed**: the `VirtualSize == 0` tolerance in `pe/pe_analyze.py`, and
@@ -325,7 +327,7 @@ anything large enough to notice.
 
 ## Rise of Legends (2006)
 
-**Repo**: private ·
+**Repo**: [sp00nznet/rol](https://github.com/sp00nznet/rol) ·
 **Engine**: Big Huge Games rts2, MSVC 7.1
 
 **Notable**: The stress test. 13.25 MB, 19.2 million instructions, **25,513
@@ -450,7 +452,7 @@ Third Borland project after Operation Neptune and Gizmos & Gadgets.
 
 ## Missile Attack! (1992)
 
-**Repo**: [sp00nznet/missileattack](https://github.com/sp00nznet/missileattack) (private) *
+**Repo**: [sp00nznet/missileattack](https://github.com/sp00nznet/missileattack) ·
 **Original**: `MISSILE.EXE`, 87 KB NE shareware, **one code segment**
 
 **Notable**: the fixture for the 16-bit pipeline. 21 KB in a single segment, so
@@ -464,7 +466,7 @@ El-Fish problem at 1/100th the size.
 
 ## The Electronic Whole Earth Catalog (1988)
 
-**Repo**: [sp00nznet/wholeearth](https://github.com/sp00nznet/wholeearth) (private)
+**Repo**: [sp00nznet/wholeearth](https://github.com/sp00nznet/wholeearth)
 
 **Notable**: not a PC title at all. The disc has an Apple Partition Map and an
 HFS volume and no ISO 9660 descriptor -- Macintosh, Broderbund, the same shelf as
@@ -476,7 +478,7 @@ to `macrecomp`.
 
 ## World Empire (1994)
 
-**Repo**: sp00nznet/worldempire (private) - P0
+**Repo**: [sp00nznet/worldempire](https://github.com/sp00nznet/worldempire) ·
 
 **Notable**: the first target where the x86 lives in a different file than the
 game. `EMPIRE.EXE` imports `VBRUN300.DLL` and nothing else and carries 14
