@@ -714,7 +714,8 @@ class Lifter:
 
     def _fmem(self, insn, op, kind):
         a = self.addr_expr(insn, op); sz = op.size
-        if kind == "f":  return f"rdf32({a})" if sz == 4 else f"rdf64({a})"
+        if kind == "f":
+            return {4: f"rdf32({a})", 8: f"rdf64({a})", 10: f"rdf80({a})"}[sz]
         return {2: f"rdi16({a})", 4: f"rdi32({a})", 8: f"rdi64({a})"}[sz]
 
     def fpu(self, insn):
@@ -724,12 +725,19 @@ class Lifter:
         # An x87 register here is a `double`, and that is a deliberate model
         # choice: a real x87 register is wider than the values it holds, so
         # widening costs nothing for the loads and stores a compiler emits.
-        # It does cost something for the ones it does not. `fld tbyte` reads a
-        # genuine 80-bit extended double, `fbld`/`fbstp` read and write packed
-        # BCD, and `fldenv`/`fnstenv`/`fsave`/`frstor` move the whole 28-byte
-        # FPU environment. None of those fit, and reading eight of ten bytes as
-        # a double produces a number that looks plausible and is not.
-        if memop is not None and memop.size in (10, 28, 94, 108):
+        # It does cost something for the ones it does not. `fbld`/`fbstp` read
+        # and write packed BCD, and `fldenv`/`fnstenv`/`fsave`/`frstor` move
+        # the whole 28-byte FPU environment. Neither fits, and reading part of
+        # one as a double produces a number that looks plausible and is not.
+        #
+        # The ten-byte format does fit, through rdf80/wrf80 - it is the format
+        # the register really has, and MachStorm's runtime loads long double
+        # constants out of .data with it.
+        # fbld/fbstp take ten bytes too, but of packed BCD, so the width
+        # alone does not say which format is in front of it.
+        if memop is not None and (memop.size in (28, 94, 108)
+                                  or (memop.size == 10
+                                      and m not in ("fld", "fst", "fstp"))):
             return [_todo(insn.address, f"x87 m{memop.size * 8}: {m} {insn.op_str}")]
 
         if m in ("fld",):
@@ -759,7 +767,7 @@ class Lifter:
             pop = "; fpop(c);" if m == "fstp" else ";"
             if memop:
                 sz = memop.size; a = self.addr_expr(insn, memop)
-                st = "wrf32" if sz == 4 else "wrf64"
+                st = {4: "wrf32", 8: "wrf64", 10: "wrf80"}[sz]
                 return [f"{st}({a}, *fst(c, 0)){pop}"]
             return [f"*fst(c, {self._st_idx(ops[0])}) = *fst(c, 0){pop}"]
         if m in ("fist", "fistp"):

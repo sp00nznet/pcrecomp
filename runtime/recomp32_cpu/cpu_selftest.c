@@ -11,6 +11,7 @@
  */
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include "cpu.h"
 
 static int fails;
@@ -23,6 +24,18 @@ static void eqf(const char *what, float got, float want)
     memcpy(&g, &got, 4); memcpy(&w, &want, 4);
     if (g != w) {
         printf("FAIL %-28s got %g (0x%08X) want %g (0x%08X)\n", what, got, g, want, w);
+        fails++;
+    }
+}
+
+static void eqd(const char *what, double got, double want)
+{
+    uint64_t g, w;
+    memcpy(&g, &got, 8); memcpy(&w, &want, 8);
+    if (g != w) {
+        printf("FAIL %-28s got %.17g (0x%016llX) want %.17g (0x%016llX)
+", what,
+               got, (unsigned long long)g, want, (unsigned long long)w);
         fails++;
     }
 }
@@ -145,5 +158,45 @@ int main(void)
 
     if (fails == 0)
         printf("cpu_selftest: all checks passed\n");
+    /* ---- x87 extended, the ten-byte format ----
+     *
+     * The reference is the compiler's own long double, which on this target
+     * IS the x87 format: what it stores in ten bytes is by definition what
+     * `fstp tbyte` would have stored, and what rdf80 reads back has to be the
+     * same number a real fld would have left in the register. Checking against
+     * hand-written bit patterns would only be checking my arithmetic twice.
+     *
+     * If long double is not 80-bit here (MSVC makes it a double) there is
+     * nothing to compare against and the check says so rather than passing. */
+    if (sizeof(long double) < 10) {
+        printf("SKIP x87 m80: long double is %d bytes here, not the x87 format\n",
+               (int)sizeof(long double));
+    } else {
+        static const double vals[] = {
+            1.0, 0.5, -3.14159265358979, 1e300, -1e-300, 0.0, -0.0,
+            2147483648.0, 1.0 / 3.0,
+        };
+        unsigned k;
+        for (k = 0; k < sizeof(vals) / sizeof(vals[0]); k++) {
+            unsigned char buf[16] = {0};
+            long double ld = (long double)vals[k];
+            double back;
+            char what[64];
+
+            memcpy(buf, &ld, 10);
+            back = rdf80((uint32_t)(uintptr_t)buf);
+            sprintf(what, "rdf80 %g", vals[k]);
+            eqd(what, back, vals[k]);
+
+            memset(buf, 0xCC, sizeof buf);
+            wrf80((uint32_t)(uintptr_t)buf, vals[k]);
+            sprintf(what, "wrf80 %g", vals[k]);
+            /* Round-trip rather than a memcmp against the compiler's bytes:
+             * an unused mantissa bit in a zero or a denormal is not something
+             * hardware promises, and the value is what anything reads back. */
+            eqd(what, rdf80((uint32_t)(uintptr_t)buf), vals[k]);
+        }
+    }
+
     return fails != 0;
 }

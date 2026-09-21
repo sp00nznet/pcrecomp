@@ -356,6 +356,46 @@ static inline void   wri32(uint32_t a, double v) { int32_t i = (int32_t)nearbyin
 static inline void   wri16(uint32_t a, double v) { int16_t i = (int16_t)nearbyint(v); memcpy((void *)(uintptr_t)a, &i, 2); }
 static inline void   wri64(uint32_t a, double v) { int64_t i = (int64_t)nearbyint(v); memcpy((void *)(uintptr_t)a, &i, 8); }
 
+/* x87 extended precision, the ten-byte format `fld tbyte` reads. An x87
+ * register is modelled here as a double, which is the right trade for every
+ * load and store a compiler emits - except this one, which is the format the
+ * register really has. Reading eight of the ten bytes as a double gives a
+ * number that looks plausible and is not, so the conversion is done properly.
+ *
+ * Unlike every other float format the mantissa carries its integer bit
+ * explicitly, so the value is just the mantissa scaled: 63 bits of fraction
+ * under a bias of 16383. Rounding to a double's 53 bits is the cast's job and
+ * it rounds to nearest, which is what the hardware would do converting the
+ * same value down. */
+static inline double rdf80(uint32_t a) {
+    uint64_t m; uint16_t se; int e;
+    memcpy(&m,  (void *)(uintptr_t)a,     8);
+    memcpy(&se, (void *)(uintptr_t)(a + 8), 2);
+    e = se & 0x7FFF;
+    if (e == 0x7FFF) {
+        double v = (m << 1) ? (double)NAN : (double)INFINITY;
+        return (se & 0x8000) ? -v : v;
+    }
+    /* A zero exponent is a denormal, whose exponent is one above the encoding. */
+    return ldexp((se & 0x8000) ? -(double)m : (double)m,
+                 (e ? e : 1) - 16383 - 63);
+}
+
+static inline void wrf80(uint32_t a, double v) {
+    uint64_t m; uint16_t se; int e, sign = signbit(v);
+    if (v != v)             { m = 0xC000000000000000ULL; se = 0x7FFF; }
+    else if (isinf(v))      { m = 0x8000000000000000ULL; se = 0x7FFF; }
+    else if (v == 0.0)      { m = 0; se = 0; }
+    else {
+        double f = frexp(sign ? -v : v, &e);   /* v = f * 2^e, 0.5 <= f < 1 */
+        m = (uint64_t)ldexp(f, 64);            /* so 2^63 <= m < 2^64 */
+        se = (uint16_t)(e - 1 + 16383);
+    }
+    if (sign) se |= 0x8000;
+    memcpy((void *)(uintptr_t)a,       &m,  8);
+    memcpy((void *)(uintptr_t)(a + 8), &se, 2);
+}
+
 /* fcom/fcomp: set C3/C2/C0 (st0 vs v). Cleared C1. */
 static inline void fcompare(CPU *c, double a, double b) {
     uint32_t sw = c->fpu_sw & ~0x4700u;
