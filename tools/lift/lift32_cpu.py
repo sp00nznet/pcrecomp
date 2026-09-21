@@ -468,6 +468,29 @@ class Lifter:
             fn = "op_rol" if m == "rol" else "op_ror"
             return [self.dst_write(insn, d,
                                    f"{fn}(c, {self._read_dst(insn,d)}, {cnt}, {d.size})")]
+        if m in ("bsf", "bsr"):
+            d, src = ops[0], ops[1]
+            fn = "op_bsf" if m == "bsf" else "op_bsr"
+            return [self.dst_write(insn, d,
+                                   f"{fn}(c, {self._read_dst(insn,d)}, "
+                                   f"{self.src(insn,src)}, {d.size})")]
+        # Only the register form. The memory form addresses a bit STRING - the
+        # index can run past the operand into the next dword, so `bt [eax], 40`
+        # tests bit 8 of [eax+4] and not bit 8 of [eax] - and translating it as
+        # if the index wrapped would silently read the wrong bit. It stays a
+        # TODO until a boot reaches one.
+        if m in ("bt", "bts", "btr", "btc") and ops[0].type == X86_OP_REG:
+            d, src = ops[0], ops[1]
+            op = {"bt": 0, "bts": 1, "btr": 2, "btc": 3}[m]
+            expr = (f"op_bittest(c, {self._read_dst(insn,d)}, "
+                    f"{self.src(insn,src)}, {d.size}, {op})")
+            # `bt` only reads; the other three write the changed value back.
+            return [f"(void){expr};"] if m == "bt" else [self.dst_write(insn, d, expr)]
+        if m in ("rcl", "rcr"):
+            d = ops[0]; cnt = self.src(insn, ops[1]) if len(ops) > 1 else "1"
+            fn = "op_rcl" if m == "rcl" else "op_rcr"
+            return [self.dst_write(insn, d,
+                                   f"{fn}(c, {self._read_dst(insn,d)}, {cnt}, {d.size})")]
         if m in ("shld", "shrd"):
             d, s2 = ops[0], ops[1]
             cnt = self.src(insn, ops[2]) if len(ops) > 2 else "R8L(c->ecx)"

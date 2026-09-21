@@ -73,6 +73,39 @@ int main(void)
        op_shrd(&c, 0xF0F0F0F0u, 0x0F0F0F0Fu, 4, 4), 0xFF0F0F0Fu);
     eq("shld by 0 is identity", op_shld(&c, 0xAAAAAAAAu, 0u, 0, 4), 0xAAAAAAAAu);
 
+    /* bit scans. The flag is the whole interface - ZF says whether there was
+     * a set bit at all - and with a zero source the destination is
+     * architecturally undefined, so it must be left alone rather than given a
+     * value that code could come to depend on. Values from hardware. */
+    eq("bsf 0x12345678", op_bsf(&c, 0u, 0x12345678u, 4), 3u);
+    eq("bsr 0x12345678", op_bsr(&c, 0u, 0x12345678u, 4), 28u);
+    eq("bsr sets ZF on zero", (op_bsr(&c, 0xDEADu, 0u, 4), c.zf), 1u);
+    eq("bsr leaves dst on zero", op_bsr(&c, 0xDEADu, 0u, 4), 0xDEADu);
+    eq("bsf clears ZF otherwise", (op_bsf(&c, 0u, 1u, 4), c.zf), 0u);
+
+    /* bit test: the selected bit into CF, and the count modulo the width -
+     * which is what makes `bt eax, 33` test bit 1 and not read past. */
+    eq("bt  0x20 bit 5 -> CF", (op_bittest(&c, 0x20u, 5, 4, 0), c.cf), 1u);
+    eq("bt  does not write", op_bittest(&c, 0x20u, 5, 4, 0), 0x20u);
+    eq("bts 0x00 bit 5", op_bittest(&c, 0x00u, 5, 4, 1), 0x20u);
+    eq("btr 0x20 bit 5", op_bittest(&c, 0x20u, 5, 4, 2), 0x00u);
+    eq("btc 0x20 bit 5", op_bittest(&c, 0x20u, 5, 4, 3), 0x00u);
+    eq("bt  bit 33 is bit 1", (op_bittest(&c, 0x02u, 33, 4, 0), c.cf), 1u);
+
+    /* rotate through carry: the rotated quantity is one bit wider than the
+     * operand, so a 32-bit rcl by 4 is not the same as a rol by 4. */
+    c.cf = 0; eq("rcl 80000001,1 CF=0", op_rcl(&c, 0x80000001u, 1, 4), 0x00000002u);
+    eq("rcl 80000001,1 -> CF", c.cf, 1u);
+    c.cf = 1; eq("rcl 80000001,1 CF=1", op_rcl(&c, 0x80000001u, 1, 4), 0x00000003u);
+    c.cf = 1; eq("rcr 00000001,1 CF=1", op_rcr(&c, 0x00000001u, 1, 4), 0x80000000u);
+    c.cf = 0; eq("rcl 12345678,4", op_rcl(&c, 0x12345678u, 4, 4), 0x23456780u);
+    eq("rcl 12345678,4 -> CF", c.cf, 1u);
+    c.cf = 1; eq("rcr 12345678,4", op_rcr(&c, 0x12345678u, 4, 4), 0x11234567u);
+    c.cf = 1; eq("rcl al FF,1", op_rcl(&c, 0xFFu, 1, 1), 0xFFu);
+    /* a zero count must change no flag at all, CF included */
+    c.cf = 1; (void)op_rcl(&c, 0x12345678u, 0, 4);
+    eq("rcl by 0 keeps CF", c.cf, 1u);
+
     /* segment registers exist and are 16-bit storage */
     c.ds = 0x1234; c.es = 0xFFFF; c.gs = 0x0007;
     eq("ds", c.ds, 0x1234u);

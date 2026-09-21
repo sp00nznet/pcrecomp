@@ -305,6 +305,80 @@ static inline uint32_t op_shld(CPU *c, uint32_t d, uint32_t s, uint32_t cnt, int
     c->zf = (r == 0); c->sf = (r & sign_sz(sz)) != 0; c->pf = parity8((uint8_t)r);
     return r;
 }
+/* BSF/BSR: the index of the lowest (or highest) set bit. The flag is the
+ * whole interface - ZF says whether there WAS one - and when the source is
+ * zero the destination is architecturally undefined, so it is left alone
+ * rather than given a value that code might come to depend on. */
+static inline uint32_t op_bsf(CPU *c, uint32_t d, uint32_t s, int sz) {
+    uint32_t i, n = (uint32_t)sz * 8;
+    c->zf = (s == 0);
+    if (s == 0) return d;
+    for (i = 0; i < n; i++) if (s & (1u << i)) return i;
+    return d;
+}
+
+static inline uint32_t op_bsr(CPU *c, uint32_t d, uint32_t s, int sz) {
+    uint32_t i, n = (uint32_t)sz * 8;
+    c->zf = (s == 0);
+    if (s == 0) return d;
+    for (i = n; i-- > 0; ) if (s & (1u << i)) return i;
+    return d;
+}
+
+/* BT/BTS/BTR/BTC: the selected bit into CF, then the register form's own
+ * change to it. The count is taken modulo the operand width - which is what
+ * makes `bt eax, 33` test bit 1 and not read past the register. Only the
+ * register form is expressed here; the memory form of these addresses a bit
+ * string that can run past the operand, and no lifted site uses it. */
+static inline uint32_t op_bittest(CPU *c, uint32_t d, uint32_t bit, int sz, int op) {
+    uint32_t mask = 1u << (bit & ((uint32_t)sz * 8 - 1));
+    c->cf = (d & mask) ? 1 : 0;
+    switch (op) {
+        case 1: return d | mask;      /* bts */
+        case 2: return d & ~mask;     /* btr */
+        case 3: return d ^ mask;      /* btc */
+        default: return d;            /* bt  */
+    }
+}
+
+/* RCL/RCR rotate through CF, so the rotated quantity is one bit wider than
+ * the operand and the count is taken modulo that wider width. Writing this as
+ * a bit at a time is slower than the closed form and is the version that is
+ * obviously right, which for an instruction this rare is the better trade. */
+static inline uint32_t op_rcl(CPU *c, uint32_t d, uint32_t cnt, int sz) {
+    uint32_t n = (uint32_t)sz * 8, i;
+    uint32_t mask = (n == 32) ? 0xFFFFFFFFu : ((1u << n) - 1u);
+    cnt %= (n + 1);
+    if (cnt == 0) return d;        /* a zero count changes no flag at all */
+    for (i = 0; i < cnt; i++) {
+        uint32_t top = (d >> (n - 1)) & 1u;
+        d = ((d << 1) | c->cf) & mask;
+        c->cf = top;
+    }
+    /* OF is defined only for a count of one; hardware leaves something there
+     * for the rest and nothing may read it. */
+    if (cnt == 1) c->of = (uint32_t)(((d >> (n - 1)) & 1u) ^ c->cf);
+    return d;
+}
+
+static inline uint32_t op_rcr(CPU *c, uint32_t d, uint32_t cnt, int sz) {
+    uint32_t n = (uint32_t)sz * 8, i;
+    uint32_t mask = (n == 32) ? 0xFFFFFFFFu : ((1u << n) - 1u);
+    cnt %= (n + 1);
+    if (cnt == 0) return d;
+    /* RCR sets OF from the two top bits of the RESULT, and before the rotate
+     * rather than after - but only the count-of-one case is defined, and for
+     * that one the two are the same thing. */
+    if (cnt == 1) c->of = (uint32_t)((((d >> 1) | (c->cf << (n - 1))) >> (n - 1)) & 1u)
+                        ^ (uint32_t)((((d >> 1) | (c->cf << (n - 1))) >> (n - 2)) & 1u);
+    for (i = 0; i < cnt; i++) {
+        uint32_t bot = d & 1u;
+        d = ((d >> 1) | (c->cf << (n - 1))) & mask;
+        c->cf = bot;
+    }
+    return d;
+}
+
 static inline uint32_t op_shrd(CPU *c, uint32_t d, uint32_t s, uint32_t cnt, int sz) {
     uint32_t m = mask_sz(sz); int w = sz * 8;
     d &= m; s &= m; cnt &= 31;
