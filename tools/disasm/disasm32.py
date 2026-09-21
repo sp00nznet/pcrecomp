@@ -799,44 +799,78 @@ def drop_mid_instruction_entries(read_va, functions, code_start, code_end,
     ENDS = ("ret", "retn", "retf", "iret", "iretd")
     WINDOW = 0x2000
 
+    # No function is bigger than this, and a branch further than this is a tail
+    # call into somewhere else - which is not ours to mark.
+    REACH = 0x10000
+
     def body_instructions(addr):
-        """Walk a function's real extent, following unconditional jumps.
+        """Walk a function's real extent as a graph, not as a line.
 
         Stopping at a `jmp` was the obvious rule and is wrong: MSVC emits them
         inside a function constantly - around a loop, out of a switch arm, to a
         shared tail - and stopping there ends the walk in the middle of the
         body. `0x00768220` ends at `jmp 0x76825F` twenty-three instructions in,
         so a false entry at `0x00768279` was never reached and survived two
-        passes. Follow the jump instead, exactly as probes_as_function_body
-        does; only `ret` and an indirect jump really end a body.
+        passes.
+
+        Stopping at `ret` is wrong for exactly the same reason, and it is the
+        more common one: a `ret` ends a PATH, not a function. Any function with
+        an early exit - a guard clause, a failed check, `if (!ok) return false;`
+        - has its whole real body after the first `ret`, and a linear walk
+        never sees a byte of it.
+
+        `0x007464E0` in Mario Kart Arcade GP DX is thirteen instructions of
+        error path ending in `ret` at `0x00746516`, and a hundred more after
+        it. Three false entries sat inside the `call __security_check_cookie`
+        at `0x0074656F`, were never marked interior, survived every round, and
+        the lifter emitted a "function" whose entire body was `or byte ptr
+        [eax], al` decoded from the middle of that call's operand. It faulted
+        on the first frame the game tried to draw.
+
+        So: a worklist. Follow both edges of a conditional branch, follow an
+        unconditional one, end a path at `ret` or an indirect jump, then take
+        the next pending target. Bounded by REACH and a visited set, because
+        over-marking is the only way this can do harm - marking a real function
+        start as interior would drop it.
         """
-        va, n = addr, 0
+        pending = [addr]
         seen = set()
-        while n < 4096:
-            try:
-                code = read_va(va, min(WINDOW, code_end - va))
-            except Exception:
-                return
-            advanced = False
-            for ins in md.disasm(code, va):
-                advanced = True
-                n += 1
-                va = ins.address + ins.size
-                yield ins
-                if ins.mnemonic.split()[-1] in ENDS:
-                    return
-                if ins.mnemonic.split()[-1] == "jmp":
-                    op = ins.op_str.strip()
-                    if not op.startswith("0x"):
-                        return                      # indirect: a table or a thunk
-                    t = int(op, 16)
-                    if t in seen or not (code_start <= t < code_end):
-                        return
-                    seen.add(t)
-                    va = t
+        n = 0
+        while pending and n < 8192:
+            va = pending.pop()
+            while va is not None and n < 8192:
+                if va in seen:
                     break
-            if not advanced:
-                return
+                seen.add(va)
+                try:
+                    code = read_va(va, min(WINDOW, code_end - va))
+                except Exception:
+                    break
+                advanced = False
+                for ins in md.disasm(code, va):
+                    advanced = True
+                    n += 1
+                    va = ins.address + ins.size
+                    yield ins
+                    m = ins.mnemonic.split()[-1]
+                    if m in ENDS:
+                        va = None
+                        break
+                    # A call returns, so its target is somebody else's body but
+                    # the instruction after it is still ours.
+                    if m != "call" and m.startswith("j"):
+                        op = ins.op_str.strip()
+                        t = int(op, 16) if op.startswith("0x") else None
+                        if t is not None and addr <= t < code_end and \
+                           t - addr < REACH and t not in seen:
+                            pending.append(t)
+                        if m == "jmp":
+                            va = None    # unconditional: this path ends here
+                            break
+                    if va in seen:
+                        break
+                if not advanced:
+                    break
 
     for _ in range(max_rounds):
         interior = bytearray(max(0, code_end - code_start))
@@ -1135,6 +1169,32 @@ def demo():
     assert drop_mid_instruction_entries(_read, cat, 0x1000, 0x1000 + len(blob),
                                         verbose=False) == 0, cat
     assert len(cat) == 2, cat
+
+    # A `ret` ends a path, not a function. This is the shape that survived
+    # every round in Mario Kart: a guard clause returning early, the real body
+    # after it, and a false entry inside an instruction in that real body.
+    #
+    #   0x1000  test eax, eax
+    #   0x1002  jne  0x1006        -> the real body
+    #   0x1004  ret                -> the early exit a linear walk stops at
+    #   0x1005  nop
+    #   0x1006  fld dword [0x8E0848]   6 bytes; 0x1009 is inside it
+    #   0x100C  ret
+    early = (bytes([0x85, 0xC0]) +                          # test eax, eax
+             bytes([0x75, 0x02]) +                          # jne  0x1006
+             bytes([0xC3]) +                                # ret
+             bytes([0x90]) +                                # nop
+             bytes([0xD9, 0x05, 0x48, 0x08, 0x8E, 0x00]) +  # fld  [0x8E0848]
+             bytes([0xC3]))                                 # ret
+
+    def _read_early(va, n):
+        off = va - 0x1000
+        return early[off:off + n] if 0 <= off < len(early) else b""
+
+    cat = {0x1000: len(early), 0x1009: len(early) - 9}
+    gone = drop_mid_instruction_entries(_read_early, cat, 0x1000,
+                                        0x1000 + len(early), verbose=False)
+    assert gone == 1 and 0x1009 not in cat and 0x1000 in cat, (gone, cat)
 
     # close_dispatch_targets: a branch that leaves its own extent needs an
     # entry at the target, or the lifter emits a dispatch nothing answers.

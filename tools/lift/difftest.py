@@ -121,6 +121,38 @@ CASES = [
     Case('fpu.store-pops', bytes.fromhex('d9e8dd1f')),             # fld1; fstp qword [edi]
     Case('fpu.zero', bytes.fromhex('d9ee')),                       # fldz
 
+    # fxch has to actually exchange. Capstone reports `fxch st(1)` with BOTH
+    # registers - st(0) first - so reading its first operand gives st(0) and
+    # the swap becomes st(0) with st(0), which is nothing at all. Nothing
+    # crashes: the wrong one of two live values gets stored and the arithmetic
+    # after it stays plausible. So store the one that should have moved.
+    #
+    # fld 1.0; fld 3.0; fxch st(1); fstp qword [edi]  ->  3.0, not 1.0
+    Case('fpu.xch-1', bytes.fromhex('dd06dd4608d9c9dd1f'),
+         mem={SCRATCH: struct.pack('<dd', 1.0, 3.0)}),
+    # And at a depth greater than one, because an emitter that hardcodes st(1)
+    # passes the case above.
+    # fld 1; fld 2; fld 3; fxch st(2); fstp qword [edi]  ->  1.0
+    Case('fpu.xch-2', bytes.fromhex('dd06dd4608dd4610d9cadd1f'),
+         mem={SCRATCH: struct.pack('<ddd', 1.0, 2.0, 3.0)}),
+
+    # The popping arithmetic names its DESTINATION, unlike the non-popping
+    # form: `faddp st(1)` is st(1) = st(1) + st(0), and the result survives the
+    # pop because it was written one slot down. Written to st(0) instead it is
+    # thrown away by the very next pop, and the instruction returns the operand
+    # it was supposed to have added to.
+    #
+    # fld 1.0; fld 3.0; faddp st(1); fstp qword [edi]  ->  4.0, not 1.0
+    Case('fpu.addp-dest', bytes.fromhex('dd06dd4608dec1dd1f'),
+         mem={SCRATCH: struct.pack('<dd', 1.0, 3.0)}),
+    # fld 1; fld 2; fld 3; fmulp st(2); fstp st(0); fstp qword [edi]  ->  3.0
+    Case('fpu.mulp-dest-2', bytes.fromhex('dd06dd4608dd4610deca ddd8 dd1f'.replace(' ', '')),
+         mem={SCRATCH: struct.pack('<ddd', 1.0, 2.0, 3.0)}),
+    # fsubrp reverses the operands as well as naming the destination:
+    # fld 1.0; fld 3.0; fsubrp st(1); fstp qword [edi]  ->  3.0 - 1.0 = 2.0
+    Case('fpu.subrp-dest', bytes.fromhex('dd06dd4608dee1dd1f'),
+         mem={SCRATCH: struct.pack('<dd', 1.0, 3.0)}),
+
     # Load and store a value back unchanged: any mangling shows in memory, and
     # the stack must end where it started.
     Case('fpu.load-store', bytes.fromhex('dd06dd1f'),              # fld [esi]; fstp [edi]

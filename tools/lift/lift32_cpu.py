@@ -111,7 +111,8 @@ SSE_MNEMONICS = (
                  "ucomiss", "comiss", "ucomisd", "comisd",
                  "cvtsi2ss", "cvtsi2sd", "cvttss2si", "cvttsd2si",
                  "cvtss2si", "cvtsd2si", "cvtss2sd", "cvtsd2ss",
-                 "cvtdq2ps", "cvtps2dq", "cvttps2dq"})
+                 "cvtdq2ps", "cvtps2dq", "cvttps2dq",
+                 "cvtps2pd", "cvtpd2ps"})
     | frozenset(o + w for o in SSE_ARITH for w in ("ss", "sd", "ps", "pd"))
 )
 
@@ -720,6 +721,22 @@ class Lifter:
             return [f"fpush(c, {self._fmem(insn, memop, 'i')});"]
         if m in ("fldz",): return ["fpush(c, 0.0);"]
         if m in ("fld1",): return ["fpush(c, 1.0);"]
+        # The other five constants the 8087 carries in microcode. A compiler
+        # emits fldln2 and fldl2e for log() and exp() whenever it cannot call
+        # the CRT helper, and fldpi turns up in any code that builds a rotation
+        # - so "rare" they are not. Written to more digits than a double can
+        # hold on purpose: the value that matters is the nearest double to the
+        # real constant, not to a shortened decimal.
+        if m in ("fldpi",):
+            return ["fpush(c, 3.14159265358979323846264338327950288);"]
+        if m in ("fldl2e",):
+            return ["fpush(c, 1.44269504088896340735992468100189214);"]
+        if m in ("fldl2t",):
+            return ["fpush(c, 3.32192809488736234787031942948939018);"]
+        if m in ("fldlg2",):
+            return ["fpush(c, 0.301029995663981195213738894724493027);"]
+        if m in ("fldln2",):
+            return ["fpush(c, 0.693147180559945309417232121458176568);"]
         if m in ("fst", "fstp"):
             pop = "; fpop(c);" if m == "fstp" else ";"
             if memop:
@@ -755,12 +772,48 @@ class Lifter:
         if m in ("frndint",): return ["*fst(c, 0) = nearbyint(*fst(c, 0));"]
         if m in ("fscale",): return ["*fst(c, 0) = ldexp(*fst(c, 0), (int)*fst(c, 1));"]
         if m in ("fsincos",): return ["{ double _s=sin(*fst(c,0)), _c=cos(*fst(c,0)); *fst(c,0)=_s; fpush(c,_c); }"]
+        # The rest of the 8087's transcendental set. These are not exotic: a
+        # compiler builds log() out of `fldln2; fxch; fyl2x` and exp() out of
+        # `fldl2e; fmul; ...; f2xm1; fscale`, so a game that takes a logarithm
+        # anywhere reaches them. Each one consumes st(0) the way the manual
+        # says, which is the only part that is easy to get wrong: fyl2x pops,
+        # f2xm1 does not.
+        if m in ("fyl2x",):        # st(1) = st(1) * log2(st(0)), pop
+            return ["{ double _x = *fst(c, 0), _y = *fst(c, 1);"
+                    " fpop(c); *fst(c, 0) = _y * log2(_x); }"]
+        if m in ("fyl2xp1",):      # st(1) = st(1) * log2(st(0) + 1), pop
+            return ["{ double _x = *fst(c, 0), _y = *fst(c, 1);"
+                    " fpop(c); *fst(c, 0) = _y * log2(_x + 1.0); }"]
+        if m in ("f2xm1",):        # st(0) = 2**st(0) - 1, no pop
+            return ["*fst(c, 0) = pow(2.0, *fst(c, 0)) - 1.0;"]
+        if m in ("fprem", "fprem1"):
+            # Both leave the remainder in st(0) and do not pop. The difference
+            # is the rounding of the implied quotient - truncating for fprem,
+            # to-nearest for fprem1 - which is fmod and remainder exactly.
+            f = "fmod" if m == "fprem" else "remainder"
+            return [f"*fst(c, 0) = {f}(*fst(c, 0), *fst(c, 1));"]
+        if m in ("fxtract",):      # st(0) -> exponent, then push the mantissa
+            return ["{ int _e = 0; double _m = frexp(*fst(c, 0), &_e);"
+                    " *fst(c, 0) = (double)(_e - 1); fpush(c, _m * 2.0); }"]
+        if m in ("ftst",):         # compare st(0) with zero, flags only
+            return ["fcompare(c, *fst(c, 0), 0.0);"]
         if m in ("fxch",):
-            # Capstone spells this one with both registers - st(0) first, the
-            # one to swap with second - so the operand that matters is the
-            # last, not the first. Reading ops[0] makes every fxch a swap of
-            # st(0) with itself, which compiles, runs, and silently leaves the
-            # stack in the order the code was written to avoid.
+            # ops[-1], not ops[0]. Capstone prints `fxch st(1)` but reports it
+            # with BOTH registers, st(0) first, so ops[0] is always st(0) and
+            # the swap this emitted was st(0) with st(0) - a no-op, for every
+            # fxch in the program.
+            #
+            # It is the kind of wrong that does not look wrong: an fxch is
+            # usually followed by an fstp, so the value that gets stored is
+            # simply the other one, and the arithmetic downstream stays
+            # plausible. In Mario Kart it turned a fixed-timestep accumulator
+            # into an infinite loop - the game subtracted its step from the
+            # wrong register, the step was negative, and the guest thread never
+            # came out of the frame it was in.
+            #
+            # Found twice, independently, on two branches that reached the same
+            # line of code. Which is the argument for one toolbox and not
+            # three.
             i = self._st_idx(ops[-1]) if ops else 1
             return [f"{{ double _t = *fst(c, 0); *fst(c, 0) = *fst(c, {i}); *fst(c, {i}) = _t; }}"]
         if m in ("fadd","fsub","fsubr","fmul","fdiv","fdivr",
@@ -772,9 +825,21 @@ class Lifter:
                 src = self._fmem(insn, memop, "f"); dst = "(*fst(c, 0))"
                 expr = f"{src} {opc} {dst}" if rev else f"{dst} {opc} {src}"
                 return [f"*fst(c, 0) = {expr};"]
-            # register form: default dst st(0) when single operand
+            # register form. Which register is the DESTINATION depends on
+            # whether this pops, and capstone prints one operand for both:
+            #
+            #   fadd  st(1)   (D8 C1)  st(0) = st(0) + st(1)   dst is st(0)
+            #   faddp st(1)   (DE C1)  st(1) = st(1) + st(0)   dst is st(1)
+            #
+            # The popping forms name their destination, which is the opposite
+            # of the non-popping ones, and treating them alike wrote the result
+            # into the register the very next fpop threw away - so `faddp`
+            # returned the operand it was supposed to have added to. Forty
+            # thousand of them in one game.
             if len(ops) == 2:
                 a = self._st_idx(ops[0]); b = self._st_idx(ops[1])
+            elif pops:
+                a = self._st_idx(ops[0]) if ops else 1; b = 0
             else:
                 a = 0; b = self._st_idx(ops[0]) if ops else 1
             dst = f"(*fst(c, {a}))"; src = f"(*fst(c, {b}))"
@@ -1029,6 +1094,38 @@ class Lifter:
                                 f"sse_cvtt_i32(nearbyintf(_s.f32[{i}]));")
             return [f"{{ XMM _s = {self._xm(insn, s)}; " + " ".join(body) + " }"]
 
+        # ---- the two that change lane width ----
+        #
+        # cvtps2pd reads TWO floats - the low 64 bits - and writes two doubles.
+        # That asymmetry is the whole reason it needs its own case: reading the
+        # source with _xm() would fetch sixteen bytes for an eight-byte
+        # operand, which is a fault the moment the operand sits in the last
+        # eight bytes of a page. So the memory form reads exactly the two
+        # floats it is entitled to.
+        #
+        # Both read the source into locals before writing the destination,
+        # because `cvtps2pd xmm0, xmm0` is real code and the lanes overlap.
+        if m == "cvtps2pd":
+            n = self._xi(d)
+            if self._is_xmm(s):
+                j = self._xi(s)
+                src = f"c->xmm[{j}].f32[0], _b = c->xmm[{j}].f32[1]"
+                return [f"{{ float _a = {src};"
+                        f" c->xmm[{n}].f64[0] = _a; c->xmm[{n}].f64[1] = _b; }}"]
+            return [f"{{ uint32_t _p = {self.addr_expr(insn, s)};"
+                    f" float _a = rdf32(_p), _b = rdf32(_p + 4u);"
+                    f" c->xmm[{n}].f64[0] = _a; c->xmm[{n}].f64[1] = _b; }}"]
+
+        # cvtpd2ps is the other way: two doubles in, two floats into the low 64
+        # bits, and the top 64 bits ZEROED - which is architectural, not tidy,
+        # and code that then reads lane 2 or 3 depends on it.
+        if m == "cvtpd2ps":
+            n = self._xi(d)
+            return [f"{{ XMM _s = {self._xm(insn, s)};"
+                    f" c->xmm[{n}].f32[0] = (float)_s.f64[0];"
+                    f" c->xmm[{n}].f32[1] = (float)_s.f64[1];"
+                    f" c->xmm[{n}].i32[2] = 0; c->xmm[{n}].i32[3] = 0; }}"]
+
         return [_todo(insn.address, f"sse {m} {insn.op_str}")]
 
     def _read_dst(self, insn, op):
@@ -1236,5 +1333,50 @@ def main():
     print(f"[*] wrote {out_c} and {list_h} ({len(done)} funcs)", file=sys.stderr)
 
 
+def selftest():
+    """The x87 forms where capstone's operand list is a trap.
+
+    difftest.py runs lifted C against Unicorn, and it covers lift32.py - the
+    global-register lifter - not this one. Both of the bugs below had already
+    been found and fixed there and came back here, so this is the smallest
+    check that says so: lift the bytes and read the C.
+
+    Text assertions, because the thing being tested is a code generator and the
+    text is its output. Run it directly:  python tools/lift/lift32_cpu.py --selftest
+    """
+    lf = Lifter(None, 0x100000)
+    def emit(code):
+        insn = next(lf.md.disasm(code, 0x401000))
+        return " ".join(lf.fpu(insn))
+
+    # fxch st(N) is reported as [st(0), st(N)]: the first operand is always
+    # st(0), so an emitter reading ops[0] swaps st(0) with itself and every
+    # fxch in the program does nothing.
+    for code, want in ((b"\xd9\xc9", 1), (b"\xd9\xca", 2), (b"\xd9\xcd", 5)):
+        out = emit(code)
+        assert f"*fst(c, {want})" in out and "fst(c, 0) = *fst(c, 0)" not in out, \
+            "fxch st(%d) lifted as a no-op: %s" % (want, out)
+
+    # The popping arithmetic names its DESTINATION - `faddp st(1)` is
+    # st(1) += st(0) - which is the opposite of `fadd st(1)`, st(0) += st(1).
+    # Writing to st(0) puts the result in the slot fpop() then discards.
+    assert emit(b"\xde\xc1").startswith("*fst(c, 1) ="), \
+        "faddp st(1) writes the wrong register: " + emit(b"\xde\xc1")
+    assert emit(b"\xde\xca").startswith("*fst(c, 2) ="), \
+        "fmulp st(2) writes the wrong register: " + emit(b"\xde\xca")
+    # ...while the non-popping form still lands in st(0).
+    assert emit(b"\xd8\xc1").startswith("*fst(c, 0) ="), \
+        "fadd st(1) writes the wrong register: " + emit(b"\xd8\xc1")
+    # fsubrp st(1): st(1) = st(0) - st(1), reversed as well as redirected.
+    out = emit(b"\xde\xe1")
+    assert out.startswith("*fst(c, 1) =") and "(*fst(c, 0)) - (*fst(c, 1))" in out, \
+        "fsubrp st(1) is wrong: " + out
+
+    print("lift32_cpu x87 selftest: ok")
+
+
 if __name__ == "__main__":
-    main()
+    if "--selftest" in sys.argv:
+        selftest()
+    else:
+        main()
