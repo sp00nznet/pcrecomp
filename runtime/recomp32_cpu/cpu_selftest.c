@@ -33,8 +33,7 @@ static void eqd(const char *what, double got, double want)
     uint64_t g, w;
     memcpy(&g, &got, 8); memcpy(&w, &want, 8);
     if (g != w) {
-        printf("FAIL %-28s got %.17g (0x%016llX) want %.17g (0x%016llX)
-", what,
+        printf("FAIL %-28s got %.17g (0x%016llX) want %.17g (0x%016llX)\n", what,
                got, (unsigned long long)g, want, (unsigned long long)w);
         fails++;
     }
@@ -117,15 +116,26 @@ int main(void)
     eq("ucomiss clears af", c.af, 0u);
 
     /* min/max are "if (dst OP src) dst else src", so the second operand wins
-     * every tie. These four are the ones fmin/fmax get wrong. */
-    eqf("minss(1,2)", sse_minf(1.0f, 2.0f), 1.0f);
-    eqf("minss(2,1)", sse_minf(2.0f, 1.0f), 1.0f);
-    eqf("minss(+0,-0) is src", sse_minf(0.0f, -0.0f), -0.0f);
-    eqf("minss(-0,+0) is src", sse_minf(-0.0f, 0.0f), 0.0f);
-    eqf("minss(NaN,3) is src", sse_minf((float)NAN, 3.0f), 3.0f);
-    eqf("minss(3,NaN) is src", sse_minf(3.0f, (float)NAN), (float)NAN);
-    eqf("maxss(1,2)", sse_maxf(1.0f, 2.0f), 2.0f);
-    eqf("maxss(NaN,3) is src", sse_maxf((float)NAN, 3.0f), 3.0f);
+     * every tie. These four are the ones fmin/fmax get wrong.
+     *
+     * Through volatile, because the signed-zero pair has to be computed and
+     * not folded: given two literals MSVC recognises the ternary as a min and
+     * constant-folds it by a rule that does not keep the sign of a zero, so
+     * the check would be measuring the compiler's front end rather than the
+     * helper the lifted code actually calls. It reported +0 for both orders,
+     * which no evaluation of `(d < s) ? d : s` can produce. */
+    {
+        volatile float pz = 0.0f, nz = -0.0f, one = 1.0f, two = 2.0f,
+                       three = 3.0f, nan = (float)NAN;
+        eqf("minss(1,2)", sse_minf(one, two), 1.0f);
+        eqf("minss(2,1)", sse_minf(two, one), 1.0f);
+        eqf("minss(+0,-0) is src", sse_minf(pz, nz), -0.0f);
+        eqf("minss(-0,+0) is src", sse_minf(nz, pz), 0.0f);
+        eqf("minss(NaN,3) is src", sse_minf(nan, three), 3.0f);
+        eqf("minss(3,NaN) is src", sse_minf(three, nan), (float)NAN);
+        eqf("maxss(1,2)", sse_maxf(one, two), 2.0f);
+        eqf("maxss(NaN,3) is src", sse_maxf(nan, three), 3.0f);
+    }
 
     /* Out of range, x86 yields the integer indefinite rather than whatever a
      * C cast would have done - which is undefined and may trap. */
@@ -156,47 +166,47 @@ int main(void)
     eq("fcomi clears OF|SF|AF", (uint32_t)(c.of | c.sf | c.af), 0u);
 #undef FLAGS3
 
-    if (fails == 0)
-        printf("cpu_selftest: all checks passed\n");
     /* ---- x87 extended, the ten-byte format ----
      *
-     * The reference is the compiler's own long double, which on this target
-     * IS the x87 format: what it stores in ten bytes is by definition what
-     * `fstp tbyte` would have stored, and what rdf80 reads back has to be the
-     * same number a real fld would have left in the register. Checking against
-     * hand-written bit patterns would only be checking my arithmetic twice.
+     * The patterns are what a real x87 stores: taken from a compiler whose
+     * long double IS this format, which MSVC's is not - it makes long double
+     * a double, so comparing against it here would compare nothing. Pinning
+     * the bytes instead means the check works in the build that matters.
      *
-     * If long double is not 80-bit here (MSVC makes it a double) there is
-     * nothing to compare against and the check says so rather than passing. */
-    if (sizeof(long double) < 10) {
-        printf("SKIP x87 m80: long double is %d bytes here, not the x87 format\n",
-               (int)sizeof(long double));
-    } else {
-        static const double vals[] = {
-            1.0, 0.5, -3.14159265358979, 1e300, -1e-300, 0.0, -0.0,
-            2147483648.0, 1.0 / 3.0,
+     * Reading eight of the ten bytes as a double would give a number that
+     * looks plausible and is not, which is the whole reason these exist. */
+    {
+        static const struct { double v; uint64_t m; uint16_t se; } x87[] = {
+            { 1.0,                 0x8000000000000000ULL, 0x3FFF },
+            { 0.5,                 0x8000000000000000ULL, 0x3FFE },
+            { -3.14159265358979,   0xC90FDAA221688800ULL, 0xC000 },
+            { 1e300,               0xBF21E44003ACE000ULL, 0x43E3 },
+            { -1e-300,             0xAB70FE17C79AC800ULL, 0xBC1A },
+            { 0.0,                 0x0000000000000000ULL, 0x0000 },
+            { -0.0,                0x0000000000000000ULL, 0x8000 },
+            { 2147483648.0,        0x8000000000000000ULL, 0x401E },
+            { 1.0 / 3.0,           0xAAAAAAAAAAAAA800ULL, 0x3FFD },
         };
         unsigned k;
-        for (k = 0; k < sizeof(vals) / sizeof(vals[0]); k++) {
-            unsigned char buf[16] = {0};
-            long double ld = (long double)vals[k];
-            double back;
-            char what[64];
+        for (k = 0; k < sizeof(x87) / sizeof(x87[0]); k++) {
+            unsigned char buf[16];
+            uint64_t m; uint16_t se;
 
-            memcpy(buf, &ld, 10);
-            back = rdf80((uint32_t)(uintptr_t)buf);
-            sprintf(what, "rdf80 %g", vals[k]);
-            eqd(what, back, vals[k]);
+            memcpy(buf,     &x87[k].m,  8);
+            memcpy(buf + 8, &x87[k].se, 2);
+            eqd("fld tbyte", rdf80((uint32_t)(uintptr_t)buf), x87[k].v);
 
             memset(buf, 0xCC, sizeof buf);
-            wrf80((uint32_t)(uintptr_t)buf, vals[k]);
-            sprintf(what, "wrf80 %g", vals[k]);
-            /* Round-trip rather than a memcmp against the compiler's bytes:
-             * an unused mantissa bit in a zero or a denormal is not something
-             * hardware promises, and the value is what anything reads back. */
-            eqd(what, rdf80((uint32_t)(uintptr_t)buf), vals[k]);
+            wrf80((uint32_t)(uintptr_t)buf, x87[k].v);
+            memcpy(&m,  buf,     8);
+            memcpy(&se, buf + 8, 2);
+            eq("fstp tbyte mantissa hi", (uint32_t)(m >> 32), (uint32_t)(x87[k].m >> 32));
+            eq("fstp tbyte mantissa lo", (uint32_t)m,         (uint32_t)x87[k].m);
+            eq("fstp tbyte sign+exp",    se,                  x87[k].se);
         }
     }
 
+    if (fails == 0)
+        printf("cpu_selftest: all checks passed\n");
     return fails != 0;
 }

@@ -705,6 +705,17 @@ class Lifter:
         if m == "leave":
             return ["c->esp = c->ebp; c->ebp = pop32(c);"]
 
+        # MXCSR, the SSE control word, read and written by the CRT on the way
+        # in to set flush-to-zero. Treated exactly as fnstcw/fldcw already are:
+        # the default is reported and a write is dropped, because neither
+        # rounding modes nor FP exceptions are modelled, so there is nothing
+        # for the bits to control. If something ever compares a value it wrote
+        # against what it reads back, that will stop here and say so.
+        if m == "stmxcsr":
+            return [self.wr(insn, ops[0], "0x00001F80u")]
+        if m == "ldmxcsr":
+            return ["/* ldmxcsr ignored (no rounding modes or FP exceptions) */"]
+
         return [_todo(ea, f"{m} {insn.op_str}")]
 
     # ---- x87 FPU ----
