@@ -54,6 +54,8 @@ typedef union {
      * register by a byte count, not each lane by a bit count, so they are the
      * one SSE shift that cannot be written in terms of any wider lane. */
     uint8_t  u8[16];
+    int8_t   i8[16];
+    int64_t  i64[2];
 } XMM;
 
 typedef struct {
@@ -93,6 +95,12 @@ static inline uint32_t rd32(uint32_t a) { return *(uint32_t *)(uintptr_t)a; }
 static inline void wr8 (uint32_t a, uint8_t  v) { *(uint8_t  *)(uintptr_t)a = v; }
 static inline void wr16(uint32_t a, uint16_t v) { *(uint16_t *)(uintptr_t)a = v; }
 static inline void wr32(uint32_t a, uint32_t v) { *(uint32_t *)(uintptr_t)a = v; }
+/* movlps/movhps and friends move a lane as bits, not as a number: a double
+ * round-trip would be exact for every value except the signalling NaNs a
+ * mask-producing compare leaves behind. memcpy, because the address need
+ * not be aligned. */
+static inline uint64_t rd64(uint32_t a) { uint64_t v; memcpy(&v, (void *)(uintptr_t)a, 8); return v; }
+static inline void wr64(uint32_t a, uint64_t v) { memcpy((void *)(uintptr_t)a, &v, 8); }
 
 /* ---- EFLAGS pack/unpack (modelled bits only) ---- */
 /* `lock`-prefixed read-modify-write.
@@ -430,5 +438,15 @@ static inline double sse_maxd(double d, double s) { return (d > s) ? d : s; }
 static inline int32_t sse_cvtt_i32(double v) {
     return (v >= -2147483648.0 && v < 2147483648.0) ? (int32_t)v : (int32_t)0x80000000;
 }
+
+/* The packed integer ops that saturate rather than wrap. PADDSW and friends
+ * clamp to the lane's own range instead of carrying into the next lane, and
+ * the arithmetic has to be done a width up for the clamp to see the overflow
+ * at all - which is the whole reason these are functions and not expressions
+ * in the generated code. */
+static inline int8_t   sse_sat_i8 (int32_t v) { return v >  127 ?  127 : v < -128 ? -128 : (int8_t)v; }
+static inline int16_t  sse_sat_i16(int32_t v) { return v >  32767 ?  32767 : v < -32768 ? -32768 : (int16_t)v; }
+static inline uint8_t  sse_sat_u8 (int32_t v) { return v >  255 ?  255 : v < 0 ? 0 : (uint8_t)v; }
+static inline uint16_t sse_sat_u16(int32_t v) { return v > 65535 ? 65535 : v < 0 ? 0 : (uint16_t)v; }
 
 #endif /* PCRECOMP_CPU_H */
