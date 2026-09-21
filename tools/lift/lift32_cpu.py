@@ -100,6 +100,17 @@ SSE_MOV128 = frozenset({"movaps", "movups", "movapd", "movupd", "movdqa", "movdq
 # mistranslates string loops and MMX code into nonsense that still compiles.
 SSE_AMBIGUOUS = frozenset({"movsd", "movq", "movd", "pxor", "pand", "por", "pandn"})
 
+# psll*/psrl*/psra*: (C operator, lane width in bits, arithmetic?). pslldq and
+# psrldq are not here - they shift the register by bytes, not each lane by
+# bits, and are handled on their own.
+SSE_SHIFT = {
+    "psllw": ("<<", 16, False), "pslld": ("<<", 32, False),
+    "psllq": ("<<", 64, False),
+    "psrlw": (">>", 16, False), "psrld": (">>", 32, False),
+    "psrlq": (">>", 64, False),
+    "psraw": (">>", 16, True),  "psrad": (">>", 32, True),
+}
+
 SSE_MNEMONICS = (
     SSE_MOV128 | SSE_AMBIGUOUS | frozenset(SSE_BITWISE)
     | frozenset({"movss", "sqrtss", "sqrtsd", "minss", "maxss", "minsd", "maxsd",
@@ -107,7 +118,16 @@ SSE_MNEMONICS = (
                  "cvtsi2ss", "cvtsi2sd", "cvttss2si", "cvttsd2si",
                  "cvtss2si", "cvtsd2si", "cvtss2sd", "cvtsd2ss",
                  "cvtdq2ps", "cvtps2dq", "cvttps2dq",
-                 "cvtps2pd", "cvtpd2ps"})
+                 "cvtps2pd", "cvtpd2ps",
+                 "pextrw", "pinsrw",
+                 "unpcklpd", "unpckhpd", "unpcklps", "unpckhps",
+                 "sqrtps", "sqrtpd",
+                 "minps", "maxps", "minpd", "maxpd",
+                 "shufps", "shufpd", "pshufd",
+                 "psllw", "pslld", "psllq", "pslldq",
+                 "psrlw", "psrld", "psrlq", "psrldq",
+                 "psraw", "psrad"})
+    | frozenset(o + w for o in SSE_ARITH for w in ("ps", "pd"))
     | frozenset(o + w for o in SSE_ARITH for w in ("ss", "sd"))
 )
 
@@ -881,6 +901,43 @@ class Lifter:
             st = "wrsd" if wide else "wrss"
             return [f"{st}({self.addr_expr(insn, d)}, {rd_(insn, s)});"]
 
+        # pextrw/pinsrw: one 16-bit lane in or out, chosen by an immediate.
+        #
+        # MachStorm's C runtime reaches `pextrw eax, xmm0, 3` 26200 dispatches
+        # into its startup - it is how MSVC's SSE2 strlen finds which byte of
+        # a compare result matched. The index is masked to three bits because
+        # that is what the hardware does with it, rather than trusting the
+        # encoding to be in range.
+        if m in ("pextrw", "pinsrw"):
+            i = ops[2].imm & 7 if len(ops) > 2 else 0
+            if m == "pextrw":
+                return [self.dst_write(insn, d,
+                                       f"c->xmm[{self._xi(s)}].u16[{i}]")]
+            return [f"c->xmm[{self._xi(d)}].u16[{i}] = "
+                    f"(uint16_t)({self.src(insn, s)});"]
+
+        # unpck*: interleave lanes from the destination and the source.
+        #
+        # Through a temporary because the destination is also an input and is
+        # very often the same register as the source - MachStorm's CRT reaches
+        # `unpcklpd xmm1, xmm1` to broadcast a double into both lanes, which
+        # would read back what it had just written without one.
+        if m in ("unpcklpd", "unpckhpd", "unpcklps", "unpckhps"):
+            src = self._xm(insn, s)
+            xd = self._xi(d)
+            lo = m.endswith("lpd") or m.endswith("lps")
+            if m.endswith("pd"):
+                a, b = (0, 0) if lo else (1, 1)
+                return [f"{{ XMM _s = {src}; XMM _d = c->xmm[{xd}];"
+                        f" c->xmm[{xd}].u64[0] = _d.u64[{a}];"
+                        f" c->xmm[{xd}].u64[1] = _s.u64[{b}]; }}"]
+            i, j = (0, 1) if lo else (2, 3)
+            return [f"{{ XMM _s = {src}; XMM _d = c->xmm[{xd}];"
+                    f" c->xmm[{xd}].u32[0] = _d.u32[{i}];"
+                    f" c->xmm[{xd}].u32[1] = _s.u32[{i}];"
+                    f" c->xmm[{xd}].u32[2] = _d.u32[{j}];"
+                    f" c->xmm[{xd}].u32[3] = _s.u32[{j}]; }}"]
+
         # movd/movq: the integer-lane moves. Same asymmetry as above.
         if m == "movd":
             if self._is_xmm(d):
@@ -913,6 +970,126 @@ class Lifter:
                      f"c->xmm[{n}].u64[0] {op}= _s.u64[0];"
                      f" c->xmm[{n}].u64[1] {op}= _s.u64[1];")
             return [f"{{ XMM _s = {self._xm(insn, s)}; {lanes} }}"]
+
+        # ---- packed shifts ----
+        #
+        # `psllq xmm3, 0x20` in MachStorm's own code at 0x008f3a21. Every lane
+        # of the register moves by the same count, and the count is either an
+        # immediate or the low quadword of the source - never per-lane, which
+        # is what makes one rule cover the family.
+        #
+        # x86 saturates rather than wrapping: a count at or past the lane width
+        # zeroes the lane, where C's shift operator would be undefined. That is
+        # not an edge case here, it is how SSE code clears a register. The
+        # arithmetic forms saturate to the sign bit instead, so the guard is
+        # written as a count clamp rather than a zero.
+        if m in SSE_SHIFT:
+            lane, bits, arith = SSE_SHIFT[m]
+            xd = self._xi(d)
+            if s.type == X86_OP_IMM:
+                cnt = "unsigned _n = %uu;" % (s.imm & 0xFF)
+            else:
+                cnt = ("XMM _s = %s;"
+                       " unsigned _n = _s.u64[0] > 255u ? 255u"
+                       " : (unsigned)_s.u64[0];" % self._xm(insn, s))
+            n = 128 // bits
+            if arith:
+                body = ("for (_i = 0; _i < %d; _i++)"
+                        " c->xmm[%d].i%d[_i] >>= (_n > %du ? %du : _n);"
+                        % (n, xd, bits, bits - 1, bits - 1))
+            else:
+                body = ("for (_i = 0; _i < %d; _i++)"
+                        " c->xmm[%d].u%d[_i] = _n > %du ? 0"
+                        " : (uint%d_t)(c->xmm[%d].u%d[_i] %s _n);"
+                        % (n, xd, bits, bits - 1, bits, xd, bits, lane))
+            return [f"{{ {cnt} int _i; {body} }}"]
+
+        # pslldq/psrldq move the whole register by a byte count. Unlike every
+        # other shift here they have no lanes at all, and the count is always
+        # an immediate.
+        if m in ("pslldq", "psrldq"):
+            xd = self._xi(d)
+            k = min(s.imm & 0xFF, 16)
+            if m == "pslldq":
+                pick = "(_i >= %d) ? c->xmm[%d].u8[_i - %d] : 0" % (k, xd, k)
+            else:
+                pick = "(_i + %d < 16) ? c->xmm[%d].u8[_i + %d] : 0" % (k, xd, k)
+            return [f"{{ XMM _t; int _i;"
+                    f" for (_i = 0; _i < 16; _i++) _t.u8[_i] = {pick};"
+                    f" c->xmm[{xd}] = _t; }}"]
+
+        # shuf*/pshuf*: lanes chosen by an immediate.
+        #
+        # The first instruction MachStorm reaches in its OWN code rather than
+        # its C runtime - `shufps xmm1, xmm0, 0x55` at 0x0070d974 - and the
+        # one a 3D game uses most, because broadcasting one component of a
+        # vector across a register is how everything from a dot product to a
+        # matrix multiply is written.
+        #
+        # shufps takes its low two lanes from the destination and its high two
+        # from the source; pshufd takes all four from the source. Both read
+        # the destination, so both need the temporary.
+        if m in ("shufps", "shufpd", "pshufd"):
+            imm = ops[2].imm if len(ops) > 2 else 0
+            xd = self._xi(d)
+            if m == "shufpd":
+                sets = ("c->xmm[%d].f64[0] = _d.f64[%d];"
+                        " c->xmm[%d].f64[1] = _s.f64[%d];"
+                        % (xd, imm & 1, xd, (imm >> 1) & 1))
+            elif m == "shufps":
+                sets = " ".join(
+                    "c->xmm[%d].u32[%d] = %s.u32[%d];"
+                    % (xd, i, "_d" if i < 2 else "_s", (imm >> (2 * i)) & 3)
+                    for i in range(4)
+                )
+            else:
+                sets = " ".join(
+                    "c->xmm[%d].u32[%d] = _s.u32[%d];"
+                    % (xd, i, (imm >> (2 * i)) & 3)
+                    for i in range(4)
+                )
+            return [f"{{ XMM _s = {self._xm(insn, s)};"
+                    f" XMM _d = c->xmm[{xd}]; {sets} }}"]
+
+        # ---- packed arithmetic ----
+        #
+        # Only the scalar forms were here, which is what a game that uses SSE
+        # for one float at a time needs. MachStorm's C runtime does two at
+        # once - `mulpd xmm2, xmm1` inside its own floating point formatting -
+        # so the packed forms have to exist as well. Both lanes, or all four,
+        # through a temporary for the same reason unpck needs one: the
+        # destination is an input and may be the source.
+        if m[:-2] in SSE_ARITH and m[-2:] in ("ps", "pd"):
+            wide = m[-2:] == "pd"
+            op = SSE_ARITH[m[:-2]]
+            lane, n = ("f64", 2) if wide else ("f32", 4)
+            sets = " ".join(
+                "c->xmm[%d].%s[%d] = _d.%s[%d] %s _s.%s[%d];"
+                % (self._xi(d), lane, i, lane, i, op, lane, i)
+                for i in range(n)
+            )
+            return [f"{{ XMM _s = {self._xm(insn, s)};"
+                    f" XMM _d = c->xmm[{self._xi(d)}]; {sets} }}"]
+        if m in ("sqrtps", "sqrtpd"):
+            wide = m == "sqrtpd"
+            lane, n, fn = ("f64", 2, "sqrt") if wide else ("f32", 4, "sqrtf")
+            sets = " ".join(
+                "c->xmm[%d].%s[%d] = %s(_s.%s[%d]);"
+                % (self._xi(d), lane, i, fn, lane, i)
+                for i in range(n)
+            )
+            return [f"{{ XMM _s = {self._xm(insn, s)}; {sets} }}"]
+        if m in ("minps", "maxps", "minpd", "maxpd"):
+            wide = m.endswith("pd")
+            lane, n = ("f64", 2) if wide else ("f32", 4)
+            fn = f"sse_{m[:3]}{'d' if wide else 'f'}"
+            sets = " ".join(
+                "c->xmm[%d].%s[%d] = %s(_d.%s[%d], _s.%s[%d]);"
+                % (self._xi(d), lane, i, fn, lane, i, lane, i)
+                for i in range(n)
+            )
+            return [f"{{ XMM _s = {self._xm(insn, s)};"
+                    f" XMM _d = c->xmm[{self._xi(d)}]; {sets} }}"]
 
         # ---- scalar arithmetic ----
         if m[:-2] in SSE_ARITH and m[-2:] in ("ss", "sd"):

@@ -45,6 +45,15 @@ typedef union {
     uint32_t u32[4];
     uint64_t u64[2];
     int32_t  i32[4];
+    /* The word lanes pextrw and pinsrw address. Expressing those two through
+     * u32 and a shift works and reads like arithmetic; a lane array says what
+     * the instruction says. */
+    uint16_t u16[8];
+    int16_t  i16[8];
+    /* The byte lanes pslldq and psrldq shift through. Those two move the whole
+     * register by a byte count, not each lane by a bit count, so they are the
+     * one SSE shift that cannot be written in terms of any wider lane. */
+    uint8_t  u8[16];
 } XMM;
 
 typedef struct {
