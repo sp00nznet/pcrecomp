@@ -42,3 +42,7 @@ desktop.ini
 
 # Claude
 .claude/
+
+# IDA-derived Win16 ordinal map. Built locally by tools/ne/idt_to_json.py from
+# an IDA install; it is IDA's data, not ours to redistribute.
+tools/ne/win16_imports.json

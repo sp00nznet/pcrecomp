@@ -55,8 +55,16 @@ def _find_map():
                 return cand
         parent = os.path.dirname(here)
         if parent == here:
-            return None
+            break
         here = parent
+    # Toolbox-level fallback. The ordinal map is the same for every Win16
+    # target -- KERNEL.90 is lstrlen in all of them -- so a project should
+    # not have to carry its own copy. Four of them did, and the widest was a
+    # strict superset of the other three. Nothing is shipped here: the file is
+    # gitignored and built by idt_to_json.py from a local IDA install.
+    shared = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          'win16_imports.json')
+    return shared if os.path.exists(shared) else None
 
 
 @dataclass
@@ -455,3 +463,179 @@ PURGE.update({
     ('USER', 'UNIONRECT'):          12,   # LPRECT(4), LPCRECT(4), LPCRECT(4)
     ('USER', 'ANSINEXT'):            4,   # LPCSTR(4)
 })
+
+# ---------------------------------------------------------------------------
+# Purge derived from the documented prototype, not hand-counted.
+#
+# Win16 is PASCAL: the callee pops its arguments, so the purge is just the sum
+# of the argument sizes. Every handle, int, BOOL, UINT and WPARAM is 2 bytes;
+# every LONG, DWORD, COLORREF, LPARAM and far pointer is 4. Writing the
+# argument TYPES instead of a byte count is the whole point -- the number is
+# derived, the derivation stays readable, and a wrong entry is visible as a
+# wrong prototype rather than an unfalsifiable integer.
+#
+# Method validated before use: the same derivation was applied to the 163
+# entries already in PURGE above and reproduced 162 of them. The one
+# disagreement was TrackPopupMenu, where this table said 14 and the prototype
+# says 16 -- it takes seven arguments (the fifth, nReserved, was missing) --
+# and an independent scan of real call sites in VBRUN300.DLL also read 16.
+# That one is corrected below.
+#
+# Sources that are NOT this: guessing from call sites. That was tried (see
+# docs/PROJECTS.md) and tops out near 86%, because a nested call inside an
+# argument list hides the arguments pushed above it.
+_W, _D = 2, 4   # WORD-sized / DWORD-sized argument
+
+_PROTO = {
+    # ---- GDI ----
+    'GDI.ARC': [_W,_W,_W,_W,_W,_W,_W,_W,_W],
+    'GDI.COMBINERGN': [_W,_W,_W,_W],
+    'GDI.COPYMETAFILE': [_W,_D],
+    'GDI.CREATEBITMAP': [_W,_W,_W,_W,_D],
+    'GDI.CREATEBRUSHINDIRECT': [_D],
+    'GDI.CREATEDC': [_D,_D,_D,_D],
+    'GDI.CREATEHATCHBRUSH': [_W,_D],
+    'GDI.CREATEPENINDIRECT': [_D],
+    'GDI.CREATERECTRGN': [_W,_W,_W,_W],
+    'GDI.DELETEMETAFILE': [_W],
+    'GDI.ENUMFONTS': [_W,_D,_D,_D],
+    'GDI.ENUMMETAFILE': [_W,_W,_D,_D],
+    'GDI.ESCAPE': [_W,_W,_W,_D,_D],
+    'GDI.EXCLUDECLIPRECT': [_W,_W,_W,_W,_W],
+    'GDI.EXTTEXTOUT': [_W,_W,_W,_W,_D,_D,_W,_D],
+    'GDI.GETBITMAPBITS': [_W,_D,_D],
+    'GDI.GETBKCOLOR': [_W],
+    'GDI.GETCLIPBOX': [_W,_D],
+    'GDI.GETMETAFILEBITS': [_W],
+    'GDI.GETNEARESTCOLOR': [_W,_D],
+    'GDI.GETPIXEL': [_W,_W,_W],
+    'GDI.GETROP2': [_W],
+    'GDI.GETTEXTFACE': [_W,_W,_D],
+    'GDI.GETWINDOWORG': [_W],
+    'GDI.INTERSECTCLIPRECT': [_W,_W,_W,_W,_W],
+    'GDI.OFFSETWINDOWORG': [_W,_W,_W],
+    'GDI.PIE': [_W,_W,_W,_W,_W,_W,_W,_W,_W],
+    'GDI.PLAYMETAFILERECORD': [_W,_D,_D,_W],
+    'GDI.RESTOREDC': [_W,_W],
+    'GDI.ROUNDRECT': [_W,_W,_W,_W,_W,_W,_W],
+    'GDI.SAVEDC': [_W],
+    'GDI.SETBITMAPBITS': [_W,_D,_D],
+    'GDI.SETBRUSHORG': [_W,_W,_W],
+    'GDI.SETDIBITS': [_W,_W,_W,_W,_D,_D,_W],
+    'GDI.SETMAPMODE': [_W,_W],
+    'GDI.SETMETAFILEBITS': [_W],
+    'GDI.SETRECTRGN': [_W,_W,_W,_W,_W],
+    'GDI.SETROP2': [_W,_W],
+    'GDI.SETSTRETCHBLTMODE': [_W,_W],
+    'GDI.SETVIEWPORTEXT': [_W,_W,_W],
+    'GDI.SETVIEWPORTORG': [_W,_W,_W],
+    'GDI.SETWINDOWORG': [_W,_W,_W],
+    'GDI.UNREALIZEOBJECT': [_W],
+
+    # ---- KERNEL ----
+    'KERNEL.ACCESSRESOURCE': [_W,_W],
+    'KERNEL.ALLOCDSTOCSALIAS': [_W],
+    'KERNEL.ALLOCSELECTOR': [_W],
+    'KERNEL.FREEMODULE': [_W],
+    'KERNEL.FREESELECTOR': [_W],
+    'KERNEL.GETCODEHANDLE': [_D],
+    'KERNEL.GETCURRENTPDB': [],
+    'KERNEL.GETPROFILESTRING': [_D,_D,_D,_D,_W],
+    'KERNEL.GETSELECTORBASE': [_W],
+    'KERNEL.GETTEMPDRIVE': [_W],
+    'KERNEL.GLOBALFIX': [_W],
+    'KERNEL.GLOBALUNFIX': [_W],
+    'KERNEL.LOCALSIZE': [_W],
+    'KERNEL.PRESTOCHANGOSELECTOR': [_W,_W],
+    'KERNEL.SETERRORMODE': [_W],
+    'KERNEL.SETHANDLECOUNT': [_W],
+
+    # ---- KEYBOARD ----
+    'KEYBOARD.ANSITOOEM': [_D,_D],
+    'KEYBOARD.ANSITOOEMBUFF': [_D,_D,_W],
+    'KEYBOARD.GETKBCODEPAGE': [],
+    'KEYBOARD.OEMTOANSI': [_D,_D],
+    'KEYBOARD.OEMTOANSIBUFF': [_D,_D,_W],
+    'KEYBOARD.VKKEYSCAN': [_W],
+
+    # ---- USER ----
+    'USER.ANSILOWER': [_D],
+    'USER.ANSILOWERBUFF': [_D,_W],
+    'USER.ANSIUPPER': [_D],
+    'USER.ANSIUPPERBUFF': [_D,_W],
+    'USER.BEGINDEFERWINDOWPOS': [_W],
+    'USER.CALLWINDOWPROC': [_D,_W,_W,_W,_D],
+    'USER.CLOSECLIPBOARD': [],
+    'USER.COPYRECT': [_D,_D],
+    'USER.CREATEICON': [_W,_W,_W,_W,_W,_D,_D],
+    'USER.DEFERWINDOWPOS': [_W,_W,_W,_W,_W,_W,_W,_W],
+    'USER.DEFFRAMEPROC': [_W,_W,_W,_W,_D],
+    'USER.DEFHOOKPROC': [_W,_W,_D,_D],
+    'USER.DEFMDICHILDPROC': [_W,_W,_W,_D],
+    'USER.DESTROYCURSOR': [_W],
+    'USER.DESTROYMENU': [_W],
+    'USER.DRAWFOCUSRECT': [_W,_D],
+    'USER.DRAWICON': [_W,_W,_W,_W],
+    'USER.EMPTYCLIPBOARD': [],
+    'USER.ENDDEFERWINDOWPOS': [_W],
+    'USER.ENDMENU': [],
+    'USER.FINDWINDOW': [_D,_D],
+    'USER.GETCAPTURE': [],
+    'USER.GETCARETPOS': [_D],
+    'USER.GETCLASSINFO': [_W,_D,_D],
+    'USER.GETCLASSLONG': [_W,_W],
+    'USER.GETCLIPBOARDDATA': [_W],
+    'USER.GETDOUBLECLICKTIME': [],
+    'USER.GETKEYBOARDSTATE': [_D],
+    'USER.GETKEYSTATE': [_W],
+    'USER.GETLASTACTIVEPOPUP': [_W],
+    'USER.GETMENUSTRING': [_W,_W,_D,_W,_W],
+    'USER.GETPARENT': [_W],
+    'USER.GETSCROLLPOS': [_W,_W],
+    'USER.GETTABBEDTEXTEXTENT': [_W,_D,_W,_W,_D],
+    'USER.GETUPDATERGN': [_W,_W,_W],
+    'USER.GETWINDOW': [_W,_W],
+    'USER.GETWINDOWTASK': [_W],
+    'USER.GETWINDOWTEXT': [_W,_D,_W],
+    'USER.GETWINDOWTEXTLENGTH': [_W],
+    'USER.INSERTMENU': [_W,_W,_W,_W,_D],
+    'USER.INTERSECTRECT': [_D,_D,_D],
+    'USER.ISCHARALPHA': [_W],
+    'USER.ISCHARALPHANUMERIC': [_W],
+    'USER.ISCHILD': [_W,_W],
+    'USER.ISCLIPBOARDFORMATAVAILABLE': [_W],
+    'USER.ISRECTEMPTY': [_D],
+    'USER.ISWINDOW': [_W],
+    'USER.ISWINDOWENABLED': [_W],
+    'USER.ISZOOMED': [_W],
+    'USER.LSTRCMP': [_D,_D],
+    'USER.LSTRCMPI': [_D,_D],
+    'USER.OPENCLIPBOARD': [_W],
+    'USER.PTINRECT': [_D,_D],
+    'USER.REGISTERCLIPBOARDFORMAT': [_D],
+    'USER.REGISTERWINDOWMESSAGE': [_D],
+    'USER.REMOVEMENU': [_W,_W,_W],
+    'USER.SCREENTOCLIENT': [_W,_D],
+    'USER.SETACTIVEWINDOW': [_W],
+    'USER.SETCARETPOS': [_W,_W],
+    'USER.SETCLIPBOARDDATA': [_W,_W],
+    'USER.SETKEYBOARDSTATE': [_D],
+    'USER.SETWINDOWSHOOK': [_W,_D],
+    'USER.TABBEDTEXTOUT': [_W,_W,_W,_D,_W,_W,_D,_W],
+    'USER.TRANSLATEMDISYSACCEL': [_W,_D],
+    'USER.UNHOOKWINDOWSHOOK': [_W,_D],
+    'USER.WAITMESSAGE': [],
+    'USER.WINDOWFROMPOINT': [_D],
+
+    # Corrects an existing entry: seven arguments, not six. See the note above.
+    'USER.TRACKPOPUPMENU': [_W,_W,_W,_W,_W,_W,_D],
+}
+
+PURGE.update({tuple(k.split('.', 1)): sum(v) for k, v in _PROTO.items()})
+
+# wsprintf is the exception the PASCAL rule does not cover: it is declared
+# `int FAR cdecl wsprintf(LPSTR, LPCSTR, ...)`. A varargs callee cannot know
+# how much to pop, so the CALLER cleans up and the purge is 0. That is not a
+# missing entry or a guess -- it is the answer.
+PURGE[('USER', '_WSPRINTF')] = 0
+
