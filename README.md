@@ -20,56 +20,157 @@ This repo collects every tool, runtime, and hard-won trick from our PC static re
 
 ```
 pcrecomp/
-  tools/           Reusable analysis & transformation tools
-    pe/            PE analysis (imports, exports, sections, hashes, delay-imports,
-                   protection/DRM detection, recursive binary catalog that
-                   also names the non-PE binaries (NE/LE/MZ) instead of
-                   calling them broken,
-                   stdcall_argc.py derives each import's stack purge from the SDK)
-    ne/            NE (16-bit New Executable) parse / disasm / call-graph,
-                   gen_segments_h.py and gen_unresolved_stubs.py close the
-                   lift -> compile -> link loop,
-                   Win16 import resolution (ordinal -> API name + the PASCAL
-                   stack-purge table) and C shim generation
-    disasm/        Disassemblers (32-bit recursive descent, 16-bit table-driven,
-                   x87 FPU decoder, direct call-graph scanner, large-model
-                   far-call + code/data-boundary call-graph completion,
-                   score_recovery.py scores a catalog against a reference and
-                   splits false positives into "split" vs "invented")
-    lift/          Code lifters (x86-32 and x86-16 to readable C; ne_lift.py is
-                   the NE-aware 16-bit lifter -- far-call resolution, Win16
-                   import shims, x87, segment-aware memory; lift32_cpu.py
-                   is the reentrant CPU-struct model needed for hybrid builds;
-                   recover.py finds alternate entry points a catalog missed;
-                   difftest.py / difftest16.py run the lifted C against Unicorn
-                   and name every register, flag and byte the two disagree on)
-    classify/      Function classifiers (SDK vs custom, multi-signal, string refs)
-    ghidra/        Ghidra headless scripts (decompile, export, stats, xrefs,
-                   range disasm, function bounds)
-    ida/           IDA headless scripts (code-map export, segment probe)
-    drm/           DRM analysis (SafeDisc memory dumping, DLL injection)
-    assets/        Asset extraction (InstallShield, Wise, PK3/ZIP, BIN/ISO, CAB)
-    cpp/           C++ RE helpers (MSVC/MWerks name mangling, vtable parsing)
-    formats/       Format decoders (FIF fractal images, M20/MVB, SPAM, DAT,
-                   string tables)
-  runtime/         Drop-in runtime support for recompiled code
-    recomp32/      32-bit x86 runtime (global registers, memory model, dispatch,
-                   image loader, crash reporter)
-    recomp32_cpu/  32-bit x86 runtime, explicit CPU struct (reentrant; pairs
-                   with lift32_cpu.py, required for hybrid builds)
-    recomp16/      16-bit DOS runtime (CPU state, INT handlers, HAL, SDL2)
-    win16/         16-bit Windows NE runtime: the CPU header lifted Win16 code
-                   compiles against, plus recomp_stubs.c -- the entry ring,
-                   indirect dispatch and loud-abort helpers every lifted unit
-                   references, so a fresh target LINKS on day one and stops
-                   dead at anything unimplemented
-    compat/        Win32 API compatibility layers (Win32 -> SDL2 mapping)
-    hybrid/        The lifted <-> real boundary: import trampoline, real->lifted
-                   __thiscall trampoline, vtable routing. Lets a framework
-                   (MFC, the CRT) stay real while the app body runs recompiled
-  templates/       Starter files for new projects (CMake, .gitignore)
-  docs/            Deep dives and philosophy
+  tools/           Analysis & transformation tools (Python, a few C and Java)
+    pe/            PE: headers, imports, resources, protection, symbol recovery
+    ne/            NE (16-bit Windows / OS-2): parse, disassemble, Win16 imports,
+                   and the generators that close lift -> compile -> link
+    disasm/        Disassemblers, call graphs, and scoring a catalog
+    lift/          Lifters for x86-16, x86-32 and x86-64, whole-image drivers,
+                   and a differential tester for each
+    cpp/           C++ recovery: RTTI, vtables, name (de)mangling
+    classify/      Sorting functions: SDK vs custom, library vs game
+    ghidra/ ida/   Headless scripts for both
+    drm/           SafeDisc memory dumping
+    assets/        Installers, archives and disc images
+    formats/       Decoders for formats nobody else reads (C)
+    audit_repo.py  Is this repo safe to make public?
+  runtime/         What the lifted C compiles and links against
+    recomp16/      16-bit DOS: CPU state, INT handlers, HAL, SDL2
+    win16/         16-bit Windows NE: CPU header + link-on-day-one stubs
+    recomp32/      32-bit, global registers: memory, dispatch, loader, crash report
+    recomp32_cpu/  32-bit, explicit CPU struct (reentrant)
+    recomp64_cpu/  64-bit, explicit CPU struct, plus guest C++ exception handling
+    hybrid/        The lifted <-> real boundary, for keeping MFC or the CRT real
+    compat/        Win32 -> SDL2 mapping
+  templates/       Starter CMakeLists and .gitignore for a new project
+  docs/            Pipeline, philosophy, the hybrid boundary, publishing
 ```
+
+### The pipeline, by architecture
+
+Every target goes **analyse -> find the functions -> lift -> generate the build
+tree -> link against a runtime -> test the lift**. The tool at each step depends
+on what the binary is:
+
+| Stage | 16-bit DOS (MZ) | 16-bit Windows (NE) | 32-bit PE | 64-bit PE |
+|-------|-----------------|---------------------|-----------|-----------|
+| Analyse | `disasm/decode16` | `ne/ne_parse`, `ne/ne_xref` | `pe/pe_analyze`, `pe/catalog`, `pe/extract_imports` | same as 32-bit |
+| Find functions | `disasm/analyze`, `disasm/largemodel16` | `ne/ne_decode` (or IDA via `ida/ida_export`) | `disasm/disasm32`, `cpp/rtti`, `cpp/vtable_scan`, `lift/recover`, `disasm/seed_from_log` | an IDA catalog, closed by `lift/generate64` |
+| Lift | `lift/lift16` | `lift/ne_lift` | `lift/lift32` (global registers) or `lift/lift32_cpu` (CPU struct) | `lift/lift64_cpu` |
+| Generate the build tree | the project's own driver | `ne/gen_segments_h`, `ne/gen_unresolved_stubs`, `ne/gen_win16_stubs`, `ne/gen_image` | `python -m tools` (`lift/translator`), `lift/generate` | `lift/generate64` |
+| Runtime | `runtime/recomp16` | `runtime/win16` | `runtime/recomp32` or `recomp32_cpu`, plus `hybrid` | `runtime/recomp64_cpu` |
+| Test the lift | `lift/difftest16`, `recomp16/cpu_selftest.c` | `lift/difftest16 --ne` | `lift/difftest` (Unicorn), `recomp32_cpu/cpu_selftest.c` | `lift/difftest64` (the host CPU) |
+
+`disasm/score_recovery` scores any of the catalogs against a linker map, a PDB
+or IDA, whatever the architecture.
+
+### Every tool, one line each
+
+**Reading the binary** (`tools/pe/`)
+
+| Tool | What it does |
+|------|--------------|
+| `pe_analyze.py` | Headers, sections, imports, exports; `--json` feeds the rest of the pipeline |
+| `extract_imports.py` | Imports of one module, or the shared API surface across a whole install folder |
+| `delay_imports.py` | The delay-load table that the plain import table leaves out |
+| `analyze_sections.py` | Packing and DRM detection (SafeDisc, SecuROM, UPX, ...) |
+| `catalog.py` | Catalog every binary in a folder, naming NE/LE/MZ images rather than calling them broken |
+| `stdcall_argc.py` | Each import's stdcall stack purge, from the SDK's `_Name@N` decorations instead of a hand-typed table |
+| `rsrc.py` | List and extract `.rsrc` (bitmaps get their file header back, so they open) |
+| `map_names.py` | Names from an MSVC linker MAP; `port` carries library names onto a binary that shipped without one |
+| `debug_symbols.py` | Which source file each function came from, from surviving `__FILE__` strings |
+| `merge_names.py` | Every name source (MAP > RTTI > `__FILE__` > anything else) merged into one C-safe name per address |
+
+**Finding the functions** (`tools/disasm/`, `tools/cpp/`, `tools/lift/recover.py`)
+
+| Tool | What it does |
+|------|--------------|
+| `disasm/disasm32.py` | 32-bit recursive descent from the entry point, exports and `--seed-functions` |
+| `disasm/decode16.py` | Table-driven 16-bit decoder: resident image, one overlay, or a byte range |
+| `disasm/analyze.py` | 16-bit function boundaries (MSC 5.x patterns) and a symbol table |
+| `disasm/largemodel16.py` | Library: clips DGROUP off the code and resolves large-model far calls |
+| `disasm/fpu_decode.py` | x87 decoding for the 16-bit side |
+| `disasm/callgraph.py` | Direct callers/callees, hot functions and leaves, no Ghidra or IDA needed |
+| `disasm/seed_from_log.py` | Feed the unresolved `ICALL`/`ITAIL` targets a run printed back into the next disassembly |
+| `disasm/score_recovery.py` | Precision/recall of a catalog against a reference, false positives split into *split* and *invented* |
+| `cpp/rtti.py` | Classes, vtables, virtual methods and inheritance from MSVC RTTI; every method is a proven entry point |
+| `cpp/vtable_scan.py` | The same vtables without RTTI, found as runs of code pointers in data |
+| `lift/recover.py` | Entries a catalog missed: jmp-thunk chains, stored function pointers, alternate entries inside merged functions |
+
+**Lifting** (`tools/lift/`)
+
+| Tool | What it does |
+|------|--------------|
+| `lift16.py` | x86-16 -> C for DOS MZ; a library (`from lift16 import Lifter`) |
+| `ne_lift.py` | NE-aware x86-16 -> C: far calls through relocations, Win16 imports as `MODULE_API(cpu)`, x87, segment-aware memory |
+| `lift32.py` | x86-32 -> C against global registers (`recomp32`); a library |
+| `lift32_cpu.py` | x86-32 -> C against an explicit CPU struct, reentrant, needed for hybrid builds. x87 (80-bit operands, `fprem`, `fcmov`), MMX, packed SSE/SSE2, `lock`, bit-string ops, `bswap` |
+| `lift64_cpu.py` | x86-64 -> C: 32-bit writes zero-extend, RIP-relative operands rebuilt, 16 GPRs + 16 XMM, SSE2 packed integer, quadword string ops, `cpuid` forwarded. x87 and MMX deliberately emit `RECOMP_TODO` |
+| `translator.py` | `python -m tools`: the default 32-bit pipeline, analyse -> disassemble -> lift -> split into files |
+| `generate.py` | Fast 32-bit generation: one linear sweep, split on known boundaries |
+| `generate64.py` | Whole-PE x86-64 driver: chunked TUs, declarations, dispatch table, import map. It also finishes the catalog (below) |
+| `difftest.py` | Lifted C vs Unicorn for x86-32, every register, flag and byte compared |
+| `difftest16.py` | The same for x86-16, on raw bytes or a real NE segment (`--ne`) |
+| `difftest64.py` | Lifted C vs the **host CPU** running the original bytes (`difftest64.asm`): registers, memory operands, `lock` atomics |
+
+**Win16 NE** (`tools/ne/`, see [tools/ne/README.md](tools/ne/README.md))
+
+| Tool | What it does |
+|------|--------------|
+| `ne_parse.py` | Segments, relocations, imports, entry points; flags a VBRUN-only import list as p-code |
+| `ne_decode.py` | NE-aware disassembly with cross-segment far calls and imports resolved; `--ida-json` follows IDA's code map |
+| `ne_xref.py` | Segment call graph, clusters, import usage, `--dot` |
+| `win16.py` | Ordinal -> API name, and the PASCAL stack-purge table keyed by (MODULE, API) |
+| `idt_to_json.py` | The ordinal map, built from the `.idt` files IDA ships, with no IDA run |
+| `gen_win16_stubs.py` | Prototypes, plus a correctly purging stub for every import with no shim yet; refuses an import whose purge it does not know |
+| `gen_segments_h.py` | `segments.h` generated from the lifted definitions, so prototypes cannot drift |
+| `gen_unresolved_stubs.py` | Defines the call targets nothing lifted, as stubs that **abort** rather than return |
+| `gen_image.py` | The flat memory image and `mem_layout.h`, internal relocations applied |
+
+**Everything else**
+
+| Tool | What it does |
+|------|--------------|
+| `classify/classify_functions.py`, `combined_classify.py`, `deep_classify.py` | SDK vs custom code in a GoldSrc game: SDK names, string references, call-graph and address clustering |
+| `classify/resolve_stubs.py` | Maps `far_SSSS_XXXX` stubs to real functions and names the MSC 5.x C library |
+| `cpp/msvc_mangler.py`, `cross_mangler.py`, `mac_unmangler.py`, `parse_vtables.js` | MSVC mangling, Metrowerks (Mac) demangling and Mac -> MSVC translation, vtable parsing |
+| `ghidra/*.java` | Headless: decompile everything or by address, export functions, stats, xrefs, range disassembly, function bounds |
+| `ida/ida_funcs.py`, `ida_export.py`, `ida_xrefs.py`, `ida_probe_segs.py` | Headless: function catalog with FLIRT flags, instruction-head code map, call graph + import use + FPU density, segment probe |
+| `drm/safedisc_dump.py`, `inject_and_run.c` | Dump SafeDisc-decrypted `.text` from a running process; a version.dll injector for SafeDiscLoader2 |
+| `assets/extract_wise.py`, `isextract.py`, `extract_cab.sh`, `pk3_inspect.py`, `bin2iso.js` | Wise and InstallShield installers, CABs, PK3/ZIP, BIN/CUE -> ISO |
+| `assets/iso_peek.py` | Read an ISO's directory, locally or **over HTTP range requests**, and pull one file out without downloading the image |
+| `formats/` | FIF/FTC fractal image, M20/MVB, SPAM, DAT and string-table decoders (C) |
+| `audit_repo.py` | Game material or lifted output tracked in a repo, in HEAD or in history; see [docs/PUBLISHING.md](docs/PUBLISHING.md) |
+
+### What the 64-bit path does that the 32-bit one never needed
+
+The x86-64 lifter came in from [systemes3recomp](https://github.com/sp00nznet/systemes3recomp),
+where it runs Star Wars Battle Pods: a shipping UE3 build, 3.6M instructions,
+92,552 functions, 0 lift errors. That binary forced four things, and all of them
+live in `generate64.py` and `runtime/recomp64_cpu/`:
+
+- **The catalog is closed, not trusted.** `.pdata` is not a function list (it
+  splits functions into chunks and leaves out frameless leaves), so the catalog
+  comes from IDA and generate64 finishes it. It reads back every literal
+  target the generated C dispatches to and adds the ones that are not entries,
+  repeating until nothing new appears (6 rounds, +1,101). It sweeps the `DIR64`
+  relocations for stored pointers into `.text`, which finds the functions only
+  a vtable points at exactly, with no heuristic (+412). It takes entries from
+  `lea r64, [rip+disp]` for callbacks whose address is only ever computed
+  (+217). And it catalogs the int3-padded lone `jmp rel32` thunks that MSVC
+  emits and vtable slots point at, which IDA names only most of the time.
+- **Switch arms are reachable.** MSVC x64 computes a switch target in a
+  register. So a function with an indirect jump labels every instruction and
+  ends in a local dispatch switch. It falls back to the global dispatcher only
+  for a real cross-function tail call.
+- **Guest C++ exceptions work.** `eh64.c` walks the *guest* stack with the
+  original `.pdata`/`.xdata` and reads `__CxxFrameHandler3`'s FuncInfo. It runs
+  the catch funclet as guest code, then longjmps into the landing pad the lifter
+  emits for every function that had a handler. The throw is intercepted at
+  `_CxxThrowException`.
+- **Imports are forwarded, not reimplemented.** A Win64 guest on a Win64 host
+  shares the calling convention, so the loader puts the real function address
+  in the IAT slot. The import map generate64 emits is for reading crash trails.
 
 ## The Projects That Built This
 
@@ -85,52 +186,45 @@ pipeline run.
 | **[operationneptune](https://github.com/sp00nznet/operationneptune)** | Operation Neptune | 1991 / Win32 1998 | Borland PE32, ships its own linker map | **Plays!** CRT -> WinMain -> opening -> in the submarine |
 | **[skifree](https://github.com/sp00nznet/skifree)** | SkiFree | 1991 | Win16/Win32 (`ski32.exe`) | Playable rebuild from decompiled C, cross-platform + extras |
 | **[missileattack](https://github.com/sp00nznet/missileattack)** | Missile Attack! | 1992 | 16-bit Win16 NE, MS linker 5.14 | P0 - the 16-bit pipeline's fixture: 87 KB NE, **one** code segment, 21 KB of code, no segmentation at all |
+| **[tim](https://github.com/sp00nznet/tim)** | The Even More Incredible Machine | 1993 | Borland C++ Win16 NE | P0 - 27 code segments, imports nothing but KERNEL/USER/GDI, names its own window procs |
 | **[bolo](https://github.com/sp00nznet/bolo)** | Bolo Adventures III | 1993 | 16-bit DOS, PKLITE-packed QuickBASIC | Boots & runs! 932 functions, 70K lines, EGA/DOS shimmed to SDL2; shipped `tools/unpklite.py` |
+| **[coaster](https://github.com/sp00nznet/coaster)** | Roller Coaster Construction Set | 1993 | 16-bit DOS, Microsoft C (Code To Go) | Boots - 886 functions lifted, runs the MSC startup into `main()` and through device setup, DOS on SDL2 |
 | **[dinopark](https://github.com/sp00nznet/dinopark)** | DinoPark Tycoon | 1993 | 16-bit DOS / Borland large model | Boots! Whole game lifted (~90K lines), renders .PIC screens + .ACT dinosaurs in colour |
 | **[elfish](https://github.com/sp00nznet/elfish)** | El-Fish | 1993 | 16-bit NE + TSXLIB extender | Lifted & links - 2,236 functions, 121 segments, startup executes |
+| **[msbus](https://github.com/sp00nznet/msbus)** | The Magic School Bus Explores the Human Body | 1994 | Win16 NE, 18 binaries | P0 - ~60 KB of code driving 190 MB of content |
 | **[worldempire](https://github.com/sp00nznet/worldempire)** | World Empire | 1994 | Visual Basic 3 p-code over `VBRUN300.DLL` (Win16 NE) | Runs! The interpreter is the target: 99/99 segments, 14,826 functions, 226K lines, links and executes a real Win16 init path |
+| **[tv](https://github.com/sp00nznet/tv)** | Terminal Velocity | 1995 | Watcom C, DOS/4GW LE | P0 - P1 is building the LE/LX front end this toolbox does not have yet |
+| **[bob](https://github.com/sp00nznet/bob)** | Microsoft Bob | 1995 | Win16 NE + MFC, Jet/Access, WinG | Bring-up - all three modules lift link-clean, `InitInstance` runs Bob's real startup, frontier is inside Jet |
 | **[hellbender](https://github.com/sp00nznet/hellbender)** | Hellbender | 1996 | Terminal Reality voxel engine (Win32/MSVC) | Bring-up - lifts clean (5,262 functions, 0 errors), 507 import bridges; same toolchain as Fury³ |
 | **[fury3](https://github.com/sp00nznet/fury3)** | Fury³ | 1995 | Terminal Reality voxel engine (Win32/MSVC) | **Playable!** Flies the canyon - 1,945 functions, SDL2+imgui frontend, real joystick |
+| **[mtm](https://github.com/sp00nznet/mtm)** | Monster Truck Madness 1 + 2 | 1996 / 1998 | Terminal Reality, voxel runtime as a standalone DLL | P0 - the Fury³ engine a third time, renderer split into named DLLs |
 | **[catz](https://github.com/sp00nznet/catz-recomp)** | Catz | 1996 | 16-bit NE engine DLL (PF Magic) | Runs! Win32 window, original frame loop, toys and saving work |
 | **[encarta](https://github.com/sp00nznet/encarta)** | Encarta 97 Encyclopedia | 1996 | MFC 4.0 + proprietary | **Runs!** Whole app lifted (7,326 fns); hybrid boundary puts the app body in recompiled code - 10,242 real MFC virtual dispatches land lifted per session |
 | **[gta](https://github.com/sp00nznet/gta)** | Grand Theft Auto | 1997 | DMA "Race'n'Chase" | Builds & runs - 4,094 functions, 444K lines, runtime bringup |
 | **[pod](https://github.com/sp00nznet/pod-recomp)** | POD Gold | 1997 | Ubi Soft MMX software rasteriser | Compiles & links - 3,405 functions, 0 lift errors, 422K lines |
 | **[ejay](https://github.com/sp00nznet/ejay)** | Dance eJay 1 + 2 | 1997 | PXD Musicsoft audio engine behind a VB front end | **Plays and draws!** Decodes its intro, streams to a real sound card at 22,050 Hz and animates its cursor - out of recompiled 16-bit code |
+| **[xvt](https://github.com/sp00nznet/xvt)** | X-Wing vs TIE Fighter + Balance of Power | 1997 | Totally Games (the X-Wing Alliance engine's predecessor) | Boots to a window - 1,790 functions, the guest CRT runs into `WinMain` and messages dispatch into recompiled code; DirectDraw next |
 | **[fallout1-re](https://github.com/sp00nznet/fallout1-re)** | Fallout | 1997 | Custom (Interplay) | Fork - native + HTML5 web port, multiplayer |
 | **[fallout2-re](https://github.com/sp00nznet/fallout2-re)** | Fallout 2 | 1998 | Custom (Interplay) | Fork - decompilation ~complete (alexbatalov upstream) |
 | **[trespasser](https://github.com/sp00nznet/trespasser)** | Jurassic Park: Trespasser | 1998 | DreamWorks Interactive rigid-body engine (MSVC 6.0) | P0 - reconnaissance. Ships a linker map, which makes it the calibration target for function recovery |
 | **[nocturne](https://github.com/sp00nznet/nocturne)** | Nocturne | 1999 | Terminal Reality, Watcom C/C++32 | Phase 7 - 6,027 functions lift with 0 errors; real window, 42 MB image mapped, IAT dispatch, 95 of 171 imports live |
 | **[mechwarrior3-recomp](https://github.com/sp00nznet/mechwarrior3-recomp)** | MechWarrior 3 | 1999 | Zipper GOS engine (VC6 + MFC42, DirectX 6) | Compiles - 2,805 functions, 0 lift errors, 158K lines, all 7 TUs build as a static lib |
+| **[recoil-recomp](https://github.com/sp00nznet/recoil-recomp)** | Recoil | 1999 | Zipper GOS engine (VC6 + MFC42) | Compiles - 3,490 functions, 0 lift errors, 321K lines, 8/8 TUs build |
 | **[xwa](https://github.com/sp00nznet/xwa)** | X-Wing Alliance | 1999 | Custom (LucasArts) | Active - D3D11 port, concourse UI runs, 2,702 functions |
 | **[sof](https://github.com/sp00nznet/sof)** | Soldier of Fortune | 2000 | Quake II + GHOUL | Active - SDL2 port, 8 subsystems, full maps render |
 | **[gunman](https://github.com/sp00nznet/gunman)** | Gunman Chronicles | 2000 | GoldSrc (Half-Life) | Phase 2 - 3,990 functions, weapons/entities rebuilt |
 | **[heavymetal](https://github.com/sp00nznet/heavymetal)** | Heavy Metal: FAKK2 | 2000 | id Tech 3 + UberTools | Foundation - 57 source files, core systems scaffolded |
 | **[crimsonskies](https://github.com/sp00nznet/crimsonskies)** | Crimson Skies | 2000 | Zipper GOS engine | Compiles & links - 6,232 functions, 826K lines, runtime bringup |
+| **[forcecommander](https://github.com/sp00nznet/forcecommander)** | Star Wars: Force Commander | 2000 | LucasArts Ronin engine (MSVC 6) | **In game!** The campaign's briefing room renders in 3D - 39,038 functions, 10.7M lines, 0 lift errors |
 | **[bw](https://github.com/sp00nznet/bw)** | Black & White | 2001 | Lionhead custom | Active - all 569 types done, 10 Hz game loop runs |
+| **[omfbg](https://github.com/sp00nznet/omfbg)** | One Must Fall: Battlegrounds | 2003 | Diversions Entertainment, C++ module DLLs | P0 - 10,374 mangled C++ exports name the engine; SafeDisc covers 1% of the code |
+| **[bw2](https://github.com/sp00nznet/bw2)** | Black & White 2 | 2005 | Lionhead custom | P0 partial - `white.exe` (21.7 MB, the largest target yet) not extracted from the discs |
 | **[rol](https://github.com/sp00nznet/rol)** | Rise of Nations: Rise of Legends | 2006 | Big Huge Games rts2 (MSVC 7.1) | Phase 3 - the largest binary this toolchain has faced: 13.25 MB, 25,513 vtable-only functions, no RTTI |
 
 Every row above links to a repo that is actually there. See
 [docs/PROJECTS.md](docs/PROJECTS.md) for what each one taught the toolbox,
 including the three fixes One Must Fall: Battlegrounds forced before its
 disc would even open.
-
-**Also not public** -- same toolbox, repos still private, listed because the
-tools here carry their scars: **coaster** (Roller Coaster Construction Set,
-1993 -- ~560 functions, boots), **bob** (Microsoft Bob, 1995 -- Win16 NE +
-Jet/WinG, `InitInstance` runs), **recoil-recomp** (Recoil, 1999 -- 3,490
-functions) and **xvt** (X-Wing vs TIE Fighter, 1997).
-
-`coaster` and `bob` are held back by their own generated code rather than by
-progress: lifted C is a derivative work of the binary it came from, and every
-public repo here should track none of it. See
-[docs/PUBLISHING.md](docs/PUBLISHING.md) and `tools/audit_repo.py`.
-
-Still at P0, so still private: **tim** (The Even More Incredible Machine, 1993), **msbus** (Magic School Bus:
-Human Body, 1994), **tv** (Terminal Velocity, 1995), **mtm** (Monster Truck
-Madness 1+2, 1996 / 1998), **forcecommander** (Star Wars: Force Commander,
-2000), **omfbg** (One Must Fall: Battlegrounds, 2003) and **bw2** (Black &
-White 2, 2005). Each is in [docs/PROJECTS.md](docs/PROJECTS.md) with what it
-cost the toolbox.
 
 ### Sibling toolboxes
 
@@ -144,6 +238,10 @@ submodules:
   ported across and what is queued next.
 - **[macrecomp](https://github.com/sp00nznet/macrecomp)** -- 68k Macintosh,
   A-trap dispatch and a QuickDraw/Toolbox HAL.
+- **[systemes3recomp](https://github.com/sp00nznet/systemes3recomp)** -- Sega
+  System ES3 arcade, which is Windows on x86-64. The 64-bit lifter, its runtime
+  and difftest64 were written there against Star Wars Battle Pods and merged
+  into this repo; see [the 64-bit path](#what-the-64-bit-path-does-that-the-32-bit-one-never-needed).
 
 ## Quick Start
 
@@ -207,7 +305,7 @@ python tools/disasm/analyze.py GAME.EXE -symbols work/symbols.toml
 #
 # Lifting is a library too, same as the 32-bit side: `from lift16 import Lifter`.
 # Copy a project's driver to start -- dinopark/tools/lift_full.py (DOS MZ,
-# large model) or elfish/tools/ne_lift.py (NE, segmented).
+# large model). For NE, tools/lift/ne_lift.py is in this repo; see below.
 ```
 
 ### "Did the lifter get the semantics right?"
@@ -286,10 +384,60 @@ entirely, in code that is fine. `tools/ne/win16.py` carries the accumulated
 purge table keyed by (MODULE, API); `gen_win16_stubs.py` fails rather than
 generating a stub for an import that has no entry in it.
 
-Names come from IDA, which ships the Win16 ordinal maps. Export them once with
-`tools/ida/ida_export.py`-style extraction into `work/win16_imports.json` and
-`win16.py` finds it by walking up from the project root; without it, imports
-resolve to `MODULE_OrdN` and the purge lookups all miss.
+Names come from IDA, which ships the Win16 ordinal maps as `.idt` files, so no
+IDA run is needed. `win16.py` looks for `work/win16_imports.json`, then
+`analysis/win16_imports.json`, walking up from the project root, then falls
+back to `tools/ne/win16_imports.json`. Without any of them, imports resolve to
+`MODULE_OrdN` and the purge lookups all miss:
+
+```bash
+python tools/ne/idt_to_json.py --ida "C:/Program Files/IDA Professional 9.1" \
+                               -o tools/ne/win16_imports.json
+```
+
+Then close the lift -> compile -> link loop. Each of these is generated from
+the target or from the lifted sources, so none of them is committed:
+
+```bash
+python tools/ne/gen_segments_h.py --src work/src --out runtime/segments.h --ne GAME.DLL
+python tools/ne/gen_unresolved_stubs.py --src work/src --out work/src/_unresolved_stubs.c
+python tools/ne/gen_image.py GAME.DLL --image work/mem_image.bin --header work/runtime/mem_layout.h
+```
+
+Link against `runtime/win16/`: `cpu.h` plus `recomp_stubs.c`, which gets a
+fresh target from "compiles" to "links" on day one and aborts loudly at the
+first thing that is not implemented.
+
+### "It's a 64-bit exe"
+
+```bash
+# 1. A function catalog from a real disassembler, one "0xADDR size name" per
+#    line. .pdata is NOT one (see "the 64-bit path" above).
+# 2. Lift the whole image into a build tree. The catalog is closed here:
+#    dispatch targets, stored code pointers, lea-computed callbacks, jmp thunks.
+py -3.11 tools/lift/generate64.py game.exe funcs.txt build/gen --split 400
+
+# One function, to read what the lifter makes of it
+py -3.11 tools/lift/lift64_cpu.py game.exe funcs.txt out.c 0x140001000
+
+# Check the lifter against the host CPU, on instructions taken from THIS
+# binary plus hand-picked edge cases. Needs MSVC x64 (ml64 + cl).
+py -3.11 tools/lift/difftest64.py game.exe funcs.txt --count 2000
+```
+
+The generated C compiles against `runtime/recomp64_cpu/cpu64.h`. Add `eh64.c`
+when the guest uses C++ exceptions -- a UE3 build does, for every "failed to
+find object".
+
+### "Is this repo safe to make public?"
+
+```bash
+# Game files or lifted C tracked anywhere, including in history
+python tools/audit_repo.py ../myproject
+```
+
+[docs/PUBLISHING.md](docs/PUBLISHING.md) says what to do about what it finds,
+including how to strip history with `git-filter-repo`.
 
 ### "The exe has SafeDisc DRM"
 
@@ -335,8 +483,10 @@ python tools/ne/ne_decode.py GAME.EXE --ida-json code_map.json
 - `capstone` - disassembly engine. Required.
 - `pefile` - PE parsing. Optional; there is a pure-struct fallback.
 - `lief` - advanced binary analysis. Optional.
-- `unicorn` - the reference x86 that `lift/difftest.py` checks the lifted C
-  against. Only needed to run the differential tests.
+- `unicorn` - the reference x86 that `lift/difftest.py` and `difftest16.py`
+  check the lifted C against. Only needed to run the differential tests.
+  `difftest64.py` needs no emulator: the reference is the host CPU, built with
+  MSVC x64 (`ml64` + `cl`).
 
 **For Ghidra scripts:** Ghidra 11.0+
 
@@ -360,7 +510,10 @@ pip install capstone pefile lief unicorn
      driven by `lift/translator.py`). Write your own `run_lift.py` when the
      defaults stop fitting.
    - **16-bit DOS**: `decode16` -> `analyze` -> `lift16` (with DOS compat runtime)
-   - **16-bit Windows/OS-2 (NE)**: `ne/ne_parse` -> `ne/ne_decode` -> `lift16` (see `tools/ne/README.md`)
+   - **16-bit Windows/OS-2 (NE)**: `ne/ne_parse` -> `ne/ne_decode` -> `lift/ne_lift`
+     -> `ne/gen_*` -> `runtime/win16` (see `tools/ne/README.md`)
+   - **64-bit PE**: IDA catalog -> `lift/generate64` -> `runtime/recomp64_cpu`,
+     checked with `lift/difftest64`
    - **GoldSrc/SDK game**: `DecompileAll.java` -> `combined_classify.py` (SDK separation)
    - **C++ heavy**: `GhidraStats.java` + `msvc_mangler.py` + `parse_vtables.js`
 4. **Score the recovery before you lift it.** `disasm/score_recovery.py`
@@ -368,6 +521,8 @@ pip install capstone pefile lief unicorn
    means finding its gaps at runtime, 30,000 calls deep, instead of now.
 5. Drop in the appropriate `runtime/` files
 6. Build with CMake, fix, repeat
+7. Before going public, run `audit_repo.py` and read
+   [docs/PUBLISHING.md](docs/PUBLISHING.md). Lifted output never goes in git.
 
 ### Where the docs are
 
@@ -377,13 +532,16 @@ pip install capstone pefile lief unicorn
 | [docs/PIPELINE.md](docs/PIPELINE.md) | Each phase, which tool, what it emits |
 | [docs/HYBRID.md](docs/HYBRID.md) | Running lifted code *inside* a real program - the lifted/real boundary, its three non-obvious correctness rules, and how to bisect a hybrid build when it breaks 30,000 calls deep |
 | [docs/PROJECTS.md](docs/PROJECTS.md) | Which project contributed which tool, and why it exists |
+| [docs/PUBLISHING.md](docs/PUBLISHING.md) | What must not be in a public repo, how to strip it from history, and the order to do it in |
+| [tools/ne/README.md](tools/ne/README.md) | The Win16 NE front end in detail |
+| [tools/ida/README.md](tools/ida/README.md) | Running the IDA scripts headless |
 | [docs/CONSOLIDATION.md](docs/CONSOLIDATION.md) | What pcrecomp and [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) should share, what has been ported, what is queued |
 
 ## Philosophy (the short version)
 
 > Any PC application ever compiled can be systematically deconstructed and rebuilt for modern hardware. It's not magic, it's just work -- and with the right tools, it's *less* work every time.
 
-We've proven this across DOS, Win16, Win32, MFC, Quake-family engines, GoldSrc, id Tech 3, and completely custom engines. The pattern is always the same: **Analyze -> Disassemble -> Classify -> Lift -> Shim -> Build -> Debug -> Ship.**
+We've proven this across DOS, Win16, Win32, Win64, MFC, Quake-family engines, GoldSrc, id Tech 3, and completely custom engines. The pattern is always the same: **Analyze -> Disassemble -> Classify -> Lift -> Shim -> Build -> Debug -> Ship.**
 
 Read the full philosophy in [docs/PHILOSOPHY.md](docs/PHILOSOPHY.md).
 
