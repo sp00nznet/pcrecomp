@@ -104,6 +104,8 @@ class Instruction:
     op3: Optional[Operand] = None   # third operand (e.g. SHLD/SHRD count)
     prefix: str = ''        # REP/REPZ/REPNZ prefix
     seg_override: str = ''  # Segment override prefix (es/cs/ss/ds)
+    fpu: bytes = b''        # x87: ESC opcode + modrm/disp (emulator INTs normalised)
+    emu87_int: int = 0      # 0x34..0x3D when this came from an 8087-emulator INT
 
     # For overlay calls (INT 3Fh)
     overlay_num: int = -1
@@ -147,6 +149,16 @@ class EndOfSegment(IndexError):
 #     import decode16
 #     decode16.WRAP_NEAR_TARGETS = False
 WRAP_NEAR_TARGETS = True
+
+# Microsoft's 8087 emulator (MSC, QuickBASIC, early Borland) encodes every x87
+# instruction as an interrupt: `CD 34..3B <modrm...>` is ESC D8..DF, `CD 3C`
+# is the same with a segment override folded into the next byte, and `CD 3D`
+# is FWAIT. With an 8087 present the runtime patches those sites into real
+# opcodes as they run; a static lift has to do the same up front, or it reads
+# the modrm byte as the next instruction (`CD 37 07` = fild [bx], not pop es).
+# Off by default: a program that really means INT 34h..3Dh is not unheard of.
+EMU87_INTS = False
+_EMU87_SEG = {0: 'cs', 1: 'ss', 2: 'es', 3: 'ds'}   # top bits after CD 3C
 
 
 def _near(target: int) -> int:
@@ -701,6 +713,24 @@ class Decoder:
             inst.op1 = Operand(type=OpType.IMM8, disp=3, size=1)
 
         # INT imm8
+        elif opcode == 0xCD and EMU87_INTS and 0x34 <= self.data[self.pos] <= 0x3D:
+            int_num = self._u8()
+            inst.emu87_int = int_num
+            if int_num == 0x3D:
+                inst.mnemonic = 'wait'
+            else:
+                if int_num == 0x3C:
+                    b = self._u8()
+                    seg_override = _EMU87_SEG[b >> 6]
+                    inst.seg_override = seg_override
+                    esc = 0xC0 | (b & 0x3F)
+                else:
+                    esc = 0xD8 + int_num - 0x34
+                m0 = self.pos
+                _, inst.op1, _ = self._decode_modrm(False, seg_override)
+                inst.mnemonic = f'esc_{esc - 0xD8}'
+                inst.fpu = bytes([esc]) + bytes(self.data[m0:self.pos])
+
         elif opcode == 0xCD:
             int_num = self._u8()
             inst.mnemonic = 'int'
@@ -743,8 +773,10 @@ class Decoder:
 
         # ESC (FPU) - 0xD8-0xDF - read ModR/M and skip
         elif 0xD8 <= opcode <= 0xDF:
-            self._decode_modrm(False, seg_override)
+            m0 = self.pos
+            _, inst.op1, _ = self._decode_modrm(False, seg_override)
             inst.mnemonic = f'esc_{opcode - 0xD8}'
+            inst.fpu = bytes([opcode]) + bytes(self.data[m0:self.pos])
 
         # LOOPNZ, LOOPZ, LOOP, JCXZ
         elif opcode == 0xE0:

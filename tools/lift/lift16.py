@@ -324,7 +324,8 @@ class Lifter:
                 self._emit(_write(op1, 'pop16(cpu)'), orig)
 
         elif m == 'pushf':
-            self._emit('push16(cpu, cpu->flags);', orig)
+            # bit 1 of FLAGS is reserved and always reads 1; the helpers never set it
+            self._emit('push16(cpu, (uint16_t)(cpu->flags | 0x0002));', orig)
 
         elif m == 'popf':
             self._emit('cpu->flags = pop16(cpu);', orig)
@@ -585,7 +586,7 @@ class Lifter:
             self._emit(f'{{ {stype} _v = ({stype}){r}; uint8_t _c = ({cnt}) & 0x1F; '
                        f'if (_c) {{ uint8_t _s = (_c >= {bits}) ? {bits - 1} : _c; '
                        f'{stype} _r = _v >> _s; '
-                       f'int _cf = (_v >> (_s - 1)) & 1; '
+                       f'int _cf = (_c >= {bits}) ? (_v < 0) : ((_v >> (_s - 1)) & 1); '
                        f'cpu->flags = (cpu->flags & ~(FLAG_CF | FLAG_OF)) '
                        f'| (_cf ? FLAG_CF : 0); '
                        f'flags_shift{sz}(cpu, (uint{sz}_t)_r); '
@@ -601,13 +602,16 @@ class Lifter:
                 if m == 'rol':
                     rot = f'(_c ? ({ut})((_v << _c) | (_v >> ({w} - _c))) : _v)'
                     cfbit = '(_r & 1)'
+                    ofbit = f'(((_r >> ({w} - 1)) ^ _r) & 1)'
                 else:
                     rot = f'(_c ? ({ut})((_v >> _c) | (_v << ({w} - _c))) : _v)'
                     cfbit = f'((_r >> ({w} - 1)) & 1)'
+                    ofbit = f'(((_r >> ({w} - 1)) ^ (_r >> ({w} - 2))) & 1)'
                 self._emit(
                     f'{{ {ut} _v = ({ut}){r}; uint8_t _n = ({cnt}) & 0x1F; '
                     f'if (_n) {{ uint8_t _c = _n % {w}; {ut} _r = {rot}; '
-                    f'cpu->flags = (cpu->flags & ~FLAG_CF) | ({cfbit} ? FLAG_CF : 0); '
+                    f'cpu->flags = (cpu->flags & ~(FLAG_CF | FLAG_OF)) | ({cfbit} ? FLAG_CF : 0) '
+                    f'| ({ofbit} ? FLAG_OF : 0); '
                     f'{_write(op1, "_r")} }} }}', orig)
             else:
                 # Rotate through carry; modulus is width+1 (the CF bit).
@@ -616,12 +620,16 @@ class Lifter:
                 cbit = 1 << w
                 rotexpr = (f'((_val << _c) | (_val >> ({m1} - _c)))' if m == 'rcl'
                            else f'((_val >> _c) | (_val << ({m1} - _c)))')
+                # OF: rcl = msb ^ cf(new); rcr = msb ^ msb-1 of the result
+                ofbit = (f'(((_r >> ({w} - 1)) ^ (_r >> {w})) & 1)' if m == 'rcl'
+                         else f'(((_r >> ({w} - 1)) ^ (_r >> ({w} - 2))) & 1)')
                 self._emit(
                     f'{{ {ut} _v = ({ut}){r}; uint8_t _n = ({cnt}) & 0x1F; '
                     f'if (_n) {{ uint8_t _c = _n % {m1}; '
                     f'uint32_t _val = (uint32_t)_v | (cf(cpu) ? {cbit}u : 0u); '
                     f'uint32_t _r = ({rotexpr}) & {full}u; '
-                    f'cpu->flags = (cpu->flags & ~FLAG_CF) | (((_r >> {w}) & 1) ? FLAG_CF : 0); '
+                    f'cpu->flags = (cpu->flags & ~(FLAG_CF | FLAG_OF)) | (((_r >> {w}) & 1) ? FLAG_CF : 0) '
+                    f'| ({ofbit} ? FLAG_OF : 0); '
                     f'{_write(op1, f"({ut})_r")} }} }}', orig)
 
         # ─── Control flow ───
@@ -800,15 +808,39 @@ class Lifter:
                 if not func_name:
                     func_name = f'far_{seg:04X}_{off:04X}'
                 self.func_calls.add(func_name)
-                # Simulate FAR CALL: push 4-byte return CS:IP on CPU stack
-                self._emit(f'push16(cpu, cpu->cs); push16(cpu, 0xFFFF);', f'far call return addr')
+                # Simulate FAR CALL: push 4-byte return CS:IP on CPU stack. The
+                # CS is this function's constant: cpu->cs still holds whatever
+                # segment the last callee ran in, and QB's string returns read
+                # the pushed CS back and retf to it.
+                if (far_base is not None and far_base + seg * 16 + off
+                        in getattr(self, 'inline_table_calls', ())):
+                    # A runtime helper that reads data placed right after the
+                    # call (QB's ON..GOTO: a count byte and a word table) and
+                    # leaves by jumping, never back here. It needs the real
+                    # return IP to find the table, and nothing after the call
+                    # is code: the targets are function starts of their own.
+                    ip = (inst.offset + len(inst.raw) - int(_CODE_SEG, 16) * 16) & 0xFFFF
+                    self._emit(f'push16(cpu, {_cseg()}); push16(cpu, 0x{ip:04X});',
+                               'far call, real return addr (inline table follows)')
+                    # ON..GOSUB: the label's RETURN comes back to the code
+                    # after the table, which the project names per call site.
+                    # ponytail: an out-of-range index jumps to that code
+                    # itself (no RETURN), which would then run twice here;
+                    # tell the two apart at run time if a game relies on it.
+                    after = getattr(self, 'inline_table_after', {}).get(inst.offset)
+                    if after is not None and after in self.known_funcs:
+                        self._emit(f'{func_name}(cpu); {self.known_funcs[after]}(cpu); return;', orig)
+                    else:
+                        self._emit(f'{func_name}(cpu); return;', orig)
+                    return
+                self._emit(f'push16(cpu, {_cseg()}); push16(cpu, 0xFFFF);', f'far call return addr')
                 self._emit(f'{func_name}(cpu);', orig)
             else:
                 if getattr(self, 'dispatch', False) and op1:
                     if op1.type == OpType.MEM and op1.size == 4:
                         seg, off = _mem_addr(op1)
                         self._emit(f'{{ uint16_t _o={off}; uint16_t _s={seg}; '
-                                   f'push16(cpu,cpu->cs); push16(cpu,0xFFFF); '
+                                   f'push16(cpu,{_cseg()}); push16(cpu,0xFFFF); '
                                    f'dispatch_far(cpu, mem_read16(cpu,_s,(uint16_t)(_o+2)), '
                                    f'mem_read16(cpu,_s,_o)); }}', orig)
                     else:  # near indirect (word mem or register)
@@ -826,11 +858,11 @@ class Lifter:
             if getattr(self, 'dispatch', False) and op1 and op1.type == OpType.MEM:
                 seg, off = _mem_addr(op1)
                 self._emit(f'{{ uint16_t _o={off}; uint16_t _s={seg}; '
-                           f'push16(cpu,cpu->cs); push16(cpu,0xFFFF); '
+                           f'push16(cpu,{_cseg()}); push16(cpu,0xFFFF); '
                            f'dispatch_far(cpu, mem_read16(cpu,_s,(uint16_t)(_o+2)), '
                            f'mem_read16(cpu,_s,_o)); }}', orig)
             elif getattr(self, 'dispatch', False) and op1 and op1.type == OpType.FAR:
-                self._emit(f'push16(cpu,cpu->cs); push16(cpu,0xFFFF); '
+                self._emit(f'push16(cpu,{_cseg()}); push16(cpu,0xFFFF); '
                            f'dispatch_far(cpu, 0x{op1.far_seg:X}, 0x{op1.disp:X});', orig)
             else:
                 self._emit(f'/* UNHANDLED: {orig} */', orig)
@@ -895,7 +927,7 @@ class Lifter:
                     func_name = f'ovl{ovl_num:02d}_{ovl_off:04X}'
                 self.ovl_calls.add(func_name)
                 # Simulate FAR CALL for overlay dispatch
-                self._emit(f'push16(cpu, cpu->cs); push16(cpu, 0xFFFF);',
+                self._emit(f'push16(cpu, {_cseg()}); push16(cpu, 0xFFFF);',
                            f'overlay far call return addr')
                 self._emit(f'{func_name}(cpu);',
                            f'INT 3Fh -> OVL {ovl_num:02X}:{ovl_off:04X}')
@@ -1065,7 +1097,9 @@ class Lifter:
         elif m == 'sahf':
             self._emit('cpu->flags = (cpu->flags & 0xFF00) | cpu->ah;', orig)
         elif m == 'lahf':
-            self._emit('cpu->ah = (uint8_t)(cpu->flags & 0xFF);', orig)
+            # SF:ZF:0:AF:0:PF:1:CF -- QB's video setup saves flags with lahf and
+            # later uses AH as data, so a missing bit 1 turns 0x46 into 0x44
+            self._emit('cpu->ah = (uint8_t)((cpu->flags & 0xD5) | 0x02);', orig)
 
         # ─── Misc ───
 
@@ -1073,15 +1107,29 @@ class Lifter:
             self._emit('/* nop */', orig)
 
         elif m == 'xlat':
-            self._emit('cpu->al = mem_read8(cpu, cpu->ds, '
+            # honour a segment override: QB keeps its GET/PUT action table in
+            # its code segment (`cs: xlat`), and reading it from DS turned
+            # XOR (18h) into 3Fh -- rotate-by-7 -- so every sprite came out
+            # scrambled
+            ov = inst.seg_override
+            seg = _cseg() if ov == 'cs' else (f'cpu->{ov}' if ov else 'cpu->ds')
+            self._emit(f'cpu->al = mem_read8(cpu, {seg}, '
                        '(uint16_t)(cpu->bx + cpu->al));', orig)
 
         elif m == 'hlt':
             self._emit('cpu->halted = 1; return;', orig)
 
         elif m == 'iret':
-            self._emit('/* iret - return from interrupt */', orig)
-            self._emit('return;')
+            if getattr(self, 'iret_frame', False):
+                # Pop the whole frame. `pushf; push cs; call <iret>` is how real
+                # code restores flags and returns in one go (QB's PIT reprogram
+                # does it); a bare return leaves those 6 bytes on the stack.
+                # Opt-in: a runtime that calls an ISR directly must push a
+                # FLAGS/CS/IP frame first, like the CPU does.
+                self._emit('cpu->sp += 4; cpu->flags = pop16(cpu); return;', orig)
+            else:
+                self._emit('/* iret - return from interrupt */', orig)
+                self._emit('return;')
 
         elif m == 'enter':
             size_val = op1.disp
@@ -1115,8 +1163,21 @@ class Lifter:
             fn = 'port_out16' if w16 else 'port_out8'
             self._emit(f'{fn}(cpu, {port_expr}, {val_expr});', orig)
 
-        elif m == 'wait':
+        elif m == 'wait' and not (getattr(inst, 'emu87_int', 0)
+                                 and getattr(self, 'x87_emu_dispatch', False)):
             self._emit('/* wait */', orig)
+
+        elif getattr(inst, 'emu87_int', 0) and getattr(self, 'x87_emu_dispatch', False):
+            # Run it the way an 8087-less PC does: INT n into the program's own
+            # emulator, with a real return IP (just past `CD nn`) so the handler
+            # can read the operand bytes that follow. Mixing a native x87 with
+            # the emulator is not an option: QB's runtime also calls into the
+            # emulator directly, and the two would keep separate stacks.
+            ip = (inst.offset + 2 - int(_CODE_SEG, 16) * 16) & 0xFFFF
+            self._emit(f'x87_emu_int(cpu, 0x{inst.emu87_int:02X}, {_cseg()}, 0x{ip:04X});', orig)
+
+        elif m.startswith('esc_') and getattr(self, 'x87', False) and inst.fpu:
+            self._emit(self._lift_x87(inst), orig)
 
         elif m.startswith('esc_'):
             self._emit(f'/* FPU: {orig} */', orig)
@@ -1139,6 +1200,112 @@ class Lifter:
 
         else:
             self._emit(f'/* UNHANDLED: {orig} */', orig)
+
+    # x87, from the ESC opcode and modrm (inst.fpu; the 8087 emulator INTs
+    # arrive here already normalised by decode16.EMU87_INTS). Opt-in through
+    # `lifter.x87`: the runtime has to provide the x87_* helpers (cpu.h).
+    # Decoded by opcode and reg field rather than by mnemonic, because the
+    # reversed fsub/fsubr and fdiv/fdivr register forms are exactly where
+    # disassemblers disagree with each other.
+    _X87_MEM_ARITH = {0xD8: 4, 0xDC: 8, 0xDA: -4, 0xDE: -2}
+    _X87_MEM = {   # (opcode, reg) -> (action, kind)
+        (0xD9, 0): ('ld', 4), (0xD9, 2): ('st', 4), (0xD9, 3): ('stp', 4),
+        (0xDD, 0): ('ld', 8), (0xDD, 2): ('st', 8), (0xDD, 3): ('stp', 8),
+        (0xDB, 5): ('ld', 10), (0xDB, 7): ('stp', 10),
+        (0xDB, 0): ('ld', -4), (0xDB, 2): ('st', -4), (0xDB, 3): ('stp', -4),
+        (0xDF, 0): ('ld', -2), (0xDF, 2): ('st', -2), (0xDF, 3): ('stp', -2),
+        (0xDF, 5): ('ld', -8), (0xDF, 7): ('stp', -8),
+        (0xD9, 5): ('ldcw', 0), (0xD9, 7): ('stcw', 0), (0xDD, 7): ('stsw', 0),
+    }
+    _X87_CONST = {0: '1.0', 1: '3.321928094887362', 2: '1.4426950408889634',
+                  3: '3.141592653589793', 4: '0.3010299956639812',
+                  5: '0.6931471805599453', 6: '0.0'}
+
+    def _lift_x87(self, inst):
+        b = inst.fpu
+        esc, modrm = b[0], b[1]
+        mod, reg, rm = modrm >> 6, (modrm >> 3) & 7, modrm & 7
+        if mod != 3:
+            seg, off = _mem_addr(inst.op1)
+            at = f'cpu, {seg}, {off}'
+            if esc in self._X87_MEM_ARITH:
+                v = f'x87_rd({at}, {self._X87_MEM_ARITH[esc]})'
+                if reg in (2, 3):
+                    return f'x87_cmp(X87_ST(0), {v});' + (' x87_pop();' if reg == 3 else '')
+                return f'x87_arith({reg}, &X87_ST(0), {v});'
+            act, kind = self._X87_MEM.get((esc, reg), (None, 0))
+            if act == 'ld':
+                return f'x87_push(x87_rd({at}, {kind}));'
+            if act in ('st', 'stp'):
+                return f'x87_wr({at}, {kind}, X87_ST(0));' + (' x87_pop();' if act == 'stp' else '')
+            if act == 'ldcw':
+                return f'g_x87.cw = mem_read16({at});'
+            if act == 'stcw':
+                return f'mem_write16({at}, g_x87.cw);'
+            if act == 'stsw':
+                return f'mem_write16({at}, x87_sw());'
+            return f'x87_unhandled("{b.hex()}");'
+        i = rm
+        if esc == 0xD8:
+            if reg in (2, 3):
+                return f'x87_cmp(X87_ST(0), X87_ST({i}));' + (' x87_pop();' if reg == 3 else '')
+            return f'x87_arith({reg}, &X87_ST(0), X87_ST({i}));'
+        if esc in (0xDC, 0xDE):
+            if esc == 0xDE and modrm == 0xD9:
+                return 'x87_cmp(X87_ST(0), X87_ST(1)); x87_pop(); x87_pop();'   # fcompp
+            if reg in (2, 3):
+                return f'x87_cmp(X87_ST(0), X87_ST({i}));' + (' x87_pop();' if reg == 3 else '')
+            op = {0: 0, 1: 1, 4: 5, 5: 4, 6: 7, 7: 6}[reg]   # dst is ST(i): sub/subr swap
+            return (f'x87_arith({op}, &X87_ST({i}), X87_ST(0));'
+                    + (' x87_pop();' if esc == 0xDE else ''))
+        if esc == 0xD9:
+            if reg == 0:
+                return f'{{ double _v = X87_ST({i}); x87_push(_v); }}'
+            if reg == 1:
+                return f'{{ double _v = X87_ST(0); X87_ST(0) = X87_ST({i}); X87_ST({i}) = _v; }}'
+            if modrm == 0xD0:
+                return '/* fnop */'
+            if modrm == 0xE0:
+                return 'X87_ST(0) = -X87_ST(0);'
+            if modrm == 0xE1:
+                return 'X87_ST(0) = fabs(X87_ST(0));'
+            if modrm == 0xE4:
+                return 'x87_cmp(X87_ST(0), 0.0);'
+            if reg == 5 and i in self._X87_CONST:
+                return f'x87_push({self._X87_CONST[i]});'
+            if modrm == 0xFA:
+                return 'X87_ST(0) = sqrt(X87_ST(0));'
+            if modrm == 0xFC:
+                return 'X87_ST(0) = nearbyint(X87_ST(0));'
+            if modrm == 0xFD:
+                return 'X87_ST(0) = ldexp(X87_ST(0), (int)trunc(X87_ST(1)));'
+            if modrm == 0xF8:
+                return 'X87_ST(0) = fmod(X87_ST(0), X87_ST(1));'
+            if modrm == 0xF3:
+                return 'X87_ST(1) = atan2(X87_ST(1), X87_ST(0)); x87_pop();'
+            if modrm == 0xF2:
+                return 'X87_ST(0) = tan(X87_ST(0)); x87_push(1.0);'
+            if modrm == 0xF1:
+                return 'X87_ST(1) = X87_ST(1) * log2(X87_ST(0)); x87_pop();'
+            if modrm == 0xF0:
+                return 'X87_ST(0) = exp2(X87_ST(0)) - 1.0;'
+            if modrm == 0xF6:
+                return 'g_x87.top = (g_x87.top - 1) & 7;'
+            if modrm == 0xF7:
+                return 'g_x87.top = (g_x87.top + 1) & 7;'
+        if esc == 0xDB and modrm in (0xE0, 0xE1, 0xE4):
+            return '/* feni/fdisi/fsetpm */'
+        if esc == 0xDB and modrm == 0xE2:
+            return 'g_x87.sw &= 0x7F00;'                         # fnclex
+        if esc == 0xDB and modrm == 0xE3:
+            return 'g_x87.top = 0; g_x87.sw = 0; g_x87.cw = 0x037F;'   # fninit
+        if esc == 0xDD and reg == 0:
+            return '/* ffree */'
+        if esc == 0xDD and reg in (2, 3):
+            return f'X87_ST({i}) = X87_ST(0);' + (' x87_pop();' if reg == 3 else '')
+        if esc == 0xDF and modrm == 0xE0:
+            return 'cpu->ax = x87_sw();'                          # fnstsw ax
+        return f'x87_unhandled("{b.hex()}");'
 
     def lift_function(self, name: str, instructions: list, func_start: int,
                       is_far: bool = False, entry_addr=None) -> str:

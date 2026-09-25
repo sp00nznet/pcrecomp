@@ -123,7 +123,7 @@ def testable(stmt, text):
         return False
     if text.startswith(('rep', 'movs', 'stos', 'lods', 'scas', 'cmps', 'int',
                         'call', 'j', 'loop', 'ret', 'push', 'pop', 'lds',
-                        'les', 'nop', 'in ', 'out', 'hlt', 'iret', 'cli',
+                        'les', 'nop', 'in ', 'ins', 'out', 'hlt', 'iret', 'cli',
                         'sti', 'enter', 'leave')):
         return False
     return True
