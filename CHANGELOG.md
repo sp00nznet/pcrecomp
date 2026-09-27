@@ -5,7 +5,7 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
-Found running Gunman Chronicles (MSVC 6 CRT, Quake-lineage software renderer)
+From #4. Found running Gunman Chronicles (MSVC 6 CRT, Quake-lineage software renderer)
 fully recompiled; each is generic x86 semantics or code generation. Each fix
 has a difftest case against Unicorn: 175/187 match, 12 known divergences,
 0 failures.
