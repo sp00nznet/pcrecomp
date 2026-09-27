@@ -207,7 +207,18 @@ FPU_CMP = {'EQ': '==', 'NE': '!=', 'B': '<', 'BE': '<=', 'A': '>', 'AE': '>=',
            'L': '<', 'LE': '<=', 'G': '>', 'GE': '>='}
 
 
-def lift_function_linear(lifter, name, instructions, leaders, func_start):
+def push_return_label(insn, nxt, leaders):
+    """The label of a `push label; jmp func` pair, or None."""
+    if (nxt is not None and insn.mnemonic == 'push' and nxt.mnemonic == 'jmp'
+            and nxt.get_branch_target() is not None):
+        t = insn.get_branch_target()      # the push's immediate
+        if t is not None and t in leaders:
+            return t
+    return None
+
+
+def lift_function_linear(lifter, name, instructions, leaders, func_start,
+                         indirect_targets=None):
     """Lift a linearly-disassembled function to C code.
 
     The preamble comes from `lift32.FUNCTION_LOCALS`, not from a list written
@@ -232,6 +243,7 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start):
     lines = [f'void {name}(void) {{']
     for decl in lift32.FUNCTION_LOCALS:
         lines.append(f'    {decl}')
+    lines.append('    RECOMP_REGS_LOCALS')   # empty unless RECOMP_LOCAL_REGS
     lines.append(f'    RECOMP_ENTER(0x{va:08X}u);')
     lines.append('')
 
@@ -240,17 +252,60 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start):
     # An indirect jump inside a function (a switch/jump table) can compute a
     # target that lands on ANY instruction in it, so when one is present every
     # instruction needs a label for the local dispatch below to reach.
+    #
+    # indirect_targets: the caller KNOWS every local target of this body's
+    # indirect jumps (jump-table arms, entry-vector labels -- all already in
+    # `leaders`). Then only real leaders get labels and the switch lists just
+    # those targets. Labelling every instruction makes each one a join point,
+    # and the optimiser can keep nothing in registers across any of them:
+    # Gunman's span drawer ran slower as one body than as seven tail calls
+    # until this. None = unknown targets, label everything, as before.
     has_indirect = any(i.is_uncond_jump and i.get_branch_target() is None
                        for i in instructions)
+    label_all = has_indirect and indirect_targets is None
 
-    for insn in instructions:
-        if has_indirect or insn.address in leaders:
+    # A body can hold code BELOW its entry: a branch back to a block the
+    # compiler (or an assembly programmer) put before the label. The C runs in
+    # address order, so enter at the entry.
+    if instructions and instructions[0].address != va:
+        lines.append(f'    goto L_{va:08X};')
+        leaders = set(leaders) | {va}
+
+    skip = False
+    for k, insn in enumerate(instructions):
+        if label_all or insn.address in leaders:
             lines.append(f'L_{insn.address:08X}:')
+        if skip:
+            skip = False
+            continue
+        # `push label; jmp func` is a call that returns to `label` (Quake's
+        # R_GenerateSpans reaches TrailingEdge this way). A lifted callee
+        # returns to its C caller whatever address was pushed, so lifting the
+        # jmp as a tail call ended the span loop at the first trailing edge.
+        nxt = instructions[k + 1] if k + 1 < len(instructions) else None
+        ret = push_return_label(insn, nxt, leaders)
+        if ret is not None:
+            tgt = nxt.get_branch_target()
+            call = (f'RECOMP_CALL(sub_{tgt:08X});' if lifter.lifted is None or tgt in lifter.lifted
+                    else f'RECOMP_ICALL(0x{tgt:08X}u);')
+            lines.append(f"    {call} RECOMP_FLAGS_IN(); goto L_{ret:08X}; /* 0x{insn.address:08X}: push 0x{ret:08X}; jmp 0x{tgt:08X} */")
+            skip = True
+            continue
         for line in lifter.lift_instruction(insn):
             lines.append(f'    {line}')
 
-    # Ensure function doesn't fall off the end without return
-    if instructions and not instructions[-1].is_ret:
+    # A body that runs off its end falls through into whatever the catalog
+    # starts there -- typically an epilogue MSVC shares between two paths and
+    # the disassembler catalogued as its own entry. A bare `return` skips it:
+    # Gunman's vgui.dll small-block heap lost `pop edi/esi/ebx` that way and
+    # came back with ebx = 0. So fall through the way the CPU does, as a tail
+    # call to the next address.
+    if instructions and not (instructions[-1].is_ret or
+                             instructions[-1].is_uncond_jump or
+                             instructions[-1].mnemonic in ('int3', 'hlt')):
+        nxt = instructions[-1].end_address
+        lines.append(f'    RECOMP_ITAIL(0x{nxt:08X}u); return; /* falls through */')
+    elif instructions and not instructions[-1].is_ret:
         lines.append('    return; /* end of function */')
 
     # Intra-function indirect jumps lift to RECOMP_ITAIL(expr), but the global
@@ -270,7 +325,9 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start):
                             % m.group(1))
         lines.append('  _ljump:')
         lines.append('    switch (_itail_tgt) {')
-        for lbl in defined:
+        cases = (defined if indirect_targets is None else
+                 [lbl for lbl in defined if int(lbl[2:], 16) in indirect_targets])
+        for lbl in cases:
             lines.append(f'      case 0x{int(lbl[2:], 16):08X}u: goto {lbl};')
         lines.append('      default: RECOMP_ITAIL(_itail_tgt); return;')
         lines.append('    }')
@@ -281,8 +338,11 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start):
     for lbl in sorted(refed - set(defined)):
         lines.append(f'    {lbl}: RECOMP_ITAIL(0x{int(lbl[2:], 16):08X}u); return;')
 
+    # With RECOMP_LOCAL_REGS every exit writes the registers back (the macro
+    # is empty otherwise), including a body that runs off its closing brace.
+    lines.append('    RECOMP_REGS_OUT();')
     lines.append('}')
-    out = '\n'.join(lines)
+    out = re.sub(r'\breturn;', '{ RECOMP_REGS_OUT(); return; }', '\n'.join(lines))
     return re.sub(r'CMP_(\w+)\(_fpu_cmp\)',
                   lambda m: f'((_fpu_cmp) {FPU_CMP.get(m.group(1), "==")} 0)', out)
 
@@ -364,6 +424,13 @@ def _selftest():
     out3 = lift_function_linear(Lifter(iat_map={}), 'sub_00401000', i3, l3, base)
     assert 'RECOMP_ITAIL' not in out3, 'the continuation became a tail transfer'
 
+    # A body cut before a shared epilogue must fall INTO it, not return past
+    # it: push ebx / xor ebx,ebx -- and the pop/ret belongs to the next entry.
+    fall = bytes([0x53, 0x33, 0xDB])
+    i4, l4 = linear_disassemble_function(md, fall, base, base, base + len(fall))
+    out4 = lift_function_linear(Lifter(iat_map={}), 'sub_00401000', i4, l4, base)
+    assert 'RECOMP_ITAIL(0x00401003u); { RECOMP_REGS_OUT(); return; } /* falls through */' in out4, out4
+
     # ...and trailing int3 padding still ends the body: the first one is
     # emitted (it lifts to a trap, which is correct for unreachable filler) and
     # the sweep stops rather than decoding the rest of the padding run.
@@ -386,7 +453,7 @@ def _selftest():
     out5 = lift_function_linear(Lifter(iat_map={}), 'sub_00401000', i5, l5, base)
     assert 'RECOMP_ITAIL' not in out5, 'the block past the padding was dropped'
     # ...and the int3 before the gap must not fall through into it.
-    assert 'int3 breakpoint */ return;' in out5, out5
+    assert 'int3 breakpoint */ { RECOMP_REGS_OUT(); return; }' in out5, out5
 
     # A straight-line function needs no dispatch machinery at all.
     ret = bytes([0x33, 0xC0, 0xC3])            # xor eax,eax / ret

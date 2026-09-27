@@ -112,7 +112,8 @@ FLAG_KIND = {
     'cmp': 'FK_CMP', 'sub': 'FK_CMP', 'dec': 'FK_DEC',
     'add': 'FK_ADD', 'inc': 'FK_INC',
     'and': 'FK_TEST', 'or': 'FK_TEST', 'xor': 'FK_TEST', 'test': 'FK_TEST',
-    'bt': 'FK_BT', 'fcom': 'FK_FCOM',
+    'bt': 'FK_BT', 'bts': 'FK_BT', 'btr': 'FK_BT', 'btc': 'FK_BT', 'fcom': 'FK_FCOM',
+    'eflags': 'FK_EFLAGS',
 }
 
 # jcc -> runtime condition code, for the sites where the setter is not known
@@ -218,7 +219,8 @@ class Lifter:
 
     def __init__(self, iat_map: dict = None, func_names: dict = None,
                  lifted: set = None, precise_sbb: bool = False,
-                 patch_sites: set = None):
+                 patch_sites: set = None, precise_carry: bool = False,
+                 reloc=None):
         """
         iat_map: VA -> (dll, func_name) for import resolution
         func_names: VA -> name for known function names
@@ -231,11 +233,24 @@ class Lifter:
         # will ever define. None = trust every target, as before.
         self.lifted = lifted
         self.precise_sbb = precise_sbb
+        # adc/sbb take their carry-in from the lazy flag state (recomp_carry)
+        # instead of the `_cf` variable, which add/sub/cmp never write. Quake's
+        # span stepper is `add edx, eax; sbb ecx, ecx; add ebx, ebp; adc esi,
+        # [ecx*4 + step]`: reading `_cf`, every texel step lost its carry and
+        # Gunman's textures smeared along each span. Opt-in because Fury3
+        # leans on the old imprecision (see the sbb note below).
+        self.precise_carry = precise_carry
+        # reloc(va) -> new va, or None: moves static data. Every absolute
+        # displacement and every immediate that points into a moved block is
+        # rewritten to the same offset in its new home -- how Gunman's
+        # resolution-sized tables get room for 4K (run_lift.py RELOCS).
+        self.reloc = reloc
         # Code addresses the program writes a dword to (see _patched_imm). An
         # instruction whose trailing imm32 sits on one of these is patched at
         # runtime, so its constant in the file is a placeholder.
         self.patch_sites = patch_sites or set()
         self._patched_imm = None
+        self._patched_disp = None   # (placeholder, expr) for a patched disp32
         self._labels = None        # block starts of the function being lifted
         self._jump_targets = None  # arms its switch tables dispatch to
         self._flag_state = None  # (setter_mnemonic, operands_str)
@@ -281,9 +296,10 @@ class Lifter:
             return reg_name(r)
         elif op.type == X86_OP_IMM:
             if self._patched_imm:
-                expr, self._patched_imm = self._patched_imm, None
-                return expr
+                return self._patched_imm
             val = op.imm & 0xFFFFFFFF
+            if self.reloc and val > 0xFFFF:
+                val = self.reloc(val) or val
             if val > 0xFFFF:
                 return f"0x{val:08X}u"
             elif val > 9:
@@ -328,8 +344,13 @@ class Lifter:
                 parts.append(f"{idx} * {mem.scale}")
             else:
                 parts.append(idx)
-        if mem.disp != 0:
-            if mem.disp > 0:
+        if self._patched_disp and (mem.disp & 0xFFFFFFFF) == self._patched_disp[0]:
+            parts.append(self._patched_disp[1])
+        elif mem.disp != 0:
+            moved = self.reloc(mem.disp & 0xFFFFFFFF) if self.reloc else None
+            if moved is not None:
+                parts.append(f"0x{moved:X}")
+            elif mem.disp > 0:
                 parts.append(f"0x{mem.disp:X}")
             else:
                 parts.append(f"(-0x{-mem.disp:X})")
@@ -501,6 +522,7 @@ class Lifter:
         that is when the tuple grows a width.
         """
         self._flag_seq += 1
+        self._flag_width = width      # PF needs it: parity is of the LOW byte
         if width >= 32:
             return f"_flag_a = (uint32_t)({a}); _flag_b = (uint32_t)({b});"
         sh = 32 - width
@@ -548,10 +570,52 @@ class Lifter:
             # Reached from blocks with different flag-setters: decide at runtime.
             cc = COND_CODE.get(jform)
             if cc:
-                return f"recomp_cond(_flag_k, _flag_a, _flag_b, {cc})"
+                # _cf rides along: after inc/dec the carry is the preserved one
+                return f"recomp_cond_cf(_flag_k, _flag_a, _flag_b, {cc}, _cf)"
             return f"/* no flag state for {mnem} */ _cf"
 
         setter, ops = self._flag_state
+
+        # inc/dec leave CF UNTOUCHED: a carry read after them is the carry of
+        # whatever set it before, and that value is already in _cf (inc/dec
+        # never write it). MSVC schedules exactly this:
+        #     cmp edi, 0x20 / mov [ebp+0xf], cl / inc cl / mov [..], cl / jae
+        # -- the CRT small-block heap's __sbh_free_block (sw.dll 0x100A3E58).
+        # Evaluating jae from the inc's operands corrupted the heap in every
+        # Gunman module that links the CRT.
+        if setter in ('inc', 'dec') and jform in ('jb', 'jae', 'ja', 'jbe'):
+            zf = (f"CMP_EQ({ops})" if setter == 'dec'
+                  else f"recomp_cond(_flag_k, {ops}, CC_E)")
+            return {'jb': "(_cf != 0)", 'jae': "(_cf == 0)",
+                    'ja': f"(_cf == 0 && !{zf})", 'jbe': f"(_cf != 0 || {zf})"}[jform]
+
+        # PF: parity of the result's low byte. MSVC's float compares test it:
+        # `fnstsw ax; test ah, 5; jp` is `x < 0.0` (C0|C2), and with CMP_P a
+        # constant 0 the MxO client's `while (x < 0) x += 1.0` texture-wrap loop
+        # never exited. The result is rebuilt from the captured operands per
+        # setter; narrow operands were left-aligned by _flag_capture, so the
+        # low byte of an N-bit result sits at bit 32-N.
+        if jform in ('jp', 'jnp'):
+            parts = [x.strip() for x in ops.split(',')]
+            fa, fb = (parts + [None])[:2]
+            res = None if fb is None else {'cmp': f"({fa} - {fb})", 'sub': f"({fa} - {fb})", 'dec': f"({fa} - {fb})",
+                   'add': f"({fa} + {fb})", 'inc': f"({fa} + {fb})",
+                   'test': f"({fa} & {fb})", 'and': f"({fa} & {fb})",
+                   'or': f"({fa} & {fb})", 'xor': f"({fa} & {fb})"}.get(setter)
+            if res:
+                w = getattr(self, '_flag_width', 32)
+                pf = f"RECOMP_PF({res}, {32 - w if w < 32 else 0})"
+                return pf if jform == 'jp' else f"(!{pf})"
+
+        if setter == 'eflags':
+            # an EFLAGS image (sahf): PF is bit 2; the rest recomp_cond decodes
+            if jform in ('jp', 'jnp'):
+                pf = "((_flag_a >> 2) & 1u)"
+                return pf if jform == 'jp' else f"(!{pf})"
+            cc = COND_CODE.get(jform)
+            if cc:
+                return f"recomp_cond(FK_EFLAGS, _flag_a, 0, {cc})"
+            return f"/* eflags: unmapped {mnem} */ 0"
 
         if setter == 'cmp':
             return f"{cmp_macro}({ops})"
@@ -619,9 +683,15 @@ class Lifter:
                 return f"({ops} {op} 0)"
             return f"/* fcom: unmapped {jcc_mnemonic} */ ({ops} != 0)"
         elif setter == 'bt':
-            # BT sets CF = bit tested
-            if cmp_macro in ('CMP_B', 'CMP_AE'):  # jb/jae test CF
+            # BT sets CF = bit tested. jb/jc take CF=1, jae/jnc take CF=0 --
+            # both used to return BT_CF, which inverted every `bt; jae`: the
+            # CRT's strpbrk then matched every character, so _stat's wildcard
+            # check rejected every path and Gunman's engine could not find
+            # gfx.wad.
+            if cmp_macro == 'CMP_B':
                 return f"BT_CF({ops})"
+            if cmp_macro == 'CMP_AE':
+                return f"(!BT_CF({ops}))"
             return f"/* bt */ {cmp_macro}({ops})"
         else:
             return f"/* flag from {setter} */ {cmp_macro}({ops})"
@@ -642,9 +712,27 @@ class Lifter:
         # Self-modifying code: if the program stores a dword onto this
         # instruction's trailing imm32, read the immediate from memory rather
         # than emitting the placeholder that happens to be in the file.
+        # The trailing dword may be the immediate (`cmp esi, 0x12345678`) or the
+        # displacement (`mov esi, [0x12345678]`, `mov al, [eax+0x12345678]`);
+        # the shipped placeholder bytes say which operand they belong to. Both
+        # occur in Gunman's sw.dll span generator.
         site = insn.address + insn.size - 4
-        self._patched_imm = f"MEM32(0x{site:08X})" if site in self.patch_sites else None
+        self._patched_imm = self._patched_disp = None
+        if site in self.patch_sites:
+            ph = int.from_bytes(bytes(insn.bytes[-4:]), 'little')
+            expr = f"MEM32(0x{site:08X}u)"
+            ops_ = insn.operands if insn.operands else []
+            if any(o.type == X86_OP_IMM and (o.imm & 0xFFFFFFFF) == ph for o in ops_):
+                self._patched_imm = expr
+            elif any(o.type == X86_OP_MEM and (o.mem.disp & 0xFFFFFFFF) == ph for o in ops_):
+                self._patched_disp = (ph, expr)
         m = insn.mnemonic
+        # Capstone reports `lock inc dword ptr [x]` with mnemonic 'lock inc' (or
+        # plain 'lock' + op_str); the operands are decoded either way. Single-
+        # threaded semantics are exact here because the runtime runs lifted code
+        # under one machine lock.
+        if m.startswith('lock'):
+            m = m[4:].strip() or (insn.op_str.split() or [''])[0]
         ops = insn.operands if insn.operands else []
         lines = []
 
@@ -1036,13 +1124,30 @@ class Lifter:
                 lines.append("_cf = 0;")
                 self._flag_state = ('test', "_flag_a, _flag_b")
 
-        elif m == 'bt':
+        elif m in ('bt', 'bts', 'btr', 'btc'):
+            # A memory operand with a REGISTER bit offset addresses a bit
+            # string, not one dword: the dword is at ea + 4*(offset >> 5)
+            # (signed). The CRT's strcspn/strpbrk run `bt/bts [esp], eax` over
+            # a 256-bit character map, so reading [ea] for every bit got every
+            # character above 31 wrong. An immediate offset stays in the dword.
             if len(ops) == 2:
-                a = self._fmt_read(ops[0])
-                b = self._fmt_read(ops[1])
-                lines.append(f"/* bt {a}, {b} */ {comment}")
-                lines.append(self._flag_capture(a, b))
+                if ops[0].type == X86_OP_MEM and ops[1].type == X86_OP_REG:
+                    off = self._fmt_read(ops[1])
+                    base = self._fmt_mem_addr(ops[0].mem)
+                    addr = f"(({base}) + (uint32_t)(((int32_t)({off}) >> 5) * 4))"
+                    a = f"MEM32({addr})"
+                    idx = f"(({off}) & 31)"
+                    write = lambda v: f"MEM32({addr}) = {v}"
+                else:
+                    a = self._fmt_read(ops[0])
+                    idx = f"(({self._fmt_read(ops[1])}) & 31)"
+                    write = lambda v: self._fmt_write(ops[0], v)
+                lines.append(f"/* {m} {a}, {idx} */ {comment}")
+                lines.append(self._flag_capture(a, idx))
                 self._flag_state = ('bt', "_flag_a, _flag_b")
+                if m != 'bt':
+                    op = {'bts': '|', 'btr': '& ~', 'btc': '^'}[m]
+                    lines.append(f"{write(f'_flag_a {op} (1u << _flag_b)')}; {comment}")
 
         # --- Setcc ---
         elif m in SETCC_MAP:
@@ -1067,7 +1172,8 @@ class Lifter:
                 # is how every 64- and 96-bit addition is written, and each adc
                 # reads the one before it. Snapshot the operands, write the
                 # result, then publish the whole flag word.
-                lines.append(f"{{ uint32_t _aa = {a}, _ab = {b}, _ac = _cf; {comment}")
+                cin = 'recomp_carry(_flag_k, _flag_a, _flag_b, _cf)' if self.precise_carry else '_cf'
+                lines.append(f"{{ uint32_t _aa = {a}, _ab = {b}, _ac = {cin}; {comment}")
                 lines.append(f"  {self._fmt_write(ops[0], '_aa + _ab + _ac')};")
                 lines.append(f"  _flag_a = recomp_flags_adc(_aa, _ab, _ac); _flag_b = 0;")
                 lines.append(f"  _flag_k = FK_EFLAGS; _cf = _flag_a & 1u; }}")
@@ -1088,7 +1194,7 @@ class Lifter:
                 # per-site differential trace isolates that path, keep the conservative
                 # `_cf`. The one gameplay-affecting case (the cheat reader sub_43BFB0) is
                 # handled by a targeted host shim instead. See fury3-target.md Phase 8.
-                carry = '_cf'
+                carry = 'recomp_carry(_flag_k, _flag_a, _flag_b, _cf)' if self.precise_carry else '_cf'
                 if ops[0].type == X86_OP_REG and ops[1].type == X86_OP_REG and ops[0].reg == ops[1].reg:
                     # With precise_sbb, take the carry from the comparison that
                     # actually set it rather than the running `_cf`. `cmp X, 1;
@@ -1220,13 +1326,20 @@ class Lifter:
                 stop = '_a == _b'          # repeat while different
             else:
                 stop = None
+            # CF too, not just the lazy pair: `repe cmpsb; sbb ebx, ebx` (the
+            # inlined memcmp sign idiom) reads _cf directly, and without this it
+            # read whatever the previous instruction left -- every differing
+            # string then compared "greater", and std::map<string> lookups
+            # returned the first node for any key.
             if stop is None:
                 lines.append(f"{{ uint32_t _a, _b; {load} "
-                             f"_flag_a = _a; _flag_b = _b; }} {comment}")
+                             f"_flag_a = _a; _flag_b = _b; "
+                             f"_cf = (uint32_t)CMP_B(_a, _b); }} {comment}")
             else:
                 lines.append(f"{{ uint32_t _a = 0, _b = 0; "
                              f"while (ecx) {{ {load} ecx--; if ({stop}) break; }} "
-                             f"_flag_a = _a; _flag_b = _b; }} {comment}")
+                             f"_flag_a = _a; _flag_b = _b; "
+                             f"_cf = (uint32_t)CMP_B(_a, _b); }} {comment}")
             self._flag_state = ('cmp', "_flag_a, _flag_b")
             self._flag_seq += 1
 
@@ -1255,6 +1368,9 @@ class Lifter:
                     lines.append(f"RECOMP_ICALL({r}); {comment}")
                 else:
                     lines.append(f"RECOMP_ICALL(0); /* unresolved */ {comment}")
+            # the callee's flags (see RECOMP_FLAGS_OUT)
+            lines.append("RECOMP_FLAGS_IN();")
+            self._flag_state = None
 
         elif m == 'ret' or m == 'retn':
             # Pop the return address that RECOMP_CALL/ICALL pushed (esp += 4), plus
@@ -1263,9 +1379,9 @@ class Lifter:
             # 0xDEAD0000 dummy return address gets read as a function argument.
             if ops and ops[0].type == X86_OP_IMM:
                 n = ops[0].imm
-                lines.append(f"esp += {4 + n}; return; {comment}")
+                lines.append(f"RECOMP_FLAGS_OUT(); esp += {4 + n}; return; {comment}")
             else:
-                lines.append(f"esp += 4; return; {comment}")
+                lines.append(f"RECOMP_FLAGS_OUT(); esp += 4; return; {comment}")
 
         elif m == 'retf':
             lines.append(f"return; /* far return */ {comment}")
@@ -1313,7 +1429,8 @@ class Lifter:
                         addr = self._fmt_mem_addr(ops[0].mem)
                         lines.append(f"fp_push(*(double*)ADDR({addr})); {comment}")
                     else:
-                        lines.append(f"fp_push(0.0); /* fld size={ops[0].size} */ {comment}")
+                        addr = self._fmt_mem_addr(ops[0].mem)
+                        lines.append(f"fp_push(fp_ld80((const uint8_t*)ADDR({addr}))); {comment}")
                 else:
                     lines.append(f"fp_push(_st[{ops[0].reg - X86_REG_ST0}]); {comment}")  # ST(i) hack
 
@@ -1338,7 +1455,7 @@ class Lifter:
                     elif ops[0].size == 8:
                         lines.append(f"{{ double _v = fp_pop(); *(double*)ADDR({addr}) = _v; }} {comment}")
                     else:
-                        lines.append(f"fp_pop(); /* fstp size={ops[0].size} */ {comment}")
+                        lines.append(f"fp_st80((uint8_t*)ADDR({addr}), fp_pop()); {comment}")
                 else:
                     # fstp st(i): ST(i) <- ST(0) THEN pop. The copy uses the
                     # pre-pop numbering, so after the pop the written value lands at
@@ -1355,15 +1472,17 @@ class Lifter:
                 elif ops[0].size == 8:
                     lines.append(f"*(double*)ADDR({addr}) = _st[0]; {comment}")
 
-        elif m == 'fistp':
+        elif m in ('fistp', 'fist'):
+            # Round by the control word (fp_to_int), not by C's truncating cast.
             if ops and ops[0].type == X86_OP_MEM:
                 addr = self._fmt_mem_addr(ops[0].mem)
+                src = 'fp_pop()' if m == 'fistp' else '_st[0]'
                 if ops[0].size == 2:
-                    lines.append(f"MEM16({addr}) = (int16_t)fp_pop(); {comment}")
+                    lines.append(f"MEM16({addr}) = (int16_t)fp_to_int({src}); {comment}")
                 elif ops[0].size == 4:
-                    lines.append(f"MEM32({addr}) = (uint32_t)(int32_t)fp_pop(); {comment}")
+                    lines.append(f"MEM32({addr}) = (uint32_t)(int32_t)fp_to_int({src}); {comment}")
                 else:
-                    lines.append(f"MEM64({addr}) = (int64_t)fp_pop(); {comment}")
+                    lines.append(f"MEM64({addr}) = (int64_t)fp_to_int({src}); {comment}")
 
         elif m == 'fadd':
             if ops:
@@ -1463,7 +1582,7 @@ class Lifter:
             lines.append(f"/* {m} (no-op in fixed-window FPU stack) */ {comment}")
 
         elif m in ('fcomip', 'fucomip', 'fcompp'):
-            lines.append(f"_fpu_cmp = (_st[0] < _st[1]) ? -1 : (_st[0] > _st[1]) ? 1 : 0; {comment}")
+            lines.append(f"_fpu_cmp = FPU_CMP(_st[0], _st[1]); {comment}")
             if m == 'fcompp':
                 lines.append(f"fp_pop(); fp_pop();")
             else:
@@ -1475,9 +1594,9 @@ class Lifter:
         elif m in ('fcom', 'fcomp', 'fucom', 'fucomp'):
             if ops:
                 src = self._fmt_fpu_src(ops)
-                lines.append(f"_fpu_cmp = (_st[0] < {src}) ? -1 : (_st[0] > {src}) ? 1 : 0; {comment}")
+                lines.append(f"_fpu_cmp = FPU_CMP(_st[0], {src}); {comment}")
             else:
-                lines.append(f"_fpu_cmp = (_st[0] < _st[1]) ? -1 : (_st[0] > _st[1]) ? 1 : 0; {comment}")
+                lines.append(f"_fpu_cmp = FPU_CMP(_st[0], _st[1]); {comment}")
             if m in ('fcomp', 'fucomp'):
                 lines.append(f"fp_pop();")
             lines.append("_flag_a = (uint32_t)_fpu_cmp; _flag_b = 0;")
@@ -1507,7 +1626,15 @@ class Lifter:
             #     st0 == src -> C3=1  -> 0x4000, ah = 0x40
             #     st0 >  src ->       -> 0x0000, ah = 0x00
             # which is exactly what `test ah, 0x41` is written to distinguish.
-            sw = ("(_fpu_cmp < 0 ? 0x0100u : "
+            # Unordered (a NaN operand) sets C3, C2 and C0 together: 0x4500.
+            # Without it a NaN read as "equal" (C3 only), and MSVC's
+            # `while (x >= 1.0) x -= 1.0` wrap loop -- which exits on C0 --
+            # spun forever on x = NaN in the MxO client's frame loop.
+            # An fxam result is carried as 0x10000 | its C3..C0 bits (tested as
+            # >= 0x10000: the fcom "less" state is -1, which has bit 16 set) and
+            # reported verbatim.
+            sw = ("((_fpu_cmp >= 0x10000) ? (uint32_t)(_fpu_cmp & 0x4700) : "
+                  "_fpu_cmp == 2 ? 0x4500u : _fpu_cmp < 0 ? 0x0100u : "
                   "_fpu_cmp == 0 ? 0x4000u : 0x0000u)")
             if ops and ops[0].type == X86_OP_REG:
                 lines.append(f"eax = (eax & 0xFFFF0000u) | {sw}; {comment}")
@@ -1521,13 +1648,38 @@ class Lifter:
             # the 'fcom' state and the unsigned jcc after it maps correctly.
 
         elif m == 'sahf':
-            lines.append(f"/* sahf - load flags from ah */ {comment}")
-            # Often follows fnstsw ax; sahf; jcc pattern
+            # SF ZF AF PF CF <- ah bits 7 6 4 2 0. This was a comment, so a
+            # `jp` after it read the parity of whatever compare came before:
+            # the CRT fmod loop `fprem; fnstsw ax; sahf; jp again` in Gunman's
+            # gunman.dll then spun forever the moment a map started (the jp
+            # saw `cmp [flag], 1` with flag 0: 0xFFFFFFFF, even parity). The
+            # fcom idiom is unaffected: fnstsw builds ah from the compare, and
+            # decoding ah gives the same answers (and unordered correctly).
+            lines.append(f"_flag_a = (eax >> 8) & 0xD5u; _flag_b = 0; "
+                         f"_cf = _flag_a & 1u; _flag_k = FK_EFLAGS; {comment}")
+            self._flag_state = ('eflags', '_flag_a, _flag_b')
+            self._flag_seq += 1
+
+        elif m == 'fxam':
+            # Classify st(0) into C3 C2 C0 (+ C1 = sign). It was UNIMPLEMENTED,
+            # which only mattered once `sahf` was real: the CRT math functions
+            # (fmod, the trig family) classify their arguments with
+            # `fxam; fnstsw ax; ... xlatb` and dispatch on the class, and a
+            # stale class made Gunman's server fmod return NaN -- then its
+            # angle-wrap loop `while (a >= 360) a -= 360` never ended.
+            lines.append("{ double _v = _st[0]; uint32_t _c = "
+                         "isnan(_v) ? 0x0100u : isinf(_v) ? 0x0500u : _v == 0.0 ? 0x4000u : "
+                         "(fabs(_v) < 2.2250738585072014e-308) ? 0x4400u : 0x0400u; "
+                         "if (signbit(_v)) _c |= 0x0200u; _fpu_cmp = (int)(0x10000u | _c); } "
+                         f"{comment}")
+
+        elif m == 'xlatb' or m == 'xlat':
+            lines.append(f"SET_LO8(eax, MEM8(ebx + LO8(eax))); {comment}")
 
         elif m == 'ftst':
             # Compare ST(0) with 0.0. Same -1/0/1 convention as fcom, which is
             # what the flag-consumer path already reads.
-            lines.append(f"_fpu_cmp = (_st[0] > 0.0) - (_st[0] < 0.0); {comment}")
+            lines.append(f"_fpu_cmp = FPU_CMP(_st[0], 0.0); {comment}")
             self._flag_state = ('fcom', '_fpu_cmp')
             self._flag_seq += 1
 
@@ -1556,13 +1708,17 @@ class Lifter:
 
         elif m == 'fptan':
             # tan into ST(0), then push 1.0 -- the 8087 leaves a ratio behind.
-            lines.append(f"_st[0] = tan(_st[0]); fp_push(1.0); {comment}")
+            lines.append(f"_st[0] = tan(_st[0]); fp_push(1.0); _fpu_cmp = 1; {comment}")
 
         elif m == 'fpatan':
             lines.append(f"{{ double _x = fp_pop(); _st[0] = atan2(_st[0], _x); }} {comment}")
 
         elif m == 'fprem' or m == 'fprem1':
-            lines.append(f"_st[0] = fmod(_st[0], _st[1]); {comment}")
+            # One fmod is the WHOLE reduction, so C2 ("incomplete, go again")
+            # must read clear: fnstsw builds the status word from _fpu_cmp,
+            # and 1 is the state whose word has C2 = 0. Code after fprem only
+            # tests C2; C0/C1/C3 hold quotient bits nothing here reads.
+            lines.append(f"_st[0] = fmod(_st[0], _st[1]); _fpu_cmp = 1; {comment}")
 
         elif m == 'fscale':
             lines.append(f"_st[0] *= pow(2.0, (double)(int)_st[1]); {comment}")
@@ -1585,14 +1741,18 @@ class Lifter:
         elif m == 'fldpi':
             lines.append(f"fp_push(3.14159265358979323846); {comment}")
 
+        # The trig ops clear C2 ("in range": the host's sin reduces any
+        # argument). The CRT tests it -- `fsin; fnstsw ax; sahf; jp reduce` --
+        # and a C2 left over from its own fxam sent every call down the
+        # reduction path. _fpu_cmp = 1 is the status word with C2 clear.
         elif m == 'fsin':
-            lines.append(f"_st[0] = sin(_st[0]); {comment}")
+            lines.append(f"_st[0] = sin(_st[0]); _fpu_cmp = 1; {comment}")
 
         elif m == 'fcos':
-            lines.append(f"_st[0] = cos(_st[0]); {comment}")
+            lines.append(f"_st[0] = cos(_st[0]); _fpu_cmp = 1; {comment}")
 
         elif m == 'fsincos':
-            lines.append(f"{{ double _a = _st[0]; _st[0] = cos(_a); fp_push(sin(_a)); }} {comment}")
+            lines.append(f"{{ double _a = _st[0]; _st[0] = cos(_a); fp_push(sin(_a)); }} _fpu_cmp = 1; {comment}")
 
         elif m == 'fpatan':
             lines.append(f"{{ double _v = fp_pop(); _st[0] = atan2(_v, _st[0]); }} {comment}")
@@ -1604,7 +1764,12 @@ class Lifter:
             lines.append(f"_st[0] = _st[0] * pow(2.0, (int)_st[1]); {comment}")
 
         elif m == 'frndint':
-            lines.append(f"_st[0] = (double)(int)_st[0]; /* frndint */ {comment}")
+            # Round by the control word, like fist. `(double)(int)x` always
+            # truncated (and overflowed past 2^31), so the CRT's floor/ceil --
+            # `fldcw` down/up, `frndint`, `fldcw` back -- both truncated:
+            # ceil(0.3) came out 0, and Gunman's engine computed zero-sized
+            # surface extents at map load ("D_SCAlloc: bad cache size 0").
+            lines.append(f"_st[0] = fp_round_cw(_st[0], _fpu_cw); /* frndint */ {comment}")
 
         # --- SSE scalar float ---
         elif m == 'movss':
