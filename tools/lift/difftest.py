@@ -93,6 +93,7 @@ class Case:
     mem: dict = field(default_factory=dict)   # guest VA -> bytes
     undef: tuple = ()
     known: str = ''      # a divergence we know about and have chosen to keep
+    precise_carry: bool = False   # lift with Lifter(precise_carry=True)
 
     def start_regs(self):
         r = dict(DEFAULT_REGS)
@@ -114,6 +115,21 @@ CASES = [
     # the values stay plausible for a long time afterwards -- so a comparison
     # of values alone can pass while the model is already one slot out. These
     # cases check the balance first and the arithmetic second.
+    # fld dword [esi]; fcomp dword [esi+4]; fnstsw ax -- an unordered compare
+    # sets C3|C2|C0 (ah = 0x45). It used to read as "equal" (0x40).
+    Case('fpu.fcom-nan', bytes.fromhex('d906d85e04dfe0'),
+         mem={SCRATCH: struct.pack('<ff', float('nan'), 1.0)}),
+    Case('fpu.fcom-less', bytes.fromhex('d906d85e04dfe0'),
+         mem={SCRATCH: struct.pack('<ff', 0.5, 1.0)}),
+    # MSVC's `x < 0.0`: fld; fcomp; fnstsw ax; test ah, 5; setp cl. PF must be
+    # the parity of (ah & 5) -- it was a constant, so the branch never varied.
+    Case('fpu.lt-zero-parity-neg', bytes.fromhex('d906d85e04dfe0f6c4050f9ac1'),
+         mem={SCRATCH: struct.pack('<ff', -0.5, 0.0)}, undef=('AF',),
+         known='setp/jp read the right PF (cl matches); the MATERIALISED EFLAGS '
+               'rebuild PF from the left-aligned result without its width, so a '
+               'narrow result reads as even. Only a pushfd round trip sees it.'),
+    Case('fpu.lt-zero-parity-pos', bytes.fromhex('d906d85e04dfe0f6c4050f9ac1'),
+         mem={SCRATCH: struct.pack('<ff', 0.5, 0.0)}, undef=('AF',)),
     Case('fpu.push', bytes.fromhex('d9e8')),                       # fld1
     Case('fpu.push-twice', bytes.fromhex('d9e8d9e8')),             # fld1; fld1
     Case('fpu.push-pop', bytes.fromhex('d9e8ddd8')),               # fld1; fstp st(0)
@@ -270,6 +286,13 @@ CASES = [
     Case('cmpsb.repe-equal', bytes.fromhex('f3a6'),          # repe cmpsb
          {'ecx': 4},
          mem={SCRATCH: b'ABCD', SCRATCH + 0x100: b'ABCD'}, undef=('AF',)),
+    # The inlined memcmp sign idiom: the sbb reads CF straight after the loop.
+    Case('cmpsb.repe-less-sbb', bytes.fromhex('f3a61bdb'),   # repe cmpsb; sbb ebx,ebx
+         {'ecx': 4, 'ebx': 0x12345678},
+         mem={SCRATCH: b'ABCA', SCRATCH + 0x100: b'ABCD'}, undef=('AF',)),
+    Case('cmpsb.repe-greater-sbb', bytes.fromhex('f3a61bdb'),
+         {'ecx': 4, 'ebx': 0x12345678},
+         mem={SCRATCH: b'ABCZ', SCRATCH + 0x100: b'ABCD'}, undef=('AF',)),
     Case('cmpsd.single', bytes.fromhex('a7'),                # cmpsd, no prefix
          mem={SCRATCH: b'ABCD', SCRATCH + 0x100: b'ABCE'}),
     # The count and the pointers advance for the element that ENDS the loop too,
@@ -463,7 +486,133 @@ CASES = [
          {'eax': 0xFF, 'ecx': 0x2C, 'edx': 0}),
     Case('cmovle.after-test.positive', bytes.fromhex('85db0f4ec1'), # test ebx,ebx; cmovle eax,ecx
          {'ebx': 0x0000002C, 'eax': 0x11111111, 'ecx': 0x22222222}),
+
+    # --- bit strings: bt/bts with a register offset address past the dword ---
+    # The CRT's strcspn runs `bt [esp], eax` over a 256-bit map; bit 69 lives
+    # in the dword at +8. Reading [ea] for every bit was the bug. ZF is
+    # "unaffected" and OF/SF/AF/PF undefined for the bt family.
+    Case('bt.mem-bitstring.set', bytes.fromhex('0fa3060f92c1'),     # bt [esi],eax; setc cl
+         regs={'eax': 69}, mem={SCRATCH: bytes(8) + b' ' + bytes(23)},
+         undef=('OF', 'SF', 'AF', 'PF', 'ZF')),
+    Case('bt.mem-bitstring.clear', bytes.fromhex('0fa3060f92c1'),
+         regs={'eax': 69}, mem={SCRATCH: b' ' + bytes(31)},
+         undef=('OF', 'SF', 'AF', 'PF', 'ZF')),
+    Case('bts.mem-bitstring', bytes.fromhex('0fab060f92c1'),        # bts [esi],eax; setc cl
+         regs={'eax': 69}, mem={SCRATCH: bytes(32)},
+         undef=('OF', 'SF', 'AF', 'PF', 'ZF')),
+    Case('bts.reg', bytes.fromhex('0fabc30f92c1'),                  # bts ebx,eax; setc cl
+         regs={'eax': 0x45}, undef=('OF', 'SF', 'AF', 'PF', 'ZF')),
+    Case('btr.imm', bytes.fromhex('0fbaf3070f92c1'),                # btr ebx,7; setc cl
+         undef=('OF', 'SF', 'AF', 'PF', 'ZF')),
+    # `bt; jae` takes the branch on CF=0; setae is the same condition code.
+    Case('bt.setae.bit-clear', bytes.fromhex('0fa3060f93c1'),        # bt [esi],eax; setae cl
+         regs={'eax': 69}, mem={SCRATCH: bytes(32)},
+         undef=('OF', 'SF', 'AF', 'PF', 'ZF')),
+    Case('bt.setae.bit-set', bytes.fromhex('0fa3060f93c1'),
+         regs={'eax': 69}, mem={SCRATCH: bytes(8) + b' ' + bytes(23)},
+         undef=('OF', 'SF', 'AF', 'PF', 'ZF')),
+    # --- byte-sized read-modify-write and the flag it leaves ------------------
+    # The MSVC 6 small-block heap counts free entries per group in a byte:
+    # `dec byte ptr [ecx]; jne` (0x100A3D0B in Gunman's sw.dll).
+    Case('dec.mem8.to-zero', bytes.fromhex('fe0e0f95c1'),           # dec byte [esi]; setne cl
+         mem={SCRATCH: b'\x01' + bytes(31)}, known=WIDTH),
+    Case('dec.mem8.wraps', bytes.fromhex('fe0e0f95c1'),
+         mem={SCRATCH: bytes(32)}, known=WIDTH),
+    Case('dec.mem8.nonzero', bytes.fromhex('fe0e0f95c1'),
+         mem={SCRATCH: b'\x05' + bytes(31)}, known=WIDTH),
+    Case('inc.mem8.to-zero', bytes.fromhex('fe060f94c1'),           # inc byte [esi]; sete cl
+         mem={SCRATCH: b'\xff' + bytes(31)}, known=WIDTH),
+    Case('inc.cl.wraps', bytes.fromhex('fec10f94c2'),               # inc cl; sete dl
+         regs={'ecx': 0x123456FF}, known=WIDTH),
+    Case('dec.edx.to-zero', bytes.fromhex('4a0f95c1'),              # dec edx; setne cl
+         regs={'edx': 1}, undef=('AF',)),
+    Case('cmp.mem8.zero', bytes.fromhex('803e000f95c1'),            # cmp byte [esi],0; setne cl
+         mem={SCRATCH: b'\x80' + bytes(31)}, known=WIDTH),
+    Case('add.mem8.carry', bytes.fromhex('80060f0f92c1'),           # add byte [esi],0xf; setc cl
+         mem={SCRATCH: b'\xf8' + bytes(31)}, known=WIDTH),
+    # cmp sets CF, inc/dec must PRESERVE it, and setae/setb read the cmp's.
+    Case('cf.survives-inc', bytes.fromhex('83ff20fec10f93c2'),      # cmp edi,0x20; inc cl; setae dl
+         regs={'edi': 0x10, 'ecx': 0xFF}, known=WIDTH),
+    Case('cf.survives-dec', bytes.fromhex('83ff204a0f92c1'),        # cmp edi,0x20; dec edx; setb cl
+         regs={'edi': 0x10, 'edx': 1}, undef=('AF',)),
+    # sahf loads SF ZF AF PF CF from ah: the fmod loop's `sahf; jp` reads C2.
+    Case('sahf.pf', bytes.fromhex('b404' '9e' '0f9ac1'),             # mov ah,4; sahf; setp cl
+         regs={'eax': 0}, undef=('OF',)),
+    Case('sahf.cf-zf', bytes.fromhex('b441' '9e' '0f92c1' '0f94c2'), # mov ah,0x41; sahf; setb cl; sete dl
+         regs={'eax': 0}, undef=('OF',)),
+    Case('sahf.clear', bytes.fromhex('b400' '9e' '0f9ac1' '0f92c2'), # mov ah,0; sahf; setp cl; setb dl
+         regs={'eax': 0}, undef=('OF',)),
+    # xlatb: al = [ebx + al]
+    Case('xlatb', bytes.fromhex('d7'), regs={'ebx': SCRATCH, 'eax': 0x1234_5603},
+         mem={SCRATCH: bytes([0x10, 0x20, 0x30, 0x77]) + bytes(28)}),
+    # frndint rounds by the control word (floor/ceil in the CRT depend on it)
+    Case('frndint.nearest', bytes.fromhex('d96e08' 'd906' 'd9fc' 'db1f'),
+         mem={SCRATCH: b'\x00\x00 @\x00\x00\x00\x00\x7f\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'}),
+    Case('frndint.down', bytes.fromhex('d96e08' 'd906' 'd9fc' 'db1f'),
+         mem={SCRATCH: b'\x9a\x99\x99\xbe\x00\x00\x00\x00\x7f\x06\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'}),
+    Case('frndint.up', bytes.fromhex('d96e08' 'd906' 'd9fc' 'db1f'),
+         mem={SCRATCH: b'\x9a\x99\x99>\x00\x00\x00\x00\x7f\n\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'}),
+    Case('frndint.chop', bytes.fromhex('d96e08' 'd906' 'd9fc' 'db1f'),
+         mem={SCRATCH: b'\x9a\x99\xd9\xbf\x00\x00\x00\x00\x7f\x0e\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'}),
+    # 80-bit loads/stores: the CRT's xword 2*pi (0x4001 C90FDAA22168C235)
+    # fld xword [esi]; fstp qword [edi]
+    Case('fld.m80', bytes.fromhex('db2e' 'dd1f'),
+         mem={SCRATCH: bytes.fromhex('35c26821a2da0fc90140') + bytes(22)}),
+    # fld qword [esi]; fstp xword [edi]; fld xword [edi]; fstp qword [edi+16]
+    Case('fstp.m80', bytes.fromhex('dd06' 'db3f' 'db2f' 'dd5f10'),
+         mem={SCRATCH: struct.pack('<d', -1234.5678) + bytes(24)}),
+    # the CRT's sin: fld; fxam (a normal: C2 set); fsin; fstp; fnstsw ax;
+    # sahf; setp cl -- stored first so TOP (which fnstsw does not model) is 0
+    Case('fsin.c2', bytes.fromhex('dd06' 'd9e5' 'd9fe' 'dd1f' 'dfe0' '9e' '0f9ac1'),
+         mem={SCRATCH: struct.pack('<d', 0.5) + bytes(24)}, undef=('OF',)),
+    # Quake's span stepper: the fraction adds carry into the texel address.
+    # add edx,eax; sbb ecx,ecx; add ebx,ebp; adc esi,[edi+ecx*4+4]
+    Case('span.carry', bytes.fromhex('01c2' '19c9' '01eb' '13748f04'),
+         regs={'eax': 0x8000_0000, 'edx': 0x9000_0000, 'ebx': 0xF000_0000,
+               'ebp': 0x2000_0000, 'esi': 0x100},
+         mem={SCRATCH + 0x100: struct.pack('<II', 7, 1000)}, undef=('AF',), precise_carry=True),
+    Case('span.nocarry', bytes.fromhex('01c2' '19c9' '01eb' '13748f04'),
+         regs={'eax': 0x1000_0000, 'edx': 0x2000_0000, 'ebx': 0x1000_0000,
+               'ebp': 0x2000_0000, 'esi': 0x100},
+         mem={SCRATCH + 0x100: struct.pack('<II', 7, 1000)}, undef=('AF',), precise_carry=True),
+    # the same without the option: the documented stale-carry ceiling
+    Case('span.carry.default', bytes.fromhex('01c2' '19c9' '01eb' '13748f04'),
+         regs={'eax': 0x8000_0000, 'edx': 0x9000_0000, 'ebx': 0xF000_0000,
+               'ebp': 0x2000_0000, 'esi': 0x100},
+         mem={SCRATCH + 0x100: struct.pack('<II', 7, 1000)}, undef=('AF',),
+         known='adc/sbb read the _cf variable, which add/sub/cmp do not write; '
+               'Lifter(precise_carry=True) derives it (off by default: Fury3)'),
+    Case('lock.inc', bytes.fromhex('f0ff06'),                       # lock inc dword [esi]
+         mem={SCRATCH: (41).to_bytes(4, 'little')}),
 ]
+
+# Every x87 register form, i = 1 and 2, from a stack of three distinct values
+# (st0 = 5, st1 = 3, st2 = 2), storing all three back. The DC/DE sub/div forms
+# are the classic trap: AT&T names them swapped, and disassemblers have too.
+def _x87_forms():
+    load = bytes.fromhex('dd06' 'dd4608' 'dd4610')           # fld [esi], [esi+8], [esi+16]
+    store = bytes.fromhex('dd1f' 'dd5f08' 'dd5f10')          # fstp [edi], [edi+8], [edi+16]
+    forms = {'d8c0': 'fadd', 'd8c8': 'fmul', 'd8d0': 'fcom', 'd8e0': 'fsub', 'd8e8': 'fsubr',
+             'd8f0': 'fdiv', 'd8f8': 'fdivr', 'dcc0': 'fadd.to', 'dcc8': 'fmul.to',
+             'dce0': 'dc.e0', 'dce8': 'dc.e8', 'dcf0': 'dc.f0', 'dcf8': 'dc.f8',
+             'dec0': 'faddp', 'dec8': 'fmulp', 'dee0': 'de.e0', 'dee8': 'de.e8',
+             'def0': 'de.f0', 'def8': 'de.f8', 'd9c0': 'fld.st', 'd9c8': 'fxch',
+             'ddd8': 'fstp.st'}
+    out = []
+    for op, name in forms.items():
+        for i in (1, 2):
+            b = bytes.fromhex(op[:2]) + bytes([int(op[2:], 16) + i])
+            pops = name in ('faddp', 'fmulp', 'fstp.st') or name.startswith('de.')
+            pushes = name == 'fld.st'
+            # store what is left: 3 values, minus a pop, plus a push
+            n = 3 - pops + pushes
+            out.append(Case('x87.%s.st%d' % (name, i), load + b + store[:2 + 3 * (n > 1) + 3 * (n > 2)]
+                            + (bytes.fromhex('dd5f18') if n > 3 else b''),
+                            mem={SCRATCH: struct.pack('<ddd', 2.0, 3.0, 5.0)}, undef=('OF',)))
+    return out
+
+
+CASES += _x87_forms()
 
 
 # ---------------------------------------------------------------- reference
@@ -535,7 +684,7 @@ def lift_case(case):
     """Lift one case's bytes to the body of a C function."""
     md = Cs(CS_ARCH_X86, CS_MODE_32)
     md.detail = True
-    lifter = Lifter()
+    lifter = Lifter(precise_carry=case.precise_carry)
     lifter._labels = set()
     lifter._jump_targets = set()
     lifter._flag_state = None

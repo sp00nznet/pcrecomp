@@ -46,6 +46,23 @@ extern double   g_st[8];
 extern int      g_fp_top;
 extern uint16_t g_fpu_cw;
 
+/* The arithmetic flags a function RETURNS with. The lazy flag state is local
+ * to each lifted function, but assembly and the CRT return results in flags:
+ * MSVC's sin/cos call a helper that returns ZF = "argument is Inf/NaN", and
+ * the caller's `je` read its own stale flags instead -- every sin took the
+ * NaN path (Gunman's view vectors, and with them the whole frame, went
+ * black). So every `ret` publishes the state and every call picks it back up;
+ * where the caller overwrites the flags first, the compiler drops the loads.
+ * Defined here, weakly, so no project's runtime has to. */
+#if defined(_MSC_VER)
+#define RECOMP_WEAK __declspec(selectany)
+#else
+#define RECOMP_WEAK __attribute__((weak))
+#endif
+RECOMP_WEAK uint32_t g_flag_k, g_flag_a, g_flag_b, g_flag_cf;
+#define RECOMP_FLAGS_OUT() (g_flag_k = _flag_k, g_flag_a = _flag_a, g_flag_b = _flag_b, g_flag_cf = _cf)
+#define RECOMP_FLAGS_IN()  (_flag_k = g_flag_k, _flag_a = g_flag_a, _flag_b = g_flag_b, _cf = g_flag_cf)
+
 /* Segment registers (flat mode Win32 - effectively unused) */
 extern uint16_t g_seg_cs, g_seg_ds, g_seg_es, g_seg_fs, g_seg_gs, g_seg_ss;
 
@@ -66,7 +83,32 @@ extern const uint32_t recomp_dispatch_count;
  * Register Name Aliases (used in generated code)
  * ============================================================ */
 
-#ifdef RECOMP_GENERATED_CODE
+#if defined(RECOMP_GENERATED_CODE) && defined(RECOMP_LOCAL_REGS)
+/* RECOMP_LOCAL_REGS: each lifted function works on local copies of the eight
+ * registers, loaded on entry and written back before every call, tail call
+ * and return (and reloaded after calls, which may run native code, callbacks
+ * or other lifted functions). Globals can alias any guest memory store, so
+ * the optimiser had to reload them after every MEM32 write; locals whose
+ * address is never taken stay in host registers. Opt-in: every exit from a
+ * body must pass RECOMP_REGS_OUT, which generate.py arranges. */
+#define eax l_eax
+#define ecx l_ecx
+#define edx l_edx
+#define ebx l_ebx
+#define esp l_esp
+#define esi l_esi
+#define edi l_edi
+#define ebp l_ebp
+#define RECOMP_REGS_LOCALS uint32_t l_eax = g_eax, l_ecx = g_ecx, l_edx = g_edx, l_ebx = g_ebx, l_esp = g_esp, l_esi = g_esi, l_edi = g_edi, l_ebp = g_ebp;
+#define RECOMP_REGS_OUT() (g_eax = l_eax, g_ecx = l_ecx, g_edx = l_edx, g_ebx = l_ebx, g_esp = l_esp, g_esi = l_esi, g_edi = l_edi, g_ebp = l_ebp)
+#define RECOMP_REGS_IN() (l_eax = g_eax, l_ecx = g_ecx, l_edx = g_edx, l_ebx = g_ebx, l_esp = g_esp, l_esi = g_esi, l_edi = g_edi, l_ebp = g_ebp)
+#else
+#define RECOMP_REGS_LOCALS
+#define RECOMP_REGS_OUT() ((void)0)
+#define RECOMP_REGS_IN() ((void)0)
+#endif
+
+#if defined(RECOMP_GENERATED_CODE) && !defined(RECOMP_LOCAL_REGS)
 #define eax g_eax
 #define ecx g_ecx
 #define edx g_edx
@@ -75,6 +117,8 @@ extern const uint32_t recomp_dispatch_count;
 #define esi g_esi
 #define edi g_edi
 #define ebp g_ebp
+#endif
+#ifdef RECOMP_GENERATED_CODE
 /* x87 FPU stack is global; _fpu_cmp stays per-function (set+used within one fn) */
 #define _st g_st
 #define _fp_top g_fp_top
@@ -116,7 +160,13 @@ extern const uint32_t recomp_dispatch_count;
 
 extern ptrdiff_t g_mem_base;
 
+#ifdef RECOMP_FLAT_MEMORY
+/* Guest VAs ARE host addresses (a 32-bit host mapping each module at its own
+ * base): nothing to add, and no global to reload on every access. */
+#define ADDR(va)     ((uintptr_t)(uint32_t)(va))
+#else
 #define ADDR(va)     ((uintptr_t)(uint32_t)(va) + g_mem_base)
+#endif
 
 /* Thread-relative segment bases. In Win32, fs: points at the TIB/TEB; gs is
  * unused on x86. The lifter emits fs:/gs: accesses as FS_BASE/GS_BASE + addr,
@@ -275,7 +325,7 @@ enum {
     FK_ADD,     /* add            -- a + b            */
     FK_TEST,    /* and/or/xor/test/shift -- a & b     */
     FK_BT,      /* bt             -- CF = bit b of a  */
-    FK_FCOM,    /* fcom           -- a is -1/0/1      */
+    FK_FCOM,    /* fcom           -- a is -1/0/1, 2 = unordered */
     /* INC and DEC are ADD and SUB that do NOT write CF. No condition can tell
      * them apart (a jcc reading CF after an inc is reading a flag the
      * instruction never wrote), but PUSHFD can: it has to report the carry
@@ -308,7 +358,13 @@ static inline int recomp_cond(uint32_t kind, uint32_t a, uint32_t b, int cc) {
     }
 
     if (kind == FK_FCOM) {
-        int32_t v = (int32_t)a;          /* -1 less, 0 equal, 1 greater */
+        int32_t v = (int32_t)a;          /* -1 less, 0 equal, 1 greater, 2 unordered */
+        if (v == 2) {                    /* NaN: ZF = PF = CF = 1, as fcomi/sahf leave them */
+            switch (cc) {
+            case CC_E: case CC_B: case CC_BE: return 1;
+            default:                          return 0;
+            }
+        }
         switch (cc) {
         case CC_E:                return v == 0;
         case CC_NE:               return v != 0;
@@ -322,8 +378,9 @@ static inline int recomp_cond(uint32_t kind, uint32_t a, uint32_t b, int cc) {
 
     switch (kind) {
     case FK_ADD:
-    case FK_INC:                          /* CF is stale for INC; no condition
-                                             is entitled to read it anyway */
+    case FK_INC:                          /* CF here is the ADD's; after INC the
+                                             real CF is the preserved one --
+                                             see recomp_cond_cf */
         r  = a + b;
         cf = (r < a);
         of = (int)((~(a ^ b) & (a ^ r)) >> 31);
@@ -367,6 +424,38 @@ decide:
     return 0;
 }
 
+/* recomp_cond, with the carry that inc/dec PRESERVE. `cmp; inc; jae` reads
+ * the cmp's CF, which the lifted code still has in _cf; deriving it from the
+ * inc's operands is wrong (it corrupted MSVC 6's small-block heap). */
+/* x87 compare outcome: -1 less, 0 equal, 1 greater, 2 unordered (a NaN). */
+#define FPU_CMP(x, y) ((x) < (y) ? -1 : (x) > (y) ? 1 : (x) == (y) ? 0 : 2)
+
+static inline int recomp_cond_cf(uint32_t kind, uint32_t a, uint32_t b, int cc,
+                                 uint32_t cf) {
+    if ((kind == FK_INC || kind == FK_DEC) &&
+        (cc == CC_B || cc == CC_AE || cc == CC_A || cc == CC_BE)) {
+        int zf = recomp_cond(kind, a, b, CC_E);
+        switch (cc) {
+        case CC_B:  return cf != 0;
+        case CC_AE: return cf == 0;
+        case CC_A:  return cf == 0 && !zf;
+        default:    return cf != 0 || zf;
+        }
+    }
+    return recomp_cond(kind, a, b, cc);
+}
+
+/* CF as adc/sbb read it: derived from an add/sub/cmp's operands (which do
+ * not write `_cf`), otherwise the `_cf` the instruction kept (adc, sbb, shifts,
+ * logic ops, inc/dec, popfd/sahf). The lifter's precise_carry option. */
+static inline uint32_t recomp_carry(uint32_t kind, uint32_t a, uint32_t b, uint32_t cf) {
+    switch (kind) {
+    case FK_ADD: return a + b < a;
+    case FK_CMP: return a < b;
+    default:     return cf;
+    }
+}
+
 /* Bit 1 reads as 1 on every x86, and IF is set in any process this runtime
  * will ever host. A PUSHFD that omitted them differs from hardware in a way
  * guest CPU-detection code notices. */
@@ -378,6 +467,10 @@ static inline uint32_t recomp_parity8(uint8_t v) {
     v ^= (uint8_t)(v >> 1);
     return (uint32_t)((~v) & 1u);
 }
+
+/* PF of a lazily captured result: parity of its low byte. `shift` undoes the
+ * left-alignment _flag_capture gives narrow operands (24 for 8-bit). */
+#define RECOMP_PF(r, shift) ((int)recomp_parity8((uint8_t)((uint32_t)(r) >> (shift))))
 
 /* The six arithmetic flags as a word, given a result and the three that do
  * not come from it. */
@@ -701,11 +794,53 @@ static inline double fp_pop_impl(double* st, int* top) {
 #define fp_push(val) fp_push_impl(_st, &_fp_top, (val))
 #define fp_pop()     fp_pop_impl(_st, &_fp_top)
 
+/* fist/fistp round by the control word's RC field (bits 10-11), not by C's
+ * truncating cast. MSVC's __ftol sets chop before its fistp, so a plain cast
+ * looked right for years; Quake-lineage rasterisers deliberately run fistp in
+ * nearest (the default), floor or ceil mode, and a cast shifts every span and
+ * texture coordinate by up to one. */
+static inline double fp_round_cw(double v, uint16_t cw) {
+    switch ((cw >> 10) & 3) {
+    case 0:  return nearbyint(v);   /* nearest-even: the host default mode */
+    case 1:  return floor(v);
+    case 2:  return ceil(v);
+    default: return trunc(v);
+    }
+}
+#define fp_to_int(v) fp_round_cw((v), _fpu_cw)
+
+/* The 80-bit extended format, for `fld/fstp xword`. The model's stack is
+ * double, so a load rounds to double and a store widens. The CRT keeps 2*pi
+ * and friends as xword constants; a load that pushed 0.0 made sin/cos reduce
+ * by fmod(x, 0) = NaN, and Gunman's AngleVectors drew nothing. */
+static inline double fp_ld80(const uint8_t* p) {
+    uint64_t m; uint16_t se;
+    memcpy(&m, p, 8); memcpy(&se, p + 8, 2);
+    int e = se & 0x7FFF;
+    double v;
+    if (e == 0x7FFF)
+        v = (m << 1) ? NAN : INFINITY;
+    else
+        v = ldexp((double)m, (e ? e : 1) - 16383 - 63);
+    return (se & 0x8000) ? -v : v;
+}
+static inline void fp_st80(uint8_t* p, double v) {
+    uint64_t m = 0; uint16_t se = signbit(v) ? 0x8000 : 0;
+    if (isnan(v)) { se |= 0x7FFF; m = 0xC000000000000000ull; }
+    else if (isinf(v)) { se |= 0x7FFF; m = 0x8000000000000000ull; }
+    else if (v != 0.0) {
+        int e; double f = frexp(fabs(v), &e);      /* f in [0.5, 1) */
+        m = (uint64_t)ldexp(f, 64);                /* exact: 53 bits */
+        se |= (uint16_t)(e - 1 + 16383);
+    }
+    memcpy(p, &m, 8); memcpy(p + 8, &se, 2);
+}
+
 /* ============================================================
  * CPUID stub
  * ============================================================ */
 
-static inline void CPUID(uint32_t eax_val, uint32_t ebx_val, uint32_t ecx_val, uint32_t edx_val) {
+static inline void CPUID_impl(uint32_t eax_val, uint32_t ebx_val, uint32_t ecx_val, uint32_t edx_val) {
     /* Return something reasonable for a Pentium III era check */
 #ifdef _MSC_VER
     int info[4];
@@ -715,6 +850,9 @@ static inline void CPUID(uint32_t eax_val, uint32_t ebx_val, uint32_t ecx_val, u
     (void)eax_val; (void)ebx_val; (void)ecx_val; (void)edx_val;
 #endif
 }
+
+/* CPUID_impl writes the global registers */
+#define CPUID(a, b, c, d) do { RECOMP_REGS_OUT(); CPUID_impl(a, b, c, d); RECOMP_REGS_IN(); } while (0)
 
 /* ============================================================
  * Indirect Call Dispatch
@@ -760,7 +898,9 @@ recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
 #define RECOMP_CALL(func) do { \
     uint32_t _caller = g_cur_func; \
     PUSH32(esp, RECOMP_RETADDR); /* dummy return address */ \
+    RECOMP_REGS_OUT(); \
     func(); \
+    RECOMP_REGS_IN(); \
     g_cur_func = _caller;  /* the callee RECOMP_ENTER clobbered it */ \
 } while(0)
 
@@ -777,7 +917,9 @@ recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
     if (_fn) { \
         uint32_t _caller = g_cur_func; \
         PUSH32(esp, RECOMP_RETADDR); \
+        RECOMP_REGS_OUT(); \
         _fn(); \
+        RECOMP_REGS_IN(); \
         g_cur_func = _caller;  /* the callee RECOMP_ENTER clobbered it */ \
     } else { \
         fprintf(stderr, "ICALL: unresolved VA 0x%08X from 0x%08X\n", _va, g_cur_func); \
@@ -796,7 +938,7 @@ recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_import(_va); \
-    if (_fn) { _fn(); } \
+    if (_fn) { RECOMP_REGS_OUT(); _fn(); RECOMP_REGS_IN(); } \
     else if (_va == RECOMP_RETADDR) { /* setjmp and friends return by jumping \
         to the saved return address; that is a return, not a missing target. */ } \
     else { fprintf(stderr, "ITAIL: unresolved VA 0x%08X from 0x%08X\n", _va, g_cur_func); } \
