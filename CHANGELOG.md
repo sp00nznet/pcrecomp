@@ -12,7 +12,8 @@ versions follow [SemVer](https://semver.org/).
   (`SteamStartup`/`SteamIsAppSubscribed` answered). Headless, deterministic,
   `--selftest` for the IAT picker. Found on The Movies (2005), whose Steam
   build packs all three executables this way. (#5)
-From `fix/lift32-narrow-muldiv` (PR number to follow). Found running SimCity 2000
+
+From #6. Found running SimCity 2000
 (Windows 95, MSVC 2.x) recompiled: its simulation faulted after `div cl`.
 
 ### Fixed
