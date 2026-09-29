@@ -85,6 +85,10 @@ void mach_enter(void) {
     EnterCriticalSection(&g_mach);
     mstate* m = (mstate*)TlsGetValue(g_mach_tls);
     if (!m) {
+        /* Stack left for a fault handler after an overflow: without it the
+         * report itself overflows and the process just vanishes. */
+        ULONG guarantee = 64 * 1024;
+        SetThreadStackGuarantee(&guarantee);
         m = (mstate*)calloc(1, sizeof *m);
         uint32_t lo = (uint32_t)(uintptr_t)VirtualAlloc(NULL, GUEST_STACK,
                           MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -251,12 +255,46 @@ recomp_func_t recomp_lookup_import(uint32_t va) {
     return native_bridge;
 }
 
+/* Built-in shims every host gets, ahead of its own.
+ *
+ * CreateThread: the thread runs LIFTED code on its native stack, and a lifted
+ * function's frame is several times the original's (register locals, flag
+ * state, the C compiler's own spills), so the size the original asked for is
+ * far too small. The Movies' worker threads overflowed theirs, and with no
+ * stack left even the fault report died. Reserve 16 MB (committed on demand). */
+#define GUEST_THREAD_STACK (16u << 20)
+static void shim_CreateThread(void) {
+    uint32_t* a = (uint32_t*)(uintptr_t)(g_esp + 4);
+    SIZE_T size = a[1] > GUEST_THREAD_STACK ? a[1] : GUEST_THREAD_STACK;
+    HANDLE h = CreateThread((LPSECURITY_ATTRIBUTES)(uintptr_t)a[0], size,
+                            (LPTHREAD_START_ROUTINE)(uintptr_t)a[2], (LPVOID)(uintptr_t)a[3],
+                            a[4] | STACK_SIZE_PARAM_IS_A_RESERVATION, (LPDWORD)(uintptr_t)a[5]);
+    g_eax = (uint32_t)(uintptr_t)h;
+    g_esp += 4 + 6 * 4;
+}
+
+static native32_shim_t g_builtin[] = {
+    { "CreateThread", shim_CreateThread },
+};
+
 int native32_bind(uint32_t base, native32_shim_t* shims, int nshims) {
     uint8_t* b = (uint8_t*)(uintptr_t)base;
     IMAGE_NT_HEADERS32* nt = (IMAGE_NT_HEADERS32*)(b + ((IMAGE_DOS_HEADER*)b)->e_lfanew);
     IMAGE_DATA_DIRECTORY dd = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     IMAGE_IMPORT_DESCRIPTOR* d = (IMAGE_IMPORT_DESCRIPTOR*)(b + dd.VirtualAddress);
     int native = 0, shimmed = 0, missing = 0;
+    /* The host's shims, then every built-in the host did not replace. */
+    int nb = (int)(sizeof g_builtin / sizeof g_builtin[0]);
+    native32_shim_t* all = (native32_shim_t*)calloc(nshims + nb, sizeof *all);
+    int n = 0;
+    for (int i = 0; i < nshims; i++) all[n++] = shims[i];
+    for (int i = 0; i < nb; i++) {
+        int dup = 0;
+        for (int k = 0; k < nshims; k++) dup |= !strcmp(shims[k].name, g_builtin[i].name);
+        if (!dup) all[n++] = g_builtin[i];
+    }
+    shims = all;
+    nshims = n;
     g_shims = shims;
     g_nshims = nshims;
     for (; dd.VirtualAddress && d->Name; d++) {
