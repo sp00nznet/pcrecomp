@@ -129,7 +129,7 @@ recompiled: its simulation hung in the CRT's `strstr`.
   its top, not 64. The bridge copies 24 argument slots up from `esp` whatever
   the callee takes, so a native call from a nearly empty guest stack read past
   the end of the allocation and faulted whenever the next page was unmapped:
-  `native32_selftest` crashed on 9 of 20 runs, and passes 20 of 20 now.
+  `native32_selftest` crashed on 9 of 20 runs, and passes 20 of 20 now. (#16)
 
 From #4. Found running Gunman Chronicles (MSVC 6 CRT, Quake-lineage software renderer)
 fully recompiled; each is generic x86 semantics or code generation. Each fix
