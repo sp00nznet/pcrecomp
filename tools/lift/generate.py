@@ -397,13 +397,20 @@ def _jump_table(ins, code, code_start, lo, hi, limit=1024):
     mem = ins.operands[0].mem
     if mem.base or not mem.index or mem.scale != 4:
         return []
-    arms, at = [], (mem.disp & 0xFFFFFFFF) - code_start
+    # A table's first entries can be unused: CRT memmove indexes one with
+    # `edi & 3` on a path where that is never 0, and its slot 0 overlaps the
+    # bytes of the jmp before it. Stopping at the first bad entry lost every
+    # arm. So skip up to three leading bad entries; after the first good one,
+    # a bad entry ends the table.
+    arms, at, k = [], (mem.disp & 0xFFFFFFFF) - code_start, 0
     while 0 <= at <= len(code) - 4 and len(arms) < limit:
         t = int.from_bytes(code[at:at + 4], 'little')
-        if not lo <= t < hi:
+        if lo <= t < hi:
+            arms.append(t)
+        elif arms or k >= 3:
             break
-        arms.append(t)
         at += 4
+        k += 1
     return arms
 
 
@@ -695,6 +702,14 @@ def _selftest():
     assert got == {0x1000, 0x1010, 0x1012}, sorted(map(hex, got))
     insns, _ = linear_disassemble_function(md, code, 0x1000, 0x1000, 0x1013, reached=got)
     assert [i.address for i in insns] == [0x1000, 0x1010, 0x1012], [hex(i.address) for i in insns]
+
+    # A biased table: slot 0 is never used and holds garbage (memmove).
+    #   1000 jmp [eax*4+1007] / 1007 dd garbage, 1010 / 1010 ret
+    code = bytes([0xFF, 0x24, 0x85, 0x07, 0x10, 0x00, 0x00, 0xEF, 0xBE, 0xAD, 0xDE,
+                  0x10, 0x10, 0x00, 0x00, 0x90, 0xC3])
+    got = set()
+    true_extent(md, code, 0x1000, 0x1000, 0x1011, {0x1000}, reached=got)
+    assert 0x1010 in got, sorted(map(hex, got))
 
     # The _stat shape: a jump to a catalogued "entry" that lies inside this
     # body's own span is internal, not a tail call.
