@@ -176,6 +176,17 @@ static void native_bridge(void) {
         fprintf(stderr, "[native] %-32s (%08X %08X %08X %08X) from sub_%08X",
                 n ? n : "?", src[0], src[1], src[2], src[3], g_cur_func);
         if (!n) fprintf(stderr, " @%08X", fn);
+        for (int k = 0; k < 4; k++) {       /* arguments that are strings (gunman) */
+            MEMORY_BASIC_INFORMATION mbi;
+            const char* p = (const char*)(uintptr_t)src[k];
+            if (src[k] < 0x10000 || !VirtualQuery(p, &mbi, sizeof mbi) ||
+                mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+                continue;
+            size_t room = (size_t)((const char*)mbi.BaseAddress + mbi.RegionSize - p), len = 0;
+            while (len < room && len < 96 && p[len] >= 0x20 && p[len] < 0x7F) len++;
+            if (len >= 3 && (len == room || len == 96 || !p[len]))
+                fprintf(stderr, " a%d=\"%.*s\"", k, (int)len, p);
+        }
     }
     g_cur_import = native32_name(fn);
     if (!g_cur_import) g_cur_import = "(native)";
