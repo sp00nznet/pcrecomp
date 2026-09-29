@@ -1376,6 +1376,18 @@ def main(argv=None):
     if info.entry_point_rva:
         seeds.add(info.image_base + info.entry_point_rva)
 
+    # Exports, for the same reason: a DLL's entry points are reached through
+    # GetProcAddress, so the only reference to one is its name. Bunghole in
+    # One's game DLL has two exports and nothing inside it calls either; both
+    # were missing, and the engine's first call into the module was an
+    # unresolved ICALL. An export into a code section only: a forwarder or an
+    # exported variable is not a function.
+    exported = {info.image_base + e.rva for e in info.exports
+                if info.code_start <= info.image_base + e.rva < info.code_end}
+    if exported:
+        print(f"[*] {len(exported)} exports seeded")
+    seeds |= exported
+
     if args.seed_functions:
         with open(args.seed_functions) as f:
             doc = json.load(f)
