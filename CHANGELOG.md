@@ -5,6 +5,14 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- `drm/emu_unpack.py`: unpack a compressed PE32 by running its stub under
+  Unicorn to the OEP, then rebuild the import directory around the IAT the code
+  calls through. Handles PECompact 2.x and Valve's Steam2 wrapper on top of it
+  (`SteamStartup`/`SteamIsAppSubscribed` answered). Headless, deterministic,
+  `--selftest` for the IAT picker. Found on The Movies (2005), whose Steam
+  build packs all three executables this way.
+
 From #4. Found running Gunman Chronicles (MSVC 6 CRT, Quake-lineage software renderer)
 fully recompiled; each is generic x86 semantics or code generation. Each fix
 has a difftest case against Unicorn: 175/187 match, 12 known divergences,
