@@ -119,7 +119,7 @@ recompiled: its simulation hung in the CRT's `strstr`.
   through an exec-fault trampoline on the non-executable guest code, and one
   machine lock gives each guest thread its own stack and TIB.
   `native32_selftest.c` checks stdcall/cdecl/thiscall purges and a double
-  return. The Movies runs its lifted CRT on it.
+  return. The Movies runs its lifted CRT on it. (#7)
 
 From #4. Found running Gunman Chronicles (MSVC 6 CRT, Quake-lineage software renderer)
 fully recompiled; each is generic x86 semantics or code generation. Each fix
