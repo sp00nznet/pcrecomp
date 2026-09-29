@@ -110,6 +110,16 @@ recompiled: its simulation hung in the CRT's `strstr`.
   haystack and looped forever. The jcc after a rep compare now reads the lazy
   flag state instead of assuming a compare wrote it. Two difftest cases:
   177/189 match, 12 known divergences, 0 failures.
+### Added
+- `runtime/native32/`: a 32-bit host for lifted recomp32 code, extracted from
+  gunman. The native bridge copies the guest's argument slots to the real
+  stack and measures the callee's purge from esp, so every import,
+  GetProcAddress result and COM method is called with no argc table and no
+  shim; x87 results cross in st(0) both ways. Windows -> guest callbacks enter
+  through an exec-fault trampoline on the non-executable guest code, and one
+  machine lock gives each guest thread its own stack and TIB.
+  `native32_selftest.c` checks stdcall/cdecl/thiscall purges and a double
+  return. The Movies runs its lifted CRT on it.
 
 From #4. Found running Gunman Chronicles (MSVC 6 CRT, Quake-lineage software renderer)
 fully recompiled; each is generic x86 semantics or code generation. Each fix

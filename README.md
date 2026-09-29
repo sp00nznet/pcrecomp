@@ -39,6 +39,8 @@ pcrecomp/
     win16/         16-bit Windows NE: CPU header + link-on-day-one stubs
     recomp32/      32-bit, global registers: memory, dispatch, loader, crash report
     recomp32_cpu/  32-bit, explicit CPU struct (reentrant)
+    native32/      a 32-bit host for recomp32 code: imports, COM and callbacks
+                   go to real Windows with no shims (MSVC x86)
     recomp64_cpu/  64-bit, explicit CPU struct, plus guest C++ exception handling
     hybrid/        The lifted <-> real boundary, for keeping MFC or the CRT real
     compat/        Win32 -> SDL2 mapping
@@ -58,7 +60,7 @@ on what the binary is:
 | Find functions | `disasm/analyze`, `disasm/largemodel16` | `ne/ne_decode` (or IDA via `ida/ida_export`) | `disasm/disasm32`, `cpp/rtti`, `cpp/vtable_scan`, `lift/recover`, `disasm/seed_from_log` | an IDA catalog, closed by `lift/generate64` |
 | Lift | `lift/lift16` | `lift/ne_lift` | `lift/lift32` (global registers) or `lift/lift32_cpu` (CPU struct) | `lift/lift64_cpu` |
 | Generate the build tree | the project's own driver | `ne/gen_segments_h`, `ne/gen_unresolved_stubs`, `ne/gen_win16_stubs`, `ne/gen_image` | `python -m tools` (`lift/translator`), `lift/generate` | `lift/generate64` |
-| Runtime | `runtime/recomp16` | `runtime/win16` | `runtime/recomp32` or `recomp32_cpu`, plus `hybrid` | `runtime/recomp64_cpu` |
+| Runtime | `runtime/recomp16` | `runtime/win16` | `runtime/recomp32` or `recomp32_cpu`, plus `hybrid`; host it with `native32` | `runtime/recomp64_cpu` |
 | Test the lift | `lift/difftest16`, `recomp16/cpu_selftest.c` | `lift/difftest16 --ne` | `lift/difftest` (Unicorn), `recomp32_cpu/cpu_selftest.c` | `lift/difftest64` (the host CPU) |
 
 `disasm/score_recovery` scores any of the catalogs against a linker map, a PDB
