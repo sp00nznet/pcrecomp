@@ -403,7 +403,8 @@ def _jump_table(ins, code, code_start, lo, hi, limit=1024):
     # bytes of the jmp before it. Stopping at the first bad entry lost every
     # arm. So skip up to three leading bad entries; after the first good one,
     # a bad entry ends the table.
-    arms, at, k = [], (mem.disp & 0xFFFFFFFF) - code_start, 0
+    base = (mem.disp & 0xFFFFFFFF) - code_start
+    arms, at, k = [], base, 0
     while 0 <= at <= len(code) - 4 and len(arms) < limit:
         t = int.from_bytes(code[at:at + 4], 'little')
         if lo <= t < hi:
@@ -412,10 +413,22 @@ def _jump_table(ins, code, code_start, lo, hi, limit=1024):
             break
         at += 4
         k += 1
+    # ...and the index can be negative. CRT memcpy's backward copy does
+    # `jmp [ecx*4 + 0xacdf88]` with ecx from -3 to 0, so its arms sit below the
+    # displacement; reading only upward lost them (ITAIL 0x00ACDFAC). Take the
+    # contiguous run of valid entries below it too.
+    at = base - 4
+    while at >= 0 and base - at <= 64:
+        t = int.from_bytes(code[at:at + 4], 'little')
+        if not lo <= t < hi:
+            break
+        arms.append(t)
+        at -= 4
     return arms
 
 
-def true_extent(md, code, code_start, start, hard_end, entries, reached=None, behind=None):
+def true_extent(md, code, code_start, start, hard_end, entries, reached=None, behind=None,
+                called=None):
     """Exact end of the body at `start`: the highest address reached by
     fallthrough and direct branches. Returns (end, clean).
 
@@ -453,6 +466,9 @@ def true_extent(md, code, code_start, start, hard_end, entries, reached=None, be
 
     Pass a set as `behind` to collect direct branch targets below `start` that
     are not entries: the evidence find_splits() uses.
+
+    Pass a set as `called` to collect the targets of direct calls in the body:
+    a lift driver needs every one of them dispatchable, catalogued or not.
     """
     view = memoryview(code)
     seen = reached if reached is not None else set()
@@ -482,6 +498,8 @@ def true_extent(md, code, code_start, start, hard_end, entries, reached=None, be
                     clean = True
                     break
                 branch = m == 'jmp' or m in COND_JUMPS or m.startswith('loop')
+                if called is not None and m == 'call' and t is not None:
+                    called.add(t)
                 if (behind is not None and branch and t is not None and t < start
                         and t not in entries):
                     behind.add(t)
@@ -729,6 +747,14 @@ def _selftest():
     assert find_splits(md, code, 0x1000, 0x1008, {0x1000, 0x1003}) == set()
     insns, leaders = linear_disassemble_function(md, code, 0x1000, min(got), 0x1008, reached=got)
     assert [i.address for i in insns] == [0x1001, 0x1002, 0x1003, 0x1005, 0x1007]
+
+    # A negative index: the arms sit below the displacement (memcpy's backward
+    # copy). 1000 jmp [ecx*4+100b] / 1007 dd 100f / 100b dd garbage / 100f ret
+    code = bytes([0xFF, 0x24, 0x8D, 0x0B, 0x10, 0x00, 0x00, 0x0F, 0x10, 0x00, 0x00,
+                  0xEF, 0xBE, 0xAD, 0xDE, 0xC3])
+    got = set()
+    true_extent(md, code, 0x1000, 0x1000, 0x1010, {0x1000}, reached=got)
+    assert 0x100F in got, sorted(map(hex, got))
 
     # The _stat shape: a jump to a catalogued "entry" that lies inside this
     # body's own span is internal, not a tail call.
