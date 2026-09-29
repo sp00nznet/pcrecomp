@@ -1393,12 +1393,17 @@ class Lifter:
                 lines.append(f"{{ uint32_t _a, _b; {load} "
                              f"_flag_a = _a; _flag_b = _b; "
                              f"_cf = (uint32_t)CMP_B(_a, _b); }} {comment}")
+                self._flag_state = ('cmp', "_flag_a, _flag_b")
             else:
-                lines.append(f"{{ uint32_t _a = 0, _b = 0; "
+                # With ECX = 0 nothing is compared and the flags are left as
+                # they were -- kind and all -- so the next jcc cannot assume a
+                # compare wrote them; it evaluates the lazy state instead.
+                # strstr falls out of its search loop on exactly that.
+                lines.append(f"if (ecx) {{ uint32_t _a = 0, _b = 0; "
                              f"while (ecx) {{ {load} ecx--; if ({stop}) break; }} "
                              f"_flag_a = _a; _flag_b = _b; "
-                             f"_cf = (uint32_t)CMP_B(_a, _b); }} {comment}")
-            self._flag_state = ('cmp', "_flag_a, _flag_b")
+                             f"_cf = (uint32_t)CMP_B(_a, _b); _flag_k = FK_CMP; }} {comment}")
+                self._flag_state = None
             self._flag_seq += 1
 
         # --- Control Flow ---

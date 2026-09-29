@@ -241,6 +241,15 @@ CASES = [
          {'eax': 0x1234F000, 'ecx': 0x0100, 'edx': 0x55667788}, undef=MUL_UNDEF),
     Case('imul.r16', bytes.fromhex('66f7e9'),                 # imul cx: -4096 * 256
          {'eax': 0x1234F000, 'ecx': 0x0100, 'edx': 0x55667788}, undef=MUL_UNDEF),
+    # --- a rep compare/scan with ECX = 0 runs no iterations and writes no
+    # flags: the jcc after it reads whatever came before. The CRT's strstr
+    # relies on it -- when the haystack runs out, `repne scasb` falls through
+    # with the NE left by the previous `repe cmpsb`. Lifted as "equal", the
+    # loop never ended (SimCity 2000 hung in its simulation).
+    Case('repne-scasb.ecx0-keeps-flags', bytes.fromhex('39c8f2ae'),   # cmp eax, ecx; repne scasb
+         {'eax': 5, 'ecx': 0}),
+    Case('repe-cmpsb.ecx0-keeps-flags', bytes.fromhex('39c8f3a6'),    # cmp eax, ecx; repe cmpsb
+         {'eax': 5, 'ecx': 0}),
 
     Case('add', bytes.fromhex('01c8')),                       # add eax, ecx
     Case('add.carry-out', bytes.fromhex('01c8'), {'eax': 0xFFFFFFFF, 'ecx': 2}),
