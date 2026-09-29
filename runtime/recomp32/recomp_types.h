@@ -937,10 +937,20 @@ recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
 #define RECOMP_RETADDR 0xDEAD0000u
 #endif
 
+/* Flags cross every transfer, as on the CPU: each call and tail hands the
+ * caller's flags over (RECOMP_FLAGS_OUT), every function starts from them
+ * (RECOMP_ENTER), and `ret` hands the callee's back. Without the first two, a
+ * function reached by a tail jump started from FK_NONE, and one whose first
+ * conditional reads flags its predecessor set took an arbitrary branch: the
+ * MSVC CRT's `cos` runs a load helper, then falls into `_CIcos`, a separate
+ * function whose first `je` tests the helper's ZF (Bunghole in One's ball
+ * never moved). */
+
 /* Direct call to a known recompiled function */
 #define RECOMP_CALL(func) do { \
     uint32_t _caller = g_cur_func; \
     PUSH32(esp, RECOMP_RETADDR); /* dummy return address */ \
+    RECOMP_FLAGS_OUT(); \
     RECOMP_REGS_OUT(); \
     func(); \
     RECOMP_REGS_IN(); \
@@ -960,6 +970,7 @@ recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
     if (_fn) { \
         uint32_t _caller = g_cur_func; \
         PUSH32(esp, RECOMP_RETADDR); \
+        RECOMP_FLAGS_OUT(); \
         RECOMP_REGS_OUT(); \
         _fn(); \
         RECOMP_REGS_IN(); \
@@ -984,7 +995,7 @@ recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_import(_va); \
-    if (_fn) { RECOMP_REGS_OUT(); _fn(); RECOMP_REGS_IN(); } \
+    if (_fn) { RECOMP_FLAGS_OUT(); RECOMP_REGS_OUT(); _fn(); RECOMP_REGS_IN(); } \
     else if (_va == RECOMP_RETADDR) { /* setjmp and friends return by jumping \
         to the saved return address; that is a return, not a missing target. */ } \
     else { fprintf(stderr, "ITAIL: unresolved VA 0x%08X from 0x%08X\n", _va, g_cur_func); } \
@@ -1007,9 +1018,9 @@ extern uint32_t g_cur_func;
 extern uint32_t g_enter_trace[RECOMP_ENTER_SIZE];
 extern uint32_t g_enter_idx;
 void recomp_trace_enter(uint32_t va);
-#define RECOMP_ENTER(va) do { g_cur_func = (va); recomp_trace_enter(va); } while (0)
+#define RECOMP_ENTER(va) do { g_cur_func = (va); RECOMP_FLAGS_IN(); recomp_trace_enter(va); } while (0)
 #else
-#define RECOMP_ENTER(va) (g_cur_func = (va))
+#define RECOMP_ENTER(va) (g_cur_func = (va), RECOMP_FLAGS_IN())
 #endif
 /* Always-callable trace dump (no-op unless RECOMP_TRACE). */
 void recomp_dump_trace(const char* why);

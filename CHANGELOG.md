@@ -157,6 +157,14 @@ recompiled: its simulation hung in the CRT's `strstr`.
   haystack and looped forever. The jcc after a rep compare now reads the lazy
   flag state instead of assuming a compare wrote it. Two difftest cases:
   177/189 match, 12 known divergences, 0 failures.
+- recomp32: flags cross calls and tail jumps between lifted functions, as they
+  do on the CPU. A call or tail transfer exports the caller's flags and every
+  function entry imports them (`ret` already exported the callee's). A function
+  reached by a tail jump started from `FK_NONE`, so one whose first conditional
+  tests flags its predecessor set took an arbitrary branch: the MSVC CRT's
+  `cos` falls from its load helper into `_CIcos`, whose first `je` reads the
+  helper's ZF, and Bunghole in One's golf ball never moved.
+  `runtime/recomp32/flags_selftest.c` checks both transfers, both ways.
 
 From #4. Found running Gunman Chronicles (MSVC 6 CRT, Quake-lineage software renderer)
 fully recompiled; each is generic x86 semantics or code generation. Each fix
