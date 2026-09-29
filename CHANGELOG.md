@@ -140,7 +140,7 @@ recompiled: its simulation hung in the CRT's `strstr`.
   its engine EXE (Bunghole in One: 93 imports from `Golf.exe`) now binds with
   no host code; the host uses the same two calls to shim `LoadLibraryA` and
   `GetProcAddress` for its guest DLLs. The selftest maps a system DLL as a
-  guest and checks both lookups.
+  guest and checks both lookups. (#17)
 
 From #4. Found running Gunman Chronicles (MSVC 6 CRT, Quake-lineage software renderer)
 fully recompiled; each is generic x86 semantics or code generation. Each fix
