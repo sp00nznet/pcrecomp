@@ -11,7 +11,7 @@ versions follow [SemVer](https://semver.org/).
   calls through. Handles PECompact 2.x and Valve's Steam2 wrapper on top of it
   (`SteamStartup`/`SteamIsAppSubscribed` answered). Headless, deterministic,
   `--selftest` for the IAT picker. Found on The Movies (2005), whose Steam
-  build packs all three executables this way.
+  build packs all three executables this way. (#5)
 
 From #4. Found running Gunman Chronicles (MSVC 6 CRT, Quake-lineage software renderer)
 fully recompiled; each is generic x86 semantics or code generation. Each fix
