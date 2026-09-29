@@ -31,6 +31,7 @@ import argparse
 import re
 import struct
 import sys
+import types
 
 import pefile
 from unicorn import (Uc, UcError, UC_ARCH_X86, UC_MODE_32, UC_HOOK_CODE,
@@ -48,6 +49,8 @@ HEAP_SIZE = 0x08000000
 STACK, STACK_SIZE = 0x5F000000, 0x100000
 TEB = 0x5E000000
 GDT = 0x5D000000
+CODE = 0xE0000020        # code, RWX: the unpacked code may still patch itself
+DATA = 0xC0000040        # initialised data, RW
 
 
 def align(v, a=PAGE):
@@ -229,6 +232,31 @@ class Unpacker:
             raise SystemExit('no IAT block is called through; is the OEP right?')
         return dict(best)
 
+    def layout(self, iat_rva):
+        """The rebuilt section table: [(name, rva, size, characteristics)].
+
+        A packer merges the original sections into one, so the dump has code,
+        read-only data and data in a single executable section, and a
+        disassembler decodes the data as code (The Movies: 22,355 invented
+        functions out of 61,502). Two facts put the boundaries back:
+        the original code is in the section the OEP is in, and MSVC's linker
+        starts .rdata with the IAT. So only the OEP's section stays
+        executable, and it is cut at the IAT when the IAT is inside it.
+        """
+        out = []
+        oep = self.oep - self.base
+        for s in self.pe.sections:
+            rva, vs = s.VirtualAddress, align(max(s.Misc_VirtualSize, s.SizeOfRawData))
+            name = s.Name.rstrip(b'\0')
+            if not rva <= oep < rva + vs:
+                out.append((name, rva, vs, DATA))
+            elif oep < iat_rva < rva + vs and iat_rva % PAGE == 0:
+                out.append((name, rva, iat_rva - rva, CODE))
+                out.append((b'.rdata', iat_rva, rva + vs - iat_rva, DATA))
+            else:
+                out.append((name, rva, vs, CODE))
+        return out
+
     def write(self, out):
         image = bytearray(self.uc.mem_read(self.base, self.size))
         runs = self.find_iat(image)
@@ -261,29 +289,23 @@ class Unpacker:
 
         pe = self.pe
         fa = pe.OPTIONAL_HEADER.FileAlignment
+        sections = self.layout(min(runs))
+        sections.append((b'.idata2', sect_rva, len(blob), DATA))
         # Every section becomes raw == virtual: the dump is the file.
         hdr = bytearray(image[:pe.OPTIONAL_HEADER.SizeOfHeaders])
         sec_off = pe.sections[0].get_file_offset()
-        nsec = len(pe.sections)
-        if sec_off + 40 * (nsec + 1) > pe.OPTIONAL_HEADER.SizeOfHeaders:
-            raise SystemExit('no room in the headers for another section')
+        if sec_off + 40 * len(sections) > pe.OPTIONAL_HEADER.SizeOfHeaders:
+            raise SystemExit('no room in the headers for the rebuilt section table')
         body = bytearray()
         raw_ptr = align(len(hdr), fa)
-        for i, s in enumerate(pe.sections):
-            vs = align(max(s.Misc_VirtualSize, s.SizeOfRawData))
-            o = sec_off + 40 * i
-            struct.pack_into('<IIII', hdr, o + 8, vs, s.VirtualAddress, vs, raw_ptr + len(body))
-            struct.pack_into('<I', hdr, o + 36, 0xE0000060)   # code|data, RWX
-            body.extend(image[s.VirtualAddress:s.VirtualAddress + vs])
-        o = sec_off + 40 * nsec
-        struct.pack_into('<8sIIII', hdr, o, b'.idata2', len(blob), sect_rva, len(blob),
-                         raw_ptr + len(body))
-        struct.pack_into('<IIHHI', hdr, o + 24, 0, 0, 0, 0, 0xC0000040)
-        body.extend(blob)
+        for i, (name, rva, vs, flags) in enumerate(sections):
+            struct.pack_into('<8sIIII', hdr, sec_off + 40 * i, name, vs, rva, vs, raw_ptr + len(body))
+            struct.pack_into('<IIHHI', hdr, sec_off + 40 * i + 24, 0, 0, 0, 0, flags)
+            body.extend(blob if name == b'.idata2' else image[rva:rva + vs])
 
         nt = pe.DOS_HEADER.e_lfanew
         opt = nt + 24
-        struct.pack_into('<H', hdr, nt + 6, nsec + 1)
+        struct.pack_into('<H', hdr, nt + 6, len(sections))
         struct.pack_into('<I', hdr, opt + 16, self.oep - self.base)          # entry
         struct.pack_into('<I', hdr, opt + 56, sect_rva + len(blob))          # SizeOfImage
         struct.pack_into('<I', hdr, opt + 64, 0)                             # checksum
@@ -337,6 +359,14 @@ def selftest():
     got = u.find_iat(img)
     assert got == {0x100: [u.thunks[THUNKS], u.thunks[THUNKS + 4]],
                    0x10C: [u.thunks[THUNKS + 8]]}, got
+    # Layout: the OEP's merged section is cut at the IAT; the stub's is data.
+    sec = lambda n, rva, size: types.SimpleNamespace(  # noqa: E731
+        Name=n, VirtualAddress=rva, Misc_VirtualSize=size, SizeOfRawData=0)
+    u.pe = types.SimpleNamespace(sections=[sec(b'.text', 0x1000, 0x9000), sec(b'.rsrc', 0xA000, 0x1000)])
+    u.oep = u.base + 0x2000
+    assert u.layout(0x6000) == [(b'.text', 0x1000, 0x5000, CODE), (b'.rdata', 0x6000, 0x4000, DATA),
+                                (b'.rsrc', 0xA000, 0x1000, DATA)], u.layout(0x6000)
+    assert u.layout(0x6004)[0] == (b'.text', 0x1000, 0x9000, CODE)   # unaligned: no cut
     print('emu_unpack selftest: ok')
 
 
