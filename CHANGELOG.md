@@ -143,6 +143,11 @@ recompiled: its simulation hung in the CRT's `strstr`.
   haystack and looped forever. The jcc after a rep compare now reads the lazy
   flag state instead of assuming a compare wrote it. Two difftest cases:
   177/189 match, 12 known divergences, 0 failures.
+### Fixed
+- disasm32 seeds the exports, as the README always said it did, not only the
+  entry point. Bunghole in One's game DLL is entered only through
+  `GetProcAddress`, and both its exports were missing; the engine EXE was
+  missing 57 of its 244.
 
 From #4. Found running Gunman Chronicles (MSVC 6 CRT, Quake-lineage software renderer)
 fully recompiled; each is generic x86 semantics or code generation. Each fix
