@@ -164,7 +164,7 @@ recompiled: its simulation hung in the CRT's `strstr`.
   tests flags its predecessor set took an arbitrary branch: the MSVC CRT's
   `cos` falls from its load helper into `_CIcos`, whose first `je` reads the
   helper's ZF, and Bunghole in One's golf ball never moved.
-  `runtime/recomp32/flags_selftest.c` checks both transfers, both ways.
+  `runtime/recomp32/flags_selftest.c` checks both transfers, both ways. (#20)
 
 From #4. Found running Gunman Chronicles (MSVC 6 CRT, Quake-lineage software renderer)
 fully recompiled; each is generic x86 semantics or code generation. Each fix
