@@ -25,7 +25,7 @@ import lift32
 from pe_analyze import analyze_pe, build_iat_map
 from lift32 import Lifter
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32
-from capstone.x86 import X86_OP_IMM
+from capstone.x86 import X86_OP_IMM, X86_OP_MEM
 from disasm32 import decode
 
 
@@ -95,10 +95,17 @@ def find_entries(code_data, code_start, code_end):
 MAX_RESUMES = 64        # see the resume note in linear_disassemble_function
 
 
-def linear_disassemble_function(md, code_data, code_start, func_start, func_end):
+def linear_disassemble_function(md, code_data, code_start, func_start, func_end,
+                                reached=None):
     """
     Disassemble a function using linear sweep between known boundaries.
     Returns list of LinearInstruction and set of basic block leaders.
+
+    With `reached` (the instruction set true_extent walked), decode exactly
+    those instructions: a pass stops at the first address outside the set and
+    the next resumes at the lowest reached address not yet decoded. A jump
+    table sitting between a switch and its arms is then never decoded as
+    code, where a plain sweep turns its bytes into `pushal` and loses the arms.
     """
     offset = func_start - code_start
     size = func_end - func_start
@@ -115,10 +122,12 @@ def linear_disassemble_function(md, code_data, code_start, func_start, func_end)
     while pc is not None:
         over = None        # target of the last uncond jmp decoded in this pass
         hit_pad = False
-        for insn in md.disasm(raw[pc - func_start:], pc):
+        for insn in decode(md, raw[pc - func_start:], pc):
             li = LinearInstruction(insn)
             if li.address in seen:
                 break           # walked into a block already decoded
+            if reached is not None and li.address not in reached:
+                break           # past what the walk reached: data, or another body
             seen.add(li.address)
             instructions.append(li)
 
@@ -191,7 +200,10 @@ def linear_disassemble_function(md, code_data, code_start, func_start, func_end)
         # body has shown; the symptom of needing more is a returning
         # "ITAIL: unresolved VA".
         pc = None
-        if hit_pad and over is not None and over not in seen                 and resumes < MAX_RESUMES:
+        if reached is not None:
+            rest = [a for a in reached if a not in seen and func_start <= a < func_end]
+            pc = min(rest) if rest else None
+        elif hit_pad and over is not None and over not in seen                 and resumes < MAX_RESUMES:
             pc = over
             resumes += 1
 
@@ -378,7 +390,24 @@ def write_chunk(output_dir, file_idx, funcs):
 EXTENT_REACH = 0x40000      # cap on how far one function's body may reach
 
 
-def true_extent(md, code, code_start, start, hard_end, entries):
+def _jump_table(ins, code, code_start, lo, hi, limit=1024):
+    """Arms of `jmp dword ptr [reg*4 + table]`, read while they land in [lo, hi)."""
+    if not ins.operands or ins.operands[0].type != X86_OP_MEM:
+        return []
+    mem = ins.operands[0].mem
+    if mem.base or not mem.index or mem.scale != 4:
+        return []
+    arms, at = [], (mem.disp & 0xFFFFFFFF) - code_start
+    while 0 <= at <= len(code) - 4 and len(arms) < limit:
+        t = int.from_bytes(code[at:at + 4], 'little')
+        if not lo <= t < hi:
+            break
+        arms.append(t)
+        at += 4
+    return arms
+
+
+def true_extent(md, code, code_start, start, hard_end, entries, reached=None, behind=None):
     """Exact end of the body at `start`: the highest address reached by
     fallthrough and direct branches. Returns (end, clean).
 
@@ -398,11 +427,24 @@ def true_extent(md, code, code_start, start, hard_end, entries):
       path jumps past it. Bounded by the clamp, CRT calloc lost its epilogue
       to an unresolved ITAIL (The Movies, 0x00AD578C).
 
+    * `jmp [reg*4 + table]` (an MSVC switch) is followed through the table:
+      each dword is an arm while it lands inside [start, hard_end). Without
+      this every arm past the table was outside the body and CRT memcpy's
+      tail copies became unresolved ITAILs (The Movies, 0x00ACDE33).
+
     `clean` is False when no path reached ret, int3, a tail call or another
     entry: a health metric for the catalog, not an error.
+
+    Pass a set as `reached` to get every instruction address the walk
+    decoded; linear_disassemble_function takes it to lift exactly those, so a
+    jump table's bytes are never decoded as instructions.
+
+    Pass a set as `behind` to collect direct branch targets below `start` that
+    are not entries: the evidence find_splits() uses.
     """
     view = memoryview(code)
-    seen, work, top, clean = set(), [start], start, False
+    seen = reached if reached is not None else set()
+    work, top, clean = [start], start, False
     while work:
         va = work.pop()
         if va in seen or not (start <= va < hard_end):
@@ -422,9 +464,17 @@ def true_extent(md, code, code_start, start, hard_end, entries):
             if m in ('ret', 'retn', 'retf', 'iret', 'int3', 'hlt'):
                 clean = True
                 break
+            if (behind is not None and t is not None and t < start and t not in entries
+                    and (m == 'jmp' or m in COND_JUMPS or m.startswith('loop'))):
+                behind.add(t)
             if m == 'jmp':
                 if t is not None and start < t < hard_end and t not in entries:
                     work.append(t)
+                elif t is None:
+                    arms = [a for a in _jump_table(ins, code, code_start, start, hard_end)
+                            if a not in entries]
+                    work.extend(arms)
+                    clean = clean or not arms   # an indirect tail call ends the body
                 else:
                     clean = True
                 break
@@ -432,6 +482,35 @@ def true_extent(md, code, code_start, start, hard_end, entries):
                     and start < t < hard_end and t not in entries):
                 work.append(t)
     return top, clean
+
+
+def find_splits(md, code, code_start, code_end, entries):
+    """Entries that are really the middle of the entry before them.
+
+    A catalog splits a function when it takes a loop head or a jump target for
+    a start. Two things then break: the parent's walk stops when it falls
+    through into the false entry, and the false entry's own backward jumps
+    land in its parent, where there is no label, so they become unresolved
+    ITAILs (The Movies: 2,080 of them in one region).
+
+    The code says which entries these are. A real function does not branch
+    backward into the body of the function before it; a split does. So an
+    entry E is a split when a walk from E branches to an address that is not
+    an entry, lies below E, and lies at or above the entry before E. Treat the
+    result like alias entries: remove them from the set true_extent's
+    `entries` gets, and keep them dispatchable.
+    """
+    ordered = sorted(e for e in entries if code_start <= e < code_end)
+    splits = set()
+    for i, e in enumerate(ordered):
+        if i == 0:
+            continue
+        back = set()
+        true_extent(md, code, code_start, e, min(e + EXTENT_REACH, code_end), entries,
+                    behind=back)
+        if any(ordered[i - 1] <= t < e for t in back):
+            splits.add(e)
+    return splits
 
 
 def closure(functions, roots, limit):
@@ -583,6 +662,30 @@ def _selftest():
     assert true_extent(md, code, 0x1000, 0x100F, 0x1012, ents) == (0x1011, True)
     # ...and the old bound (the catalog clamp at B) is exactly what lost it.
     assert true_extent(md, code, 0x1000, 0x1000, 0x100B, ents)[0] == 0x100B
+
+    # A switch: jmp [eax*4 + 0x1008], a pad byte, the table (arms 0x1010,
+    # 0x1012), then the arms. The walk must reach both arms, and the sweep
+    # given the walk's set must decode the arms and not the table bytes.
+    #   1000 jmp [eax*4+1008] / 1007 int3 / 1008 dd 1010, 1012 / 1010 xor / 1012 ret
+    code = bytes([0xFF, 0x24, 0x85, 0x08, 0x10, 0x00, 0x00, 0xCC,
+                  0x10, 0x10, 0x00, 0x00, 0x12, 0x10, 0x00, 0x00,
+                  0x31, 0xC0, 0xC3])
+    got = set()
+    assert true_extent(md, code, 0x1000, 0x1000, 0x1013, {0x1000}, reached=got) == (0x1013, True)
+    assert got == {0x1000, 0x1010, 0x1012}, sorted(map(hex, got))
+    insns, _ = linear_disassemble_function(md, code, 0x1000, 0x1000, 0x1013, reached=got)
+    assert [i.address for i in insns] == [0x1000, 0x1010, 0x1012], [hex(i.address) for i in insns]
+
+    # A split: the catalog took 0x1003, the middle of a loop, for an entry.
+    #   1000 xor eax,eax / 1002 inc eax / 1003 cmp eax,5 / 1006 jb 1002 / 1008 ret
+    code = bytes([0x31, 0xC0, 0x40, 0x83, 0xF8, 0x05, 0x72, 0xFA, 0xC3])
+    ents = {0x1000, 0x1003}
+    assert true_extent(md, code, 0x1000, 0x1000, 0x1009, ents)[0] == 0x1003   # cut short
+    assert find_splits(md, code, 0x1000, 0x1009, ents) == {0x1003}
+    assert true_extent(md, code, 0x1000, 0x1000, 0x1009, ents - {0x1003}) == (0x1009, True)
+    # ...and a real neighbour is not a split: C above only falls into D.
+    code = bytes([0x90, 0x90, 0xC3, 0x40, 0xC3])     # 1000 nop,nop,ret / 1003 D: inc, ret
+    assert find_splits(md, code, 0x1000, 0x1005, {0x1000, 0x1003}) == set()
 
     fns = {1: {'calls_to': [2, 3]}, 2: {'calls_to': [4]}, 3: {}, 4: {'calls_to': [1]}}
     assert closure(fns, [1], 10) == [1, 2, 3, 4]

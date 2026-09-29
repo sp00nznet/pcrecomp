@@ -14,6 +14,16 @@ versions follow [SemVer](https://semver.org/).
   the clamp cut CRT calloc off before its epilogue. On The Movies' startup
   closure, undefined-label ITAIL fallbacks 76 -> 44 and bodies with no
   terminator 7 -> 0. Selftest models the calloc shape.
+- `true_extent` follows `jmp [reg*4 + table]` switches through their tables
+  and can hand back the exact instruction set it reached;
+  `linear_disassemble_function(reached=...)` then lifts only those, so the
+  table bytes between a switch and its arms are never lifted as `pushal`
+  (The Movies: CRT memcpy's tail copies were unresolved ITAILs). The sweep
+  also decodes through `disasm32.decode`.
+- `find_splits()`: entries that are really the middle of the entry before
+  them (a walk from them branches backward into it). Dropping them from
+  `true_extent`'s `entries` stops the parent being cut at a loop head. 366 on
+  The Movies.
 
 ### Fixed
 - `disasm32.py` is 7-18x faster with byte-identical output. capstone's Python
