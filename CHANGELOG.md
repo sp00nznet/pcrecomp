@@ -46,6 +46,13 @@ recompiled: its simulation hung in the CRT's `strstr`.
   haystack and looped forever. The jcc after a rep compare now reads the lazy
   flag state instead of assuming a compare wrote it. Two difftest cases:
   177/189 match, 12 known divergences, 0 failures.
+### Fixed
+- `disasm32.py` is 7-12x faster with byte-identical output. capstone's Python
+  `disasm()` is a generator over one `cs_disasm(count=0)` call, so it decodes
+  its whole buffer, with detail, before yielding the first instruction; every
+  early-exit caller paid for a full window. `decode()` decodes in doubling
+  batches instead. Fury3 3:35 -> 0:18, Hellbender 5:19 -> 0:42; The Movies'
+  39,565 candidates went from ~110 minutes to ~11.
 
 From #4. Found running Gunman Chronicles (MSVC 6 CRT, Quake-lineage software renderer)
 fully recompiled; each is generic x86 semantics or code generation. Each fix

@@ -34,6 +34,27 @@ CALLS = {'call'}
 RETS = {'ret', 'retn', 'retf'}
 
 
+def decode(md, code, va):
+    """Yield capstone instructions from `code` at `va`, decoded in batches.
+
+    capstone's own `md.disasm()` looks lazy and is not: it is a generator over
+    one `cs_disasm(count=0)` call that decodes the whole buffer in C before the
+    first instruction comes back. Every caller here stops within a few
+    instructions, so that paid for a full window per call: 90% of a 143-minute
+    run on The Movies. Small batches, doubling, stop when the caller does.
+    """
+    view, off, batch = memoryview(code), 0, 8
+    while off < len(view):
+        n = 0
+        for ins in md.disasm(view[off:], va + off, count=batch):
+            n += 1
+            off += ins.size
+            yield ins
+        if n < batch:           # an undecodable byte, or the end of the buffer
+            return
+        batch = min(batch * 2, 256)
+
+
 @dataclass
 class Instruction:
     address: int
@@ -205,7 +226,7 @@ class Disassembler:
             return False
 
         end = va
-        for insn in self._probe_md.disasm(data, va):
+        for insn in decode(self._probe_md, data, va):
             if insn.mnemonic in RETS or insn.mnemonic in UNCOND_JUMPS:
                 return True
             end = insn.address + insn.size
@@ -275,13 +296,15 @@ class Disassembler:
         per byte of code, near-linear at O(code^1.10), which is 2.6 hours for a
         2.4 MB image. Yielding makes each caller pay only for what it consumes.
 
+        Yielding alone did not do it, though: see decode().
+
         Callers must iterate the result at most once.
         """
         data = self.read_bytes(va, max_bytes)
         if data is None:
             return
 
-        for insn in self.md.disasm(data, va):
+        for insn in decode(self.md, data, va):
             yield Instruction(
                 address=insn.address,
                 size=insn.size,
@@ -847,7 +870,7 @@ def drop_mid_instruction_entries(read_va, functions, code_start, code_end,
                 except Exception:
                     break
                 advanced = False
-                for ins in md.disasm(code, va):
+                for ins in decode(md, code, va):
                     advanced = True
                     n += 1
                     va = ins.address + ins.size
@@ -1242,6 +1265,15 @@ def demo():
     bounds = {0x1000: 0x8000, 0x1200: 0x100}
     assert clamp_extents(bounds, 0x9000) == 1
     assert bounds == {0x1000: 0x200, 0x1200: 0x100}, bounds
+
+    # decode() must see exactly what one full md.disasm() does, across batch
+    # boundaries (200 nops + a long tail) and stopping at an undecodable byte.
+    md = Cs(CS_ARCH_X86, CS_MODE_32)
+    buf = b"\x90" * 200 + b"\x8b\x44\x24\x04\xc3" * 60 + b"\xff\xff\xc3"   # ff /7: invalid
+    want = [(i.address, i.size) for i in md.disasm(buf, 0x401000)]
+    got = [(i.address, i.size) for i in decode(md, buf, 0x401000)]
+    assert got == want, "decode() diverged from md.disasm()"
+    assert len(want) == 320     # 200 nops + 60 x (mov, ret), then ff ff stops it
 
     print("disasm32.py self-test OK")
 
