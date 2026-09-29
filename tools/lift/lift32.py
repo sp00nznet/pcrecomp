@@ -136,6 +136,17 @@ SETCC_MAP = {f'set{k[1:]}': v for k, v in COND_MAP.items()}
 CMOVCC_MAP = {f'cmov{k[1:]}': v for k, v in COND_MAP.items()}
 
 
+_SEG_REGS = (X86_REG_CS, X86_REG_DS, X86_REG_ES, X86_REG_FS, X86_REG_GS, X86_REG_SS)
+
+
+def _stack_bits(insn, op):
+    """Width of a push/pop: the operand's, except a segment register moves the
+    stack by the operand size (32) unless a 66h prefix says 16."""
+    if op.type == X86_OP_REG and op.reg in _SEG_REGS:
+        return 16 if 0x66 in insn.prefix else 32
+    return op_bits(op)
+
+
 def reg_name(reg_id: int) -> str:
     """Get the C variable name for a Capstone register ID."""
     if reg_id in REG_NAMES_32:
@@ -786,15 +797,21 @@ class Lifter:
         # pop replaces the whole of ebp with a zero-extended word. A `leave`
         # after that hands the truncated value to esp and the next stack access
         # is down at 64 KB.
+        #
+        # Segment registers are the exception: `push es` / `pop es` in 32-bit
+        # code move esp by FOUR (the default operand size), even though ES is a
+        # 16-bit register. Only an explicit 66h prefix makes them two. Watcom's
+        # CRT brackets its init-table calls with push es / pop es; lifted as two
+        # bytes, every [esp+N] after the push reads two bytes off.
         elif m == 'push':
             if len(ops) == 1:
                 val = self._fmt_read(ops[0])
-                macro = 'PUSH16' if op_bits(ops[0]) == 16 else 'PUSH32'
+                macro = 'PUSH16' if _stack_bits(insn, ops[0]) == 16 else 'PUSH32'
                 lines.append(f"{macro}(esp, {val}); {comment}")
 
         elif m == 'pop':
             if len(ops) == 1:
-                if op_bits(ops[0]) == 16:
+                if _stack_bits(insn, ops[0]) == 16:
                     # _fmt_write keeps a 16-bit destination's upper half, for a
                     # register (SET_LO16) and for memory (MEM16) alike.
                     lines.append(f"{self._fmt_write(ops[0], 'POP16_VAL(esp)')}; {comment}")
@@ -884,13 +901,39 @@ class Lifter:
                 a = self._fmt_read(ops[0])
                 lines.append(f"{self._fmt_write(ops[0], f'~{a}')}; {comment}")
 
+        elif m in ('mul', 'imul') and len(ops) == 1:
+            # One operand: its width picks the registers -- AL * r8 -> AX,
+            # AX * r16 -> DX:AX, EAX * r32 -> EDX:EAX. Lifting every width as
+            # the 32-bit form overwrote EDX (and all of EAX) for `mul cl`.
+            # CF = OF = "the high half is more than the low half's extension";
+            # SF, ZF, AF and PF are undefined. The pair goes in as a literal
+            # flags word, the way POPFD's does.
+            a = self._fmt_read(ops[0])
+            w = ops[0].size
+            if w == 1 and m == 'mul':
+                lines.append(f"{{ uint32_t _r = (uint32_t)LO8(eax) * (uint8_t)({a}); {comment}")
+                lines.append("  SET_LO16(eax, _r); uint32_t _ov = (_r >> 8) != 0;")
+            elif w == 1:
+                lines.append(f"{{ int32_t _r = (int32_t)(int8_t)LO8(eax) * (int8_t)({a}); {comment}")
+                lines.append("  SET_LO16(eax, (uint16_t)_r); uint32_t _ov = _r != (int8_t)_r;")
+            elif w == 2 and m == 'mul':
+                lines.append(f"{{ uint32_t _r = (uint32_t)LO16(eax) * (uint16_t)({a}); {comment}")
+                lines.append("  SET_LO16(eax, _r); SET_LO16(edx, _r >> 16); uint32_t _ov = (_r >> 16) != 0;")
+            elif w == 2:
+                lines.append(f"{{ int32_t _r = (int32_t)(int16_t)LO16(eax) * (int16_t)({a}); {comment}")
+                lines.append("  SET_LO16(eax, (uint16_t)_r); SET_LO16(edx, (uint16_t)(_r >> 16));"
+                             " uint32_t _ov = _r != (int16_t)_r;")
+            elif m == 'mul':
+                lines.append(f"{{ uint64_t _r = (uint64_t)eax * (uint32_t)({a}); {comment}")
+                lines.append("  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32); uint32_t _ov = edx != 0;")
+            else:
+                lines.append(f"{{ int64_t _r = (int64_t)(int32_t)eax * (int32_t)({a}); {comment}")
+                lines.append("  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32); uint32_t _ov = _r != (int32_t)_r;")
+            lines.append("  _flag_k = FK_EFLAGS; _flag_a = _ov ? 0x801u : 0u; _flag_b = 0; _cf = _ov; }")
+            self._flag_state = None
+
         elif m == 'imul':
-            if len(ops) == 1:
-                # One-operand: edx:eax = eax * ops[0]
-                a = self._fmt_read(ops[0])
-                lines.append(f"{{ int64_t _r = (int64_t)(int32_t)eax * (int64_t)(int32_t){a}; {comment}")
-                lines.append(f"  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32); }}")
-            elif len(ops) == 2:
+            if len(ops) == 2:
                 a = self._fmt_read(ops[0])
                 b = self._fmt_read(ops[1])
                 lines.append(f"{self._fmt_write(ops[0], f'(uint32_t)((int32_t){a} * (int32_t){b})')}; {comment}")
@@ -898,12 +941,6 @@ class Lifter:
                 b = self._fmt_read(ops[1])
                 c = self._fmt_read(ops[2])
                 lines.append(f"{self._fmt_write(ops[0], f'(uint32_t)((int32_t){b} * (int32_t){c})')}; {comment}")
-
-        elif m == 'mul':
-            if len(ops) == 1:
-                a = self._fmt_read(ops[0])
-                lines.append(f"{{ uint64_t _r = (uint64_t)eax * (uint64_t){a}; {comment}")
-                lines.append(f"  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32); }}")
 
         elif m in ('div', 'idiv'):
             if len(ops) == 1:
@@ -914,13 +951,34 @@ class Lifter:
                 # so producing 0 and continuing is the safe recomp behaviour instead of
                 # crashing the host process (e.g. degenerate spans / z=0 in the
                 # perspective-divide texture mappers).
-                if m == 'div':
+                #
+                # The width picks the registers: AX / r8 -> AL, AH; DX:AX / r16 ->
+                # AX, DX; EDX:EAX / r32 -> EAX, EDX. `div cl` lifted as the 32-bit
+                # form overwrote EDX, and SimCity 2000 kept a pointer there.
+                # Signed INT_MIN / -1 is #DE on the CPU and undefined in C, so it
+                # takes the zero-divisor path too.
+                w = ops[0].size
+                if w == 1 and m == 'div':
+                    lines.append(f"{{ uint32_t _n = LO16(eax), _d = (uint8_t)({divisor}); {comment}")
+                    lines.append("  SET_LO16(eax, _d ? ((_n % _d) << 8) | ((_n / _d) & 0xFFu) : 0u); }")
+                elif w == 1:
+                    lines.append(f"{{ int32_t _n = (int16_t)LO16(eax), _d = (int8_t)({divisor}); {comment}")
+                    lines.append("  SET_LO16(eax, _d ? (((uint32_t)(_n % _d) & 0xFFu) << 8)"
+                                 " | ((uint32_t)(_n / _d) & 0xFFu) : 0u); }")
+                elif w == 2 and m == 'div':
+                    lines.append(f"{{ uint32_t _n = (LO16(edx) << 16) | LO16(eax), _d = (uint16_t)({divisor}); {comment}")
+                    lines.append("  SET_LO16(eax, _d ? _n / _d : 0u); SET_LO16(edx, _d ? _n % _d : 0u); }")
+                elif w == 2:
+                    lines.append(f"{{ int32_t _n = (int32_t)((LO16(edx) << 16) | LO16(eax)), _d = (int16_t)({divisor}); {comment}")
+                    lines.append("  int _ok = _d && !(_d == -1 && _n == INT32_MIN);")
+                    lines.append("  SET_LO16(eax, _ok ? (uint32_t)(_n / _d) : 0u); SET_LO16(edx, _ok ? (uint32_t)(_n % _d) : 0u); }")
+                elif m == 'div':
                     lines.append(f"{{ uint64_t _dividend = ((uint64_t)edx << 32) | eax; uint32_t _dv = (uint32_t){divisor}; {comment}")
                     lines.append(f"  if (_dv) {{ eax = (uint32_t)(_dividend / _dv); edx = (uint32_t)(_dividend % _dv); }}")
                     lines.append(f"  else {{ eax = 0; edx = 0; }} }}")
                 else:
                     lines.append(f"{{ int64_t _dividend = ((int64_t)(int32_t)edx << 32) | eax; int32_t _dv = (int32_t){divisor}; {comment}")
-                    lines.append(f"  if (_dv) {{ eax = (uint32_t)((int32_t)(_dividend / _dv)); edx = (uint32_t)((int32_t)(_dividend % _dv)); }}")
+                    lines.append(f"  if (_dv && !(_dv == -1 && _dividend == INT64_MIN)) {{ eax = (uint32_t)((int32_t)(_dividend / _dv)); edx = (uint32_t)((int32_t)(_dividend % _dv)); }}")
                     lines.append(f"  else {{ eax = 0; edx = 0; }} }}")
 
         # --- Logical ---

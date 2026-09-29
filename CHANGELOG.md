@@ -5,6 +5,17 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+From `fix/lift32-narrow-muldiv` (PR number to follow). Found running SimCity 2000
+(Windows 95, MSVC 2.x) recompiled: its simulation faulted after `div cl`.
+
+### Fixed
+- `lift32`: one-operand `mul`, `imul`, `div` and `idiv` at 8 and 16 bits use AX
+  and DX:AX. Every width was lifted as the 32-bit EDX:EAX form, so `div cl`
+  overwrote EDX. One-operand `mul`/`imul` now set CF and OF; signed
+  `INT_MIN / -1` takes the divide-by-zero path instead of C undefined behaviour.
+  (`lift32_cpu` already had this right.) Eight difftest cases: 183/195 match,
+  12 known divergences, 0 failures.
+
 From #4. Found running Gunman Chronicles (MSVC 6 CRT, Quake-lineage software renderer)
 fully recompiled; each is generic x86 semantics or code generation. Each fix
 has a difftest case against Unicorn: 175/187 match, 12 known divergences,
