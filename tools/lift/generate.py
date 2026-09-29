@@ -419,8 +419,12 @@ def true_extent(md, code, code_start, start, hard_end, entries, reached=None, be
     * A `jmp` to another entry in `entries` is a tail call and ends the path.
       `entries` must hold only real starts, not alias entries: an ordinary
       jump to an alias would stop the walk early (forcecommander 0x00554A00).
-    * Fallthrough into another entry also ends the path. That is what stops a
-      call to a noreturn function from swallowing the next function.
+    * Fallthrough into another entry ends the path only after a `call`: that
+      is the one way real code falls into the next function (a call to a
+      noreturn function with nothing after it). After any other instruction
+      the "entry" is a false start inside this body, and stopping there cut
+      CRT parse_cmdline at 0x00AE7147 into an infinite `dec eax; jmp` loop
+      (The Movies).
     * `hard_end` is a reach cap (EXTENT_REACH), never the catalog's clamped
       end. MSVC calls a function's own __finally block with a `call` into the
       middle of its body; the block is then an entry, and the parent's exit
@@ -449,12 +453,14 @@ def true_extent(md, code, code_start, start, hard_end, entries, reached=None, be
         va = work.pop()
         if va in seen or not (start <= va < hard_end):
             continue
+        after_call = False
         for ins in decode(md, view[va - code_start:hard_end - code_start], va):
             if ins.address in seen:
                 break
-            if ins.address != va and ins.address in entries:
-                clean = True
+            if after_call and ins.address in entries:
+                clean = True        # a noreturn call fell into the next function
                 break
+            after_call = ins.mnemonic == 'call'
             seen.add(ins.address)
             top = max(top, ins.address + ins.size)
             m = ins.mnemonic
@@ -652,16 +658,21 @@ def _selftest():
     # true_extent: the calloc shape. A calls its own __finally block B, jumps
     # over it, and its exit path (jne) lands on an epilogue past B. The catalog
     # has B as an entry; the extent must still reach the epilogue, and stop at
-    # C, which A only falls toward. C falls through into D and must stop there.
+    # C, which A never reaches. C ends in a (noreturn) call that falls into D,
+    # and must stop there.
     #   1000 test eax,eax / 1002 jne 100c / 1004 call 100b / 1009 jmp 100c
-    #   100b B: ret / 100c xor eax,eax / 100e ret / 100f C: nop,nop / 1011 D: ret
+    #   100b B: ret / 100c xor eax,eax / 100e ret / 100f C: call 1000 / 1014 D: ret
     code = bytes([0x85, 0xC0, 0x75, 0x08, 0xE8, 0x02, 0x00, 0x00, 0x00, 0xEB, 0x01,
-                  0xC3, 0x31, 0xC0, 0xC3, 0x90, 0x90, 0xC3])
-    ents = {0x1000, 0x100B, 0x100F, 0x1011}
-    assert true_extent(md, code, 0x1000, 0x1000, 0x1012, ents) == (0x100F, True)
-    assert true_extent(md, code, 0x1000, 0x100F, 0x1012, ents) == (0x1011, True)
+                  0xC3, 0x31, 0xC0, 0xC3, 0xE8, 0xEC, 0xFF, 0xFF, 0xFF, 0xC3])
+    ents = {0x1000, 0x100B, 0x100F, 0x1014}
+    assert true_extent(md, code, 0x1000, 0x1000, 0x1015, ents) == (0x100F, True)
+    assert true_extent(md, code, 0x1000, 0x100F, 0x1015, ents) == (0x1014, True)
     # ...and the old bound (the catalog clamp at B) is exactly what lost it.
     assert true_extent(md, code, 0x1000, 0x1000, 0x100B, ents)[0] == 0x100B
+    # Falling into an "entry" after anything but a call means the entry is a
+    # false start inside this body (CRT parse_cmdline): keep going.
+    assert true_extent(md, bytes([0x90, 0x90, 0xC3]), 0x1000, 0x1000, 0x1003,
+                       {0x1000, 0x1001}) == (0x1003, True)
 
     # A switch: jmp [eax*4 + 0x1008], a pad byte, the table (arms 0x1010,
     # 0x1012), then the arms. The walk must reach both arms, and the sweep
@@ -680,7 +691,7 @@ def _selftest():
     #   1000 xor eax,eax / 1002 inc eax / 1003 cmp eax,5 / 1006 jb 1002 / 1008 ret
     code = bytes([0x31, 0xC0, 0x40, 0x83, 0xF8, 0x05, 0x72, 0xFA, 0xC3])
     ents = {0x1000, 0x1003}
-    assert true_extent(md, code, 0x1000, 0x1000, 0x1009, ents)[0] == 0x1003   # cut short
+    assert true_extent(md, code, 0x1000, 0x1000, 0x1009, ents) == (0x1009, True)  # walks through it
     assert find_splits(md, code, 0x1000, 0x1009, ents) == {0x1003}
     assert true_extent(md, code, 0x1000, 0x1000, 0x1009, ents - {0x1003}) == (0x1009, True)
     # ...and a real neighbour is not a split: C above only falls into D.
