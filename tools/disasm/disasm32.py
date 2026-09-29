@@ -53,6 +53,22 @@ def decode(md, code, va):
         if n < batch:           # an undecodable byte, or the end of the buffer
             return
         batch = min(batch * 2, 256)
+def prologue_starts(data, code_start):
+    """Addresses that open with `push ebp; mov ebp, esp` (55 8B EC).
+
+    Except after `mov edi, edi` (8B FF): that is Microsoft's hot-patch
+    prologue (/hotpatch; D3DX, the CRT, most MS libraries). The function
+    starts at the mov, which is what every call names, and the push is one
+    instruction in. Taking the push as a start split The Movies' D3DX code two
+    bytes into 2,048 of its 3,083 framed functions.
+    """
+    found = set()
+    at = data.find(b'\x55\x8B\xEC')
+    while at >= 0:
+        hot = at >= 2 and data[at - 2:at] == b'\x8B\xFF'
+        found.add(code_start + at - (2 if hot else 0))
+        at = data.find(b'\x55\x8B\xEC', at + 1)
+    return found
 
 
 @dataclass
@@ -601,16 +617,8 @@ class Disassembler:
         print(f"[*] Found {len(call_targets)} potential call targets")
 
         # Also look for common function prologues
-        prologue_targets = set()
         data = self.read_bytes(code_start, code_end - code_start)
-        if data:
-            for offset in range(len(data) - 3):
-                va = code_start + offset
-                # push ebp; mov ebp, esp (55 8B EC)
-                if data[offset:offset + 3] == b'\x55\x8B\xEC':
-                    prologue_targets.add(va)
-                # push ebp; mov ebp, esp with sub esp (55 8B EC 83 EC)
-                # Also push esi; push edi patterns after push ebp
+        prologue_targets = prologue_starts(data, code_start) if data else set()
 
         print(f"[*] Found {len(prologue_targets)} prologue patterns")
 
@@ -1134,6 +1142,11 @@ def demo():
     a_body = BASE + 0x1000
     a_tail = a_body + len(body)
     a_junk = a_tail + len(tail)
+
+    # prologue_starts: a plain 55 8B EC starts there; after 8B FF (hot-patch)
+    # the function starts two bytes earlier, at the mov.
+    assert prologue_starts(b"\x90\x55\x8b\xec\xc3", 0x1000) == {0x1001}
+    assert prologue_starts(b"\x90\x8b\xff\x55\x8b\xec\xc3", 0x1000) == {0x1001}
 
     assert d.probes_as_function_body(a_body), "a prologue reaching ret is code"
     assert d.probes_as_function_body(a_tail), "a tail jmp is a terminator too"

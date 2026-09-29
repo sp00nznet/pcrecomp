@@ -73,6 +73,12 @@ recompiled: its simulation hung in the CRT's `strstr`.
   haystack and looped forever. The jcc after a rep compare now reads the lazy
   flag state instead of assuming a compare wrote it. Two difftest cases:
   177/189 match, 12 known divergences, 0 failures.
+### Fixed
+- `disasm32.py`'s prologue scan starts a hot-patchable function at its
+  `mov edi, edi` (8B FF), not two bytes in at `push ebp`. MSVC /hotpatch code
+  (D3DX, the CRT, most Microsoft libraries) was split two bytes into every
+  such function. The Movies: 2,048 of 3,083 framed functions; split entries
+  6,582 -> 4,536, exact function ends 87.7% -> 91.2%.
 
 From #4. Found running Gunman Chronicles (MSVC 6 CRT, Quake-lineage software renderer)
 fully recompiled; each is generic x86 semantics or code generation. Each fix
