@@ -790,8 +790,10 @@ class Disassembler:
         print(f"[*] Successfully disassembled {len(functions)} functions"
               f" ({round_no} discovery rounds)")
         sizes = {a: f.size for a, f in functions.items()}
+        called = {t for f in functions.values() for t in f.calls_to}
         gone = drop_mid_instruction_entries(
-            lambda va, n: self.read_bytes(va, n), sizes, code_start, code_end)
+            lambda va, n: self.read_bytes(va, n), sizes, code_start, code_end,
+            keep=called)
         for a in list(functions):
             if a not in sizes:
                 del functions[a]
@@ -803,7 +805,7 @@ class Disassembler:
 
 
 def drop_mid_instruction_entries(read_va, functions, code_start, code_end,
-                                 max_rounds=4, verbose=True):
+                                 max_rounds=4, verbose=True, keep=frozenset()):
     """Remove catalog entries that are not instruction boundaries.
 
     An address inside an instruction cannot be the start of anything: decoding
@@ -822,6 +824,12 @@ def drop_mid_instruction_entries(read_va, functions, code_start, code_end,
     can take a real function down with it. Two rounds is normally enough.
 
     `functions` is {addr: size}, edited in place. Returns how many went.
+
+    `keep` holds entries with direct evidence -- the targets of decoded `call`
+    instructions -- which are never dropped. The evidence against an entry is
+    only that some other body's decode straddles it, and that body can be the
+    false one: in The Movies a data-scan hit inside a jump table (0x00C1016D)
+    decoded over 0x00C10170, a function called directly, and the real one went.
     """
     from capstone import Cs, CS_ARCH_X86, CS_MODE_32
     md = Cs(CS_ARCH_X86, CS_MODE_32)
@@ -924,7 +932,8 @@ def drop_mid_instruction_entries(read_va, functions, code_start, code_end,
                         interior[k - code_start] = 1
 
         bogus = [a for a in functions
-                 if code_start <= a < code_end and interior[a - code_start]]
+                 if code_start <= a < code_end and interior[a - code_start]
+                 and a not in keep]
         if not bogus:
             break
         for a in bogus:
@@ -1201,6 +1210,12 @@ def demo():
     gone = drop_mid_instruction_entries(_read, cat, 0x1000, 0x1000 + len(blob),
                                         verbose=False)
     assert gone == 1 and 0x1002 not in cat and 0x1000 in cat, (gone, cat)
+    # ...unless a decoded call names it: then the straddling body is the
+    # suspect, and the called entry stays.
+    cat = {0x1000: len(blob), 0x1002: len(blob) - 2}
+    gone = drop_mid_instruction_entries(_read, cat, 0x1000, 0x1000 + len(blob),
+                                        verbose=False, keep={0x1002})
+    assert gone == 0 and 0x1002 in cat, (gone, cat)
 
     # ...and a neighbour that had been clamped onto the dropped entry gets its
     # extent back. Left at 2 bytes it would end in a fallthrough to an address

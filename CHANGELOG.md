@@ -90,6 +90,11 @@ recompiled: its simulation hung in the CRT's `strstr`.
   haystack and looped forever. The jcc after a rep compare now reads the lazy
   flag state instead of assuming a compare wrote it. Two difftest cases:
   177/189 match, 12 known divergences, 0 failures.
+- `disasm32.py` never drops the target of a decoded `call` as a
+  mid-instruction entry. The only evidence against such an entry is that
+  another body's decode straddles it, and that body can be the false one: a
+  data-scan hit inside a jump table decoded over a directly called function
+  in The Movies (0x00C10170) and the real function went.
 
 From #4. Found running Gunman Chronicles (MSVC 6 CRT, Quake-lineage software renderer)
 fully recompiled; each is generic x86 semantics or code generation. Each fix
