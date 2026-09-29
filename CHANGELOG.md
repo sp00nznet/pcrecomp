@@ -23,7 +23,8 @@ From #6. Found running SimCity 2000
   `INT_MIN / -1` takes the divide-by-zero path instead of C undefined behaviour.
   (`lift32_cpu` already had this right.) Eight difftest cases: 183/195 match,
   12 known divergences, 0 failures.
-From `fix/lift32-rep-ecx0-flags` (PR number to follow). Found running SimCity 2000
+
+From #8. Found running SimCity 2000
 recompiled: its simulation hung in the CRT's `strstr`.
 
 ### Fixed
