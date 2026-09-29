@@ -388,6 +388,7 @@ def write_chunk(output_dir, file_idx, funcs):
 
 
 EXTENT_REACH = 0x40000      # cap on how far one function's body may reach
+BACK_REACH = 0x100          # ...and how far below its entry a chunk may sit
 
 
 def _jump_table(ins, code, code_start, lo, hi, limit=1024):
@@ -456,11 +457,12 @@ def true_extent(md, code, code_start, start, hard_end, entries, reached=None, be
     view = memoryview(code)
     seen = reached if reached is not None else set()
     work, top, clean = [start], start, False
+    low = max(code_start, start - BACK_REACH)
     deferred = set()        # branches to entries: tail calls, unless inside our span
     while True:
         while work:
             va = work.pop()
-            if va in seen or not (start <= va < hard_end):
+            if va in seen or not (low <= va < hard_end):
                 continue
             after_call = False
             for ins in decode(md, view[va - code_start:hard_end - code_start], va):
@@ -485,13 +487,20 @@ def true_extent(md, code, code_start, start, hard_end, entries, reached=None, be
                     behind.add(t)
                 if branch and t is not None and start < t < hard_end:
                     (deferred.add if t in entries else work.append)(t)
+                # Hand-written CRT routines (strchr, strlen) put a shared exit
+                # just BELOW their entry, after int3 padding, and jump back to
+                # it. Padding before the target says it is not the middle of
+                # the function before this one (that would be a split).
+                elif (branch and t is not None and low <= t < start and t not in entries
+                        and code[t - code_start - 1] == 0xCC):
+                    work.append(t)
                 if m == 'jmp':
                     if t is None:
                         arms = _jump_table(ins, code, code_start, start, hard_end)
                         work.extend(a for a in arms if a not in entries)
                         deferred.update(a for a in arms if a in entries)
                         clean = clean or not arms   # an indirect tail call ends the body
-                    elif not (start < t < hard_end) or t in entries:
+                    elif not (low <= t < hard_end) or t in entries:
                         clean = True
                     break
         # A jump to an "entry" inside the span this body already covers is not
@@ -530,7 +539,7 @@ def find_splits(md, code, code_start, code_end, entries):
         back = set()
         true_extent(md, code, code_start, e, min(e + EXTENT_REACH, code_end), entries,
                     behind=back)
-        if any(ordered[i - 1] <= t < e for t in back):
+        if any(ordered[i - 1] <= t < e and code[t - code_start - 1] != 0xCC for t in back):
             splits.add(e)
     return splits
 
@@ -710,6 +719,16 @@ def _selftest():
     got = set()
     true_extent(md, code, 0x1000, 0x1000, 0x1011, {0x1000}, reached=got)
     assert 0x1010 in got, sorted(map(hex, got))
+
+    # The strchr shape: the found-exit sits BELOW the entry, after int3 padding.
+    #   1000 cc / 1001 X: dec eax / 1002 ret / 1003 E: test eax,eax / 1005 je 1001 / 1007 ret
+    code = bytes([0xCC, 0x48, 0xC3, 0x85, 0xC0, 0x74, 0xFA, 0xC3])
+    got = set()
+    assert true_extent(md, code, 0x1000, 0x1003, 0x1008, {0x1003}, reached=got) == (0x1008, True)
+    assert {0x1001, 0x1002} <= got, sorted(map(hex, got))
+    assert find_splits(md, code, 0x1000, 0x1008, {0x1000, 0x1003}) == set()
+    insns, leaders = linear_disassemble_function(md, code, 0x1000, min(got), 0x1008, reached=got)
+    assert [i.address for i in insns] == [0x1001, 0x1002, 0x1003, 0x1005, 0x1007]
 
     # The _stat shape: a jump to a catalogued "entry" that lies inside this
     # body's own span is internal, not a tail call.
