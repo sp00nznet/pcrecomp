@@ -776,23 +776,50 @@ static inline uint64_t mmx_pcmpgtw(uint64_t a, uint64_t b) {
  * FPU Stack Helpers
  * ============================================================ */
 
+/* The x87 register is 80 bits with a 64-bit mantissa; ours is a double with 53.
+ * That is invisible for arithmetic but not for `fild qword / fistp qword`, the
+ * era's idiom for moving 8 bytes (a packed x,y pair, a 64-bit counter): through
+ * a double, a large high dword rounds away the low bits. Nocturne's clipper
+ * copies vertices that way and got x = -20/65536 where the original had 0, then
+ * filled a 65535-pixel span. So each slot shadows the exact int64 `fild qword`
+ * loaded, and `fistp qword` stores the shadow while the slot's double still
+ * equals it (nothing has computed on it since).
+ *
+ * selectany/weak: one shared instance, defined by the header itself, so no
+ * project runtime has to grow a definition for it. */
+#if defined(_MSC_VER)
+#define RECOMP_SHARED_DATA __declspec(selectany)
+#else
+#define RECOMP_SHARED_DATA __attribute__((weak))
+#endif
+RECOMP_SHARED_DATA int64_t g_st_i64[8] = {0};
+
 static inline void fp_push_impl(double* st, int* top, double val) {
     /* Shift stack down, push new value */
-    for (int i = 7; i > 0; i--) st[i] = st[i-1];
+    for (int i = 7; i > 0; i--) { st[i] = st[i-1]; g_st_i64[i] = g_st_i64[i-1]; }
     st[0] = val;
+    g_st_i64[0] = 0;
     (*top)++;
 }
 
 static inline double fp_pop_impl(double* st, int* top) {
     double val = st[0];
-    for (int i = 0; i < 7; i++) st[i] = st[i+1];
+    for (int i = 0; i < 7; i++) { st[i] = st[i+1]; g_st_i64[i] = g_st_i64[i+1]; }
     st[7] = 0.0;
+    g_st_i64[7] = 0;
     (*top)--;
     return val;
 }
 
 #define fp_push(val) fp_push_impl(_st, &_fp_top, (val))
 #define fp_pop()     fp_pop_impl(_st, &_fp_top)
+
+/* fild qword: push with the exact value shadowed. */
+#define fp_push_i64(v) do { int64_t _pv = (int64_t)(v); \
+    fp_push((double)_pv); g_st_i64[0] = _pv; } while (0)
+/* fxch st(i), keeping each slot's shadow with its value. */
+#define fp_xch(i) do { double _t = _st[0]; _st[0] = _st[i]; _st[i] = _t; \
+    int64_t _ti = g_st_i64[0]; g_st_i64[0] = g_st_i64[i]; g_st_i64[i] = _ti; } while (0)
 
 /* fist/fistp round by the control word's RC field (bits 10-11), not by C's
  * truncating cast. MSVC's __ftol sets chop before its fistp, so a plain cast
@@ -808,6 +835,11 @@ static inline double fp_round_cw(double v, uint16_t cw) {
     }
 }
 #define fp_to_int(v) fp_round_cw((v), _fpu_cw)
+
+/* fistp qword: the exact shadow while st0 is still the value fild loaded. */
+static inline int64_t fp_st0_to_i64(double v0, int64_t shadow, uint16_t cw) {
+    return (v0 == (double)shadow) ? shadow : (int64_t)fp_round_cw(v0, cw);
+}
 
 /* The 80-bit extended format, for `fld/fstp xword`. The model's stack is
  * double, so a load rounds to double and a store widens. The CRT keeps 2*pi
@@ -922,8 +954,11 @@ recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
         RECOMP_REGS_IN(); \
         g_cur_func = _caller;  /* the callee RECOMP_ENTER clobbered it */ \
     } else { \
+        /* Nothing was pushed on this path, so there is nothing to pop: an \
+         * `esp += 4` here shifted the caller's stack by one slot per miss. \
+         * (Nocturne's CRT init runner lost its saved registers that way and \
+         * skipped ~90 static constructors after its first unlifted entry.) */ \
         fprintf(stderr, "ICALL: unresolved VA 0x%08X from 0x%08X\n", _va, g_cur_func); \
-        esp += 4; /* pop dummy ret addr */ \
         eax = 0; \
     } \
 } while(0)
