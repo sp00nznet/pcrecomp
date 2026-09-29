@@ -6,6 +6,16 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Changed
+### Added
+- `generate.py`: `true_extent()` and `closure()`, the lift-driver helpers that
+  forcecommander, prey and The Movies each carried a copy of. `true_extent`
+  walks a body's branches for its real end, capped by reach instead of the
+  catalog's clamp: MSVC calls a function's own __finally block mid-body, so
+  the clamp cut CRT calloc off before its epilogue. On The Movies' startup
+  closure, undefined-label ITAIL fallbacks 76 -> 44 and bodies with no
+  terminator 7 -> 0. Selftest models the calloc shape.
+
+### Fixed
 - `disasm32.py` is 7-18x faster with byte-identical output. capstone's Python
   `disasm()` is a generator over one `cs_disasm(count=0)` call, so it decodes
   its whole buffer, with detail, before yielding the first instruction; every

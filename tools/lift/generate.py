@@ -16,7 +16,7 @@ import json
 # never been the paths -- so it did not import at all, and every project forked
 # it instead of using it.
 _TOOLS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-for _d in ('pe', 'lift'):
+for _d in ('pe', 'lift', 'disasm'):
     _p = os.path.join(_TOOLS, _d)
     if _p not in sys.path:
         sys.path.insert(0, _p)
@@ -26,6 +26,7 @@ from pe_analyze import analyze_pe, build_iat_map
 from lift32 import Lifter
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32
 from capstone.x86 import X86_OP_IMM
+from disasm32 import decode
 
 
 COND_JUMPS = {
@@ -374,6 +375,86 @@ def write_chunk(output_dir, file_idx, funcs):
             f.write('\n\n')
 
 
+EXTENT_REACH = 0x40000      # cap on how far one function's body may reach
+
+
+def true_extent(md, code, code_start, start, hard_end, entries):
+    """Exact end of the body at `start`: the highest address reached by
+    fallthrough and direct branches. Returns (end, clean).
+
+    A catalog gives an entry and a reachability bound, and neither is an
+    extent. Clamping to the next entry cuts functions in half at false starts;
+    trusting a reachability `end` decodes unrelated code as one body. Walking
+    the branches settles it (forcecommander, where both were tried and broke).
+
+    * A `jmp` to another entry in `entries` is a tail call and ends the path.
+      `entries` must hold only real starts, not alias entries: an ordinary
+      jump to an alias would stop the walk early (forcecommander 0x00554A00).
+    * Fallthrough into another entry also ends the path. That is what stops a
+      call to a noreturn function from swallowing the next function.
+    * `hard_end` is a reach cap (EXTENT_REACH), never the catalog's clamped
+      end. MSVC calls a function's own __finally block with a `call` into the
+      middle of its body; the block is then an entry, and the parent's exit
+      path jumps past it. Bounded by the clamp, CRT calloc lost its epilogue
+      to an unresolved ITAIL (The Movies, 0x00AD578C).
+
+    `clean` is False when no path reached ret, int3, a tail call or another
+    entry: a health metric for the catalog, not an error.
+    """
+    view = memoryview(code)
+    seen, work, top, clean = set(), [start], start, False
+    while work:
+        va = work.pop()
+        if va in seen or not (start <= va < hard_end):
+            continue
+        for ins in decode(md, view[va - code_start:hard_end - code_start], va):
+            if ins.address in seen:
+                break
+            if ins.address != va and ins.address in entries:
+                clean = True
+                break
+            seen.add(ins.address)
+            top = max(top, ins.address + ins.size)
+            m = ins.mnemonic
+            t = None
+            if ins.operands and ins.operands[0].type == X86_OP_IMM:
+                t = ins.operands[0].imm & 0xFFFFFFFF
+            if m in ('ret', 'retn', 'retf', 'iret', 'int3', 'hlt'):
+                clean = True
+                break
+            if m == 'jmp':
+                if t is not None and start < t < hard_end and t not in entries:
+                    work.append(t)
+                else:
+                    clean = True
+                break
+            if ((m in COND_JUMPS or m.startswith('loop')) and t is not None
+                    and start < t < hard_end and t not in entries):
+                work.append(t)
+    return top, clean
+
+
+def closure(functions, roots, limit):
+    """Breadth-first call-graph closure from `roots`, at most `limit` entries.
+
+    `functions` maps address -> catalog entry with a `calls_to` list (disasm32's
+    output). Breadth-first because the first N functions reached from the
+    entry point are the startup path, which is what a first run needs; lift
+    that, stub the rest to report themselves, and grow by measurement.
+    """
+    from collections import deque
+    seen, order, q = set(), [], deque(r for r in roots if r in functions)
+    seen.update(q)
+    while q and len(order) < limit:
+        a = q.popleft()
+        order.append(a)
+        for t in functions[a].get('calls_to', ()):
+            if t in functions and t not in seen:
+                seen.add(t)
+                q.append(t)
+    return order
+
+
 def _selftest():
     """Lift a hand-assembled function and check the emitted C.
 
@@ -488,6 +569,24 @@ def _selftest():
     assert 'fnstsw - FPU status to ax' not in out3, 'fnstsw is still a comment'
     assert '0x4000u' in out3 and '0x0100u' in out3, out3
     assert 'eax = (eax & 0xFFFF0000u)' in out3, out3
+
+    # true_extent: the calloc shape. A calls its own __finally block B, jumps
+    # over it, and its exit path (jne) lands on an epilogue past B. The catalog
+    # has B as an entry; the extent must still reach the epilogue, and stop at
+    # C, which A only falls toward. C falls through into D and must stop there.
+    #   1000 test eax,eax / 1002 jne 100c / 1004 call 100b / 1009 jmp 100c
+    #   100b B: ret / 100c xor eax,eax / 100e ret / 100f C: nop,nop / 1011 D: ret
+    code = bytes([0x85, 0xC0, 0x75, 0x08, 0xE8, 0x02, 0x00, 0x00, 0x00, 0xEB, 0x01,
+                  0xC3, 0x31, 0xC0, 0xC3, 0x90, 0x90, 0xC3])
+    ents = {0x1000, 0x100B, 0x100F, 0x1011}
+    assert true_extent(md, code, 0x1000, 0x1000, 0x1012, ents) == (0x100F, True)
+    assert true_extent(md, code, 0x1000, 0x100F, 0x1012, ents) == (0x1011, True)
+    # ...and the old bound (the catalog clamp at B) is exactly what lost it.
+    assert true_extent(md, code, 0x1000, 0x1000, 0x100B, ents)[0] == 0x100B
+
+    fns = {1: {'calls_to': [2, 3]}, 2: {'calls_to': [4]}, 3: {}, 4: {'calls_to': [1]}}
+    assert closure(fns, [1], 10) == [1, 2, 3, 4]
+    assert closure(fns, [1], 2) == [1, 2]
 
     print('generate.py self-test OK')
 
