@@ -61,6 +61,11 @@ static void regs_load(const regs_t* r) {
 static CRITICAL_SECTION g_mach;
 static DWORD g_mach_tls = TLS_OUT_OF_INDEXES;
 
+/* Argument slots copied per call. Reading past a callee's real arguments is
+ * harmless while those words are mapped (mach_enter leaves room); CreateFontA
+ * (14) is the widest common Win32 call. */
+#define BRIDGE_SLOTS 24
+
 #define GUEST_STACK (4u << 20)
 
 /* A guest thread's TIB. Lifted code reads fs:[n] as MEM32(g_fs_base + n); the
@@ -92,7 +97,12 @@ void mach_enter(void) {
         m = (mstate*)calloc(1, sizeof *m);
         uint32_t lo = (uint32_t)(uintptr_t)VirtualAlloc(NULL, GUEST_STACK,
                           MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        m->r.esp = lo + GUEST_STACK - 64;
+        /* The bridge copies BRIDGE_SLOTS words up from esp whatever the
+         * callee takes, so the first call made from an empty stack must not
+         * read off the end of it. With 64 bytes of headroom it did, and faulted
+         * whenever ASLR left the next page unmapped: the selftest crashed on
+         * about two runs in three. */
+        m->r.esp = lo + GUEST_STACK - BRIDGE_SLOTS * 4 - 64;
         m->r.fs = make_tib(lo, lo + GUEST_STACK);
         m->r.fpu_cw = 0x027F;
         TlsSetValue(g_mach_tls, m);
@@ -154,10 +164,6 @@ static void add_name(uint32_t va, const char* dll, const char* fn) {
 }
 
 /* ------------------------------------------------------- guest -> Windows */
-
-/* Argument slots copied per call. Reading past a callee's real arguments is
- * harmless; CreateFontA (14) is the widest common Win32 call. */
-#define BRIDGE_SLOTS 24
 
 static uint32_t g_native_target;
 
