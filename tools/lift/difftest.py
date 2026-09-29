@@ -107,6 +107,9 @@ WIDTH = ('a narrow operand is stored left-aligned, so CF, ZF, SF and OF are '
          'branches on either: CMP_P/CMP_NP are stubs and no BCD instruction is '
          'lifted. Real narrow PF is what a width in the tuple would buy.')
 
+DIV_UNDEF = ('CF', 'OF', 'SF', 'ZF', 'AF', 'PF')
+MUL_UNDEF = ('SF', 'ZF', 'AF', 'PF')
+
 CASES = [
     # --- x87: the stack, which nothing here used to look at ------------------
     #
@@ -216,6 +219,29 @@ CASES = [
     Case('fpu.float-load', bytes.fromhex('d906dd1f'),              # fld dword; fstp qword
          mem={SCRATCH: struct.pack('<f', 0.1)}),
     # --- the plain arithmetic the lazy tuple is built for ---
+    # --- one-operand mul/div at 8 and 16 bits: AX and DX:AX, never EDX:EAX ---
+    #
+    # `div cl` divides AX by CL into AL/AH and leaves EDX alone. It was lifted
+    # as the 32-bit form, dividing EDX:EAX and overwriting EDX -- which in
+    # SimCity 2000's simulation (sub_0046A840) held a map-row pointer, and the
+    # next load through it faulted. div/idiv leave every flag undefined.
+    Case('div.r8', bytes.fromhex('f6f1'),                     # div cl
+         {'eax': 0xAAAA0107, 'ecx': 5, 'edx': 0x55667788}, undef=DIV_UNDEF),
+    Case('idiv.r8', bytes.fromhex('f6f9'),                    # idiv cl: -263 / 5
+         {'eax': 0xAAAAFEF9, 'ecx': 5, 'edx': 0x55667788}, undef=DIV_UNDEF),
+    Case('div.r16', bytes.fromhex('66f7f1'),                  # div cx: 65536 / 7
+         {'eax': 0xAAAA0000, 'ecx': 7, 'edx': 0xBBBB0001}, undef=DIV_UNDEF),
+    Case('idiv.r16', bytes.fromhex('66f7f9'),                 # idiv cx: -65536 / -7
+         {'eax': 0xAAAA0000, 'ecx': 0xFFF9, 'edx': 0xBBBBFFFF}, undef=DIV_UNDEF),
+    Case('mul.r8', bytes.fromhex('f6e1'),                     # mul cl: AX = AL * CL
+         {'eax': 0x123456F0, 'ecx': 3, 'edx': 0x55667788}, undef=MUL_UNDEF),
+    Case('imul.r8', bytes.fromhex('f6e9'),                    # imul cl: -16 * 3
+         {'eax': 0x123456F0, 'ecx': 3, 'edx': 0x55667788}, undef=MUL_UNDEF),
+    Case('mul.r16', bytes.fromhex('66f7e1'),                  # mul cx: DX:AX = AX * CX
+         {'eax': 0x1234F000, 'ecx': 0x0100, 'edx': 0x55667788}, undef=MUL_UNDEF),
+    Case('imul.r16', bytes.fromhex('66f7e9'),                 # imul cx: -4096 * 256
+         {'eax': 0x1234F000, 'ecx': 0x0100, 'edx': 0x55667788}, undef=MUL_UNDEF),
+
     Case('add', bytes.fromhex('01c8')),                       # add eax, ecx
     Case('add.carry-out', bytes.fromhex('01c8'), {'eax': 0xFFFFFFFF, 'ecx': 2}),
     Case('add.overflow', bytes.fromhex('01c8'), {'eax': 0x7FFFFFFF, 'ecx': 1}),
