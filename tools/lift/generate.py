@@ -449,44 +449,53 @@ def true_extent(md, code, code_start, start, hard_end, entries, reached=None, be
     view = memoryview(code)
     seen = reached if reached is not None else set()
     work, top, clean = [start], start, False
-    while work:
-        va = work.pop()
-        if va in seen or not (start <= va < hard_end):
-            continue
-        after_call = False
-        for ins in decode(md, view[va - code_start:hard_end - code_start], va):
-            if ins.address in seen:
-                break
-            if after_call and ins.address in entries:
-                clean = True        # a noreturn call fell into the next function
-                break
-            after_call = ins.mnemonic == 'call'
-            seen.add(ins.address)
-            top = max(top, ins.address + ins.size)
-            m = ins.mnemonic
-            t = None
-            if ins.operands and ins.operands[0].type == X86_OP_IMM:
-                t = ins.operands[0].imm & 0xFFFFFFFF
-            if m in ('ret', 'retn', 'retf', 'iret', 'int3', 'hlt'):
-                clean = True
-                break
-            if (behind is not None and t is not None and t < start and t not in entries
-                    and (m == 'jmp' or m in COND_JUMPS or m.startswith('loop'))):
-                behind.add(t)
-            if m == 'jmp':
-                if t is not None and start < t < hard_end and t not in entries:
-                    work.append(t)
-                elif t is None:
-                    arms = [a for a in _jump_table(ins, code, code_start, start, hard_end)
-                            if a not in entries]
-                    work.extend(arms)
-                    clean = clean or not arms   # an indirect tail call ends the body
-                else:
+    deferred = set()        # branches to entries: tail calls, unless inside our span
+    while True:
+        while work:
+            va = work.pop()
+            if va in seen or not (start <= va < hard_end):
+                continue
+            after_call = False
+            for ins in decode(md, view[va - code_start:hard_end - code_start], va):
+                if ins.address in seen:
+                    break
+                if after_call and ins.address in entries:
+                    clean = True        # a noreturn call fell into the next function
+                    break
+                after_call = ins.mnemonic == 'call'
+                seen.add(ins.address)
+                top = max(top, ins.address + ins.size)
+                m = ins.mnemonic
+                t = None
+                if ins.operands and ins.operands[0].type == X86_OP_IMM:
+                    t = ins.operands[0].imm & 0xFFFFFFFF
+                if m in ('ret', 'retn', 'retf', 'iret', 'int3', 'hlt'):
                     clean = True
-                break
-            if ((m in COND_JUMPS or m.startswith('loop')) and t is not None
-                    and start < t < hard_end and t not in entries):
-                work.append(t)
+                    break
+                branch = m == 'jmp' or m in COND_JUMPS or m.startswith('loop')
+                if (behind is not None and branch and t is not None and t < start
+                        and t not in entries):
+                    behind.add(t)
+                if branch and t is not None and start < t < hard_end:
+                    (deferred.add if t in entries else work.append)(t)
+                if m == 'jmp':
+                    if t is None:
+                        arms = _jump_table(ins, code, code_start, start, hard_end)
+                        work.extend(a for a in arms if a not in entries)
+                        deferred.update(a for a in arms if a in entries)
+                        clean = clean or not arms   # an indirect tail call ends the body
+                    elif not (start < t < hard_end) or t in entries:
+                        clean = True
+                    break
+        # A jump to an "entry" inside the span this body already covers is not
+        # a tail call: the entry is a false start in our own code. CRT _stat
+        # jumps to its own cleanup at a catalogued 0x00AD3D45; treated as a
+        # tail call, the cleanup ran twice and FindClose freed a handle twice.
+        inside = [t for t in deferred if t < top and t not in seen]
+        if not inside:
+            break
+        deferred.difference_update(inside)
+        work.extend(inside)
     return top, clean
 
 
@@ -686,6 +695,16 @@ def _selftest():
     assert got == {0x1000, 0x1010, 0x1012}, sorted(map(hex, got))
     insns, _ = linear_disassemble_function(md, code, 0x1000, 0x1000, 0x1013, reached=got)
     assert [i.address for i in insns] == [0x1000, 0x1010, 0x1012], [hex(i.address) for i in insns]
+
+    # The _stat shape: a jump to a catalogued "entry" that lies inside this
+    # body's own span is internal, not a tail call.
+    #   1000 je 1006 / 1002 xor eax,eax / 1004 jmp 1009 / 1006 E: inc eax
+    #   1007 jmp 1009 / 1009 ret
+    code = bytes([0x74, 0x04, 0x31, 0xC0, 0xEB, 0x03, 0x40, 0xEB, 0x00, 0xC3])
+    got = set()
+    assert true_extent(md, code, 0x1000, 0x1000, 0x100A, {0x1000, 0x1006},
+                       reached=got) == (0x100A, True)
+    assert 0x1006 in got and 0x1007 in got, sorted(map(hex, got))
 
     # A split: the catalog took 0x1003, the middle of a loop, for an entry.
     #   1000 xor eax,eax / 1002 inc eax / 1003 cmp eax,5 / 1006 jb 1002 / 1008 ret
