@@ -94,18 +94,13 @@ class Case:
     undef: tuple = ()
     known: str = ''      # a divergence we know about and have chosen to keep
     precise_carry: bool = False   # lift with Lifter(precise_carry=True)
+    joins: tuple = ()    # code offsets that are join points: static flag state is dropped there
 
     def start_regs(self):
         r = dict(DEFAULT_REGS)
         r.update(self.regs)
         return r
 
-
-WIDTH = ('a narrow operand is stored left-aligned, so CF, ZF, SF and OF are '
-         'derived at the right width by the 32-bit macros -- but PF and AF are '
-         'read off the bottom of the result, which is now zeros. Nothing '
-         'branches on either: CMP_P/CMP_NP are stubs and no BCD instruction is '
-         'lifted. Real narrow PF is what a width in the tuple would buy.')
 
 DIV_UNDEF = ('CF', 'OF', 'SF', 'ZF', 'AF', 'PF')
 MUL_UNDEF = ('SF', 'ZF', 'AF', 'PF')
@@ -127,9 +122,7 @@ CASES = [
     # fld [esi]; fld [esi+4]; fucompp; fnstsw ax; test ah, 0x44; setp cl --
     # MSVC's `a != b`. fucompp was unimplemented: no compare, and no pops.
     Case('fpu.fucompp-equal', bytes.fromhex('d906d94604dae9dfe0f6c4440f9ac1'),
-         mem={SCRATCH: struct.pack('<ff', 1.0, 1.0)}, undef=('AF',),
-         known='setp reads the right PF (cl matches); the materialised EFLAGS PF '
-               'is the narrow-result divergence fpu.lt-zero-parity-neg documents.'),
+         mem={SCRATCH: struct.pack('<ff', 1.0, 1.0)}, undef=('AF',)),
     Case('fpu.fucompp-less', bytes.fromhex('d906d94604dae9dfe0f6c4440f9ac1'),
          mem={SCRATCH: struct.pack('<ff', 0.5, 1.0)}, undef=('AF',)),
     Case('fpu.fucompp-nan', bytes.fromhex('d906d94604dae9dfe0f6c4440f9ac1'),
@@ -137,12 +130,18 @@ CASES = [
     # MSVC's `x < 0.0`: fld; fcomp; fnstsw ax; test ah, 5; setp cl. PF must be
     # the parity of (ah & 5) -- it was a constant, so the branch never varied.
     Case('fpu.lt-zero-parity-neg', bytes.fromhex('d906d85e04dfe0f6c4050f9ac1'),
-         mem={SCRATCH: struct.pack('<ff', -0.5, 0.0)}, undef=('AF',),
-         known='setp/jp read the right PF (cl matches); the MATERIALISED EFLAGS '
-               'rebuild PF from the left-aligned result without its width, so a '
-               'narrow result reads as even. Only a pushfd round trip sees it.'),
+         mem={SCRATCH: struct.pack('<ff', -0.5, 0.0)}, undef=('AF',)),
     Case('fpu.lt-zero-parity-pos', bytes.fromhex('d906d85e04dfe0f6c4050f9ac1'),
          mem={SCRATCH: struct.pack('<ff', 0.5, 0.0)}, undef=('AF',)),
+    # The same with the setp at a join point (a branch target, or any
+    # instruction of a function that labels them all): the lifter forgets its
+    # static flag state there and the setp reads the kind at runtime
+    # (recomp_cond). That path had no parity -- jp fell back to _cf -- and The
+    # Movies' cursor clamp took `x < 0.0` as true for every x.
+    Case('fpu.lt-zero-parity-join-neg', bytes.fromhex('d906d85e04dfe0f6c4050f9ac1'),
+         mem={SCRATCH: struct.pack('<ff', -0.5, 0.0)}, undef=('AF',), joins=(10,)),
+    Case('fpu.lt-zero-parity-join-pos', bytes.fromhex('d906d85e04dfe0f6c4050f9ac1'),
+         mem={SCRATCH: struct.pack('<ff', 0.5, 0.0)}, undef=('AF',), joins=(10,)),
     Case('fpu.push', bytes.fromhex('d9e8')),                       # fld1
     Case('fpu.push-twice', bytes.fromhex('d9e8d9e8')),             # fld1; fld1
     Case('fpu.push-pop', bytes.fromhex('d9e8ddd8')),               # fld1; fstp st(0)
@@ -448,11 +447,11 @@ CASES = [
 
     # --- sub-register widths: the flag tuple stores what the operand read ---
     Case('add.8bit-sign', bytes.fromhex('00d8'),                  # add al, bl
-         {'eax': 0x00, 'ebx': 0x80}, known=WIDTH),
+         {'eax': 0x00, 'ebx': 0x80}),
     Case('cmp.8bit-signed', bytes.fromhex('38d8'),                # cmp al, bl
-         {'eax': 0x80, 'ebx': 0x01}, known=WIDTH),
+         {'eax': 0x80, 'ebx': 0x01}),
     Case('add.16bit-carry', bytes.fromhex('6601c8'),              # add ax, cx
-         {'eax': 0xFFFF, 'ecx': 2}, known=WIDTH),
+         {'eax': 0xFFFF, 'ecx': 2}),
 
     # --- rotates: the right width, and the carry they actually write ---
     #
@@ -560,24 +559,24 @@ CASES = [
     # The MSVC 6 small-block heap counts free entries per group in a byte:
     # `dec byte ptr [ecx]; jne` (0x100A3D0B in Gunman's sw.dll).
     Case('dec.mem8.to-zero', bytes.fromhex('fe0e0f95c1'),           # dec byte [esi]; setne cl
-         mem={SCRATCH: b'\x01' + bytes(31)}, known=WIDTH),
+         mem={SCRATCH: b'\x01' + bytes(31)}),
     Case('dec.mem8.wraps', bytes.fromhex('fe0e0f95c1'),
-         mem={SCRATCH: bytes(32)}, known=WIDTH),
+         mem={SCRATCH: bytes(32)}),
     Case('dec.mem8.nonzero', bytes.fromhex('fe0e0f95c1'),
-         mem={SCRATCH: b'\x05' + bytes(31)}, known=WIDTH),
+         mem={SCRATCH: b'\x05' + bytes(31)}),
     Case('inc.mem8.to-zero', bytes.fromhex('fe060f94c1'),           # inc byte [esi]; sete cl
-         mem={SCRATCH: b'\xff' + bytes(31)}, known=WIDTH),
+         mem={SCRATCH: b'\xff' + bytes(31)}),
     Case('inc.cl.wraps', bytes.fromhex('fec10f94c2'),               # inc cl; sete dl
-         regs={'ecx': 0x123456FF}, known=WIDTH),
+         regs={'ecx': 0x123456FF}),
     Case('dec.edx.to-zero', bytes.fromhex('4a0f95c1'),              # dec edx; setne cl
          regs={'edx': 1}, undef=('AF',)),
     Case('cmp.mem8.zero', bytes.fromhex('803e000f95c1'),            # cmp byte [esi],0; setne cl
-         mem={SCRATCH: b'\x80' + bytes(31)}, known=WIDTH),
+         mem={SCRATCH: b'\x80' + bytes(31)}),
     Case('add.mem8.carry', bytes.fromhex('80060f0f92c1'),           # add byte [esi],0xf; setc cl
-         mem={SCRATCH: b'\xf8' + bytes(31)}, known=WIDTH),
+         mem={SCRATCH: b'\xf8' + bytes(31)}),
     # cmp sets CF, inc/dec must PRESERVE it, and setae/setb read the cmp's.
     Case('cf.survives-inc', bytes.fromhex('83ff20fec10f93c2'),      # cmp edi,0x20; inc cl; setae dl
-         regs={'edi': 0x10, 'ecx': 0xFF}, known=WIDTH),
+         regs={'edi': 0x10, 'ecx': 0xFF}),
     Case('cf.survives-dec', bytes.fromhex('83ff204a0f92c1'),        # cmp edi,0x20; dec edx; setb cl
          regs={'edi': 0x10, 'edx': 1}, undef=('AF',)),
     # sahf loads SF ZF AF PF CF from ah: the fmod loop's `sahf; jp` reads C2.
@@ -737,6 +736,8 @@ def lift_case(case):
     body, seen = [], 0
     for insn in md.disasm(bytes(case.code), BASE):
         seen += insn.size
+        if insn.address - BASE in case.joins:
+            lifter._flag_state = None          # what generate.py does at a label
         for line in lifter.lift_instruction(insn):
             body.append('    ' + line)
     if seen != len(case.code):

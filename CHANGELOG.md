@@ -17,6 +17,19 @@ versions follow [SemVer](https://semver.org/).
   a project that does not set `smc_imm`. (#39)
 
 ### Fixed
+- lift32/recomp32: `jp`/`jnp` (and `setp`/`setnp`) evaluated at runtime read
+  parity. A jcc at a join point (a branch target, or any instruction of a
+  function with an unresolved indirect jump, which labels them all) reads the
+  flag kind at runtime, and `recomp_cond` had no PF: the lifter emitted
+  `/* no flag state for jp */ _cf`. MSVC's float compares are
+  `fnstsw ax; test ah, N; jp`, so every one of them in such a function took
+  one fixed branch. The Movies has 274; its cursor clamp read `x < 0.0` as
+  true for every x, pinning the mouse to the top-left corner. A narrow flag
+  setter now records its left-align shift in the kind
+  (`FK_NARROW(kind, shift)`), which also gives `recomp_eflags` the right PF and
+  AF for 8- and 16-bit results: difftest's `WIDTH` divergences (11 cases) and
+  both x87 parity ones now match, 202/202 with two new join-point cases.
+
 - disasm32: a call target is kept only while a body that calls it is still an
   entry, re-derived each round of the drop. #14 took its `keep` set from every
   decoded body, garbage included, before any were dropped: in Bunghole in

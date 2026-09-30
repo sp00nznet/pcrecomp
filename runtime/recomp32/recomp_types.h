@@ -340,17 +340,32 @@ enum {
     FK_EFLAGS
 };
 
+/* A NARROW setter's kind carries its left-align shift (24 for 8-bit, 16 for
+ * 16-bit) in bits 8 and up. CF, ZF, SF and OF come out of the left-aligned
+ * operands at 32 bits unchanged (lift32's _flag_capture); PF and AF are read
+ * off the result's LOW byte, and only the shift says where that byte is. The
+ * lifter knows the width statically, but a jcc at a join point reads the kind
+ * at runtime, and there `fnstsw ax; test ah, 5; jp` -- MSVC's `x < 0.0` --
+ * needs the parity of AH. Every reader masks the kind with FK_KIND. */
+#define FK_NARROW(k, shift) ((uint32_t)(k) | ((uint32_t)(shift) << 8))
+#define FK_KIND(k)          ((k) & 0xFFu)
+#define FK_SHIFT(k)         ((k) >> 8)
+
 enum {
     CC_E = 0, CC_NE, CC_S, CC_NS, CC_G, CC_GE, CC_L, CC_LE,
-    CC_A, CC_AE, CC_B, CC_BE, CC_O, CC_NO
+    CC_A, CC_AE, CC_B, CC_BE, CC_O, CC_NO, CC_P, CC_NP
 };
 
-static inline int recomp_cond(uint32_t kind, uint32_t a, uint32_t b, int cc) {
-    uint32_t r;
-    int zf, sf, cf, of;
+static inline uint32_t recomp_parity8(uint8_t v);
 
+static inline int recomp_cond(uint32_t kind, uint32_t a, uint32_t b, int cc) {
+    uint32_t r, sh = FK_SHIFT(kind);
+    int zf, sf, cf, of, pf;
+
+    kind = FK_KIND(kind);
     if (kind == FK_EFLAGS) {
         cf = (int)(a & 1u);
+        pf = (int)((a >> 2) & 1u);
         zf = (int)((a >> 6) & 1u);
         sf = (int)((a >> 7) & 1u);
         of = (int)((a >> 11) & 1u);
@@ -361,11 +376,12 @@ static inline int recomp_cond(uint32_t kind, uint32_t a, uint32_t b, int cc) {
         int32_t v = (int32_t)a;          /* -1 less, 0 equal, 1 greater, 2 unordered */
         if (v == 2) {                    /* NaN: ZF = PF = CF = 1, as fcomi/sahf leave them */
             switch (cc) {
-            case CC_E: case CC_B: case CC_BE: return 1;
-            default:                          return 0;
+            case CC_E: case CC_B: case CC_BE: case CC_P: return 1;
+            default:                                     return 0;
             }
         }
         switch (cc) {
+        case CC_NP:               return 1;
         case CC_E:                return v == 0;
         case CC_NE:               return v != 0;
         case CC_B:  case CC_L:    return v <  0;
@@ -403,6 +419,7 @@ static inline int recomp_cond(uint32_t kind, uint32_t a, uint32_t b, int cc) {
     }
     zf = (r == 0);
     sf = (int)(r >> 31);
+    pf = (int)recomp_parity8((uint8_t)(r >> sh));
 
 decide:
     switch (cc) {
@@ -420,6 +437,8 @@ decide:
     case CC_BE:  return cf || zf;
     case CC_O:   return of;
     case CC_NO:  return !of;
+    case CC_P:   return pf;
+    case CC_NP:  return !pf;
     }
     return 0;
 }
@@ -432,7 +451,7 @@ decide:
 
 static inline int recomp_cond_cf(uint32_t kind, uint32_t a, uint32_t b, int cc,
                                  uint32_t cf) {
-    if ((kind == FK_INC || kind == FK_DEC) &&
+    if ((FK_KIND(kind) == FK_INC || FK_KIND(kind) == FK_DEC) &&
         (cc == CC_B || cc == CC_AE || cc == CC_A || cc == CC_BE)) {
         int zf = recomp_cond(kind, a, b, CC_E);
         switch (cc) {
@@ -449,7 +468,7 @@ static inline int recomp_cond_cf(uint32_t kind, uint32_t a, uint32_t b, int cc,
  * not write `_cf`), otherwise the `_cf` the instruction kept (adc, sbb, shifts,
  * logic ops, inc/dec, popfd/sahf). The lifter's precise_carry option. */
 static inline uint32_t recomp_carry(uint32_t kind, uint32_t a, uint32_t b, uint32_t cf) {
-    switch (kind) {
+    switch (FK_KIND(kind)) {
     case FK_ADD: return a + b < a;
     case FK_CMP: return a < b;
     default:     return cf;
@@ -501,8 +520,10 @@ static inline uint32_t recomp_flags_pack(uint32_t r, uint32_t cf, uint32_t af,
  */
 static inline uint32_t recomp_eflags(uint32_t kind, uint32_t a, uint32_t b,
                                      uint32_t cf_in, int df) {
-    uint32_t r, e;
+    uint32_t r, e, sh = FK_SHIFT(kind);
     uint32_t cf = cf_in & 1u, of = 0, af = 0;
+
+    kind = FK_KIND(kind);
 
     if (kind == FK_EFLAGS) {
         /* Already a word. DF still comes from `_df`: a CLD after the POPFD
@@ -525,7 +546,7 @@ static inline uint32_t recomp_eflags(uint32_t kind, uint32_t a, uint32_t b,
         r  = a + b;
         if (kind == FK_ADD) cf = (r < a);
         of = (~(a ^ b) & (a ^ r)) >> 31;
-        af = ((a ^ b ^ r) >> 4) & 1u;
+        af = ((a ^ b ^ r) >> (sh + 4)) & 1u;
         break;
     case FK_TEST:
         /* and/or/xor/test clear CF (the lifter stores that); a shift leaves
@@ -547,11 +568,13 @@ static inline uint32_t recomp_eflags(uint32_t kind, uint32_t a, uint32_t b,
         r  = a - b;
         if (kind == FK_CMP) cf = (a < b);
         of = ((a ^ b) & (a ^ r)) >> 31;
-        af = ((a ^ b ^ r) >> 4) & 1u;
+        af = ((a ^ b ^ r) >> (sh + 4)) & 1u;
         break;
     }
 
     e = recomp_flags_pack(r, cf, af, of);
+    if (sh)                               /* narrow: PF of the low byte, at bit sh */
+        e = (e & ~4u) | (recomp_parity8((uint8_t)(r >> sh)) << 2);
     if (df < 0) e |= 0x400u;              /* DF */
     return e;
 }
