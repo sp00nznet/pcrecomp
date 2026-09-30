@@ -43,6 +43,8 @@ pcrecomp/
     recomp32_cpu/  32-bit, explicit CPU struct (reentrant)
     native32/      a 32-bit host for recomp32 code: imports, COM and callbacks
                    go to real Windows with no shims (MSVC x86)
+    nextstep/      a NeXTSTEP 3.x host for recomp32 code: Mach-O + shlib
+                   loader, name-bound libsys shims, ObjC runtime, AppKit on SDL2
     recomp64_cpu/  64-bit, explicit CPU struct, plus guest C++ exception handling
     hybrid/        The lifted <-> real boundary, for keeping MFC or the CRT real
     compat/        Win32 -> SDL2 mapping

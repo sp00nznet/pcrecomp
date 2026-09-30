@@ -69,16 +69,6 @@ class MachO:
     def cstr(self, off, n):
         return self.d[off:off + n].split(b'\0', 1)[0].decode('latin-1')
 
-    def pe_sections(self):
-        """Sections in the shape disasm32.Disassembler expects (image_base 0).
-        Code = __TEXT,__text only (see CODE_SECTIONS)."""
-        from types import SimpleNamespace
-        return [SimpleNamespace(name='%s,%s' % (s['seg'], s['name']), virtual_address=s['addr'],
-                                virtual_size=s['size'], raw_offset=s['offset'],
-                                raw_size=0 if s['name'] in ('__bss', '__common') else s['size'],
-                                is_code=s['seg'] == '__TEXT' and s['name'] in CODE_SECTIONS)
-                for s in self.sections if s['size']]
-
     def gcc_prologues(self):
         """Every `push ebp; mov ebp, esp` as NeXT's gcc encodes it (55 89 E5, not
         MSVC's 55 8B EC), 4-aligned as the linker placed them. On NeXTDoom this
@@ -90,6 +80,53 @@ class MachO:
                 out |= {s['addr'] + m.start() for m in re.finditer(b'\x55\x89\xe5', b)
                         if (s['addr'] + m.start()) % 4 == 0}
         return out
+
+    def gcc_functions(self):
+        """[(start, end)] for every function in __text: the gcc prologues plus
+        the entry point, each running to the next.
+
+        This is exact for a NeXT gcc build, and a catalog is not. gcc keeps a
+        function's switch arms inside its body and its jump tables in
+        __TEXT,__const, so the next prologue is the true end, and on NeXTDoom
+        every decoded call targets a prologue. disasm32's raw
+        E8/E9 scan instead took a switch arm for a function start and clamped
+        P_CrossSpecialLine short of its own cases.
+
+        Hand-written assembly has no frame. It is reached through a pointer
+        (NeXTDoom's R_DrawColumn / R_DrawSpan: `mov [colfunc], 0x22d40`), so an
+        immediate operand that lands in __text where the previous function
+        ended -- a `ret`, then only padding -- is a start too. The `ret` is what
+        rules out constants: FRACUNIT (0x10000) and friends land after the nop
+        runs gcc puts in front of loop heads, inside a body. Decoding the new
+        bodies can name more, hence the loop.
+        """
+
+        def after_ret(v):
+            i = v - lo - 1
+            while i > 0 and code[i] in (0x00, 0x90):
+                i -= 1
+            return code[i] == 0xC3
+        import capstone
+        from capstone import x86
+        text = self.section('__TEXT', '__text')
+        lo, hi = text['addr'], text['addr'] + text['size']
+        code = self.sect_bytes(text)
+        md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+        md.detail = True
+        starts = self.gcc_prologues() | ({self.entry} if self.entry else set())
+        while True:
+            ordered = sorted(starts)
+            found = set()
+            for a, e in zip(ordered, ordered[1:] + [hi]):
+                for ins in md.disasm(code[a - lo:e - lo], a):
+                    for op in ins.operands:
+                        v = op.imm & 0xFFFFFFFF if op.type == x86.X86_OP_IMM else None
+                        if (v and lo < v < hi and v not in starts and not ins.mnemonic.startswith(('j', 'call'))
+                                and after_ret(v)):
+                            found.add(v)
+            if not found:
+                return list(zip(ordered, ordered[1:] + [hi]))
+            starts |= found
 
     def section(self, seg, name):
         return next((s for s in self.sections if s['seg'] == seg and s['name'] == name), None)

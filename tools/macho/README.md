@@ -2,7 +2,7 @@
 
 Front end for NeXTSTEP 3.x applications. Their executables are fat Mach-O
 (m68k + i486, sometimes hppa/sparc); we lift the **i386 slice** with the same
-disasm32 + lift32 as PE targets. What differs is everything around the code:
+lift32 as PE targets. What differs is everything around the code:
 a UFS disk instead of an ISO, Mach-O instead of PE, and imports that are
 *direct* calls into fixed-address shared libraries instead of an IAT.
 
@@ -14,10 +14,10 @@ hd.img (NeXT disklabel + 4.3BSD UFS)
    v
 fat Mach-O
    | macho.py    slices, segments, sections, fvmlibs, symbols, entry;
-   |             pe_sections() + gcc_prologues() feed disasm32
+   |             gcc_functions() is the function catalog
    | survey.py   shlib imports and ObjC classes/selectors  <- the scope gate
    v
-disasm32 (seeds = gcc prologues, data_scan=False) -> lift32 (iat_map = import_map)
+generate.linear_disassemble_function per function -> lift32 (iat_map = import_map)
 ```
 
 ```bash
@@ -38,10 +38,13 @@ python survey.py Doom.app/Doom --shlibs shlib
   to the Lifter as its `iat_map`, so each site lifts to `RECOMP_ICALL(slot)`
   and the runtime bridges it by address. The shlibs on an i386 install are
   thin i386, so only that slice's imports resolve by name.
-* **Low load address.** Text starts at `0x3990`, so small integers look like
-  code pointers and disasm32's data scan invents functions (~480 on Doom).
-  Seed with `MachO.gcc_prologues()` -- NeXT's gcc encodes the frame setup as
-  `55 89 E5`, not MSVC's `55 8B EC` -- and pass `data_scan=False`.
+* **No catalog needed.** NeXT's gcc gives every function a frame
+  (`55 89 E5`, not MSVC's `55 8B EC`), keeps switch arms inside the body and
+  jump tables in `__TEXT,__const`. So `MachO.gcc_functions()` -- prologue to
+  next prologue -- is exact: on NeXTDoom every decoded call lands on one.
+  disasm32 is the wrong tool here. Text starts at `0x3990`, so its data scan
+  reads small integers as code pointers (~480 invented functions on Doom), and
+  its raw E8/E9 scan took a switch arm for a start, cutting a function short.
 * **Big-endian filesystem.** The disklabel and UFS are big-endian even on an
   i386 install; `ufs.py` detects the byte order from the superblock magic.
 * **Objective-C.** AppKit is reached through `objc_msgSend`, so the real host
