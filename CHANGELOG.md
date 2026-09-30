@@ -5,6 +5,14 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- `disasm32.py` is 7-18x faster with byte-identical output. capstone's Python
+  `disasm()` is a generator over one `cs_disasm(count=0)` call, so it decodes
+  its whole buffer, with detail, before yielding the first instruction; every
+  early-exit caller paid for a full window. `decode()` decodes in doubling
+  batches instead. Fury3 3:35 -> 0:18, Hellbender 5:19 -> 0:42; The Movies'
+  whole catalog went from 143 minutes to 8. (#10)
+
 From #9. Found bringing Nocturne (Terminal Reality, Watcom C/C++32) in game.
 
 ### Fixed
