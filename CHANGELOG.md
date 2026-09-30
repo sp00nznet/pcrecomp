@@ -5,6 +5,19 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- `runtime/native32/`: a 32-bit host for lifted recomp32 code, extracted from
+  gunman. The native bridge copies the guest's argument slots to the real
+  stack and measures the callee's purge from esp, so every import,
+  GetProcAddress result and COM method is called with no argc table and no
+  shim; x87 results cross in st(0) both ways. Windows -> guest callbacks enter
+  through an exec-fault trampoline on the non-executable guest code, and one
+  machine lock gives each guest thread its own stack and TIB.
+  `native32_selftest.c` checks stdcall/cdecl/thiscall purges and a double
+  return. Guest threads get at least 16 MB of stack (a lifted frame is several
+  times the original's) and a 64 KB guarantee, so an overflow can still be
+  reported. The Movies runs on it. (#7)
+
 ### Fixed
 - `lift32`: `fucompp` was unimplemented, so the compare never ran and its two
   pops never happened, leaking two x87 slots per call. The Movies has 3,244;
