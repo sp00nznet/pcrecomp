@@ -271,10 +271,20 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
         lines.append(f'    goto L_{va:08X};')
         leaders = set(leaders) | {va}
 
+    # A branch target is a join point: the lifter's static flag state describes
+    # the textually preceding instruction, not the flags a jump arrives with.
+    # Carried across the label, `cmp ebx,0x102; jae L` reached L's `jbe` as the
+    # TEST_Z of an unrelated `and` just above it (Nocturne's window procedure
+    # never saw a WM_CHAR). Forget it there; the jcc reads _flag_k at runtime.
+    targets = {t for i in instructions if i.is_jump
+               for t in [i.get_branch_target()] if t is not None}
+
     skip = False
     for k, insn in enumerate(instructions):
         if label_all or insn.address in leaders:
             lines.append(f'L_{insn.address:08X}:')
+            if label_all or insn.address in targets:
+                lifter._flag_state = None
         if skip:
             skip = False
             continue

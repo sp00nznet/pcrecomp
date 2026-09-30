@@ -5,6 +5,19 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+From #9. Found bringing Nocturne (Terminal Reality, Watcom C/C++32) in game.
+
+### Fixed
+- `lift32`: `push`/`pop` of a segment register moves esp by 4 in 32-bit code
+  (2 only with a 66h prefix); `add` publishes CF, so `add`/`adc` chains carry
+  right; `fild`/`fistp qword` are exact, the x87 stack shadowing an int64 per
+  slot (`g_st_i64`).
+- `generate`: static flag state no longer crosses a branch target.
+- `recomp_types.h`: an unresolved `RECOMP_ICALL` no longer pops a return
+  address it never pushed (Nocturne's CRT init lost its saved registers and
+  skipped ~90 static constructors).
+  difftest: 186/197 match, 11 known divergences, 0 failures.
+
 ### Added
 - `drm/emu_unpack.py`: unpack a compressed PE32 by running its stub under
   Unicorn to the OEP, then rebuild the import directory around the IAT the code

@@ -143,7 +143,9 @@ def _stack_bits(insn, op):
     """Width of a push/pop: the operand's, except a segment register moves the
     stack by the operand size (32) unless a 66h prefix says 16."""
     if op.type == X86_OP_REG and op.reg in _SEG_REGS:
-        return 16 if 0x66 in insn.prefix else 32
+        # No modrm or immediate on these forms, so every byte before the
+        # opcode is a prefix (works for Capstone insns and LinearInstruction).
+        return 16 if 0x66 in bytes(insn.bytes)[:-1] else 32
     return op_bits(op)
 
 
@@ -851,6 +853,13 @@ class Lifter:
                 a = self._fmt_read(ops[0])
                 b = self._fmt_read(ops[1])
                 lines.append(self._flag_capture(a, b, op_bits(ops[0])))
+                # add writes CF, and `add eax, eax / adc edx, edx` -- a 64-bit
+                # shift left -- reads it straight from _cf. Unpublished, the adc
+                # took whatever an earlier imul left there, and Nocturne's
+                # fixed-point polygon clipper put clipped x a hair below zero:
+                # a 65535-pixel span. The capture is left-aligned for narrow
+                # operands, so the carry out of bit 31 is the carry at any width.
+                lines.append("_cf = (uint32_t)((uint32_t)(_flag_a + _flag_b) < (uint32_t)_flag_a);")
                 lines.append(f"{self._fmt_write(ops[0], f'{a} + {b}')}; {comment}")
                 self._flag_state = ('add', "_flag_a, _flag_b")
 
@@ -1506,8 +1515,10 @@ class Lifter:
                     addr = self._fmt_mem_addr(ops[0].mem)
                     lines.append(f"fp_push((double)(int32_t)MEM32({addr})); {comment}")
                 else:
+                    # Exact: see g_st_i64 in recomp_types.h (fild/fistp qword
+                    # is an 8-byte copy, and a double keeps only 53 bits).
                     addr = self._fmt_mem_addr(ops[0].mem)
-                    lines.append(f"fp_push((double)(int64_t)MEM64({addr})); {comment}")
+                    lines.append(f"fp_push_i64((int64_t)MEM64({addr})); {comment}")
 
         elif m == 'fstp':
             if ops:
@@ -1525,7 +1536,7 @@ class Lifter:
                     # st(i-1). Writing `_st[i] = fp_pop()` (pop first, then store) is
                     # off by one -- and for fstp st(0) it wrongly keeps the popped top.
                     i = ops[0].reg - X86_REG_ST0
-                    lines.append(f"{{ _st[{i}] = _st[0]; fp_pop(); }} {comment}")
+                    lines.append(f"{{ _st[{i}] = _st[0]; g_st_i64[{i}] = g_st_i64[0]; fp_pop(); }} {comment}")
 
         elif m == 'fst':
             if ops and ops[0].type == X86_OP_MEM:
@@ -1545,7 +1556,9 @@ class Lifter:
                 elif ops[0].size == 4:
                     lines.append(f"MEM32({addr}) = (uint32_t)(int32_t)fp_to_int({src}); {comment}")
                 else:
-                    lines.append(f"MEM64({addr}) = (int64_t)fp_to_int({src}); {comment}")
+                    pop = ' (void)fp_pop();' if m == 'fistp' else ''
+                    lines.append(f"{{ int64_t _q = fp_st0_to_i64(_st[0], g_st_i64[0], _fpu_cw);{pop} "
+                                 f"MEM64({addr}) = (uint64_t)_q; }} {comment}")
 
         elif m == 'fadd':
             if ops:
@@ -1629,9 +1642,9 @@ class Lifter:
             # OTHER operand (the last one), not st(0) with itself.
             if ops:
                 i = ops[-1].reg - X86_REG_ST0
-                lines.append(f"{{ double _t = _st[0]; _st[0] = _st[{i}]; _st[{i}] = _t; }} {comment}")
+                lines.append(f"fp_xch({i}); {comment}")
             else:
-                lines.append(f"{{ double _t = _st[0]; _st[0] = _st[1]; _st[1] = _t; }} {comment}")
+                lines.append(f"fp_xch(1); {comment}")
 
         # FPU stack-pointer ops. In our fixed-window stack (st[0] is always top),
         # `fincstp; ffree st(7)` is the standard "pop without storing" idiom, so we
