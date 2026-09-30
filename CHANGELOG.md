@@ -5,6 +5,13 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- native32: a guest thread's stack starts `BRIDGE_SLOTS * 4 + 64` bytes below
+  its top, not 64. The bridge copies 24 argument slots up from `esp` whatever
+  the callee takes, so a native call from a nearly empty guest stack read past
+  the end of the allocation and faulted whenever the next page was unmapped:
+  `native32_selftest` crashed on 9 of 20 runs, and passes 20 of 20 now. (#16)
+
 ### Added
 - `runtime/native32/`: a 32-bit host for lifted recomp32 code, extracted from
   gunman. The native bridge copies the guest's argument slots to the real
@@ -123,13 +130,6 @@ recompiled: its simulation hung in the CRT's `strstr`.
   haystack and looped forever. The jcc after a rep compare now reads the lazy
   flag state instead of assuming a compare wrote it. Two difftest cases:
   177/189 match, 12 known divergences, 0 failures.
-
-### Fixed
-- native32: a guest thread's stack starts `BRIDGE_SLOTS * 4 + 64` bytes below
-  its top, not 64. The bridge copies 24 argument slots up from `esp` whatever
-  the callee takes, so a native call from a nearly empty guest stack read past
-  the end of the allocation and faulted whenever the next page was unmapped:
-  `native32_selftest` crashed on 9 of 20 runs, and passes 20 of 20 now. (#16)
 
 From #4. Found running Gunman Chronicles (MSVC 6 CRT, Quake-lineage software renderer)
 fully recompiled; each is generic x86 semantics or code generation. Each fix
