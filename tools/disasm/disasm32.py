@@ -595,7 +595,8 @@ class Disassembler:
         return found
 
     def find_functions(self, code_start: int, code_end: int, iat_map: dict = None,
-                       seeds=(), release_operands: bool = False) -> dict:
+                       seeds=(), release_operands: bool = False,
+                       data_scan: bool = True) -> dict:
         """
         Find all functions in the code section.
         Uses call target analysis + common prologue patterns.
@@ -609,6 +610,12 @@ class Disassembler:
         this pass has finished with it. It saves a great deal of memory on a
         large image, and it is safe ONLY if the caller is going to export the
         catalog rather than lift it in process -- the lifter reads operands.
+
+        `data_scan=False` skips find_data_code_pointers. That scan assumes a
+        code address is an unlikely integer, which holds at 0x00401000 and not
+        for a NeXTSTEP Mach-O whose text starts at 0x3990: NeXTDoom's fixed-point
+        tables alone invented ~480 functions. Pass the real starts as `seeds`
+        instead (for gcc, the `55 89 E5` prologues -- see macho.gcc_prologues).
 
         Returns dict of addr -> Function.
         """
@@ -778,7 +785,7 @@ class Disassembler:
                           for ins in b.instructions:
                               ins.operands = None
 
-          if data_scanned:
+          if data_scanned or not data_scan:
               break
           data_scanned = True
           ptrs = self.find_data_code_pointers(code_start, code_end, covered, queued,

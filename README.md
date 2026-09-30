@@ -24,6 +24,8 @@ pcrecomp/
     pe/            PE: headers, imports, resources, protection, symbol recovery
     ne/            NE (16-bit Windows / OS-2): parse, disassemble, Win16 imports,
                    and the generators that close lift -> compile -> link
+    macho/         Mach-O (NeXTSTEP): UFS disk reader, fat slices, shlib
+                   imports, ObjC survey; feeds disasm32/lift32 the i386 slice
     disasm/        Disassemblers, call graphs, and scoring a catalog
     lift/          Lifters for x86-16, x86-32 and x86-64, whole-image drivers,
                    and a differential tester for each
