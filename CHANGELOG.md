@@ -66,6 +66,7 @@ versions follow [SemVer](https://semver.org/).
   returned into the middle of its own bytes. Hover! faulted as level 1
   started; SimCity 2000's CRT memcpy lifted the same garbage. Bunghole in
   One, Civilization III and The Movies are unchanged, function for function.
+  (#24)
 - disasm32: a call target is kept only while a body that calls it is still an
   entry, re-derived each round of the drop. #14 took its `keep` set from every
   decoded body, garbage included, before any were dropped: in Bunghole in
