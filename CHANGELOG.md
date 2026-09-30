@@ -5,6 +5,19 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+- native32: guest modules that import from each other.
+  `native32_module(name)` finds a mapped guest image by file name and
+  `native32_export(base, name_or_ordinal)` reads its export table, and
+  `native32_bind` uses them: an import from a module that is itself mapped
+  as a guest binds to that module's export VA, which is in the dispatch
+  table, instead of going to `LoadLibrary`. A game DLL that calls back into
+  its engine EXE (Bunghole in One: 93 imports from `Golf.exe`) now binds with
+  no host code; the host uses the same two calls to shim `LoadLibraryA` and
+  `GetProcAddress` for its guest DLLs. The selftest maps a system DLL as a
+  guest and checks both lookups. Every shim gets its VA on every bind (the
+  bind rebuilds the table with #7's built-ins, so a VA set for one module
+  was lost to the next); the selftest binds two modules with one array. (#17)
+
 ### Fixed
 - native32: a guest thread's stack starts `BRIDGE_SLOTS * 4 + 64` bytes below
   its top, not 64. The bridge copies 24 argument slots up from `esp` whatever
@@ -130,17 +143,6 @@ recompiled: its simulation hung in the CRT's `strstr`.
   haystack and looped forever. The jcc after a rep compare now reads the lazy
   flag state instead of assuming a compare wrote it. Two difftest cases:
   177/189 match, 12 known divergences, 0 failures.
-  return. The Movies runs its lifted CRT on it. (#7)
-- native32: guest modules that import from each other.
-  `native32_module(name)` finds a mapped guest image by file name and
-  `native32_export(base, name_or_ordinal)` reads its export table, and
-  `native32_bind` uses them: an import from a module that is itself mapped
-  as a guest binds to that module's export VA, which is in the dispatch
-  table, instead of going to `LoadLibrary`. A game DLL that calls back into
-  its engine EXE (Bunghole in One: 93 imports from `Golf.exe`) now binds with
-  no host code; the host uses the same two calls to shim `LoadLibraryA` and
-  `GetProcAddress` for its guest DLLs. The selftest maps a system DLL as a
-  guest and checks both lookups. (#17)
 
 From #4. Found running Gunman Chronicles (MSVC 6 CRT, Quake-lineage software renderer)
 fully recompiled; each is generic x86 semantics or code generation. Each fix

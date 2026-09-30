@@ -92,6 +92,27 @@ int main(void) {
     }
     CHECK(native32_export(base, "NoSuchExport") == 0);
 
+    /* Two modules bound with one shim array: a shim only the first imports
+     * still resolves after the second bind (each bind rebuilds the table). */
+    {
+        IMAGE_NT_HEADERS32* nt = (IMAGE_NT_HEADERS32*)(uintptr_t)(base + ((IMAGE_DOS_HEADER*)(uintptr_t)base)->e_lfanew);
+        IMAGE_IMPORT_DESCRIPTOR* d = (IMAGE_IMPORT_DESCRIPTOR*)(uintptr_t)(base +
+            nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
+        uint32_t* ilt = (uint32_t*)(uintptr_t)(base + (d->OriginalFirstThunk ? d->OriginalFirstThunk : d->FirstThunk));
+        uint32_t* slot = (uint32_t*)(uintptr_t)(base + d->FirstThunk);
+        static native32_shim_t shims[1];
+        char sys2[MAX_PATH];
+        shims[0].name = (const char*)(uintptr_t)(base + *ilt + 2);   /* version.dll's first import */
+        shims[0].fn = (recomp_func_t)add3;
+        native32_bind(base, shims, 1);
+        uint32_t va1 = *slot;
+        GetSystemDirectoryA(sys2, MAX_PATH);
+        strcat(sys2, "\\msimg32.dll");             /* small, and imports none of version.dll's */
+        CHECK(native32_map(sys2, 0x21000000u) != 0);
+        native32_bind(0x21000000u, shims, 1);
+        CHECK(recomp_lookup_import(va1) == (recomp_func_t)add3);
+    }
+
     printf("native32 selftest: %s\n", fails ? "FAILED" : "ok");
     return fails != 0;
 }
