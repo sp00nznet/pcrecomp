@@ -119,7 +119,7 @@ void mach_leave(void) {
 /* ---------------------------------------------------------------- modules */
 
 #define MAX_MODULES 32
-static struct { uint32_t base, span; } g_mods[MAX_MODULES];
+static struct { uint32_t base, span; char name[MAX_PATH]; } g_mods[MAX_MODULES];
 static int g_mod_n;
 
 int native32_in_guest(uint32_t va) {
@@ -131,8 +131,10 @@ int native32_in_guest(uint32_t va) {
 uint32_t native32_map(const char* path, uint32_t base) {
     uint32_t span = recomp_load_image(path, base);
     if (!span || g_mod_n == MAX_MODULES) return 0;
+    const char* file = strrchr(path, '\\');
     g_mods[g_mod_n].base = base;
-    g_mods[g_mod_n++].span = span;
+    g_mods[g_mod_n].span = span;
+    strncpy(g_mods[g_mod_n++].name, file ? file + 1 : path, MAX_PATH - 1);
     IMAGE_NT_HEADERS32* nt = (IMAGE_NT_HEADERS32*)(uintptr_t)(base + ((IMAGE_DOS_HEADER*)(uintptr_t)base)->e_lfanew);
     IMAGE_SECTION_HEADER* s = IMAGE_FIRST_SECTION(nt);
     for (int i = 0; i < nt->FileHeader.NumberOfSections; i++, s++) {
@@ -142,6 +144,33 @@ uint32_t native32_map(const char* path, uint32_t base) {
                            PAGE_READWRITE, &old);
     }
     return span;
+}
+
+uint32_t native32_module(const char* name) {
+    const char* file = strrchr(name, '\\');
+    file = file ? file + 1 : name;
+    for (int i = 0; i < g_mod_n; i++)
+        if (!_stricmp(g_mods[i].name, file)) return g_mods[i].base;
+    return 0;
+}
+
+/* GetProcAddress over a mapped guest image: a name, or an ordinal below
+ * 0x10000. Forwarders are not followed; no guest module has needed one. */
+uint32_t native32_export(uint32_t base, const char* name) {
+    uint8_t* b = (uint8_t*)(uintptr_t)base;
+    IMAGE_NT_HEADERS32* nt = (IMAGE_NT_HEADERS32*)(b + ((IMAGE_DOS_HEADER*)b)->e_lfanew);
+    IMAGE_DATA_DIRECTORY dd = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dd.VirtualAddress) return 0;
+    IMAGE_EXPORT_DIRECTORY* e = (IMAGE_EXPORT_DIRECTORY*)(b + dd.VirtualAddress);
+    uint32_t* funcs = (uint32_t*)(b + e->AddressOfFunctions);
+    uint32_t* names = (uint32_t*)(b + e->AddressOfNames);
+    uint16_t* ords = (uint16_t*)(b + e->AddressOfNameOrdinals);
+    uint32_t idx = 0xFFFFFFFFu;
+    if ((uintptr_t)name < 0x10000) idx = (uint32_t)(uintptr_t)name - e->Base;
+    else
+        for (uint32_t i = 0; i < e->NumberOfNames; i++)
+            if (!strcmp((const char*)(b + names[i]), name)) { idx = ords[i]; break; }
+    return idx < e->NumberOfFunctions && funcs[idx] ? base + funcs[idx] : 0;
 }
 
 /* ---------------------------------------------------------------- names */
@@ -288,7 +317,7 @@ int native32_bind(uint32_t base, native32_shim_t* shims, int nshims) {
     IMAGE_NT_HEADERS32* nt = (IMAGE_NT_HEADERS32*)(b + ((IMAGE_DOS_HEADER*)b)->e_lfanew);
     IMAGE_DATA_DIRECTORY dd = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     IMAGE_IMPORT_DESCRIPTOR* d = (IMAGE_IMPORT_DESCRIPTOR*)(b + dd.VirtualAddress);
-    int native = 0, shimmed = 0, missing = 0;
+    int native = 0, shimmed = 0, guested = 0, missing = 0;
     /* The host's shims, then every built-in the host did not replace. */
     int nb = (int)(sizeof g_builtin / sizeof g_builtin[0]);
     native32_shim_t* all = (native32_shim_t*)calloc(nshims + nb, sizeof *all);
@@ -299,28 +328,40 @@ int native32_bind(uint32_t base, native32_shim_t* shims, int nshims) {
         for (int k = 0; k < nshims; k++) dup |= !strcmp(shims[k].name, g_builtin[i].name);
         if (!dup) all[n++] = g_builtin[i];
     }
+    /* Every entry gets its VA now, not only the ones this module imports: a
+     * host binding several guest modules calls this once per module, each
+     * call builds a new array and it replaces g_shims, so a VA set only on
+     * the first module's copy was lost to the second, and the first module's
+     * shimmed imports stopped resolving. Same array in, same VAs out. */
+    for (int i = 0; i < n; i++) all[i].va = g_shim_page + 16 * i;
     shims = all;
     nshims = n;
     g_shims = shims;
     g_nshims = nshims;
     for (; dd.VirtualAddress && d->Name; d++) {
         const char* dll = (const char*)(b + d->Name);
-        HMODULE h = LoadLibraryA(dll);
+        /* A guest module importing from another one (a game DLL calling back
+         * into its engine EXE) binds to the guest's own exports: those VAs are
+         * in the dispatch table. LoadLibrary would load the original binary as
+         * native code, or fail. */
+        uint32_t guest = native32_module(dll);
+        HMODULE h = guest ? NULL : LoadLibraryA(dll);
         uint32_t* ilt = (uint32_t*)(b + (d->OriginalFirstThunk ? d->OriginalFirstThunk : d->FirstThunk));
         uint32_t* iat = (uint32_t*)(b + d->FirstThunk);
         for (; *ilt; ilt++, iat++) {
             int by_ord = (*ilt & 0x80000000u) != 0;
             const char* nm = by_ord ? (const char*)(uintptr_t)(*ilt & 0xFFFF) : (const char*)(b + *ilt + 2);
             uint32_t va = 0;
-            for (int i = 0; !by_ord && i < nshims; i++)
+            for (int i = 0; !guest && !by_ord && i < nshims; i++)
                 if (!strcmp(shims[i].name, nm)) {
-                    shims[i].va = g_shim_page + 16 * i;
                     va = shims[i].va;
                     shimmed++;
                 }
             if (!va) {
-                va = h ? (uint32_t)(uintptr_t)GetProcAddress(h, nm) : 0;
-                if (va) native++;
+                va = guest ? native32_export(guest, nm)
+                   : h ? (uint32_t)(uintptr_t)GetProcAddress(h, nm) : 0;
+                if (va && guest) guested++;
+                else if (va) native++;
                 else {
                     fprintf(stderr, "[bind] %s!%s%s unresolved\n", dll, by_ord ? "#" : "",
                             by_ord ? "" : nm);
@@ -331,8 +372,8 @@ int native32_bind(uint32_t base, native32_shim_t* shims, int nshims) {
             *iat = va;
         }
     }
-    fprintf(stderr, "[bind] 0x%08X: %d native, %d shimmed, %d unresolved\n",
-            base, native, shimmed, missing);
+    fprintf(stderr, "[bind] 0x%08X: %d native, %d guest, %d shimmed, %d unresolved\n",
+            base, native, guested, shimmed, missing);
     return missing;
 }
 

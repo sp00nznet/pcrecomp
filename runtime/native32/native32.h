@@ -49,6 +49,15 @@ uint32_t native32_map(const char* path, uint32_t base);
  * (by name), then LoadLibrary + GetProcAddress. Returns unresolved count. */
 int native32_bind(uint32_t base, native32_shim_t* shims, int nshims);
 
+/* A mapped guest module by file name ("Golf.exe", or a path ending in one;
+ * case-insensitive), and one of its exports by name or ordinal; 0 if none.
+ * native32_bind uses both, so a guest DLL's imports from a guest EXE land on
+ * lifted code. A host uses them to shim LoadLibraryA / GetProcAddress for its
+ * guest DLLs. Map every guest module before binding one that imports from it,
+ * and pass every native32_bind call the same shim array. */
+uint32_t native32_module(const char* name);
+uint32_t native32_export(uint32_t base, const char* name);
+
 /* Run lifted code at va to completion on this thread's guest stack. */
 void native32_call_guest(uint32_t va, int nargs, const uint32_t* args);
 
