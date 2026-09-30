@@ -6,6 +6,14 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- disasm32: a pointer-shaped guess (the data scan, the code-immediate harvest)
+  whose decode straddles a directly called entry is dropped. #14 keeps the
+  called entry; this removes the false body it leaves beside it. Bunghole in
+  One: a DIDATAFORMAT in `.text`, taken for code from its `push offset`, over
+  the `jmp [DirectInputCreateA]` thunk. Against IDA on top of #14: POD invented
+  starts 108 -> 62 (F1 62.76% -> 63.09%), Hellbender 66.62% -> 66.64%. (#19)
+
+### Fixed
 - disasm32 seeds the exports, as the README always said it did, not only the
   entry point. Bunghole in One's game DLL is entered only through
   `GetProcAddress`, and both its exports were missing; the engine EXE was
