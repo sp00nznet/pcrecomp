@@ -5,7 +5,6 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
-### Changed
 ### Added
 - `generate.py`: `true_extent()` and `closure()`, the lift-driver helpers that
   forcecommander, prey and The Movies each carried a copy of. `true_extent`
@@ -23,9 +22,9 @@ versions follow [SemVer](https://semver.org/).
 - `find_splits()`: entries that are really the middle of the entry before
   them (a walk from them branches backward into it). Dropping them from
   `true_extent`'s `entries` stops the parent being cut at a loop head. 366 on
-  The Movies.
+  The Movies. (#11)
 
-### Fixed
+### Changed
 - `disasm32.py` is 7-18x faster with byte-identical output. capstone's Python
   `disasm()` is a generator over one `cs_disasm(count=0)` call, so it decodes
   its whole buffer, with detail, before yielding the first instruction; every
