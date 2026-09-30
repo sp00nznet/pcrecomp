@@ -6,6 +6,18 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- `lift32`: `fucompp` was unimplemented, so the compare never ran and its two
+  pops never happened, leaking two x87 slots per call. The Movies has 3,244;
+  its audio code read every position/length ratio as 1.0 and asserted.
+  difftest cases for equal, less and NaN (177/190 match, 0 failures). (#15)
+
+### Added
+- `recomp_types.h`: `g_cpuid_edx1` / `g_cpuid_ecx1` / `g_cpuid_edx_ext`, the
+  CPUID feature bits the guest sees (all ones by default), so a host can hide
+  SSE/3DNow! and CPU-dispatching libraries take their x87 paths. `CPUID` also
+  honours the sub-leaf in ecx now (`__cpuidex`). (#15)
+
+### Fixed
 - `disasm32.py` never drops the target of a decoded `call` as a
   mid-instruction entry. The only evidence against such an entry is that
   another body's decode straddles it, and that body can be the false one: a
@@ -98,16 +110,6 @@ recompiled: its simulation hung in the CRT's `strstr`.
   haystack and looped forever. The jcc after a rep compare now reads the lazy
   flag state instead of assuming a compare wrote it. Two difftest cases:
   177/189 match, 12 known divergences, 0 failures.
-- `lift32`: `fucompp` was unimplemented, so the compare never ran and its two
-  pops never happened, leaking two x87 slots per call. The Movies has 3,244;
-  its audio code read every position/length ratio as 1.0 and asserted.
-  difftest cases for equal, less and NaN (177/190 match, 0 failures).
-
-### Added
-- `recomp_types.h`: `g_cpuid_edx1` / `g_cpuid_ecx1` / `g_cpuid_edx_ext`, the
-  CPUID feature bits the guest sees (all ones by default), so a host can hide
-  SSE/3DNow! and CPU-dispatching libraries take their x87 paths. `CPUID` also
-  honours the sub-leaf in ecx now (`__cpuidex`).
 
 From #4. Found running Gunman Chronicles (MSVC 6 CRT, Quake-lineage software renderer)
 fully recompiled; each is generic x86 semantics or code generation. Each fix
