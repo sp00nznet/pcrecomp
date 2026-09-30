@@ -39,6 +39,7 @@ repo is a scar from one specific binary, and the entry below names it.
 | `classify/*` | Gunman Chronicles | 78% of a GoldSrc game is the SDK; find the other 13% |
 | `cpp/*` | Black & White | Mangling, demangling and vtable parsing across MSVC and Metrowerks |
 | `drm/safedisc_dump.py`, `inject_and_run.c` | X-Wing Alliance, Black & White | SafeDisc v1 and v2+ |
+| `drm/emu_unpack.py` | The Movies | Steam's 2007 build is PECompact 2.x with a Steam2 ownership check in the stub; running it would need Steam and a window |
 | `assets/isextract.py` | Soldier of Fortune | InstallShield, including multi-volume |
 | `assets/isextract.py` v6+ layout | One Must Fall: Battlegrounds | v7 and v9 discs; the flat 0x57 descriptor array |
 | `pe/catalog.py` MZ sniffing | One Must Fall: Battlegrounds | The engine ships its modules as `.ModuleDLL` |

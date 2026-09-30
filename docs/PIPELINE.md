@@ -358,6 +358,11 @@ for a long time with `Resource\Music` and `Resource\Movies` simply absent --
 - **SafeDisc v1**: `safedisc_dump.py` -- launch via Steam, dump decrypted .text section
 - **SafeDisc v2+**: `inject_and_run.c` -- DLL injection for deeper analysis
 - **General approach**: Let the DRM decrypt at runtime, capture the result
+- **Compressors (PECompact 2.x, Steam2's wrapper)**: `emu_unpack.py` -- run the stub
+  under Unicorn instead of Windows. Everything below the stub is mapped
+  non-executable, so the first fetch from it faults at the OEP; the IAT is the
+  run of GetProcAddress results the code calls through, and a new import
+  directory is written pointing at it. No process, no window.
 
 ---
 
@@ -505,6 +510,7 @@ The output is a standard native executable that runs on modern Windows (or Linux
 | IDA xrefs | `ida/ida_xrefs.py` | Addresses (in IDA) | Caller/writer sites |
 | SafeDisc dump | `drm/safedisc_dump.py` | Protected PE | Clean PE |
 | DLL injection | `drm/inject_and_run.c` | DRM'd process | Memory dump |
+| Emulated unpack | `drm/emu_unpack.py` | Packed PE32 | PE at its OEP, imports rebuilt |
 | Wise installer extract | `assets/extract_wise.py` | Wise setup `.exe` | Script + file list |
 | InstallShield extract | `assets/isextract.py` | .hdr/.cab | Extracted files |
 | PK3/ZIP inspect | `assets/pk3_inspect.py` | .pk3/.zip | Content listing |

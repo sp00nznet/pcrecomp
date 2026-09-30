@@ -30,7 +30,7 @@ pcrecomp/
     cpp/           C++ recovery: RTTI, vtables, name (de)mangling
     classify/      Sorting functions: SDK vs custom, library vs game
     ghidra/ ida/   Headless scripts for both
-    drm/           SafeDisc memory dumping
+    drm/           SafeDisc memory dumping, and unpacking by emulation
     assets/        Installers, archives and disc images
     formats/       Decoders for formats nobody else reads (C)
     audit_repo.py  Is this repo safe to make public?
@@ -137,6 +137,7 @@ or IDA, whatever the architecture.
 | `ghidra/*.java` | Headless: decompile everything or by address, export functions, stats, xrefs, range disassembly, function bounds |
 | `ida/ida_funcs.py`, `ida_export.py`, `ida_xrefs.py`, `ida_probe_segs.py` | Headless: function catalog with FLIRT flags, instruction-head code map, call graph + import use + FPU density, segment probe |
 | `drm/safedisc_dump.py`, `inject_and_run.c` | Dump SafeDisc-decrypted `.text` from a running process; a version.dll injector for SafeDiscLoader2 |
+| `drm/emu_unpack.py` | Unpack a compressed PE32 (PECompact 2.x, and Valve's Steam2 wrapper built on it) by running its stub under Unicorn to the OEP, then rebuild the import table. Headless: nothing is launched |
 | `assets/extract_wise.py`, `isextract.py`, `extract_cab.sh`, `pk3_inspect.py`, `bin2iso.js` | Wise and InstallShield installers, CABs, PK3/ZIP, BIN/CUE -> ISO |
 | `assets/iso_peek.py` | Read an ISO's directory, locally or **over HTTP range requests**, and pull one file out without downloading the image |
 | `formats/` | FIF/FTC fractal image, M20/MVB, SPAM, DAT and string-table decoders (C) |
@@ -449,6 +450,19 @@ python tools/pe/analyze_sections.py game.exe
 python tools/drm/safedisc_dump.py game.exe decrypted.exe
 python tools/drm/safedisc_dump.py --pid 1234 game.exe decrypted.exe
 ```
+
+### "The exe is packed" (one high-entropy section, a handful of imports)
+
+```bash
+# Run the unpacker stub under Unicorn to the original entry point, dump, and
+# rebuild the imports. No process is started, so it works over RDP and in CI.
+python tools/drm/emu_unpack.py packed.exe unpacked.exe
+python tools/drm/emu_unpack.py --selftest
+```
+
+An unknown call from the stub stops the run and names the import; add it to
+`APIS` in the script. Steam2-era titles (2004-2008) call `steam.dll`'s
+`SteamStartup` / `SteamIsAppSubscribed` from the stub, and those are answered.
 
 ### "It's a Wise installer and I want the files out"
 
