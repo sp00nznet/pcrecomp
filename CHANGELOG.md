@@ -6,6 +6,16 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- `disasm32.py`'s callback harvest (`push offset` / `mov r, offset` into code)
+  no longer skips a target that an earlier body already covers: that body fell
+  into it after a call it did not know was noreturn, and the target becomes an
+  alias entry, as a jump into a body already does. The Movies: CRT
+  `__endthreadex` ends in `ExitThread` and runs on into `__threadstartex`,
+  whose only reference is the `push offset` ahead of `CreateThread`; the
+  game's first worker thread faulted. POD and Hellbender catalogs unchanged.
+  (#13)
+
+### Fixed
 - `disasm32.py`'s prologue scan starts a hot-patchable function at its
   `mov edi, edi` (8B FF), not two bytes in at `push ebp`. MSVC /hotpatch code
   (D3DX, the CRT, most Microsoft libraries) was split two bytes into every
