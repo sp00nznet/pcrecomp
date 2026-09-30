@@ -417,10 +417,22 @@ def _jump_table(ins, code, code_start, lo, hi, limit=1024):
     # `jmp [ecx*4 + 0xacdf88]` with ecx from -3 to 0, so its arms sit below the
     # displacement; reading only upward lost them (ITAIL 0x00ACDFAC). Take the
     # contiguous run of valid entries below it too.
+    #
+    # An entry never points into its own table, which is data. MSVC 2 puts
+    # the table straight after `jmp [reg*4 + table]`, so the dword below the
+    # table is that jmp's displacement: the table's own address, always in
+    # range. Taken as an arm, the table's bytes were walked as code, their
+    # garbage decode ran into the first real instruction after the table from
+    # the middle, and the body lifted both streams interleaved: a call
+    # returned into the middle of its own bytes (Hover!, 0x004164A0). A second
+    # jmp through the same table reads the same dword (CRT memcpy's backward
+    # copy: Hover! 0x00440489, SimCity 2000 0x0048ECB1), so the test is where
+    # the entry points, not which jmp is reading.
+    table_end = at + code_start          # where the upward scan stopped
     at = base - 4
     while at >= 0 and base - at <= 64:
         t = int.from_bytes(code[at:at + 4], 'little')
-        if not lo <= t < hi:
+        if not lo <= t < hi or at + code_start <= t < table_end:
             break
         arms.append(t)
         at -= 4
@@ -755,6 +767,20 @@ def _selftest():
     got = set()
     true_extent(md, code, 0x1000, 0x1000, 0x1010, {0x1000}, reached=got)
     assert 0x100F in got, sorted(map(hex, got))
+
+    # MSVC 2's inline table: straight after the jmp, so the dword below it
+    # is the jmp's own displacement (the table address) and must not be read
+    # as a negative-index arm. 1000 jmp [eax*4+1007] / 1007 dd 100b / 100b ret
+    code = bytes([0xFF, 0x24, 0x85, 0x07, 0x10, 0x00, 0x00, 0x0B, 0x10, 0x00, 0x00, 0xC3])
+    got = set()
+    true_extent(md, code, 0x1000, 0x1000, 0x100C, {0x1000}, reached=got)
+    assert got == {0x1000, 0x100B}, sorted(map(hex, got))
+    # ...and a second jmp through the same table, further down, reads the
+    # same dword: it must not take it either (CRT memcpy's backward copy).
+    #   ... / 100c jmp [eax*4+1007] / 1013 ret
+    code = code + bytes([0xFF, 0x24, 0x85, 0x07, 0x10, 0x00, 0x00, 0xC3])
+    second = next(md.disasm(code[0xC:0x13], 0x100C))
+    assert _jump_table(second, code, 0x1000, 0x1000, 0x1014) == [0x100B]
 
     # The _stat shape: a jump to a catalogued "entry" that lies inside this
     # body's own span is internal, not a tail call.
