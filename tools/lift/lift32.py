@@ -1657,9 +1657,14 @@ class Lifter:
         elif m in ('ffree', 'ffreep'):
             lines.append(f"/* {m} (no-op in fixed-window FPU stack) */ {comment}")
 
-        elif m in ('fcomip', 'fucomip', 'fcompp'):
+        # fucompp is fcompp that does not fault on a quiet NaN; FPU_CMP already
+        # reports unordered for a NaN either way. It was unimplemented: the
+        # compare never ran (so _fpu_cmp kept its last value) and its two pops
+        # never happened, leaking two x87 slots per call. The Movies has 3,244
+        # of them; its audio code read every position/length ratio as 1.0.
+        elif m in ('fcomip', 'fucomip', 'fcompp', 'fucompp'):
             lines.append(f"_fpu_cmp = FPU_CMP(_st[0], _st[1]); {comment}")
-            if m == 'fcompp':
+            if m in ('fcompp', 'fucompp'):
                 lines.append(f"fp_pop(); fp_pop();")
             else:
                 lines.append(f"fp_pop();")

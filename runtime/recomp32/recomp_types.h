@@ -872,12 +872,23 @@ static inline void fp_st80(uint8_t* p, double v) {
  * CPUID stub
  * ============================================================ */
 
+/* Feature bits the guest may see, ANDed into leaf 1 (edx/ecx) and leaf
+ * 0x80000001 (edx: 3DNow!). All ones by default. Libraries that dispatch on
+ * CPUID -- D3DX above all -- pick SSE/3DNow! paths on a modern host, and the
+ * global-register lifter does not implement most of those instructions; a
+ * host that clears the bits gets the x87 paths instead (The Movies: 16,977
+ * unimplemented SIMD sites against a handful of x87 ones). */
+RECOMP_WEAK uint32_t g_cpuid_edx1 = 0xFFFFFFFFu, g_cpuid_ecx1 = 0xFFFFFFFFu;
+RECOMP_WEAK uint32_t g_cpuid_edx_ext = 0xFFFFFFFFu;
+
 static inline void CPUID_impl(uint32_t eax_val, uint32_t ebx_val, uint32_t ecx_val, uint32_t edx_val) {
-    /* Return something reasonable for a Pentium III era check */
 #ifdef _MSC_VER
     int info[4];
-    __cpuid(info, eax_val);
+    __cpuidex(info, eax_val, ecx_val);
     g_eax = info[0]; g_ebx = info[1]; g_ecx = info[2]; g_edx = info[3];
+    if (eax_val == 1) { g_edx &= g_cpuid_edx1; g_ecx &= g_cpuid_ecx1; }
+    if (eax_val == 0x80000001u) g_edx &= g_cpuid_edx_ext;
+    (void)ebx_val; (void)edx_val;
 #else
     (void)eax_val; (void)ebx_val; (void)ecx_val; (void)edx_val;
 #endif

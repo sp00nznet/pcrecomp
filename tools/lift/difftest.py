@@ -124,6 +124,16 @@ CASES = [
          mem={SCRATCH: struct.pack('<ff', float('nan'), 1.0)}),
     Case('fpu.fcom-less', bytes.fromhex('d906d85e04dfe0'),
          mem={SCRATCH: struct.pack('<ff', 0.5, 1.0)}),
+    # fld [esi]; fld [esi+4]; fucompp; fnstsw ax; test ah, 0x44; setp cl --
+    # MSVC's `a != b`. fucompp was unimplemented: no compare, and no pops.
+    Case('fpu.fucompp-equal', bytes.fromhex('d906d94604dae9dfe0f6c4440f9ac1'),
+         mem={SCRATCH: struct.pack('<ff', 1.0, 1.0)}, undef=('AF',),
+         known='setp reads the right PF (cl matches); the materialised EFLAGS PF '
+               'is the narrow-result divergence fpu.lt-zero-parity-neg documents.'),
+    Case('fpu.fucompp-less', bytes.fromhex('d906d94604dae9dfe0f6c4440f9ac1'),
+         mem={SCRATCH: struct.pack('<ff', 0.5, 1.0)}, undef=('AF',)),
+    Case('fpu.fucompp-nan', bytes.fromhex('d906d94604dae9dfe0f6c4440f9ac1'),
+         mem={SCRATCH: struct.pack('<ff', float('nan'), 1.0)}, undef=('AF',)),
     # MSVC's `x < 0.0`: fld; fcomp; fnstsw ax; test ah, 5; setp cl. PF must be
     # the parity of (ah & 5) -- it was a constant, so the branch never varied.
     Case('fpu.lt-zero-parity-neg', bytes.fromhex('d906d85e04dfe0f6c4050f9ac1'),
