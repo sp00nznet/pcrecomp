@@ -639,6 +639,7 @@ class Disassembler:
         interior = bytearray(max(0, code_end - code_start))   # ...and every byte within one
         owner = {}               # instruction address -> the function that decoded it
         alias_entries = set()    # entry points inside another function's body
+        weak = set()             # entries only a pointer-shaped value vouches for
         queue = list(all_targets)
         queued = set(all_targets)
 
@@ -755,6 +756,7 @@ class Disassembler:
                                   # as a jump into a body: an alias entry.
                                   alias_entries.add(tgt)
                               queued.add(tgt)
+                              weak.add(tgt)      # a pointer-shaped value, like the data scan's
                               queue.append(tgt)
 
               # Both harvests are done with these instructions. Each retained
@@ -785,6 +787,7 @@ class Disassembler:
               break
           print(f"[*] Data scan: {len(ptrs)} functions reachable only via data pointers...")
           queued |= ptrs
+          weak |= ptrs
           queue = sorted(ptrs)
 
         print(f"[*] Successfully disassembled {len(functions)} functions"
@@ -793,7 +796,7 @@ class Disassembler:
         called = {t for f in functions.values() for t in f.calls_to}
         gone = drop_mid_instruction_entries(
             lambda va, n: self.read_bytes(va, n), sizes, code_start, code_end,
-            keep=called)
+            keep=called, weak=weak & set(sizes))
         for a in list(functions):
             if a not in sizes:
                 del functions[a]
@@ -805,7 +808,8 @@ class Disassembler:
 
 
 def drop_mid_instruction_entries(read_va, functions, code_start, code_end,
-                                 max_rounds=4, verbose=True, keep=frozenset()):
+                                 max_rounds=4, verbose=True, keep=frozenset(),
+                                 weak=frozenset()):
     """Remove catalog entries that are not instruction boundaries.
 
     An address inside an instruction cannot be the start of anything: decoding
@@ -830,6 +834,14 @@ def drop_mid_instruction_entries(read_va, functions, code_start, code_end,
     only that some other body's decode straddles it, and that body can be the
     false one: in The Movies a data-scan hit inside a jump table (0x00C1016D)
     decoded over 0x00C10170, a function called directly, and the real one went.
+
+    `weak` holds entries only a pointer-shaped value vouches for (the data scan,
+    the code-immediate harvest). Keeping the called entry leaves the straddling
+    decode in the catalog as well; when that decode is weak it is the false one
+    for certain, so it is dropped, and it marks nothing that round. Bunghole in
+    One: `push 0x41c0c0` hands DirectInput a data-format table that sits in
+    .text; decoded as code it is `add bh, bh` across 0x0041C0D8, the `jmp
+    [DirectInputCreateA]` thunk that real code calls.
     """
     from capstone import Cs, CS_ARCH_X86, CS_MODE_32
     md = Cs(CS_ARCH_X86, CS_MODE_32)
@@ -922,18 +934,23 @@ def drop_mid_instruction_entries(read_va, functions, code_start, code_end,
                     break
 
     for _ in range(max_rounds):
+        evict = {a for a in set(weak) & set(functions)
+                 if a not in keep and functions[a] > 0 and any(
+                     k in keep and k in functions
+                     for ins in body_instructions(a)
+                     for k in range(ins.address + 1, ins.address + ins.size))}
         interior = bytearray(max(0, code_end - code_start))
         for addr in functions:
-            if functions[addr] <= 0:
+            if functions[addr] <= 0 or addr in evict:
                 continue
             for ins in body_instructions(addr):
                 for k in range(ins.address + 1, ins.address + ins.size):
                     if code_start <= k < code_end:
                         interior[k - code_start] = 1
 
-        bogus = [a for a in functions
-                 if code_start <= a < code_end and interior[a - code_start]
-                 and a not in keep]
+        bogus = sorted(evict | {a for a in functions
+                                if code_start <= a < code_end and interior[a - code_start]
+                                and a not in keep})
         if not bogus:
             break
         for a in bogus:
@@ -1216,6 +1233,17 @@ def demo():
     gone = drop_mid_instruction_entries(_read, cat, 0x1000, 0x1000 + len(blob),
                                         verbose=False, keep={0x1002})
     assert gone == 0 and 0x1002 in cat, (gone, cat)
+    # ...and when only a pointer-shaped value vouched for the straddling body,
+    # that body is the false decode and it goes.
+    cat = {0x1000: len(blob), 0x1002: len(blob) - 2}
+    gone = drop_mid_instruction_entries(_read, cat, 0x1000, 0x1000 + len(blob),
+                                        verbose=False, keep={0x1002}, weak={0x1000})
+    assert gone == 1 and list(cat) == [0x1002], (gone, cat)
+    # A weak body over an entry nothing calls changes nothing: the inner one goes.
+    cat = {0x1000: len(blob), 0x1002: len(blob) - 2}
+    gone = drop_mid_instruction_entries(_read, cat, 0x1000, 0x1000 + len(blob),
+                                        verbose=False, weak={0x1000})
+    assert gone == 1 and list(cat) == [0x1000], (gone, cat)
 
     # ...and a neighbour that had been clamped onto the dropped entry gets its
     # extent back. Left at 2 bytes it would end in a fallthrough to an address
