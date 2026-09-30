@@ -12,7 +12,7 @@ versions follow [SemVer](https://semver.org/).
   One's game DLL a mid-instruction body's `call` kept a garbage entry inside a
   real function's `call [..]` and clamped that function short (it is a
   handler the engine calls; its lift ended mid-instruction). The Movies' 0x00C10170
-  (#14's case) is still kept; POD unchanged, Hellbender one fewer split.
+  (#14's case) is still kept; POD unchanged, Hellbender one fewer split.  (#21)
 
 - recomp32: flags cross calls and tail jumps between lifted functions, as they
   do on the CPU. A call or tail transfer exports the caller's flags and every
