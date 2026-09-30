@@ -5,6 +5,15 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+- recomp32: flags cross calls and tail jumps between lifted functions, as they
+  do on the CPU. A call or tail transfer exports the caller's flags and every
+  function entry imports them (`ret` already exported the callee's). A function
+  reached by a tail jump started from `FK_NONE`, so one whose first conditional
+  tests flags its predecessor set took an arbitrary branch: the MSVC CRT's
+  `cos` falls from its load helper into `_CIcos`, whose first `je` reads the
+  helper's ZF, and Bunghole in One's golf ball never moved.
+  `runtime/recomp32/flags_selftest.c` checks both transfers, both ways. (#20)
+
 ### Fixed
 - disasm32: a pointer-shaped guess (the data scan, the code-immediate harvest)
   whose decode straddles a directly called entry is dropped. #14 keeps the
