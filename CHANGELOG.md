@@ -6,6 +6,14 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- `disasm32.py` never drops the target of a decoded `call` as a
+  mid-instruction entry. The only evidence against such an entry is that
+  another body's decode straddles it, and that body can be the false one: a
+  data-scan hit inside a jump table decoded over a directly called function
+  in The Movies (0x00C10170) and the real function went. Against IDA:
+  POD F1 62.01% -> 62.76%, Hellbender 66.57% -> 66.62%. (#14)
+
+### Fixed
 - `disasm32.py`'s callback harvest (`push offset` / `mov r, offset` into code)
   no longer skips a target that an earlier body already covers: that body fell
   into it after a call it did not know was noreturn, and the target becomes an
