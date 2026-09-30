@@ -740,10 +740,20 @@ class Disassembler:
                               if op.type != X86_OP_IMM:
                                   continue
                               tgt = op.imm & 0xFFFFFFFF
-                              if tgt in queued or tgt in covered:
+                              if tgt in queued or tgt in functions:
                                   continue
                               if not self.is_code_address(tgt):
                                   continue
+                              if tgt in covered:
+                                  # Inside another body: a function after a
+                                  # noreturn call it did not know about. CRT
+                                  # __endthreadex ends in ExitThread and fell
+                                  # into __threadstartex, whose only reference
+                                  # is `push offset` ahead of CreateThread;
+                                  # dropped as covered, the thread start was
+                                  # never lifted (The Movies). Same treatment
+                                  # as a jump into a body: an alias entry.
+                                  alias_entries.add(tgt)
                               queued.add(tgt)
                               queue.append(tgt)
 
