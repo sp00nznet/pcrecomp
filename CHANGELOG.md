@@ -5,6 +5,25 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- `generate.py`: `true_extent()` and `closure()`, the lift-driver helpers that
+  forcecommander, prey and The Movies each carried a copy of. `true_extent`
+  walks a body's branches for its real end, capped by reach instead of the
+  catalog's clamp: MSVC calls a function's own __finally block mid-body, so
+  the clamp cut CRT calloc off before its epilogue. On The Movies' startup
+  closure, undefined-label ITAIL fallbacks 76 -> 44 and bodies with no
+  terminator 7 -> 0. Selftest models the calloc shape.
+- `true_extent` follows `jmp [reg*4 + table]` switches through their tables
+  and can hand back the exact instruction set it reached;
+  `linear_disassemble_function(reached=...)` then lifts only those, so the
+  table bytes between a switch and its arms are never lifted as `pushal`
+  (The Movies: CRT memcpy's tail copies were unresolved ITAILs). The sweep
+  also decodes through `disasm32.decode`.
+- `find_splits()`: entries that are really the middle of the entry before
+  them (a walk from them branches backward into it). Dropping them from
+  `true_extent`'s `entries` stops the parent being cut at a loop head. 366 on
+  The Movies. (#11)
+
 ### Changed
 - `disasm32.py` is 7-18x faster with byte-identical output. capstone's Python
   `disasm()` is a generator over one `cs_disasm(count=0)` call, so it decodes
