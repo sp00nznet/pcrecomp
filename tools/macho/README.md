@@ -54,5 +54,5 @@ python survey.py Doom.app/Doom --shlibs shlib
 | NeXTDoom 1.2 | 43k | 47 | 12 | 2 / 4 | 38 |
 | DoomEd 0.91 | 42k | 61 | 39 | 37 / 18 | 455 |
 
-The `lcall`/`int` "kernel entries" survey reports come from its linear sweep
-decoding data; an app reaches the kernel through libsys.
+`__fvmlib_init0` is not code: it is {value, address} pairs crt0 stores into
+the shlibs' data (app symbols the libs call back into).

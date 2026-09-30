@@ -7,7 +7,8 @@
 import re, struct, sys
 
 CPU = {6: 'm68k', 7: 'i386', 11: 'hppa', 14: 'sparc'}
-CODE_SECTIONS = ("__text", "__fvmlib_init0")
+# __fvmlib_init0 is not code: {value, address} pairs crt0 stores into the shlibs.
+CODE_SECTIONS = ("__text",)
 LC_SEGMENT, LC_SYMTAB, LC_UNIXTHREAD, LC_LOADFVMLIB, LC_IDFVMLIB = 1, 2, 5, 6, 7
 
 
@@ -70,8 +71,7 @@ class MachO:
 
     def pe_sections(self):
         """Sections in the shape disasm32.Disassembler expects (image_base 0).
-        Code = the __TEXT sections that hold instructions; __fvmlib_init0 is the
-        shlib-init stub the linker appends, and it is code too."""
+        Code = __TEXT,__text only (see CODE_SECTIONS)."""
         from types import SimpleNamespace
         return [SimpleNamespace(name='%s,%s' % (s['seg'], s['name']), virtual_address=s['addr'],
                                 virtual_size=s['size'], raw_offset=s['offset'],

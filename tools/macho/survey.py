@@ -13,7 +13,7 @@ import argparse, bisect, collections, json, os, sys
 import capstone
 from capstone import x86
 sys.path.insert(0, os.path.dirname(__file__))
-from macho import MachO, slices
+from macho import CODE_SECTIONS, MachO, slices
 
 
 class Shlib:
@@ -78,7 +78,7 @@ def _external_targets(m, libs):
     md.detail = True
     md.skipdata = True
     hits, unresolved, kernel, ninsn = [], collections.Counter(), collections.Counter(), 0
-    for sect in ('__text', '__fvmlib_init0'):
+    for sect in CODE_SECTIONS:
         s = m.section('__TEXT', sect)
         if not s or not s['size']:
             continue
