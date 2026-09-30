@@ -5,6 +5,15 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- disasm32: a call target is kept only while a body that calls it is still an
+  entry, re-derived each round of the drop. #14 took its `keep` set from every
+  decoded body, garbage included, before any were dropped: in Bunghole in
+  One's game DLL a mid-instruction body's `call` kept a garbage entry inside a
+  real function's `call [..]` and clamped that function short (it is a
+  handler the engine calls; its lift ended mid-instruction). The Movies' 0x00C10170
+  (#14's case) is still kept; POD unchanged, Hellbender one fewer split.  (#21)
+
 - recomp32: flags cross calls and tail jumps between lifted functions, as they
   do on the CPU. A call or tail transfer exports the caller's flags and every
   function entry imports them (`ret` already exported the callee's). A function
