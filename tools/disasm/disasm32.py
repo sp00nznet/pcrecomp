@@ -793,10 +793,13 @@ class Disassembler:
         print(f"[*] Successfully disassembled {len(functions)} functions"
               f" ({round_no} discovery rounds)")
         sizes = {a: f.size for a, f in functions.items()}
-        called = {t for f in functions.values() for t in f.calls_to}
+        callers = {}
+        for a, f in functions.items():
+            for t in f.calls_to:
+                callers.setdefault(t, set()).add(a)
         gone = drop_mid_instruction_entries(
             lambda va, n: self.read_bytes(va, n), sizes, code_start, code_end,
-            keep=called, weak=weak & set(sizes))
+            callers=callers, weak=weak & set(sizes))
         for a in list(functions):
             if a not in sizes:
                 del functions[a]
@@ -808,7 +811,7 @@ class Disassembler:
 
 
 def drop_mid_instruction_entries(read_va, functions, code_start, code_end,
-                                 max_rounds=4, verbose=True, keep=frozenset(),
+                                 max_rounds=4, verbose=True, keep=frozenset(), callers=None,
                                  weak=frozenset()):
     """Remove catalog entries that are not instruction boundaries.
 
@@ -834,6 +837,15 @@ def drop_mid_instruction_entries(read_va, functions, code_start, code_end,
     only that some other body's decode straddles it, and that body can be the
     false one: in The Movies a data-scan hit inside a jump table (0x00C1016D)
     decoded over 0x00C10170, a function called directly, and the real one went.
+
+    `callers` maps a call target to the bodies whose decoded `call` names it.
+    Such a target is kept only while one of those bodies is still an entry, so
+    this is re-derived every round: a garbage body's `call` is no evidence once
+    the garbage body is itself dropped. Bunghole in One: 0x10002E99, dropped as
+    mid-instruction, decoded a `call 0x10001026`; that kept 0x10001026, which
+    is inside `call dword ptr [0x1001c004]` of the real 0x10001000, and the real
+    function was clamped short there. The engine calls it through a registered
+    handler, and the game stalled at the end of the first hole's fly-through.
 
     `weak` holds entries only a pointer-shaped value vouches for (the data scan,
     the code-immediate harvest). Keeping the called entry leaves the straddling
@@ -933,7 +945,12 @@ def drop_mid_instruction_entries(read_va, functions, code_start, code_end,
                 if not advanced:
                     break
 
+    static_keep = set(keep)
     for _ in range(max_rounds):
+        # A call is evidence only while the body making it is still an entry:
+        # a garbage decode's `call` protected garbage (see `callers`).
+        keep = static_keep | {t for t, cs in (callers or {}).items()
+                              if any(c in functions for c in cs)}
         evict = {a for a in set(weak) & set(functions)
                  if a not in keep and functions[a] > 0 and any(
                      k in keep and k in functions
@@ -1233,6 +1250,17 @@ def demo():
     gone = drop_mid_instruction_entries(_read, cat, 0x1000, 0x1000 + len(blob),
                                         verbose=False, keep={0x1002})
     assert gone == 0 and 0x1002 in cat, (gone, cat)
+    # A call is evidence only while its caller survives. The caller here is
+    # 0x1008, itself inside the `fstp`: once it goes, so does what it called.
+    cat = {0x1000: len(blob), 0x1002: len(blob) - 2, 0x1008: len(blob) - 8}
+    drop_mid_instruction_entries(_read, cat, 0x1000, 0x1000 + len(blob),
+                                 verbose=False, callers={0x1002: {0x1008}})
+    assert list(cat) == [0x1000], cat
+    # ...while a live caller keeps it, as before.
+    cat = {0x1000: len(blob), 0x1002: len(blob) - 2}
+    drop_mid_instruction_entries(_read, cat, 0x1000, 0x1000 + len(blob),
+                                 verbose=False, callers={0x1002: {0x1000}})
+    assert 0x1002 in cat, cat
     # ...and when only a pointer-shaped value vouched for the straddling body,
     # that body is the false decode and it goes.
     cat = {0x1000: len(blob), 0x1002: len(blob) - 2}
