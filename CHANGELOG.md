@@ -5,6 +5,12 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- disasm32 seeds the exports, as the README always said it did, not only the
+  entry point. Bunghole in One's game DLL is entered only through
+  `GetProcAddress`, and both its exports were missing; the engine EXE was
+  missing 57 of its 244. (#18)
+
 - native32: guest modules that import from each other.
   `native32_module(name)` finds a mapped guest image by file name and
   `native32_export(base, name_or_ordinal)` reads its export table, and
