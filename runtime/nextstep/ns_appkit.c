@@ -364,20 +364,21 @@ static void f_NXDrawBitmap(void) {
             out[x] = 0xFF000000u | r << 16 | g << 8 | b;
         }
     }
-    {   /* NS_SHOT=path[:frame] saves one frame as BMP (default frame 300) -- how
-         * a headless check sees the picture */
+    {   /* NS_SHOT=first,count,path saves frames first..first+count-1 as BMP;
+         * path takes a printf %d for the frame number. How a headless check
+         * (or a README gif) sees the picture. */
         static int frame;
         const char *shot = getenv("NS_SHOT");
-        const char *colon = shot ? strrchr(shot, ':') : NULL;
-        int want = colon && colon[1] >= '0' && colon[1] <= '9' ? atoi(colon + 1) : 300;
-        if (shot && ++frame == want) {
+        char *p;
+        int first = shot ? (int)strtol(shot, &p, 10) : 0, count = shot && *p == ',' ? (int)strtol(p + 1, &p, 10) : 0;
+        ++frame;
+        if (shot && *p == ',' && frame >= first && frame < first + count) {
             char path[1024];
-            snprintf(path, sizeof path, "%.*s", colon && colon[1] >= '0' && colon[1] <= '9'
-                     ? (int)(colon - shot) : (int)strlen(shot), shot);
+            snprintf(path, sizeof path, p + 1, frame);
             SDL_Surface *s = SDL_CreateRGBSurfaceWithFormatFrom(pix, w, h, 32, pitch, SDL_PIXELFORMAT_ARGB8888);
             SDL_SaveBMP(s, path);
             SDL_FreeSurface(s);
-            fprintf(stderr, "appkit: frame %d saved to %s\n", frame, path);
+            if (frame == first + count - 1) fprintf(stderr, "appkit: frames %d..%d saved\n", first, frame);
         }
     }
     SDL_UnlockTexture(g_wins[i].tex);
