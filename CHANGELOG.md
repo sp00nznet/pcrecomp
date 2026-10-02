@@ -116,6 +116,20 @@ versions follow [SemVer](https://semver.org/).
   lift16 already emitted them and the struct had no such members. Writing the
   16-bit half leaves the top half alone, as on the hardware. (#38)
 
+- `runtime/win32hle/` SDL2 present + input (`present.c`): shows the gdi32
+  framebuffer in a window (via the window surface, so the same path works under
+  the SDL "dummy" driver and over RDP) and turns SDL input into `WM_*` messages
+  posted to the user32 queue. It wires itself as user32's pump hook
+  (`hle_present_enable`), so a guest's own `GetMessage`/`PeekMessage` loop shows
+  frames and receives input with no change to the guest; user32 stays SDL-free
+  (the hook is a function pointer, NULL when headless). `pump_selftest.c` proves
+  the hook drives a guest message loop (SDL-free); `present_selftest.c` drives
+  the SDL layer headless under the dummy driver, checking a key, a mouse move
+  and a quit translate to the right `WM_*`. With this the host maps, binds,
+  runs, draws and takes input for a lifted 32-bit Windows GUI program on Linux.
+  Needs 32-bit SDL2 (`libsdl2-dev:i386`); the rest of win32hle stays
+  display-free. (#31)
+
 - `runtime/win32hle/` full host + user32 message core: `host.c`
   (`recomp_host_init`/`_boot`/`_run`/`_main`) registers the shim modules, maps a
   PE and binds its IAT, then calls the lifted entry point, so a lifted 32-bit

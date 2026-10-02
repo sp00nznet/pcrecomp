@@ -36,9 +36,12 @@ handler.
 | `pe_format.h` | the 32-bit PE structures, portably (no windows.h) |
 | `pe_loader.c` | `recomp_pe_map` (mmap sections at their VAs, zero `.bss`), `recomp_pe_bind` (IAT → shims), `recomp_pe_relocate` (HIGHLOW) |
 | `host.c` | the full host: `recomp_host_init`/`_boot`/`_run`/`_main` — register the shim modules, map+bind a PE, call its lifted entry |
+| `present.c` | the optional SDL2 layer: shows the gdi32 framebuffer in a window and turns SDL input into `WM_*` messages. The only file that needs a display; wires itself as user32's pump hook so a guest's own message loop drives it |
 | `win32hle_selftest.c` | a synthetic lifted guest driving the shims + a callback, headless |
 | `pe_loader_selftest.c` | builds a minimal PE (2 imports, a reloc), maps/binds/relocates it, headless |
 | `host_selftest.c` | a full boot: a synthetic lifted GUI app (entry → class → window → message loop → `WndProc` paints) driven through the host, headless |
+| `pump_selftest.c` | the pump hook drives a guest `GetMessage` loop (SDL-free) |
+| `present_selftest.c` | the SDL2 present/input layer under the dummy video driver (headless) |
 
 ## State (what's real, what's next)
 
@@ -51,16 +54,18 @@ Implemented and tested headless, under gcc `-m32`:
 - the full host: map + bind + call the lifted entry, with a real Win32 message
   loop (`GetMessage`/`DispatchMessage` → `WndProc` via `hle_call_guest`) and the
   gdi32 paint path, driven end to end by a synthetic lifted GUI app
+- SDL2 present + input: the gdi32 framebuffer shown in a window, SDL input
+  turned into `WM_*` messages, wired as user32's pump hook so a guest's own
+  message loop drives it — all exercisable headless under the SDL dummy driver
 
-Deferred (tracked in the port plan / ROADMAP):
+So the host now **maps, binds, runs, draws, and takes input** for a lifted
+32-bit Windows GUI program on Linux. What a specific title still needs:
 
-- **SDL2 present** — the one thing still missing to run a *real* windowed game:
-  copy the gdi32 framebuffer to a texture, show a window, and feed SDL input
-  back as `WM_*` messages. The message core and paint path are already here and
-  headless; this bolts a display onto them. Needs 32-bit SDL2 (`libsdl2-dev:i386`).
-- 8/16/24bpp DIBs and the palette-animation emulator (generalised from SC2K).
-- the breadth of kernel32/user32/gdi32 a given title needs, filled in as titles
-  hit the gaps (the shim registry makes each one a few lines).
+- its own **lift** (the generated C — per game, never in this repo), and
+- the **breadth** of kernel32/user32/gdi32 it happens to call, filled in as it
+  hits gaps (the shim registry makes each one a few lines), plus
+- 8/16/24bpp DIBs and the palette-animation emulator (generalised from SC2K),
+  as titles need them.
 
 ## Building the selftest
 
