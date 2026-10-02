@@ -6,6 +6,15 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- generate: a gap in the middle of a lifted body falls through to the right
+  address. An instruction that can fall through, followed in the emitted list
+  by one that is not at its end (the extent walk stops after a `call` that is
+  followed by a catalog entry), ran on into the next emitted block. Now it gets
+  a goto, or a tail transfer when the address is outside the body, the same as
+  the end of a body. Yuri's Revenge lost an inline strcat after `call sprintf`
+  and showed its insert-disc box; 73 such gaps in its lift, 1 in The Movies'
+  3,000-function closure.
+
 - `tools/lift/translator.py` (`python -m tools … --all`) now seeds the PE entry
   point and every export into function discovery. disasm32's `find_functions`
   already took a `seeds` list — "the PE entry point above all" — but the default
