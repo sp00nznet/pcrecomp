@@ -110,6 +110,7 @@ extern int win32hle_trace;               /* env SC2K/HLE trace: one line per shi
 
 /* Each module's shim table (defined in its .c, registered by the host). */
 extern const win32hle_shim win32hle_kernel32[];
+extern const win32hle_shim win32hle_kernel32_ext[];   /* file I/O, Global*, .ini */
 extern const win32hle_shim win32hle_gdi32[];
 extern const win32hle_shim win32hle_user32[];
 

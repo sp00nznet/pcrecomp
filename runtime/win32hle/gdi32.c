@@ -103,7 +103,28 @@ static void g_DeleteObject(void) {
 }
 static void g_SelectObject(void)      { RET(A32(1), 2); }   /* return "previous"; stateless for now */
 
+/* GetDeviceCaps(hdc, index): report a plain 32bpp desktop the size of the
+ * framebuffer. A software renderer reads these to size its backbuffer and to
+ * decide it is NOT a palette device (so it takes the truecolour path). */
+static void g_GetDeviceCaps(void) {
+    int w, h; (void)hle_gdi_framebuffer(&w, &h);
+    uint32_t v;
+    switch (A32(1)) {
+        case 8:  v = (uint32_t)(w > 0 ? w : 640); break;  /* HORZRES   */
+        case 10: v = (uint32_t)(h > 0 ? h : 480); break;  /* VERTRES   */
+        case 12: v = 32; break;                           /* BITSPIXEL */
+        case 14: v = 1;  break;                           /* PLANES    */
+        case 104: v = 0; break;                           /* SIZEPALETTE: not a palette device */
+        case 38: v = 0;  break;                           /* RASTERCAPS: no RC_PALETTE */
+        default: v = 0;  break;
+    }
+    RET(v, 2);
+}
+static void g_GetStockObject(void) { RET(0x0DB00001u + A32(0), 1); }  /* a distinct nonzero handle */
+
 const win32hle_shim win32hle_gdi32[] = {
+    { "GetDeviceCaps",      g_GetDeviceCaps },
+    { "GetStockObject",     g_GetStockObject },
     { "CreateDIBSection",   g_CreateDIBSection },
     { "StretchDIBits",      g_StretchDIBits },
     { "GetDC",              g_GetDC },
