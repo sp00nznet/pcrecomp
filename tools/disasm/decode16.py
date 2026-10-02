@@ -731,6 +731,18 @@ class Decoder:
                 inst.mnemonic = f'esc_{esc - 0xD8}'
                 inst.fpu = bytes([esc]) + bytes(self.data[m0:self.pos])
 
+        # Borland's emulator shortcut: INT 3Eh plus a function byte and a NOP
+        # pad, for the transcendentals its math library falls back to without
+        # a 387 (the 387 path beside it is fsin / fsincos+fdiv / fpatan). The
+        # two trailing bytes are not instructions; decoded as such they become
+        # `repnz nop` and hide which function was meant.
+        elif opcode == 0xCD and EMU87_INTS and self.data[self.pos] == 0x3E                 and self._safe(3):
+            self.pos += 1
+            inst.mnemonic = 'emu3e'
+            inst.emu87_int = 0x3E
+            inst.op1 = Operand(type=OpType.IMM8, disp=self._u8(), size=1)
+            self.pos += 1
+
         elif opcode == 0xCD:
             int_num = self._u8()
             inst.mnemonic = 'int'
