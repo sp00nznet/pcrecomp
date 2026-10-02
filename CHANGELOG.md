@@ -116,6 +116,21 @@ versions follow [SemVer](https://semver.org/).
   lift16 already emitted them and the struct had no such members. Writing the
   16-bit half leaves the top half alone, as on the hardware. (#38)
 
+
+- `runtime/win32hle/kernel32_ext.c`: the KERNEL32 file-I/O (`CreateFileA`/
+  `ReadFile`/`WriteFile`/`SetFilePointer`/`GetFileSize`/`SetEndOfFile`/
+  `FlushFileBuffers`/`CloseHandle` over a HANDLE→`FILE*` table), `Global*`
+  (fixed-memory: `HGLOBAL` is the pointer), and `.ini` profile
+  (`GetPrivateProfileStringA`/`IntA`, `WritePrivateProfileStringA`) shims every
+  Win32 title needs at startup and for load/save — on libc/POSIX. `gdi32.c`
+  gains `GetDeviceCaps` (reports a plain 32bpp desktop the size of the
+  framebuffer, so a software renderer takes the truecolour path) and
+  `GetStockObject`. Chosen by the first real title's import census (Fury³: 157
+  imports / 5 DLLs; this lifts win32hle's coverage of it from 31 to 46).
+  `kernel32_ext_selftest.c` round-trips a file, a `Global` block and an `.ini`
+  key from a synthetic lifted guest, headless under gcc `-m32`. (#32)
+
+### Added
 - `runtime/win32hle/` SDL2 present + input (`present.c`): shows the gdi32
   framebuffer in a window (via the window surface, so the same path works under
   the SDL "dummy" driver and over RDP) and turns SDL input into `WM_*` messages

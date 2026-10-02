@@ -63,7 +63,12 @@ So the host now **maps, binds, runs, draws, and takes input** for a lifted
 
 - its own **lift** (the generated C — per game, never in this repo), and
 - the **breadth** of kernel32/user32/gdi32 it happens to call, filled in as it
-  hits gaps (the shim registry makes each one a few lines), plus
+  hits gaps (the shim registry makes each one a few lines). The first real
+  census drove the current set: Fury³ imports 157 functions across 5 DLLs, of
+  which win32hle now answers 46 — the universally-needed file-I/O / `Global*` /
+  `.ini` / device-caps batch (`kernel32_ext.c`); the rest (WINMM audio, the
+  common dialogs, the window/menu/dialog breadth of USER32) land as a lift
+  actually calls them. Plus
 - 8/16/24bpp DIBs and the palette-animation emulator (generalised from SC2K),
   as titles need them.
 

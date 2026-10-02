@@ -15,6 +15,7 @@ static int      g_booted;
 
 void recomp_host_init(void) {
     win32hle_register(win32hle_kernel32);
+    win32hle_register(win32hle_kernel32_ext);
     win32hle_register(win32hle_gdi32);
     win32hle_register(win32hle_user32);
 }
