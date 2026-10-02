@@ -1199,6 +1199,10 @@ class Lifter:
             fn = 'port_out16' if w16 else 'port_out8'
             self._emit(f'{fn}(cpu, {port_expr}, {val_expr});', orig)
 
+        elif m == 'emu3e':
+            # sin/tan/atan of ST(0) by function byte; the runtime owns the table
+            self._emit(f'x87_emu3e(cpu, 0x{op1.disp:02X});', orig)
+
         elif m == 'wait' and not (getattr(inst, 'emu87_int', 0)
                                  and getattr(self, 'x87_emu_dispatch', False)):
             self._emit('/* wait */', orig)
@@ -1321,6 +1325,14 @@ class Lifter:
                 return 'X87_ST(1) = atan2(X87_ST(1), X87_ST(0)); x87_pop();'
             if modrm == 0xF2:
                 return 'X87_ST(0) = tan(X87_ST(0)); x87_push(1.0);'
+            # 387 trig. Borland's math library tests for a 387 and takes
+            # these instead of the fptan series when one is there.
+            if modrm == 0xFE:
+                return 'X87_ST(0) = sin(X87_ST(0));'
+            if modrm == 0xFF:
+                return 'X87_ST(0) = cos(X87_ST(0));'
+            if modrm == 0xFB:
+                return '{ double _v = X87_ST(0); X87_ST(0) = sin(_v); x87_push(cos(_v)); }'
             if modrm == 0xF1:
                 return 'X87_ST(1) = X87_ST(1) * log2(X87_ST(0)); x87_pop();'
             if modrm == 0xF0:
