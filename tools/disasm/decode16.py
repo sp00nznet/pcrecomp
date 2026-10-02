@@ -532,7 +532,7 @@ class Decoder:
             reg, rm, rn = self._decode_modrm(True, seg_override)
             inst.mnemonic = 'mov'
             inst.op1 = rm
-            inst.op2 = Operand(type=OpType.SREG, reg=rn & 3, size=2)
+            inst.op2 = Operand(type=OpType.SREG, reg=rn if rn < 6 else rn & 3, size=2)
 
         # LEA reg16, m
         elif opcode == 0x8D:
@@ -543,7 +543,7 @@ class Decoder:
         elif opcode == 0x8E:
             reg, rm, rn = self._decode_modrm(True, seg_override)
             inst.mnemonic = 'mov'
-            inst.op1 = Operand(type=OpType.SREG, reg=rn & 3, size=2)
+            inst.op1 = Operand(type=OpType.SREG, reg=rn if rn < 6 else rn & 3, size=2)
             inst.op2 = rm
 
         # POP r/m16
