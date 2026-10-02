@@ -10,7 +10,7 @@ versions follow [SemVer](https://semver.org/).
   decoding the format rather than running the stub. `test_unlzexe.py` builds a
   packed file with a small encoder (literals, short and long matches, an
   extended length, a delta-coded relocation table) and checks the round trip.
-  Blake Stone's two executables both ship packed. (#?)
+  Blake Stone's two executables both ship packed. (#35)
 
 ### Fixed
 - disasm32: a call target is kept only while a body that calls it is still an
