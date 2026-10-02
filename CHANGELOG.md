@@ -14,7 +14,7 @@ versions follow [SemVer](https://semver.org/).
   its step into `add edx, 12345678h`, and its raycaster flips `jge`/`jle` per
   view quadrant; lifted as constants the walls were noise and actors were
   corrupted by a raycaster running off its tables. Opt-in: nothing changes for
-  a project that does not set `smc_imm`. (#?)
+  a project that does not set `smc_imm`. (#39)
 
 ### Fixed
 - disasm32: a call target is kept only while a body that calls it is still an
