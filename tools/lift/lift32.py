@@ -786,6 +786,23 @@ class Lifter:
                 lines.append(f"  {self._fmt_write(ops[0], b)};")
                 lines.append(f"  {self._fmt_write(ops[1], '_tmp')}; }}")
 
+        # cmpxchg8b m64: if EDX:EAX == m64 then m64 = ECX:EBX, ZF = 1; else
+        # EDX:EAX = m64, ZF = 0. The lock-free queues in LithTech's TCP engine
+        # (The Matrix Online's launcher.exe) are built on it; unimplemented, a
+        # push never landed and the connection thread never saw a write.
+        # Lifted code runs on one host thread, so `lock` adds nothing.
+        elif m == 'cmpxchg8b':
+            if len(ops) == 1 and ops[0].type == X86_OP_MEM:
+                addr = self._fmt_mem_addr(ops[0].mem)
+                lines.append(f"{{ uint32_t _p = {addr}, _ne; {comment}")
+                lines.append("  if (MEM32(_p) == eax && MEM32(_p + 4) == edx) {"
+                             " MEM32(_p) = ebx; MEM32(_p + 4) = ecx; _ne = 0; }")
+                lines.append("  else { eax = MEM32(_p); edx = MEM32(_p + 4); _ne = 1; }")
+                # ZF only (CF is untouched): a cmp of _ne against 0.
+                lines.append("  " + self._flag_capture('_ne', '0') + " }")
+                self._flag_state = ('cmp', "_flag_a, _flag_b")
+            self._flag_seq += 1
+
         elif m == 'bswap':
             if len(ops) == 1:
                 r = self._fmt_read(ops[0])
@@ -1652,9 +1669,13 @@ class Lifter:
         elif m in ('ffree', 'ffreep'):
             lines.append(f"/* {m} (no-op in fixed-window FPU stack) */ {comment}")
 
-        elif m in ('fcomip', 'fucomip', 'fcompp'):
+        # fucompp was missing here and lifted to UNIMPLEMENTED: no compare, no
+        # pops. Every `fucompp; fnstsw ax; test ah, N` then branched on the
+        # previous compare and left two stale values on the x87 stack -- 783
+        # sites in The Matrix Online's client.dll alone.
+        elif m in ('fcomip', 'fucomip', 'fcompp', 'fucompp'):
             lines.append(f"_fpu_cmp = FPU_CMP(_st[0], _st[1]); {comment}")
-            if m == 'fcompp':
+            if m in ('fcompp', 'fucompp'):
                 lines.append(f"fp_pop(); fp_pop();")
             else:
                 lines.append(f"fp_pop();")

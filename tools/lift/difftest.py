@@ -293,6 +293,27 @@ CASES = [
     Case('stosd.rep-backward', bytes.fromhex('fdf3ab'),      # std; rep stosd
          {'eax': 0x11223344, 'ecx': 2, 'edi': SCRATCH + 0x104}),
 
+    # fld; fld; fucompp; fnstsw ax -- compare and pop twice. It lifted to
+    # UNIMPLEMENTED: no compare and no pops, so ah held the previous compare
+    # and the x87 stack stayed two deep (783 sites in MxO's client.dll).
+    Case('fpu.fucompp-less', bytes.fromhex('d906d94604dae9dfe0'),
+         mem={SCRATCH: struct.pack('<ff', 2.0, 1.0)}),
+    Case('fpu.fucompp-nan', bytes.fromhex('d906d94604dae9dfe0'),
+         mem={SCRATCH: struct.pack('<ff', 2.0, float('nan'))}),
+
+    # lock cmpxchg8b [esi]; setz cl -- the lock-free queue in LithTech's TCP
+    # engine. Unimplemented, a push never landed.
+    Case('cmpxchg8b.equal', bytes.fromhex('f00fc70e0f94c1'),
+         {'eax': 0x11111111, 'edx': 0x22222222, 'ebx': 0x33333333, 'ecx': 0x44444444},
+         mem={SCRATCH: struct.pack('<II', 0x11111111, 0x22222222)},
+         known='cmpxchg8b writes ZF only; the lazy model derives every flag '
+               'from one compare, so the materialised PF reads that compare '
+               '(even, for 0) instead of keeping its old value. Code after '
+               'cmpxchg8b tests ZF; only a pushfd would see PF.'),
+    Case('cmpxchg8b.differs', bytes.fromhex('f00fc70e0f94c1'),
+         {'eax': 0x11111111, 'edx': 0x22222222, 'ebx': 0x33333333, 'ecx': 0x44444444},
+         mem={SCRATCH: struct.pack('<II', 0x11111111, 0x99999999)}),
+
     # --- string compare / scan, every width ---
     #
     # Only the byte forms were implemented, so `repe cmpsd` lifted to an empty

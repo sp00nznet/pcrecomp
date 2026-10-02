@@ -872,12 +872,23 @@ static inline void fp_st80(uint8_t* p, double v) {
  * CPUID stub
  * ============================================================ */
 
+/* Feature bits a project cannot run. The lift does not implement every SIMD
+ * extension the host reports, and code that dispatches on CPUID then runs
+ * instructions emitted as UNIMPLEMENTED -- Crypto++'s SSE2 multiply in The
+ * Matrix Online made every RSA verify fail. A project clears what its lift
+ * lacks (leaf 1 EDX/ECX, leaf 0x80000001 EDX). Default: the host's answer. */
+RECOMP_WEAK uint32_t g_cpuid_mask_edx = 0xFFFFFFFFu;
+RECOMP_WEAK uint32_t g_cpuid_mask_ecx = 0xFFFFFFFFu;
+RECOMP_WEAK uint32_t g_cpuid_mask_ext_edx = 0xFFFFFFFFu;
+
 static inline void CPUID_impl(uint32_t eax_val, uint32_t ebx_val, uint32_t ecx_val, uint32_t edx_val) {
     /* Return something reasonable for a Pentium III era check */
 #ifdef _MSC_VER
     int info[4];
     __cpuid(info, eax_val);
     g_eax = info[0]; g_ebx = info[1]; g_ecx = info[2]; g_edx = info[3];
+    if (eax_val == 1) { g_edx &= g_cpuid_mask_edx; g_ecx &= g_cpuid_mask_ecx; }
+    if (eax_val == 0x80000001u) g_edx &= g_cpuid_mask_ext_edx;
 #else
     (void)eax_val; (void)ebx_val; (void)ecx_val; (void)edx_val;
 #endif
