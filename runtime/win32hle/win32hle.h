@@ -64,6 +64,11 @@ int  win32hle_register(const win32hle_shim *shims);
 /* Synthetic VA for a registered shim, or 0 if unknown. */
 uint32_t hle_resolve(const char *name);
 
+/* Like hle_resolve, but registers a self-naming "unimplemented" stub for an
+ * unknown name and returns its VA (used as the resolver for a permissive bind,
+ * so an unresolved import aborts with its name when first called, not at bind). */
+uint32_t hle_resolve_or_stub(const char *name);
+
 /* Human name for a synthetic shim VA (for traces/faults), or NULL. */
 const char *hle_name(uint32_t va);
 
@@ -111,6 +116,7 @@ extern int win32hle_trace;               /* env SC2K/HLE trace: one line per shi
 /* Each module's shim table (defined in its .c, registered by the host). */
 extern const win32hle_shim win32hle_kernel32[];
 extern const win32hle_shim win32hle_kernel32_ext[];   /* file I/O, Global*, .ini */
+extern const win32hle_shim win32hle_kernel32_crt[];   /* CRT startup -> WinMain */
 extern const win32hle_shim win32hle_gdi32[];
 extern const win32hle_shim win32hle_user32[];
 

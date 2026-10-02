@@ -153,15 +153,45 @@ const char *hle_name(uint32_t va) {
     return NULL;
 }
 
+/* The shim VA last dispatched, so the unimplemented-import stub can name itself
+ * (its fn is shared, so it learns which import it is from here). */
+static uint32_t g_last_import_va;
+
 /* An import VA that is one of our synthetic shim VAs resolves to its shim. */
 recomp_func_t recomp_lookup_import(uint32_t va) {
     if (va < SHIM_BASE || va >= SHIM_BASE + SHIM_STEP * (uint32_t)g_shim_n) return NULL;
     uint32_t i = (va - SHIM_BASE) / SHIM_STEP;
     if (i < (uint32_t)g_shim_n && g_shim[i].va == va) {
+        g_last_import_va = va;
         if (win32hle_trace) fprintf(stderr, "[hle] %s\n", g_shim[i].name);
         return g_shim[i].fn;
     }
     return NULL;
+}
+
+/* Permissive bind: unresolved imports bind here instead of failing. A stdcall
+ * import can't be a silent no-op (it would not pop its args and the stack would
+ * drift), so this names itself from the last-dispatched VA and stops — giving
+ * the exact import the running program reached and who called it. Implement
+ * that import, rerun, get the next. */
+static void hle_unimplemented(void) {
+    const char *nm = hle_name(g_last_import_va);
+    hle_fatal("unimplemented import %s (0x%08X) called from guest 0x%08X",
+              nm ? nm : "?", g_last_import_va, g_cur_func);
+}
+
+/* Resolve a name to a shim VA, or register a self-naming stub for it and return
+ * that. Used as the resolver for a permissive bind. */
+uint32_t hle_resolve_or_stub(const char *name) {
+    uint32_t va = hle_resolve(name);
+    if (va) return va;
+    if (g_shim_n >= MAX_SHIMS) hle_fatal("too many shims");
+    /* names from the IAT outlive the bind; the loader's image is mapped for the
+     * whole run, so keeping the pointer is safe. */
+    g_shim[g_shim_n].name = name;
+    g_shim[g_shim_n].fn   = hle_unimplemented;
+    g_shim[g_shim_n].va   = SHIM_BASE + SHIM_STEP * (uint32_t)g_shim_n;
+    return g_shim[g_shim_n++].va;
 }
 
 /* ------------------------------------------------------- native -> guest */

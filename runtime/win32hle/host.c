@@ -16,17 +16,26 @@ static int      g_booted;
 void recomp_host_init(void) {
     win32hle_register(win32hle_kernel32);
     win32hle_register(win32hle_kernel32_ext);
+    win32hle_register(win32hle_kernel32_crt);
     win32hle_register(win32hle_gdi32);
     win32hle_register(win32hle_user32);
 }
 
-int recomp_host_boot(const char *path) {
+static int boot(const char *path, uint32_t (*resolve)(const char *)) {
     if (recomp_pe_map(path, &g_img) != 0) return 1;
-    int unresolved = recomp_pe_bind(&g_img, hle_resolve);
+    int unresolved = recomp_pe_bind(&g_img, resolve);
     g_booted = 1;
     fprintf(stderr, "[host] %s booted: entry 0x%08X, %d unresolved imports\n",
             path, g_img.entry, unresolved);
-    return unresolved ? 2 : 0;
+    return unresolved;
+}
+
+int recomp_host_boot(const char *path) {
+    return boot(path, hle_resolve) ? 2 : 0;         /* fail if anything unresolved */
+}
+int recomp_host_boot_permissive(const char *path) {
+    boot(path, hle_resolve_or_stub);                /* unresolved -> self-naming stub */
+    return g_booted ? 0 : 1;
 }
 
 uint32_t recomp_host_entry(void) { return g_booted ? g_img.entry : 0; }

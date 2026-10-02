@@ -15,6 +15,12 @@ void recomp_host_init(void);
  * success (image mapped, all imports resolved), nonzero otherwise. */
 int recomp_host_boot(const char *path);
 
+/* Like recomp_host_boot, but unresolved imports bind to a self-naming stub
+ * instead of failing the boot, so recomp_host_run can proceed until the program
+ * actually calls one (then it aborts naming it). The bring-up loop for a new
+ * title: run, see the import it reached, implement it, repeat. */
+int recomp_host_boot_permissive(const char *path);
+
 /* Call the mapped image's entry point as lifted code (CRT startup ->
  * WinMain -> the game's message loop). Returns the guest's exit code if the
  * entry returns; a real CRT exits through ExitProcess and never comes back. */

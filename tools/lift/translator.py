@@ -45,9 +45,20 @@ def load_pe(filepath: str):
 
 
 def discover_functions(pe_data: bytes, info, iat_map: dict) -> dict:
-    """Discover all functions in the PE's code section."""
+    """Discover all functions in the PE's code section.
+
+    The PE entry point and every export are seeded explicitly: they are
+    functions whether or not the call/jmp/prologue scan recognises them.
+    Without this, a CRT entry that opens with `mov eax, fs:[0]` (the SEH
+    prologue) was lost when the prologue scan seeded the inner `push ebp`
+    instead, and `recomp_host_run` had no function at the entry VA. disasm32's
+    find_functions documents this (`seeds` -- "the PE entry point above all");
+    the default pipeline just never passed them.
+    """
     disasm = Disassembler(pe_data, info.image_base, info.sections)
-    functions = disasm.find_functions(info.code_start, info.code_end, iat_map)
+    seeds = [info.image_base + info.entry_point_rva]
+    seeds += [info.image_base + e.rva for e in getattr(info, 'exports', []) if e.rva]
+    functions = disasm.find_functions(info.code_start, info.code_end, iat_map, seeds=seeds)
     return functions
 
 
