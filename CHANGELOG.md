@@ -24,7 +24,7 @@ versions follow [SemVer](https://semver.org/).
 - decode16: `mov sreg, r/m` and `mov r/m, sreg` with reg 4/5 are FS/GS. The
   field was masked with `& 3`, so `mov gs, ax` decoded as `mov cs, ax`; Blake
   Stone's wall scaler loads its texture segment into GS and every texel was
-  read from the wrong segment. (#?)
+  read from the wrong segment. (#37)
 
 - recomp16 `cpu.h`: SI, DI, BP and SP are unions with ESI, EDI, EBP and ESP. A
   386 running 16-bit code uses the 32-bit forms with an operand-size prefix
