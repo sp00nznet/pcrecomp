@@ -1046,6 +1046,26 @@ void recomp_trace_enter(uint32_t va);
 #else
 #define RECOMP_ENTER(va) (g_cur_func = (va), RECOMP_FLAGS_IN())
 #endif
+/* A backward branch in lifted code: a loop. Every RECOMP_YIELD_EVERY of them,
+ * hand the machine to other guest threads if the host has a way to
+ * (native32_yield). A lifted spin-wait makes no native call, and native32
+ * hands its machine lock over only at native calls, so a loop waiting on
+ * another guest thread's flag never let that thread run: Yuri's Revenge's
+ * exit spins until its sound thread acknowledges a stop (0x0040A047) and hung
+ * there. The registers go back to the globals around the hand-over, which is
+ * all a native call does. The counter is global and unsynchronised on purpose:
+ * only the thread holding the machine runs lifted code. */
+RECOMP_WEAK void (*recomp_yield_hook)(void);
+RECOMP_WEAK uint32_t g_backedges;
+#ifndef RECOMP_YIELD_EVERY
+#define RECOMP_YIELD_EVERY 0x10000u
+#endif
+#define RECOMP_BACKEDGE() do { \
+    if (++g_backedges >= RECOMP_YIELD_EVERY && recomp_yield_hook) { \
+        g_backedges = 0; \
+        RECOMP_REGS_OUT(); recomp_yield_hook(); RECOMP_REGS_IN(); \
+    } } while (0)
+
 /* Always-callable trace dump (no-op unless RECOMP_TRACE). */
 void recomp_dump_trace(const char* why);
 
