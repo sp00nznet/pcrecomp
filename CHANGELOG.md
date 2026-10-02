@@ -13,7 +13,7 @@ versions follow [SemVer](https://semver.org/).
   a goto, or a tail transfer when the address is outside the body, the same as
   the end of a body. Yuri's Revenge lost an inline strcat after `call sprintf`
   and showed its insert-disc box; 73 such gaps in its lift, 1 in The Movies'
-  3,000-function closure.
+  3,000-function closure. (#41)
 
 - `tools/lift/translator.py` (`python -m tools … --all`) now seeds the PE entry
   point and every export into function discovery. disasm32's `find_functions`
