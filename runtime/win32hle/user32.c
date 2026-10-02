@@ -40,6 +40,13 @@ static struct { uint32_t hwnd, wndproc; } g_win[MAXW];
 static int g_win_n;
 static uint32_t g_next_hwnd = 0x00010001u;
 
+/* Optional pump hook: when the message queue is empty, GetMessage/PeekMessage
+ * call this before giving up. The SDL present layer sets it (hle_present_enable)
+ * so a guest's own message loop polls input and shows frames with no change to
+ * the guest; left NULL (headless, no present) the queue behaves as before. */
+static void (*g_pump)(void);
+void hle_set_pump_hook(void (*fn)(void)) { g_pump = fn; }
+
 static uint32_t cls_wndproc(const char *name) {
     for (int i = 0; i < g_cls_n; i++) if (!strcmp(g_cls[i].name, name)) return g_cls[i].wndproc;
     return 0;
@@ -48,6 +55,22 @@ static uint32_t win_wndproc(uint32_t hwnd) {
     for (int i = 0; i < g_win_n; i++) if (g_win[i].hwnd == hwnd) return g_win[i].wndproc;
     return 0;
 }
+
+/* Host-callable queue access, so an optional present/input layer (present.c)
+ * can inject translated SDL events as WM_* messages and a host can drive the
+ * queue — without user32 itself depending on SDL. */
+void hle_post_message(uint32_t hwnd, uint32_t message, uint32_t wParam, uint32_t lParam) {
+    msg_t m = { hwnd, message, wParam, lParam }; q_push(m);
+}
+int hle_msg_pop(uint32_t *message, uint32_t *wParam, uint32_t *lParam) {
+    msg_t m;
+    if (!q_pop(&m)) return 0;
+    if (message) *message = m.message;
+    if (wParam)  *wParam  = m.wParam;
+    if (lParam)  *lParam  = m.lParam;
+    return 1;
+}
+uint32_t hle_first_hwnd(void) { return g_win_n ? g_win[0].hwnd : 0; }
 
 /* RegisterClassA(const WNDCLASSA*): lpfnWndProc at +4, lpszClassName at +36. */
 static void u_RegisterClassA(void) {
@@ -88,7 +111,13 @@ static void u_PostQuitMessage(void) {                            /* (exitCode) *
 static void u_GetMessageA(void) {
     uint32_t lp = A32(0);
     msg_t m;
-    if (!q_pop(&m)) { m.hwnd = 0; m.message = WM_QUIT; m.wParam = 0; m.lParam = 0; }
+    /* Block until a message arrives, pumping the present layer each turn so SDL
+     * input becomes messages and a frame is shown. With no pump hook (headless)
+     * an empty queue means WM_QUIT, so a loop still terminates. */
+    while (!q_pop(&m)) {
+        if (!g_pump) { m.hwnd = 0; m.message = WM_QUIT; m.wParam = 0; m.lParam = 0; break; }
+        g_pump();
+    }
     MEM32(lp + 0) = m.hwnd; MEM32(lp + 4) = m.message;
     MEM32(lp + 8) = m.wParam; MEM32(lp + 12) = m.lParam;
     RET(m.message == WM_QUIT ? 0u : 1u, 4);
@@ -98,7 +127,10 @@ static void u_GetMessageA(void) {
 static void u_PeekMessageA(void) {
     uint32_t lp = A32(0);
     msg_t m;
-    if (!q_pop(&m)) RET(0, 5);
+    if (!q_pop(&m)) {
+        if (g_pump) g_pump();          /* non-blocking: pump once, then re-check */
+        if (!q_pop(&m)) RET(0, 5);
+    }
     MEM32(lp + 0) = m.hwnd; MEM32(lp + 4) = m.message;
     MEM32(lp + 8) = m.wParam; MEM32(lp + 12) = m.lParam;
     RET(1, 5);

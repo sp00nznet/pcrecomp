@@ -81,6 +81,29 @@ uint32_t hle_call_guest(uint32_t va, int nargs, const uint32_t *args);
 void  mach_enter(void);
 void  mach_leave(void);
 
+/* ---- user32 message queue, host-callable ----
+ * So the optional SDL present/input layer can inject translated events, and a
+ * host can drive the queue, without user32 depending on SDL. */
+void     hle_post_message(uint32_t hwnd, uint32_t message, uint32_t wParam, uint32_t lParam);
+int      hle_msg_pop(uint32_t *message, uint32_t *wParam, uint32_t *lParam);  /* 1 if one popped */
+uint32_t hle_first_hwnd(void);           /* the first created window, or 0 */
+void     hle_set_pump_hook(void (*fn)(void)); /* called when the queue is empty (present layer) */
+
+/* ---- gdi32 framebuffer, host-callable ---- */
+void            hle_gdi_set_target(uint32_t *pixels, int w, int h); /* the blit destination */
+const uint32_t *hle_gdi_framebuffer(int *w, int *h);                /* what present shows */
+
+/* ---- optional SDL2 present/input layer (present.c) ----
+ * Shows the gdi32 framebuffer in a window and turns SDL input into WM_*
+ * messages. Separate from everything above so the core stays headless and
+ * SDL-free; link it only when you want a visible window. */
+int   hle_present_open(const char *title, int w, int h);   /* 0 on success */
+void  hle_present_frame(const uint32_t *fb);                /* blit a w*h ARGB frame */
+void  hle_present_pump(void);                               /* SDL events -> WM_* */
+void  hle_present_step(void);                               /* pump + show one frame + yield */
+void  hle_present_enable(void);                             /* wire present_step as the pump hook */
+void  hle_present_close(void);
+
 /* ---- host services a shim may need ---- */
 void  hle_fatal(const char *fmt, ...);   /* print + abort: an unimplemented path */
 extern int win32hle_trace;               /* env SC2K/HLE trace: one line per shim call */

@@ -21,6 +21,13 @@ static uint32_t *g_fb;
 static int g_fb_w, g_fb_h;
 void hle_gdi_set_target(uint32_t *pixels, int w, int h) { g_fb = pixels; g_fb_w = w; g_fb_h = h; }
 
+/* The present layer reads the framebuffer to show it. */
+const uint32_t *hle_gdi_framebuffer(int *w, int *h) {
+    if (w) *w = g_fb_w;
+    if (h) *h = g_fb_h;
+    return g_fb;
+}
+
 /* BITMAPINFOHEADER is 40 bytes of little-endian fields; read by offset so no
  * windows.h struct is needed. Negative height means a top-down DIB. */
 static int32_t  bi_w(const uint8_t *b)   { return (int32_t)(b[4] | b[5]<<8 | b[6]<<16 | (uint32_t)b[7]<<24); }
