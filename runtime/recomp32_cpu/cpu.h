@@ -78,6 +78,11 @@ typedef struct {
      * runtime does not have; such code should be caught rather than lifted
      * silently. */
     uint16_t cs, ds, es, fs, gs, ss;
+    /* Linear base of the TIB that `fs:` points at. Used only by the portable
+     * fs: path (FS_* macros below): the host points this at a simulated TIB
+     * per thread, and fs:[off] reads ordinary memory at fs_base+off. Left 0 and
+     * unused on the MSVC default path, which reads the real segment. */
+    uint32_t fs_base;
 } CPU;
 
 /* ---- partial register access (preserve unaffected bits, like x86) ---- */
@@ -95,6 +100,38 @@ static inline uint32_t rd32(uint32_t a) { return *(uint32_t *)(uintptr_t)a; }
 static inline void wr8 (uint32_t a, uint8_t  v) { *(uint8_t  *)(uintptr_t)a = v; }
 static inline void wr16(uint32_t a, uint16_t v) { *(uint16_t *)(uintptr_t)a = v; }
 static inline void wr32(uint32_t a, uint32_t v) { *(uint32_t *)(uintptr_t)a = v; }
+
+/* ---- fs:-relative access (TIB / SEH chain) ----
+ *
+ * The lifter emits these for every `fs:` memory operand (SEH prologues store
+ * the exception-registration record through fs:[0]). Two implementations, one
+ * chosen at compile time so a single lift builds for either host:
+ *
+ *   MSVC default        the real segment, via the __readfsN/__writefsN
+ *                       intrinsics. Correct when the host is a 1:1 Win32
+ *                       process whose own TIB the guest shares.
+ *   portable / non-MSVC read ordinary memory at c->fs_base + off. The host
+ *                       gives each guest thread a simulated TIB and points
+ *                       c->fs_base at it. This is what a non-Windows (Linux)
+ *                       host needs; it also works on Windows if the host sets
+ *                       c->fs_base to NtCurrentTeb() and defines
+ *                       RECOMP_FS_SIMULATED.
+ */
+#if defined(_MSC_VER) && !defined(RECOMP_FS_SIMULATED)
+#define FS_RD8(c, off)      __readfsbyte(off)
+#define FS_RD16(c, off)     __readfsword(off)
+#define FS_RD32(c, off)     __readfsdword(off)
+#define FS_WR8(c, off, v)   __writefsbyte((off), (unsigned char)(v))
+#define FS_WR16(c, off, v)  __writefsword((off), (unsigned short)(v))
+#define FS_WR32(c, off, v)  __writefsdword((off), (unsigned long)(v))
+#else
+#define FS_RD8(c, off)      rd8 ((c)->fs_base + (off))
+#define FS_RD16(c, off)     rd16((c)->fs_base + (off))
+#define FS_RD32(c, off)     rd32((c)->fs_base + (off))
+#define FS_WR8(c, off, v)   wr8 ((c)->fs_base + (off), (uint8_t )(v))
+#define FS_WR16(c, off, v)  wr16((c)->fs_base + (off), (uint16_t)(v))
+#define FS_WR32(c, off, v)  wr32((c)->fs_base + (off), (uint32_t)(v))
+#endif
 /* movlps/movhps and friends move a lane as bits, not as a number: a double
  * round-trip would be exact for every value except the signalling NaNs a
  * mask-producing compare leaves behind. memcpy, because the address need

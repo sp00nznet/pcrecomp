@@ -16,6 +16,18 @@ versions follow [SemVer](https://semver.org/).
   corrupted by a raycaster running off its tables. Opt-in: nothing changes for
   a project that does not set `smc_imm`. (#39)
 
+### Changed
+- lift32_cpu: `fs:` operands emit `FS_RD*`/`FS_WR*` macros (cpu.h) instead of
+  the MSVC `__readfsdword`/`__writefsdword` intrinsics directly. The macros
+  resolve at compile time: MSVC still reads the real segment (unchanged), while
+  gcc/clang (or any build with `RECOMP_FS_SIMULATED`) reads a host-provided
+  simulated TIB at `c->fs_base`, a new `CPU` field. This lets SEH prologues lift
+  once and build for either host, which the CPU-struct (reentrant) model needs
+  for a non-Windows host; it mirrors the global-register model's existing
+  `FS_BASE`/`g_fs_base` simulated-TIB design (`recomp_types.h`), extended to the
+  per-thread CPU struct. `cpu_selftest.c` round-trips fs:[0]/[4]/[6]/[0x18] on
+  the simulated path. (#27)
+
 ### Fixed
 - lift32/recomp32: `jp`/`jnp` (and `setp`/`setnp`) evaluated at runtime read
   parity. A jcc at a join point (a branch target, or any instruction of a

@@ -24,7 +24,9 @@ Also here and not in lift32.py:
     load base. `mov dl, [ecx + 0x56d902]` is a table lookup at an absolute
     address just as much as `mov eax, [0x58d428]` is - the presence of a base
     register says nothing about it, and the reloc table is the authority.
-  * `fs:` segment access -> __readfsdword/__writefsdword, so SEH prologues work.
+  * `fs:` segment access -> FS_RD*/FS_WR* macros (cpu.h), so SEH prologues work
+    on MSVC (real segment) and on gcc/clang (a host-provided simulated TIB at
+    c->fs_base) from the same lift.
   * x87 FPU as a register stack of doubles.
 
 Usage:
@@ -350,10 +352,10 @@ class Lifter:
 
     def rd(self, insn, op):
         sz = op.size
-        if self.seg_name(op) == "fs":   # TIB-relative (SEH chain etc.) -> real fs
+        if self.seg_name(op) == "fs":   # TIB-relative (SEH chain etc.); FS_* picks real vs simulated TIB
             off = self.seg_off(insn, op)
             if sz not in (1, 2, 4): raise self._bad_size(insn, op, "rd fs:")
-            return {1:f"__readfsbyte({off})",2:f"__readfsword({off})",4:f"__readfsdword({off})"}[sz]
+            return {1:f"FS_RD8(c, {off})",2:f"FS_RD16(c, {off})",4:f"FS_RD32(c, {off})"}[sz]
         a = self.addr_expr(insn, op)
         if sz not in (1, 2, 4): raise self._bad_size(insn, op, "rd")
         return {1:f"rd8({a})", 2:f"rd16({a})", 4:f"rd32({a})"}[sz]
@@ -363,8 +365,8 @@ class Lifter:
         if self.seg_name(op) == "fs":
             off = self.seg_off(insn, op)
             if sz not in (1, 2, 4): raise self._bad_size(insn, op, "wr fs:")
-            return {1:f"__writefsbyte({off}, {val});",2:f"__writefsword({off}, (unsigned short)({val}));",
-                    4:f"__writefsdword({off}, {val});"}[sz]
+            return {1:f"FS_WR8(c, {off}, {val});",2:f"FS_WR16(c, {off}, {val});",
+                    4:f"FS_WR32(c, {off}, {val});"}[sz]
         a = self.addr_expr(insn, op)
         if sz not in (1, 2, 4): raise self._bad_size(insn, op, "wr")
         return {1:f"wr8({a}, {val});", 2:f"wr16({a}, {val});", 4:f"wr32({a}, {val});"}[sz]
