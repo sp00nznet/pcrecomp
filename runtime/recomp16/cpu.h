@@ -577,6 +577,22 @@ static inline int cc_ge(CPU *cpu) { return sf(cpu) == of(cpu); } /* greater-or-e
 static inline int cc_le(CPU *cpu) { return zf(cpu) || (sf(cpu) != of(cpu)); } /* less-or-equal */
 static inline int cc_g(CPU *cpu)  { return !zf(cpu) && (sf(cpu) == of(cpu)); } /* greater */
 
+/* A conditional jump whose opcode the program rewrites at run time: the
+ * condition is the low nibble of 7x (short) or 0F 8x (near). */
+static inline int cc_dyn(CPU *cpu, uint8_t opcode)
+{
+    switch (opcode & 0x0F) {
+    case 0x0: return cc_o(cpu);  case 0x1: return cc_no(cpu);
+    case 0x2: return cc_b(cpu);  case 0x3: return cc_ae(cpu);
+    case 0x4: return cc_e(cpu);  case 0x5: return cc_ne(cpu);
+    case 0x6: return cc_be(cpu); case 0x7: return cc_a(cpu);
+    case 0x8: return cc_s(cpu);  case 0x9: return cc_ns(cpu);
+    case 0xA: return cc_p(cpu);  case 0xB: return cc_np(cpu);
+    case 0xC: return cc_l(cpu);  case 0xD: return cc_ge(cpu);
+    case 0xE: return cc_le(cpu); default:  return cc_g(cpu);
+    }
+}
+
 /* ---------- CPU lifecycle ---------- */
 
 /* Initialize CPU state */
