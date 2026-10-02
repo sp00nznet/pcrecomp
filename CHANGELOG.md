@@ -5,6 +5,33 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- `tools/lift/translator.py` (`python -m tools … --all`) now seeds the PE entry
+  point and every export into function discovery. disasm32's `find_functions`
+  already took a `seeds` list — "the PE entry point above all" — but the default
+  pipeline never passed it, so when a CRT entry opened with `mov eax, fs:[0]`
+  (the SEH prologue) the prologue scan seeded the inner `push ebp` six bytes in
+  and the real entry VA was never lifted: a host calling the entry found no
+  function there. Fury³'s entry `0x00452BE1` was recovered only as `0x00452BE7`
+  until this; now the entry and exports are always in the catalog. (#34)
+
+### Added
+- `runtime/win32hle/`: a permissive bind for bringing up a new title. `host.c`
+  gains `recomp_host_boot_permissive`, and `hle_resolve_or_stub` binds an
+  unresolved import to a self-naming stub instead of failing the boot. A stdcall
+  import can't be a silent no-op (it wouldn't pop its args and the stack would
+  drift), so the stub names itself from the last-dispatched VA and stops when
+  first *called* — giving the exact import the running program reached and its
+  caller. The bring-up loop: run, see the import, implement it, rerun. (#34)
+- `runtime/win32hle/kernel32_crt.c`: the KERNEL32 imports an MSVC C runtime
+  calls between the PE entry and WinMain — `GetStdHandle`/`GetFileType`, the ANSI
+  codepage/locale queries (`GetACP`/`GetCPInfo`/`GetStringType*`), the
+  environment block, `GetModuleFileNameA`/`GetCurrentDirectoryA`,
+  `MultiByteToWideChar`/`WideCharToMultiByte`, `GlobalMemoryStatus`, and the
+  SEH/error hooks (`SetUnhandledExceptionFilter`, `RtlUnwind` as a no-op). With
+  these plus `kernel32_ext`, a lifted Fury³ runs its whole CRT startup on Linux
+  and reaches its own WinMain (first unmet call there: `FindWindowA`). (#34)
+
 ### Added
 - lift16: self-modifying code. `Lifter.smc_imm` is the set of linear addresses
   the program writes into its own code; an immediate overlapping one is read
