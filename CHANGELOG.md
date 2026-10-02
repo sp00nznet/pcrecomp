@@ -26,6 +26,12 @@ versions follow [SemVer](https://semver.org/).
   Stone's wall scaler loads its texture segment into GS and every texel was
   read from the wrong segment. (#?)
 
+- recomp16 `cpu.h`: SI, DI, BP and SP are unions with ESI, EDI, EBP and ESP. A
+  386 running 16-bit code uses the 32-bit forms with an operand-size prefix
+  (the Wolfenstein-family raycasters step EBP/EDX through their column loops);
+  lift16 already emitted them and the struct had no such members. Writing the
+  16-bit half leaves the top half alone, as on the hardware. (#?)
+
 ### Fixed
 - disasm32: a call target is kept only while a body that calls it is still an
   entry, re-derived each round of the drop. #14 took its `keep` set from every

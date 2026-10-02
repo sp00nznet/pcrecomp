@@ -47,11 +47,15 @@ typedef struct CPU {
     union { struct { uint8_t cl, ch; }; uint16_t cx; uint32_t ecx; };
     union { struct { uint8_t dl, dh; }; uint16_t dx; uint32_t edx; };
 
-    /* Index and pointer registers */
-    uint16_t si;
-    uint16_t di;
-    uint16_t bp;
-    uint16_t sp;
+    /* Index and pointer registers. A 386 running 16-bit code can use the
+     * 32-bit forms with an operand-size prefix, and engines written for one
+     * do -- the JAM/Wolf3D-family raycasters step ESI/EDI/EBP through their
+     * column loops. Writing the 16-bit half leaves the top half alone, as on
+     * the hardware. */
+    union { uint16_t si; uint32_t esi; };
+    union { uint16_t di; uint32_t edi; };
+    union { uint16_t bp; uint32_t ebp; };
+    union { uint16_t sp; uint32_t esp; };
 
     /* Segment registers */
     uint16_t cs;
