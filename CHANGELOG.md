@@ -79,6 +79,17 @@ versions follow [SemVer](https://semver.org/).
   started; SimCity 2000's CRT memcpy lifted the same garbage. Bunghole in
   One, Civilization III and The Movies are unchanged, function for function.
   (#24)
+
+- disasm32: a candidate in the `nop`/`int3` padding before a 16-byte boundary
+  is moved to the function at the boundary. A raw-scan candidate (an `E8` byte
+  inside another instruction, a pointer-shaped dword) landing in the padding
+  decoded as a function that walked into the real one and owned its
+  instructions, so the real start was `covered` and even a data table naming it
+  exactly could not make it an entry. Yuri's Revenge: 516 entries started in
+  padding and 66 real functions were missing, among them a static constructor
+  `_initterm` calls and a method only a data table names; after, 2 and 0, and
+  the catalog run is 15 min instead of 17.
+
 - disasm32: a call target is kept only while a body that calls it is still an
   entry, re-derived each round of the drop. #14 took its `keep` set from every
   decoded body, garbage included, before any were dropped: in Bunghole in
