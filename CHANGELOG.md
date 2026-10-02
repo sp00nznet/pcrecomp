@@ -88,7 +88,7 @@ versions follow [SemVer](https://semver.org/).
   exactly could not make it an entry. Yuri's Revenge: 516 entries started in
   padding and 66 real functions were missing, among them a static constructor
   `_initterm` calls and a method only a data table names; after, 2 and 0, and
-  the catalog run is 15 min instead of 17.
+  the catalog run is 15 min instead of 17. (#32)
 
 - disasm32: a call target is kept only while a body that calls it is still an
   entry, re-derived each round of the drop. #14 took its `keep` set from every
