@@ -57,6 +57,16 @@ versions follow [SemVer](https://semver.org/).
     both went, and the game called a function nothing had lifted.
   - A branch out of the image no longer crashes the interior walk
     (`read_bytes` returns None there).
+
+- lift/generate: a jump-table entry never points into its own table. The
+  negative-index read below `jmp [reg*4 + table]` (#11, CRT memcpy) took the
+  dword just under an inline table, which for MSVC 2's table-after-the-jmp
+  layout is the jmp's own displacement: the table's address. The table was
+  walked as code and the body lifted two interleaved decodes, so a `call`
+  returned into the middle of its own bytes. Hover! faulted as level 1
+  started; SimCity 2000's CRT memcpy lifted the same garbage. Bunghole in
+  One, Civilization III and The Movies are unchanged, function for function.
+  (#24)
 - disasm32: a call target is kept only while a body that calls it is still an
   entry, re-derived each round of the drop. #14 took its `keep` set from every
   decoded body, garbage included, before any were dropped: in Bunghole in
