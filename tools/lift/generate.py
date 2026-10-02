@@ -292,6 +292,24 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
     targets = {t for i in instructions if i.is_jump
                for t in [i.get_branch_target()] if t is not None}
 
+    # A gap inside the body: instruction k can fall through, but the next one
+    # emitted is not at its end, because the extent walk stopped there (a
+    # catalog entry right after a `call` reads as a noreturn call) or a later
+    # pass resumed below it. The C would run straight on into the next emitted
+    # block. Yuri's Revenge's init lost an inline strcat and the rest of a loop
+    # that way: `call sprintf` at 0x0052C438, a false entry at 0x0052C43D, and
+    # the C went on at 0x0052C4C0 with an empty CD search path. So fall
+    # through the way the CPU does: to a label if the address is in this body,
+    # else as a tail call to it.
+    addrs = {i.address for i in instructions}
+    gaps = {}
+    for k in range(len(instructions) - 1):
+        cur, nxt_i = instructions[k], instructions[k + 1]
+        if (nxt_i.address != cur.end_address and not cur.is_ret and not cur.is_uncond_jump
+                and cur.mnemonic not in ('int3', 'hlt')):
+            gaps[k] = cur.end_address
+    leaders = set(leaders) | {a for a in gaps.values() if a in addrs}
+
     skip = False
     for k, insn in enumerate(instructions):
         if label_all or insn.address in leaders:
@@ -316,6 +334,10 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
             continue
         for line in lifter.lift_instruction(insn):
             lines.append(f'    {line}')
+        if k in gaps:
+            t = gaps[k]
+            lines.append(f'    goto L_{t:08X}; /* falls through past a gap */' if t in addrs else
+                         f'    RECOMP_ITAIL(0x{t:08X}u); return; /* falls through past a gap */')
 
     # A body that runs off its end falls through into whatever the catalog
     # starts there -- typically an epilogue MSVC shares between two paths and
@@ -661,6 +683,17 @@ def _selftest():
     i4, l4 = linear_disassemble_function(md, fall, base, base, base + len(fall))
     out4 = lift_function_linear(Lifter(iat_map={}), 'sub_00401000', i4, l4, base)
     assert 'RECOMP_ITAIL(0x00401003u); { RECOMP_REGS_OUT(); return; } /* falls through */' in out4, out4
+
+    # ...and so must a gap in the MIDDLE of a body. The walk reached the call
+    # and the ret but not the nop between (the shape of a false catalog entry
+    # right after a call); the call must not run on into the ret.
+    #   1000 call 1006 / 1005 nop / 1006 ret
+    mid = bytes([0xE8, 0x01, 0x00, 0x00, 0x00, 0x90, 0xC3])
+    i5, l5 = linear_disassemble_function(md, mid, base, base, base + len(mid),
+                                         reached={base, base + 6})
+    assert [i.address - base for i in i5] == [0, 6], [hex(i.address) for i in i5]
+    out5 = lift_function_linear(Lifter(iat_map={}), 'sub_00401000', i5, l5, base)
+    assert 'RECOMP_ITAIL(0x00401005u); { RECOMP_REGS_OUT(); return; } /* falls through past a gap */' in out5, out5
 
     # ...and trailing int3 padding still ends the body: the first one is
     # emitted (it lifts to a trap, which is correct for unreachable filler) and
