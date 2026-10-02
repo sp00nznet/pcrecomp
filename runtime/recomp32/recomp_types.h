@@ -11,6 +11,7 @@
 #define RECOMP_TYPES_H
 
 #include <stdint.h>
+#include <stddef.h>   /* ptrdiff_t (g_mem_base); MSVC pulls it in transitively, gcc/clang do not */
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
