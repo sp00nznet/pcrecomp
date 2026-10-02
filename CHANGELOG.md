@@ -30,6 +30,33 @@ versions follow [SemVer](https://semver.org/).
   AF for 8- and 16-bit results: difftest's `WIDTH` divergences (11 cases) and
   both x87 parity ones now match, 202/202 with two new join-point cases.
 
+
+- disasm32: a catalog good enough to lift from without IDA. Scored against
+  IDA on SimCity 2000 (Win95, MSVC 2.x + static MFC): precision 54.5% ->
+  87.4% at the same recall (88.2%), exact ends 80% -> 84%. The game lifts
+  from this catalog alone with no lift errors; see the PR for the city runs.
+  - The interior walk of `drop_mid_instruction_entries` follows a switch's
+    table: a scan hit on the last byte of an instruction in an arm survived,
+    clamped CRT `__output` to 164 bytes and stalled the game before its first
+    frame. `table_entries` is now shared with recursive descent.
+  - `interior_starts`: a linear-scan candidate that another body falls into,
+    branches to conditionally, or reaches through its own switch table is a
+    label, and becomes an alias instead of cutting that body short. A target
+    reached only by `jmp` (a tail call, a thunk) or after a `call` stays a start.
+  - `eh_entries`: MSVC C++ handler stubs (`mov eax, FuncInfo; jmp`) and the
+    unwind funclets and catch handlers their FuncInfo names are aliases of the
+    function that installs them -- 1,933 of the 2,220 remaining splits.
+  - Entries on int3 padding that only a pointer-shaped constant named are
+    dropped (330).
+  - The CLI now runs `close_dispatch_targets` after clamping, extended to
+    switch arms and told which addresses are inside a known instruction, so
+    every branch target in the catalog has a body.
+  - `drop_mid_instruction_entries` counts only bodies that survive the round
+    as evidence: a bogus entry inside one jump thunk decoded over the next,
+    real thunk (named by `push offset` to the vector-constructor iterator),
+    both went, and the game called a function nothing had lifted.
+  - A branch out of the image no longer crashes the interior walk
+    (`read_bytes` returns None there).
 - disasm32: a call target is kept only while a body that calls it is still an
   entry, re-derived each round of the drop. #14 took its `keep` set from every
   decoded body, garbage included, before any were dropped: in Bunghole in

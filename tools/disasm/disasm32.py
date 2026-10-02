@@ -4,6 +4,7 @@ Uses Capstone to disassemble code, build basic blocks, and identify
 function boundaries via recursive descent.
 """
 
+import re
 import struct
 from dataclasses import dataclass, field
 from typing import Optional
@@ -169,6 +170,43 @@ class Function:
     @property
     def num_instructions(self) -> int:
         return sum(len(b.instructions) for b in self.blocks.values())
+
+
+def table_entries(read, table, is_code, limit=256):
+    """The code addresses in a jump table at `table`, read with read(va, n).
+
+    Stop at the first entry that is not a code address -- that is where the
+    table ends. Shared by recursive descent and by the interior walk in
+    drop_mid_instruction_entries, which must reach the same switch arms.
+    """
+    out = []
+    misses = 0
+    for k in range(limit):
+        raw = read(table + k * 4, 4)
+        if not raw or len(raw) < 4:
+            break
+        tgt = int.from_bytes(raw, 'little')
+        if is_code(tgt):
+            out.append(tgt)
+            misses = 0
+            continue
+        # The entries do not always begin exactly at the displacement: the
+        # index can be biased, or alignment padding sits in front of the
+        # table (memcpy's [eax*4 + 0x49E140] really starts at 0x49E144, and
+        # slot 0 reads as the tail of the preceding instruction). Stopping
+        # at the first non-code slot therefore finds nothing at all for such
+        # a table. Tolerate a couple, and end the table only once entries
+        # have actually been seen.
+        misses += 1
+        if out and misses >= 2:
+            break
+        if not out and misses >= 4:
+            break
+    return out
+
+
+# `jmp dword ptr [idx*4 + table]`; with a base register the disp is not the table
+_TABLE_JMP = re.compile(r"dword ptr \[\w+\*4 \+ (0x[0-9a-f]+)\]$")
 
 
 class Disassembler:
@@ -343,31 +381,8 @@ class Disassembler:
         op = insn.operands[0]
         if op.type != X86_OP_MEM or op.mem.scale != 4 or not op.mem.index:
             return []
-        table = op.mem.disp & 0xFFFFFFFF
-        out = []
-        misses = 0
-        for k in range(limit):
-            raw = self.read_bytes(table + k * 4, 4)
-            if not raw or len(raw) < 4:
-                break
-            tgt = int.from_bytes(raw, 'little')
-            if self.is_code_address(tgt):
-                out.append(tgt)
-                misses = 0
-                continue
-            # The entries do not always begin exactly at the displacement: the
-            # index can be biased, or alignment padding sits in front of the
-            # table (memcpy's [eax*4 + 0x49E140] really starts at 0x49E144, and
-            # slot 0 reads as the tail of the preceding instruction). Stopping
-            # at the first non-code slot therefore finds nothing at all for such
-            # a table. Tolerate a couple, and end the table only once entries
-            # have actually been seen.
-            misses += 1
-            if out and misses >= 2:
-                break
-            if not out and misses >= 4:
-                break
-        return out
+        return table_entries(self.read_bytes, op.mem.disp & 0xFFFFFFFF,
+                             self.is_code_address, limit)
 
     def disassemble_function(self, start_va: int, iat_map: dict = None) -> Optional[Function]:
         """
@@ -804,10 +819,123 @@ class Disassembler:
             if a not in sizes:
                 del functions[a]
 
+        # An entry on int3 is alignment padding that a pointer-shaped constant
+        # happened to name (330 in SimCity 2000). The probe passed it because
+        # the padding runs into the next function, which does reach a `ret`.
+        pad = [a for a, f in functions.items()
+               if a not in callers and a not in seeds and self.read_bytes(a, 1) == bytes([0xCC])]
+        for a in pad:
+            del functions[a]
+        if pad:
+            print(f"[*] Dropped {len(pad)} entries that start in int3 padding")
+
+        inner = interior_starts(functions, protected=set(callers) | set(seeds), weak=weak)
+        eh = {a for a in eh_entries(self.read_bytes, code_start, code_end)
+              if a in functions and a not in seeds and functions[a].entry_kind == "start"}
+        for a in inner | eh:
+            functions[a].entry_kind = "alias"
+        if inner:
+            print(f"[*] {len(inner)} scan candidates are labels inside another body: aliases")
+        if eh - inner:
+            print(f"[*] {len(eh - inner)} C++ EH stubs and funclets: aliases of the function that installs them")
+
         moved = clamp_extents(functions, code_end)
         if moved:
             print(f"[*] Clamped {moved} function extents to the next function start")
+
+        # Clamping cut some bodies short of their own branch targets, and the
+        # lifter dispatches to a target outside the extent: each needs a body.
+        sizes = {a: f.size for a, f in functions.items()}
+        added = set()
+        close_dispatch_targets(lambda va, n: self.read_bytes(va, n), sizes,
+                               code_start, code_end, aliases=added,
+                               inside=lambda va: interior[va - code_start] == 1)
+        for t in sorted(added):
+            f = _add_func(t, "alias")
+            if f is not None:
+                f.end, f.size = t + sizes[t], sizes[t]
         return functions
+
+
+def eh_entries(read, code_start, code_end):
+    """MSVC C++ exception-handling code: handler stubs and unwind funclets.
+
+    A function with destructors to run on unwind installs a handler stub,
+    `mov eax, offset FuncInfo; jmp ___CxxFrameHandler`, and FuncInfo's unwind
+    map and catch blocks name the funclets (`mov ecx, [ebp-0x14]; jmp ~T`).
+    All of it sits after the function's `ret` and is reachable only through
+    those tables, so it has to be an entry -- but it is part of the function
+    that installed the handler, not a function of its own. In SimCity 2000
+    1,933 of 2,220 "starts inside another function" were exactly this.
+
+    Found by shape: B8 imm32 E9 rel32 whose immediate points at a FuncInfo
+    magic (0x19930520-0x19930522). Returns the stubs and funclets.
+    """
+    text = read(code_start, code_end - code_start) or b""
+    def dword(va):
+        raw = read(va, 4)
+        return int.from_bytes(raw, "little") if raw and len(raw) == 4 else 0
+    out = set()
+    for m in re.finditer(rb"\xB8(.{4})\xE9", text, re.S):
+        fi = int.from_bytes(m.group(1), "little")
+        if dword(fi) not in (0x19930520, 0x19930521, 0x19930522):
+            continue
+        out.add(code_start + m.start())
+        max_state, unwind, n_try, tries = dword(fi + 4), dword(fi + 8), dword(fi + 12), dword(fi + 16)
+        acts = [dword(unwind + 8 * k + 4) for k in range(min(max_state, 4096))]
+        for t in range(min(n_try, 256)):
+            n_catch, catches = dword(tries + 20 * t + 12), dword(tries + 20 * t + 16)
+            acts += [dword(catches + 16 * c + 12) for c in range(min(n_catch, 64))]
+        out.update(a for a in acts if code_start <= a < code_end)
+    return out
+
+
+def interior_starts(functions, protected=frozenset(), weak=frozenset()):
+    """Starts that are really labels inside another function's body.
+
+    The linear scan seeds every `jmp rel32` target and every `push ebp; mov
+    ebp, esp` as a function start, to catch tail calls and uncalled
+    functions. In a big function both fire on ordinary code: SimCity 2000's
+    CRT `__output` jumps back to its switch head 0x0049464E from ten places,
+    and 0x00405106's `push ebp` follows the SEH prologue's `mov eax, fs:[0]`.
+    Each false start then clamps the real function short, so the switch in
+    the first piece dispatches to arms nothing lifted.
+
+    A candidate is a label, not a function, when another body reaches it
+    the way only a function's own code does: its previous instruction falls
+    straight into it, or a conditional jump in that body targets it. An
+    unconditional `jmp` alone is not enough -- that is what a tail call or a
+    jump thunk looks like (0x00401820: jmp 0x00413520, a real function).
+    A fallthrough after a `call` is not either: the call may not return.
+
+    Nor is a function's own switch arm, whatever else vouches for it: the
+    data scan reads the jump table beside the body as code pointers, and
+    MFC's dispatcher 0x004A4B70 came out in five pieces that way.
+
+    `protected` holds entries with their own evidence (called, seeded);
+    those stay starts. `weak` ones, named only by a pointer-shaped value,
+    stay starts too unless they are an arm of the body's own switch.
+    Returns the addresses to make aliases:
+    they keep their bodies, so nothing that jumps to them breaks, but they no
+    longer cut the function around them.
+    """
+    arms = {a for a, f in functions.items()
+            if f.entry_kind == "start" and a not in protected}
+    cands = arms - set(weak)
+    inner = set()
+    for a, f in functions.items():
+        inner |= {t for t in f.jump_targets if t != a and t in arms}
+        ins = sorted((i for b in f.blocks.values() for i in b.instructions),
+                     key=lambda i: i.address)
+        for prev, nxt in zip(ins, ins[1:]):
+            if nxt.address != a and nxt.address in cands and                prev.address + prev.size == nxt.address and                not (prev.is_terminator or prev.is_call or prev.mnemonic == "int3"):
+                inner.add(nxt.address)
+        for i in ins:
+            if i.is_cond_jump and i.op_str.startswith("0x"):
+                t = int(i.op_str, 16)
+                if t != a and t in cands:
+                    inner.add(t)
+    return inner
 
 
 def drop_mid_instruction_entries(read_va, functions, code_start, code_end,
@@ -902,7 +1030,15 @@ def drop_mid_instruction_entries(read_va, functions, code_start, code_end,
 
         So: a worklist. Follow both edges of a conditional branch, follow an
         unconditional one, end a path at `ret` or an indirect jump, then take
-        the next pending target. Bounded by REACH and a visited set, because
+        the next pending target.
+
+        A switch is an indirect jump, but its arms are still this body: follow
+        its table. SimCity 2000's CRT `__output` (0x0049443F) dispatches every
+        printf directive through `jmp [eax*4 + 0x494BF0]`. Ending the path
+        there never reached the arm holding `mov [ebp-0x18], -1` at 0x004944DD,
+        so a scan hit on its last byte (0x004944E3) survived as a start,
+        clamped `__output` to 164 bytes, and the lift's switch dispatched into
+        an address nothing lifted: the game stalled before its first frame. Bounded by REACH and a visited set, because
         over-marking is the only way this can do harm - marking a real function
         start as interior would drop it.
         """
@@ -919,6 +1055,8 @@ def drop_mid_instruction_entries(read_va, functions, code_start, code_end,
                     code = read_va(va, min(WINDOW, code_end - va))
                 except Exception:
                     break
+                if not code:            # read_bytes: None outside the image
+                    break
                 advanced = False
                 for ins in decode(md, code, va):
                     advanced = True
@@ -934,6 +1072,13 @@ def drop_mid_instruction_entries(read_va, functions, code_start, code_end,
                     if m != "call" and m.startswith("j"):
                         op = ins.op_str.strip()
                         t = int(op, 16) if op.startswith("0x") else None
+                        sw = _TABLE_JMP.search(op) if m == "jmp" and t is None else None
+                        if sw:
+                            for arm in table_entries(read_va, int(sw.group(1), 16),
+                                                     lambda v: code_start <= v < code_end):
+                                if addr <= arm < code_end and arm - addr < REACH \
+                                   and arm not in seen:
+                                    pending.append(arm)
                         if t is not None and addr <= t < code_end and \
                            t - addr < REACH and t not in seen:
                             pending.append(t)
@@ -956,18 +1101,28 @@ def drop_mid_instruction_entries(read_va, functions, code_start, code_end,
                      k in keep and k in functions
                      for ins in body_instructions(a)
                      for k in range(ins.address + 1, ins.address + ins.size))}
-        interior = bytearray(max(0, code_end - code_start))
-        for addr in functions:
-            if functions[addr] <= 0 or addr in evict:
-                continue
-            for ins in body_instructions(addr):
-                for k in range(ins.address + 1, ins.address + ins.size):
-                    if code_start <= k < code_end:
-                        interior[k - code_start] = 1
+        def interior_of(skip):
+            marks = bytearray(max(0, code_end - code_start))
+            for addr in functions:
+                if functions[addr] <= 0 or addr in skip:
+                    continue
+                for ins in body_instructions(addr):
+                    for k in range(ins.address + 1, ins.address + ins.size):
+                        if code_start <= k < code_end:
+                            marks[k - code_start] = 1
+            return marks
 
-        bogus = sorted(evict | {a for a in functions
-                                if code_start <= a < code_end and interior[a - code_start]
-                                and a not in keep})
+        def inside(marks):
+            return {a for a in functions
+                    if code_start <= a < code_end and marks[a - code_start] and a not in keep}
+
+        # Only bodies that survive this round count as evidence. SimCity 2000:
+        # 0x004021C9, inside the jump thunk 0x004021C6, decoded `add cl, ch`
+        # over the next thunk 0x004021CB -- a real one, named by `push offset`
+        # to the vector-constructor iterator -- and both went together. The game
+        # then called a function nothing had lifted.
+        first = inside(interior_of(evict))
+        bogus = sorted(evict | (first & inside(interior_of(evict | first))))
         if not bogus:
             break
         for a in bogus:
@@ -998,7 +1153,7 @@ def drop_mid_instruction_entries(read_va, functions, code_start, code_end,
 
 
 def close_dispatch_targets(read_va, functions, code_start, code_end,
-                           aliases=None, max_rounds=3, verbose=True):
+                           aliases=None, max_rounds=3, verbose=True, inside=None):
     """Make every direct branch target dispatchable.
 
     The lifter turns a `jcc`/`jmp`/`call` into a `goto` when the target is
@@ -1016,6 +1171,12 @@ def close_dispatch_targets(read_va, functions, code_start, code_end,
     New entries are aliases: they overlap whatever contains them on purpose,
     and must not be used as clamp limits. Their addresses are added to
     `aliases` if one is given. Returns how many were added.
+
+    The extents are decoded linearly, so a table or constant inside one reads
+    as branches to anywhere. `inside(va)`, if given, says va is inside a known
+    instruction; such a target is never added. SimCity 2000 got 0x0041E956,
+    the third byte of `mov eax, 0x4D75A8`, as an entry whose decode reached
+    `push es` -- and its instructions landed in the code map over the real ones.
     """
     from capstone import Cs, CS_ARCH_X86, CS_MODE_32
     import bisect
@@ -1039,6 +1200,14 @@ def close_dispatch_targets(read_va, functions, code_start, code_end,
             for ins in md.disasm(code, addr):
                 if ins.mnemonic.split()[-1] not in BRANCH:
                     continue
+                sw = _TABLE_JMP.search(ins.op_str) if ins.mnemonic == "jmp" else None
+                if sw:
+                    # A switch arm past a clamp is a dispatch too (MFC's
+                    # 0x004A4B70, cut by chunks it calls, lost 0x004A5025).
+                    for t in table_entries(read_va, int(sw.group(1), 16),
+                                           lambda v: code_start <= v < code_end):
+                        if not (addr <= t < end or t in functions or (inside and inside(t))):
+                            wanted.add(t)
                 for op in ins.operands:
                     if op.type != X86_OP_IMM:
                         continue
@@ -1047,7 +1216,7 @@ def close_dispatch_targets(read_va, functions, code_start, code_end,
                     # address that is already an entry is already dispatchable.
                     if addr <= t < end or t in functions:
                         continue
-                    if code_start <= t < code_end:
+                    if code_start <= t < code_end and not (inside and inside(t)):
                         wanted.add(t)
         if not wanted:
             break
@@ -1332,6 +1501,93 @@ def demo():
     assert n == 1 and 0x1004 in cat and 0x1004 in als, (n, cat, als)
     # ...and the new entry runs to the next one, not past it.
     assert cat[0x1004] == 1, cat
+
+    # interior_starts: a scan candidate that its neighbour's body falls into,
+    # or branches to conditionally, is a label; one reached only by `jmp`
+    # (a tail call, a thunk) or after a `call` stays a function.
+    def _fn(addr, *ins):
+        f = Function(address=addr)
+        f.blocks[addr] = BasicBlock(start=addr, end=ins[-1][0] + ins[-1][1],
+                                    instructions=[Instruction(a, n, m, o, b"") for a, n, m, o in ins])
+        return f
+    fns = {0x1000: _fn(0x1000, (0x1000, 6, "mov", "eax, dword ptr fs:[0]"),
+                       (0x1006, 1, "push", "ebp"),                 # falls in: a label
+                       (0x1007, 2, "ja", "0x1010"),                # jcc: a label
+                       (0x1009, 5, "call", "0x1030"),
+                       (0x100E, 2, "jmp", "0x1020"),               # jmp only: kept
+                       (0x1010, 1, "ret", "")),
+           0x1006: _fn(0x1006, (0x1006, 1, "push", "ebp"), (0x1007, 1, "ret", "")),
+           0x1010: _fn(0x1010, (0x1010, 1, "ret", "")),
+           0x1020: _fn(0x1020, (0x1020, 1, "ret", "")),
+           0x100E: _fn(0x100E, (0x100E, 1, "ret", ""))}           # after a call: kept
+    assert interior_starts(fns) == {0x1006, 0x1010}, interior_starts(fns)
+    assert interior_starts(fns, protected={0x1006}) == {0x1010}
+    # A pointer-shaped value protects a candidate from the fallthrough rule...
+    assert interior_starts(fns, weak={0x1006}) == {0x1010}
+    # ...but not when the value is the body's own switch table.
+    fns[0x1000].jump_targets = {0x1006}
+    assert interior_starts(fns, weak={0x1006}) == {0x1006, 0x1010}
+    assert interior_starts(fns, protected={0x1006}) == {0x1010}
+
+    # A body dropped this round is no evidence against another entry: two
+    # jump thunks, and a bogus entry inside the first whose `add ecx, imm32`
+    # runs over the second (SimCity 2000's 0x004021C9 / 0x004021CB).
+    thunks = bytes([0xE9, 0x00, 0x00, 0x81, 0xC1,        # 0x1000: jmp; 0x1003 reads add ecx, imm32
+                    0xE9, 0x00, 0x00, 0x00, 0x00,        # 0x1005: jmp 0x100A
+                    0xC3])                                # 0x100A: ret
+
+    def _readt(va, n):
+        off = va - 0x1000
+        return thunks[off:off + n] if 0 <= off < len(thunks) else b""
+    cat = {0x1000: 5, 0x1003: 6, 0x1005: 5}
+    drop_mid_instruction_entries(_readt, cat, 0x1000, 0x1000 + len(thunks), verbose=False)
+    assert sorted(cat) == [0x1000, 0x1005], cat
+
+    # eh_entries: a handler stub `mov eax, FuncInfo; jmp`, the FuncInfo's
+    # unwind action and catch handler, and nothing without the magic.
+    eh = {}
+    def _put(va, raw):
+        for k, b in enumerate(raw):
+            eh[va + k] = b
+    _put(0x1000, bytes([0xB8]) + (0x2000).to_bytes(4, "little") + bytes([0xE9, 0, 0, 0, 0]))
+    _put(0x100A, bytes([0xB8]) + (0x2100).to_bytes(4, "little") + bytes([0xE9, 0, 0, 0, 0]))
+    _put(0x2000, b"".join(v.to_bytes(4, "little") for v in
+                          (0x19930520, 1, 0x2040, 1, 0x2060)))          # FuncInfo
+    _put(0x2040, (0xFFFFFFFF).to_bytes(4, "little") + (0x1080).to_bytes(4, "little"))
+    _put(0x2060, b"".join(v.to_bytes(4, "little") for v in (0, 0, 1, 1, 0x2080)))
+    _put(0x2080, b"".join(v.to_bytes(4, "little") for v in (0, 0, 0, 0x1090)))
+    _put(0x2100, (0x12345678).to_bytes(4, "little"))                     # no magic
+
+    def _eh(va, n):
+        return bytes(eh.get(va + k, 0) for k in range(n))
+    assert eh_entries(_eh, 0x1000, 0x1100) == {0x1000, 0x1080, 0x1090}, eh_entries(_eh, 0x1000, 0x1100)
+
+    # A switch arm is still the body: the interior walk follows the table, so
+    # an entry on the last byte of an instruction in an arm is dropped
+    # (SimCity 2000's __output, 0x004944E3).
+    swblob = (bytes([0xFF, 0x24, 0x85, 0x10, 0x10, 0x00, 0x00]) +   # 0x1000: jmp [eax*4 + 0x1010]
+              bytes([0xCC] * 9) +                                     # 0x1007: padding
+              (0x1018).to_bytes(4, "little") * 2 +                    # 0x1010: the table
+              bytes([0xC7, 0x45, 0xE8, 0xFF, 0xFF, 0xFF, 0xFF]) +     # 0x1018: mov [ebp-0x18], -1
+              bytes([0xC3]))                                          # 0x101F: ret
+
+    def _reads(va, n):
+        off = va - 0x1000
+        return swblob[off:off + n] if 0 <= off < len(swblob) else b""
+
+    cat = {0x1000: 0x1E, 0x101E: 2}
+    gone = drop_mid_instruction_entries(_reads, cat, 0x1000, 0x1000 + len(swblob), verbose=False)
+    assert gone == 1 and list(cat) == [0x1000], (gone, cat)
+
+    # A switch arm past the extent gets a body too.
+    cat, als = {0x1000: 7}, set()
+    close_dispatch_targets(_reads, cat, 0x1000, 0x1000 + len(swblob), aliases=als, verbose=False)
+    assert als == {0x1018}, als
+    # ...unless it lands inside a known instruction.
+    cat, als = {0x1000: 7}, set()
+    close_dispatch_targets(_reads, cat, 0x1000, 0x1000 + len(swblob), aliases=als,
+                           verbose=False, inside=lambda va: va == 0x1018)
+    assert als == set(), als
 
     # A branch that stays inside its own extent adds nothing.
     cat = {0x1000: len(jmpblob)}
