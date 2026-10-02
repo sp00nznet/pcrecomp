@@ -40,7 +40,7 @@ versions follow [SemVer](https://semver.org/).
   `x87_emu3e(cpu, fn)`, the runtime owning the table (Blake Stone uses EC sin,
   F0 tan, F2 atan, each beside the 387 path it replaces). lift16 also lifts
   the 387 `fsin`, `fcos` and `fsincos` that Borland's math library takes when
-  a 387 is present; they were `x87_unhandled`. (#?)
+  a 387 is present; they were `x87_unhandled`. (#36)
 
 ### Fixed
 - lift32/recomp32: `jp`/`jnp` (and `setp`/`setnp`) evaluated at runtime read
