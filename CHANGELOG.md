@@ -116,6 +116,20 @@ versions follow [SemVer](https://semver.org/).
   lift16 already emitted them and the struct had no such members. Writing the
   16-bit half leaves the top half alone, as on the hardware. (#38)
 
+- `runtime/win32hle/` full host + user32 message core: `host.c`
+  (`recomp_host_init`/`_boot`/`_run`/`_main`) registers the shim modules, maps a
+  PE and binds its IAT, then calls the lifted entry point, so a lifted 32-bit
+  Windows GUI program boots and runs its own message loop off Windows. `user32.c`
+  is that loop, SDL-free: class/window registries, a message queue, and
+  `RegisterClass`/`CreateWindowEx`/`GetMessage`/`PeekMessage`/`TranslateMessage`/
+  `DispatchMessage`/`PostMessage`/`PostQuitMessage` — `DispatchMessage` calls the
+  window's `WndProc` back as lifted code through `hle_call_guest` (the explicit
+  native→guest path, no exec-fault trampoline). `host_selftest.c` drives a
+  synthetic lifted GUI app — entry → register class → create window → message
+  loop → `WndProc` paints a DIB through gdi32 → quit — all headless under gcc
+  `-m32 -no-pie`, no game binary and no display. Presenting the framebuffer in a
+  real window (SDL2) is the one piece left for a real windowed title. (#30)
+
 - `runtime/win32hle/` PE loader: `recomp_pe_map` maps a 32-bit PE at its
   ImageBase with `mmap` (sections to their VAs, `.bss` zero-filled),
   `recomp_pe_bind` walks the import directory and writes each IAT slot's shim VA
