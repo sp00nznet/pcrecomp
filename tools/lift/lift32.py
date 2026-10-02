@@ -126,6 +126,7 @@ COND_CODE = {
     'ja': 'CC_A', 'jnbe': 'CC_A', 'jae': 'CC_AE', 'jnb': 'CC_AE', 'jnc': 'CC_AE',
     'jb': 'CC_B', 'jnae': 'CC_B', 'jc': 'CC_B', 'jbe': 'CC_BE', 'jna': 'CC_BE',
     'jo': 'CC_O', 'jno': 'CC_NO',
+    'jp': 'CC_P', 'jpe': 'CC_P', 'jnp': 'CC_NP', 'jpo': 'CC_NP',
 }
 
 
@@ -527,15 +528,17 @@ class Lifter:
         that are already there -- no runtime cost, and no change at the hundreds
         of sites that pair a jcc with its setter statically.
 
-        ponytail: PF and AF are the price. Both are read off the bottom of the
-        result -- parity of the low byte, bit 4 -- which is now zeros. Nothing
-        reads them: CMP_P/CMP_NP are already stubs, no BCD instruction is lifted
-        at all, and the only other reader is a PUSHFD round trip, carrying two
-        bits nobody branches on. If a program ever needs real narrow-operand PF,
-        that is when the tuple grows a width.
+        PF and AF are read off the bottom of the result -- parity of the low
+        byte, bit 4 -- which is now zeros. A jcc paired with its setter
+        statically knows the width (_flag_width); one that reads the kind at
+        runtime learns it from the kind itself, FK_NARROW(kind, shift). The
+        MSVC float compare `fnstsw ax; test ah, 5; jp` is a narrow test whose
+        jp lands at runtime whenever the jp is a join point or its function
+        labels every instruction.
         """
         self._flag_seq += 1
         self._flag_width = width      # PF needs it: parity is of the LOW byte
+        self._insn_flag_width = width # ... and so does the kind this instruction writes
         if width >= 32:
             return f"_flag_a = (uint32_t)({a}); _flag_b = (uint32_t)({b});"
         sh = 32 - width
@@ -712,9 +715,13 @@ class Lifter:
     def lift_instruction(self, insn) -> list:
         """Lift one instruction, recording the runtime flag kind if it wrote flags."""
         seq0 = self._flag_seq
+        self._insn_flag_width = 32    # only this instruction's _flag_capture narrows it
         lines = self._lift_instruction(insn)
         if self._flag_seq != seq0 and self._flag_state is not None:
-            lines.append(f"_flag_k = {FLAG_KIND.get(self._flag_state[0], 'FK_CMP')};")
+            fk = FLAG_KIND.get(self._flag_state[0], 'FK_CMP')
+            if self._insn_flag_width < 32:
+                fk = f"FK_NARROW({fk}, {32 - self._insn_flag_width})"
+            lines.append(f"_flag_k = {fk};")
         return lines
 
     def _lift_instruction(self, insn) -> list:
