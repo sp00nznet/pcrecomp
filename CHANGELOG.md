@@ -10,7 +10,7 @@ versions follow [SemVer](https://semver.org/).
   decoding the format rather than running the stub. `test_unlzexe.py` builds a
   packed file with a small encoder (literals, short and long matches, an
   extended length, a delta-coded relocation table) and checks the round trip.
-  Blake Stone's two executables both ship packed. (#?)
+  Blake Stone's two executables both ship packed. (#35)
 
 - decode16/lift16: Borland's 8087-emulator `INT 3Eh` shortcuts. `CD 3E xx 90`
   is the emulator's own transcendental call -- a function byte and a pad -- not
