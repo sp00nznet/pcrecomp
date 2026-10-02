@@ -5,6 +5,17 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- lift16: self-modifying code. `Lifter.smc_imm` is the set of linear addresses
+  the program writes into its own code; an immediate overlapping one is read
+  from guest memory at run time instead of becoming a C constant, and a
+  conditional jump whose opcode byte is in it takes its condition from the byte
+  in memory (`cc_dyn` in `recomp16/cpu.h`). Blake Stone's wall scaler patches
+  its step into `add edx, 12345678h`, and its raycaster flips `jge`/`jle` per
+  view quadrant; lifted as constants the walls were noise and actors were
+  corrupted by a raycaster running off its tables. Opt-in: nothing changes for
+  a project that does not set `smc_imm`. (#?)
+
 ### Fixed
 - disasm32: a call target is kept only while a body that calls it is still an
   entry, re-derived each round of the drop. #14 took its `keep` set from every
