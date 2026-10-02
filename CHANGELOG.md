@@ -116,6 +116,23 @@ versions follow [SemVer](https://semver.org/).
   lift16 already emitted them and the struct had no such members. Writing the
   16-bit half leaves the top half alone, as on the hardware. (#38)
 
+- `runtime/win32hle/`: an *implemented* Win32-subset host for recomp32
+  (global-register) lifted code, on libc/POSIX/SDL2, so a lifted 32-bit Windows
+  program can run off Windows (Linux first). Where `native32` forwards a guest's
+  imports to the real Win32 API — and so is Windows-only — win32hle answers them
+  itself. It reuses native32's shim ABI (an import is a `recomp_func_t` that
+  reads its stdcall args from `g_esp` and pops them), so there is no inline asm;
+  native→guest calls go through an explicit `hle_call_guest`, so there is no
+  exec-fault trampoline either. The spine (`host_lite.c`) owns the register
+  file, a pthread machine lock, each thread's simulated TIB (`g_fs_base`), and
+  the shim registry. `kernel32.c` covers process/module/heap/VirtualAlloc/time/
+  error/`lstr*`; `gdi32.c` the software-renderer seam (`CreateDIBSection` +
+  `StretchDIBits` into a host framebuffer, 32bpp). `win32hle_selftest.c` drives
+  a synthetic lifted guest through all of it headless under gcc `-m32` (guest→
+  shim, pointer args, the TIB, a native→guest callback, and a DIB blit).
+  user32+SDL2 present and a PE loader are the next pieces (see README). The
+  counterpart of `runtime/nextstep/`, which already hosts recomp32 off Windows. (#28)
+
 ### Fixed
 - recomp32_cpu `cpu.h`: `wrf80` (store x87 register as 80-bit `tbyte`) dropped
   the sign bit of negative zero. The branch chain fell through to the implicit
