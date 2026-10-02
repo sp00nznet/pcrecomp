@@ -34,6 +34,14 @@ versions follow [SemVer](https://semver.org/).
   extended length, a delta-coded relocation table) and checks the round trip.
   Blake Stone's two executables both ship packed. (#35)
 
+- decode16/lift16: Borland's 8087-emulator `INT 3Eh` shortcuts. `CD 3E xx 90`
+  is the emulator's own transcendental call -- a function byte and a pad -- not
+  an interrupt followed by `repnz nop`; decoded as `emu3e` and lifted to
+  `x87_emu3e(cpu, fn)`, the runtime owning the table (Blake Stone uses EC sin,
+  F0 tan, F2 atan, each beside the 387 path it replaces). lift16 also lifts
+  the 387 `fsin`, `fcos` and `fsincos` that Borland's math library takes when
+  a 387 is present; they were `x87_unhandled`. (#36)
+
 ### Fixed
 - lift32/recomp32: `jp`/`jnp` (and `setp`/`setnp`) evaluated at runtime read
   parity. A jcc at a join point (a branch target, or any instruction of a
