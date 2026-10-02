@@ -10,7 +10,7 @@ versions follow [SemVer](https://semver.org/).
   386 running 16-bit code uses the 32-bit forms with an operand-size prefix
   (the Wolfenstein-family raycasters step EBP/EDX through their column loops);
   lift16 already emitted them and the struct had no such members. Writing the
-  16-bit half leaves the top half alone, as on the hardware. (#?)
+  16-bit half leaves the top half alone, as on the hardware. (#38)
 
 ### Fixed
 - disasm32: a call target is kept only while a body that calls it is still an
