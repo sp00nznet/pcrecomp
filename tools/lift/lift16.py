@@ -249,6 +249,32 @@ class Lifter:
                 if op and op.type == OpType.IMM16:
                     op.disp = (op.disp + self.load_seg) & 0xFFFF
 
+        # Self-modified immediates. Hand-written inner loops patch constants
+        # into their own instructions before running them -- the JAM wall
+        # scaler stores its per-column step into an `add edx, imm32` with
+        # `mov cs:[imm], edx` -- so a constant lifted as a C literal is the
+        # placeholder the programmer typed (often 12345678h), not the value.
+        # `smc_imm` holds the linear addresses something writes to; an
+        # immediate overlapping one is read from guest memory instead. The
+        # immediate is always an instruction's trailing bytes.
+        smc = getattr(self, 'smc_imm', None)
+        if smc and _CODE_SEG is not None:
+            for op in (op1, op2, op3):
+                if op is None or op.type not in (OpType.IMM8, OpType.IMM16, OpType.IMM32):
+                    continue
+                n = {OpType.IMM8: 1, OpType.IMM16: 2, OpType.IMM32: 4}[op.type]
+                opc = inst.raw.lstrip(bytes([0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65, 0x66, 0x67, 0xF2, 0xF3]))[:1]
+                sext = opc in (b'\x83', b'\x6b', b'\x6a')    # imm8, widened by the CPU
+                if sext:
+                    n = 1
+                at = inst.offset + inst.length - n
+                if not any(a in smc for a in range(at, at + n)):
+                    continue
+                if sext:
+                    raise ValueError(f'self-modified sign-extended imm8 at {inst.offset:X}')
+                op.type, op.seg, op.base, op.index = OpType.MEM, 'cs', '', ''
+                op.disp, op.size = (at - int(_CODE_SEG, 16) * 16) & 0xFFFF, n
+
         # The source operand of a string instruction is DS:SI *by default* and
         # takes a segment override like any other memory reference; the ES:DI
         # destination cannot be overridden. Ignoring the prefix turns `es lodsb`
@@ -695,15 +721,25 @@ class Lifter:
                 'jl': 'cc_l', 'jge': 'cc_ge', 'jle': 'cc_le', 'jg': 'cc_g',
             }
             target = op1.disp
-            cc = CC_MAP[m]
+            cond = f'{CC_MAP[m]}(cpu)'
+            # A self-modified condition: the code rewrites this branch's
+            # opcode (Wolf3D-family raycasters flip jge/jle per view quadrant
+            # with `mov byte cs:[x], 7Dh`), so decode the condition at run time
+            # from the byte actually in memory. Only the opcode changes; the
+            # target stays put.
+            smc = getattr(self, 'smc_imm', None)
+            opc_at = inst.offset + (1 if inst.raw[:1] == bytes([0x0F]) else 0)
+            if smc and _CODE_SEG is not None and opc_at in smc:
+                ip = (opc_at - int(_CODE_SEG, 16) * 16) & 0xFFFF
+                cond = f'cc_dyn(cpu, mem_read8(cpu, {_cseg()}, 0x{ip:04X}))'
             if target in self.valid_addrs:
                 self.labels_needed.add(target)
                 self._tick_back_edge(inst, target)
-                self._emit(f'if ({cc}(cpu)) goto {_label(target, self.func_name)};', orig)
+                self._emit(f'if ({cond}) goto {_label(target, self.func_name)};', orig)
             else:
                 # Conditional tail jump to another function.
                 abs_t = func_start + target
-                self._emit(f'if ({cc}(cpu)) {{ {self._tail_jump(abs_t)} }} '
+                self._emit(f'if ({cond}) {{ {self._tail_jump(abs_t)} }} '
                            f'/* tail-jcc 0x{abs_t:06X} */', orig)
 
         elif m == 'loop':
