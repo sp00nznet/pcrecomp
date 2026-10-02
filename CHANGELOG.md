@@ -28,6 +28,12 @@ versions follow [SemVer](https://semver.org/).
   per-thread CPU struct. `cpu_selftest.c` round-trips fs:[0]/[4]/[6]/[0x18] on
   the simulated path. (#27)
 
+- `tools/drm/unlzexe.py`: LZEXE 0.90/0.91 unpacking for DOS MZ executables, by
+  decoding the format rather than running the stub. `test_unlzexe.py` builds a
+  packed file with a small encoder (literals, short and long matches, an
+  extended length, a delta-coded relocation table) and checks the round trip.
+  Blake Stone's two executables both ship packed. (#?)
+
 ### Fixed
 - lift32/recomp32: `jp`/`jnp` (and `setp`/`setnp`) evaluated at runtime read
   parity. A jcc at a join point (a branch target, or any instruction of a

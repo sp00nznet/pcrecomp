@@ -143,6 +143,7 @@ or IDA, whatever the architecture.
 | `ghidra/*.java` | Headless: decompile everything or by address, export functions, stats, xrefs, range disassembly, function bounds |
 | `ida/ida_funcs.py`, `ida_export.py`, `ida_xrefs.py`, `ida_probe_segs.py` | Headless: function catalog with FLIRT flags, instruction-head code map, call graph + import use + FPU density, segment probe |
 | `drm/safedisc_dump.py`, `inject_and_run.c` | Dump SafeDisc-decrypted `.text` from a running process; a version.dll injector for SafeDiscLoader2 |
+| `drm/unlzexe.py` | Undo LZEXE 0.90/0.91 on a DOS MZ executable -- decoded directly, nothing is run; `test_unlzexe.py` packs a file to check it |
 | `drm/emu_unpack.py` | Unpack a compressed PE32 (PECompact 2.x, and Valve's Steam2 wrapper built on it) by running its stub under Unicorn to the OEP, then rebuild the import table. Headless: nothing is launched |
 | `assets/extract_wise.py`, `isextract.py`, `extract_cab.sh`, `pk3_inspect.py`, `bin2iso.js` | Wise and InstallShield installers, CABs, PK3/ZIP, BIN/CUE -> ISO |
 | `assets/iso_peek.py` | Read an ISO's directory, locally or **over HTTP range requests**, and pull one file out without downloading the image |
@@ -469,6 +470,15 @@ python tools/drm/emu_unpack.py --selftest
 An unknown call from the stub stops the run and names the import; add it to
 `APIS` in the script. Steam2-era titles (2004-2008) call `steam.dll`'s
 `SteamStartup` / `SteamIsAppSubscribed` from the stub, and those are answered.
+
+### "The DOS exe says LZ91 at offset 1Ch"
+
+```bash
+# LZEXE-packed (id, Apogee and JAM shipped through it). Writes a plain MZ
+# with the original relocation table, ready for decode16/analyze.
+python tools/drm/unlzexe.py PACKED.EXE unpacked.exe
+python tools/drm/test_unlzexe.py
+```
 
 ### "It's a Wise installer and I want the files out"
 
