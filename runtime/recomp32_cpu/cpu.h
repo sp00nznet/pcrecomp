@@ -646,10 +646,12 @@ static inline void wrf80(uint32_t a, double v)
         if (v < 0) se |= 0x8000;
     } else if (v != 0.0) {
         int e;
-        double m = frexp(v < 0 ? -v : v, &e);        /* m in [0.5, 1) */
+        double m = frexp(signbit(v) ? -v : v, &e);   /* m in [0.5, 1) */
         mant = (uint64_t)ldexp(m, 64);
         se = (uint16_t)((e - 1 + 16383) & 0x7FFF);
-        if (v < 0) se |= 0x8000;
+        if (signbit(v)) se |= 0x8000;
+    } else if (signbit(v)) {
+        se = 0x8000;                                 /* -0.0: mantissa 0, sign set */
     }
     memcpy(b, &mant, 8);
     memcpy(b + 8, &se, 2);

@@ -117,6 +117,22 @@ versions follow [SemVer](https://semver.org/).
   16-bit half leaves the top half alone, as on the hardware. (#38)
 
 ### Fixed
+- recomp32_cpu `cpu.h`: `wrf80` (store x87 register as 80-bit `tbyte`) dropped
+  the sign bit of negative zero. The branch chain fell through to the implicit
+  zero case for `-0.0` (since `-0.0 == 0.0` in C) and wrote a sign+exponent
+  word of 0, where the hardware writes `0x8000`. Now the sign is taken with
+  `signbit()`, which distinguishes `-0.0`, in both the normal and zero paths.
+  A real correctness bug, not compiler-specific; it survived because the
+  CPU-struct `wrf80` tested `v < 0` while the global-register model's `wrf80`
+  (`recomp_types.h`) already set the sign first and was right.
+  `runtime/recomp32_cpu/cpu_selftest.c` covers it (the `-0.0` row). (#26)
+
+- recomp32 `recomp_types.h`: include `<stddef.h>` for `ptrdiff_t` (`g_mem_base`).
+  MSVC pulls `ptrdiff_t` in transitively through other headers, so the omission
+  never showed; gcc and clang do not, so the header failed to compile outside
+  MSVC. Found building the runtime under gcc `-m32` toward an OS-agnostic
+  (Linux) host. (#26)
+
 - disasm32: a call target is kept only while a body that calls it is still an
   entry, re-derived each round of the drop. #14 took its `keep` set from every
   decoded body, garbage included, before any were dropped: in Bunghole in
