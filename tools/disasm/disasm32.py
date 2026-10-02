@@ -242,6 +242,30 @@ class Disassembler:
                 return start, end
         return None
 
+    def past_padding(self, va: int) -> int:
+        """The function a candidate in alignment padding stands in front of.
+
+        MSVC pads between functions with `nop` or `int3` up to a 16-byte
+        boundary. A raw-scan candidate (an `E8` byte inside another
+        instruction, a pointer-shaped dword) can land inside that run. Decoded
+        as a function, it walks the padding into the real function after it
+        and owns its instructions, so the real start counts as `covered` and
+        no later scan -- not even a data table pointing exactly at it -- gets
+        to make it an entry. Yuri's Revenge lost 66 functions this way, among
+        them a static constructor and a method only a data table names.
+
+        So: a candidate whose bytes up to the next 16-byte boundary are all
+        padding, with something other than padding at the boundary, is that
+        boundary. Anything else is returned unchanged.
+        """
+        if va & 15 == 0:
+            return va
+        nxt = (va + 15) & ~15
+        pad = self.read_bytes(va, nxt - va + 1)
+        if pad and len(pad) == nxt - va + 1 and pad[-1] not in (0x90, 0xCC)                 and all(x in (0x90, 0xCC) for x in pad[:-1]):
+            return nxt
+        return va
+
     def probes_as_function_body(self, va: int, window: int = 4096) -> bool:
         """Read-only: does the instruction stream at `va` look like code?
 
@@ -659,6 +683,14 @@ class Disassembler:
         queued = set(all_targets)
 
         def _add_func(addr, entry_kind="start"):
+            real = self.past_padding(addr)
+            if real != addr:
+                # Not a function: the one after the padding is. Queued rather
+                # than decoded here, so it goes through the same round logic.
+                if real not in queued:
+                    queued.add(real)
+                    queue.append(real)
+                return None
             func = self.disassemble_function(addr, iat_map)
             if not (func and func.blocks):
                 return None
@@ -1364,6 +1396,17 @@ def demo():
     a_body = BASE + 0x1000
     a_tail = a_body + len(body)
     a_junk = a_tail + len(tail)
+
+    # past_padding: a candidate in the nops before a 16-byte boundary is the
+    # function at the boundary; one already aligned, or with real code before
+    # the boundary, is left alone. The section here is all nops past 0x100D.
+    pd = Disassembler(b"\x00" * 0x400 + b"\xc3" + b"\x90" * 15 + b"\x55\x8b\xec\xc3" + b"\x90" * 0x1EC,
+                      BASE, [_Sec(".text", 0x1000, 0x400, 0x200, True)])
+    assert pd.past_padding(BASE + 0x100E) == BASE + 0x1010
+    assert pd.past_padding(BASE + 0x1001) == BASE + 0x1010
+    assert pd.past_padding(BASE + 0x1010) == BASE + 0x1010, "aligned is a start already"
+    assert pd.past_padding(BASE + 0x1000) == BASE + 0x1000, "ret is not padding"
+    assert pd.past_padding(BASE + 0x1015) == BASE + 0x1015, "padding up to more padding is not a start"
 
     # prologue_starts: a plain 55 8B EC starts there; after 8B FF (hot-patch)
     # the function starts two bytes earlier, at the mov.
