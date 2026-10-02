@@ -116,6 +116,16 @@ versions follow [SemVer](https://semver.org/).
   lift16 already emitted them and the struct had no such members. Writing the
   16-bit half leaves the top half alone, as on the hardware. (#38)
 
+- `runtime/win32hle/` PE loader: `recomp_pe_map` maps a 32-bit PE at its
+  ImageBase with `mmap` (sections to their VAs, `.bss` zero-filled),
+  `recomp_pe_bind` walks the import directory and writes each IAT slot's shim VA
+  (resolved by name through `hle_resolve`), and `recomp_pe_relocate` applies
+  HIGHLOW base relocations. The portable counterpart of what native32 did
+  through the Windows loader and windows.h — `pe_format.h` defines the PE
+  structures so no windows.h is needed, which is what kept native32 on Windows.
+  `pe_loader_selftest.c` builds a minimal PE (two KERNEL32 imports and a reloc)
+  and maps/binds/relocates it, checked headless under gcc `-m32 -no-pie`. (#29)
+
 - `runtime/win32hle/`: an *implemented* Win32-subset host for recomp32
   (global-register) lifted code, on libc/POSIX/SDL2, so a lifted 32-bit Windows
   program can run off Windows (Linux first). Where `native32` forwards a guest's
