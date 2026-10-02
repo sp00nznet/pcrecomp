@@ -116,6 +116,17 @@ void mach_leave(void) {
     LeaveCriticalSection(&g_mach);
 }
 
+/* RECOMP_BACKEDGE's hand-over: let another guest thread take the machine.
+ * Only the outermost claim can give it up; inside a callback the lock is
+ * still held further out, and the loop simply runs on. */
+static void native32_yield(void) {
+    mstate* m = (mstate*)TlsGetValue(g_mach_tls);
+    if (!m || m->depth != 1) return;
+    mach_leave();
+    SwitchToThread();
+    mach_enter();
+}
+
 /* ---------------------------------------------------------------- modules */
 
 #define MAX_MODULES 32
@@ -440,6 +451,7 @@ static LONG CALLBACK native32_veh(EXCEPTION_POINTERS* ep) {
 
 void native32_init(void) {
     InitializeCriticalSection(&g_mach);
+    recomp_yield_hook = native32_yield;
     g_mach_tls = TlsAlloc();
     g_shim_page = (uint32_t)(uintptr_t)VirtualAlloc(NULL, 0x10000, MEM_RESERVE, PAGE_NOACCESS);
     AddVectoredExceptionHandler(1, native32_veh);
