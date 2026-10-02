@@ -239,6 +239,28 @@ int main(void)
         }
     }
 
+    /* fs: via the portable simulated-TIB path (FS_* macros). The MSVC default
+     * reads the real segment, not c->fs_base, so only check it when the
+     * simulated path is the one compiled in (gcc/clang, or RECOMP_FS_SIMULATED).
+     * This is what a non-Windows host relies on for SEH prologues. */
+#if !defined(_MSC_VER) || defined(RECOMP_FS_SIMULATED)
+    {
+        static uint8_t tib[256];
+        CPU fc; memset(&fc, 0, sizeof fc);
+        fc.fs_base = (uint32_t)(uintptr_t)tib;
+        *(uint32_t *)(tib + 0) = 0xDEADBEEFu;            /* prior SEH list head */
+        eq("fs:[0] read",      FS_RD32(&fc, 0x00000000u), 0xDEADBEEFu);
+        FS_WR32(&fc, 0x00000000u, 0x00123450u);          /* push a record */
+        eq("fs:[0] write",     FS_RD32(&fc, 0x00000000u), 0x00123450u);
+        FS_WR16(&fc, 0x00000004u, 0xBEEF);
+        eq("fs:[4] word",      FS_RD16(&fc, 0x00000004u), 0xBEEFu);
+        FS_WR8 (&fc, 0x00000006u, 0x5A);
+        eq("fs:[6] byte",      FS_RD8 (&fc, 0x00000006u), 0x5Au);
+        FS_WR32(&fc, 0x00000018u, fc.fs_base);           /* fs:[0x18] = self */
+        eq("fs:[0x18] self",   FS_RD32(&fc, 0x00000018u), fc.fs_base);
+    }
+#endif
+
     if (fails == 0)
         printf("cpu_selftest: all checks passed\n");
     return fails != 0;
