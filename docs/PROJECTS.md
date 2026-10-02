@@ -39,6 +39,7 @@ repo is a scar from one specific binary, and the entry below names it.
 | `classify/*` | Gunman Chronicles | 78% of a GoldSrc game is the SDK; find the other 13% |
 | `cpp/*` | Black & White | Mangling, demangling and vtable parsing across MSVC and Metrowerks |
 | `drm/safedisc_dump.py`, `inject_and_run.c` | X-Wing Alliance, Black & White | SafeDisc v1 and v2+ |
+| `drm/unlzexe.py` | Blake Stone | Both games ship LZEXE 0.91-packed; the decoder saw only the 300-byte decompressor |
 | `drm/emu_unpack.py` | The Movies | Steam's 2007 build is PECompact 2.x with a Steam2 ownership check in the stub; running it would need Steam and a window |
 | `assets/isextract.py` | Soldier of Fortune | InstallShield, including multi-volume |
 | `assets/isextract.py` v6+ layout | One Must Fall: Battlegrounds | v7 and v9 discs; the flat 0x57 descriptor array |
@@ -474,6 +475,26 @@ HFS volume and no ISO 9660 descriptor -- Macintosh, Broderbund, the same shelf a
 Shufflepuck Cafe. Probably HyperCard, in which case there is no 68k binary to
 recompile and it is a format project. Staged pending a mount; it likely belongs
 to `macrecomp`.
+
+---
+
+## Blake Stone: Aliens of Gold (1993) and Planet Strike (1994)
+
+**Repo**: [sp00nznet/blakestone](https://github.com/sp00nznet/blakestone) ·
+**Original**: `BS_AOG.EXE` / `BS_FIRE.EXE`, LZEXE 0.91, Borland C++ 3.x medium
+model, 386 code in 16-bit segments (the Wolfenstein 3D engine, extended by JAM)
+
+**Contributed**: `drm/unlzexe.py`; in decode16/lift16, Borland's `INT 3Eh`
+emulator shortcuts, the 387 trig its math library takes, `mov` to/from FS/GS,
+self-modified immediates and branch opcodes; 32-bit index registers in
+`recomp16/cpu.h`.
+
+**Notable**: the first 16-bit target whose inner loops rewrite themselves. The
+wall scaler patches its per-column step into an `add edx, 12345678h` and the
+raycaster flips `jge`/`jle` opcodes per view quadrant; both lifted as constants
+until the lifter learned which bytes the code writes. Two games on one engine,
+so -- like Fury3 and Hellbender -- anything that works on one and not the other
+is a tool bug.
 
 ---
 

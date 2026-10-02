@@ -5,6 +5,13 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- `tools/drm/unlzexe.py`: LZEXE 0.90/0.91 unpacking for DOS MZ executables, by
+  decoding the format rather than running the stub. `test_unlzexe.py` builds a
+  packed file with a small encoder (literals, short and long matches, an
+  extended length, a delta-coded relocation table) and checks the round trip.
+  Blake Stone's two executables both ship packed. (#?)
+
 ### Fixed
 - disasm32: a call target is kept only while a body that calls it is still an
   entry, re-derived each round of the drop. #14 took its `keep` set from every
