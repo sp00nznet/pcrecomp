@@ -110,6 +110,7 @@ void  hle_present_enable(void);                             /* wire present_step
 void  hle_present_close(void);
 
 /* ---- host services a shim may need ---- */
+void  hle_set_module_path(const char *real_path);  /* real image path -> GetModuleFileNameA */
 void  hle_fatal(const char *fmt, ...);   /* print + abort: an unimplemented path */
 extern int win32hle_trace;               /* env SC2K/HLE trace: one line per shim call */
 
@@ -119,5 +120,6 @@ extern const win32hle_shim win32hle_kernel32_ext[];   /* file I/O, Global*, .ini
 extern const win32hle_shim win32hle_kernel32_crt[];   /* CRT startup -> WinMain */
 extern const win32hle_shim win32hle_gdi32[];
 extern const win32hle_shim win32hle_user32[];
+extern const win32hle_shim win32hle_winmm[];
 
 #endif /* WIN32HLE_H */

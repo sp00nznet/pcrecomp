@@ -12,6 +12,29 @@ versions follow [SemVer](https://semver.org/).
   block, OEP, code range) are read from its own code. The code section is then
   AES-256-CBC decrypted, with the IV taken from an ECB-decrypted first block. The
   dead `.bind` section is dropped. Needs `cryptography`. Found on KotOR (Steam, app 32370).
+- `runtime/win32hle/` WinMain bring-up, driven by running a lifted Fury³ under
+  the permissive host and implementing each import it reached:
+  - `user32.c`: the window-setup and RECT surface a GUI WinMain needs —
+    `FindWindowA` (single-instance), `LoadIcon/Cursor/Image/Bitmap/Accelerators/
+    Menu` (non-NULL handles; a NULL accelerator table is fatal to some games),
+    `TranslateAcceleratorA`, `GetSystemMetrics` (a 1600×960 desktop),
+    `GetClientRect`/`GetWindowRect`/`Adjust*`, `BeginPaint`/`EndPaint`,
+    `MessageBoxA` (to stderr), the focus/z-order setters, and the `*Rect`
+    helpers (`CopyRect`/`OffsetRect`/`SetRect*`/`InflateRect`).
+  - `winmm.c` (new): WINMM — multimedia timers, no-joystick, and a silent
+    waveOut device that retires every buffer immediately (so a mixer thread
+    keeps cycling without a sound card), MCI stubbed.
+  - `kernel32_crt.c`: `CreateThread` runs the lifted start routine on a pthread
+    via `hle_call_guest` (each guest thread already gets its own stack+TIB);
+    guest threads interleave cooperatively, yielding the machine lock in the
+    blocking shims (`Sleep` now yields, `WaitForSingleObject`).
+  - `kernel32_ext.c` `CreateFileA` translates Windows `\\` to `/`, and
+    `GetModuleFileNameA`/`GetCurrentDirectoryA` return the real image location
+    (`hle_set_module_path`) so a title finds its data relative to the exe.
+  With these a lifted Fury³ runs its whole CRT **and WinMain** on Linux —
+  through window creation, its worker thread, and timing — into its own asset
+  loader (it then wants its `.POD` data manifest, which is game packaging, not a
+  runtime gap). `HLE_FILETRACE=1` logs the data files a title opens. (#45)
 
 ### Fixed
 - disasm32: straight-line code longer than one scan window (8 KB, 4 KB per block) is decoded
