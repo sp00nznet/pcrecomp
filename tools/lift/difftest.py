@@ -301,6 +301,10 @@ CASES = [
     Case('fpu.fucompp-nan', bytes.fromhex('d906d94604dae9dfe0'),
          mem={SCRATCH: struct.pack('<ff', 2.0, float('nan'))}),
 
+    # bt eax, 0; adc ebx, 0 -- adc reads _cf, which bt did not write.
+    Case('bt.then-adc', bytes.fromhex('0fbae00083d300'),
+         {'eax': 0x80000001, 'ebx': 0x10}, undef=('AF', 'OF', 'SF', 'ZF', 'PF')),
+
     # lock cmpxchg8b [esi]; setz cl -- the lock-free queue in LithTech's TCP
     # engine. Unimplemented, a push never landed.
     Case('cmpxchg8b.equal', bytes.fromhex('f00fc70e0f94c1'),

@@ -880,6 +880,10 @@ static inline void fp_st80(uint8_t* p, double v) {
 RECOMP_WEAK uint32_t g_cpuid_mask_edx = 0xFFFFFFFFu;
 RECOMP_WEAK uint32_t g_cpuid_mask_ecx = 0xFFFFFFFFu;
 RECOMP_WEAK uint32_t g_cpuid_mask_ext_edx = 0xFFFFFFFFu;
+/* Leaf 1 EAX (family/model/stepping), when nonzero. Feature bits are not the
+ * only dispatch key: Crypto++ 5.2 picks SSE2 add/subtract by family == 0xF
+ * alone ("IsP4"), which every AMD CPU since K8 also reports. */
+RECOMP_WEAK uint32_t g_cpuid_signature = 0;
 
 static inline void CPUID_impl(uint32_t eax_val, uint32_t ebx_val, uint32_t ecx_val, uint32_t edx_val) {
     /* Return something reasonable for a Pentium III era check */
@@ -887,7 +891,10 @@ static inline void CPUID_impl(uint32_t eax_val, uint32_t ebx_val, uint32_t ecx_v
     int info[4];
     __cpuid(info, eax_val);
     g_eax = info[0]; g_ebx = info[1]; g_ecx = info[2]; g_edx = info[3];
-    if (eax_val == 1) { g_edx &= g_cpuid_mask_edx; g_ecx &= g_cpuid_mask_ecx; }
+    if (eax_val == 1) {
+        g_edx &= g_cpuid_mask_edx; g_ecx &= g_cpuid_mask_ecx;
+        if (g_cpuid_signature) g_eax = g_cpuid_signature;
+    }
     if (eax_val == 0x80000001u) g_edx &= g_cpuid_mask_ext_edx;
 #else
     (void)eax_val; (void)ebx_val; (void)ecx_val; (void)edx_val;

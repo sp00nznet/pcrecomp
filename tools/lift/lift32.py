@@ -1228,6 +1228,9 @@ class Lifter:
                     write = lambda v: self._fmt_write(ops[0], v)
                 lines.append(f"/* {m} {a}, {idx} */ {comment}")
                 lines.append(self._flag_capture(a, idx))
+                # CF is the tested bit, and adc/sbb/rcr read _cf directly
+                # (`bt eax, 0; adc ebx, 0` added the stale carry).
+                lines.append("_cf = (_flag_a >> _flag_b) & 1u;")
                 self._flag_state = ('bt', "_flag_a, _flag_b")
                 if m != 'bt':
                     op = {'bts': '|', 'btr': '& ~', 'btc': '^'}[m]
