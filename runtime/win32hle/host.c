@@ -19,6 +19,7 @@ void recomp_host_init(void) {
     win32hle_register(win32hle_kernel32_crt);
     win32hle_register(win32hle_gdi32);
     win32hle_register(win32hle_user32);
+    win32hle_register(win32hle_winmm);
 }
 
 static int boot(const char *path, uint32_t (*resolve)(const char *)) {

@@ -38,8 +38,17 @@ static int file_close(uint32_t h) {
 /* CreateFileA(name,access,share,sa,disp,flags,template). access GENERIC_READ
  * 0x80000000, GENERIC_WRITE 0x40000000; disp CREATE_NEW 1, CREATE_ALWAYS 2,
  * OPEN_EXISTING 3, OPEN_ALWAYS 4, TRUNCATE_EXISTING 5. */
+/* Copy a guest path, translating Windows '\\' to '/' so Linux resolves it.
+ * (A drive-relative "C:\\..." is left as-is beyond the slash flip; the host
+ * runs from the game directory and the game builds paths off GetModuleFileName,
+ * which returns the real location.) */
+static void win_path(const char *in, char *out, size_t n) {
+    size_t i = 0;
+    if (in) for (; in[i] && i + 1 < n; i++) out[i] = in[i] == '\\' ? '/' : in[i];
+    out[i] = 0;
+}
 static void k_CreateFileA(void) {
-    const char *name = ASTR(0);
+    char path[512]; win_path(ASTR(0), path, sizeof path);
     uint32_t access = A32(1), disp = A32(4);
     int wr = (access & 0x40000000u) != 0;
     const char *mode;
@@ -49,8 +58,10 @@ static void k_CreateFileA(void) {
         case 4:         mode = wr ? "rb+" : "rb"; break; /* open-always (fallback below) */
         default:        mode = wr ? "rb+" : "rb"; break; /* open-existing */
     }
-    FILE *f = name ? fopen(name, mode) : NULL;
-    if (!f && disp == 4 && name) f = fopen(name, "wb+");  /* open-always: make it */
+    FILE *f = path[0] ? fopen(path, mode) : NULL;
+    if (!f && disp == 4 && path[0]) f = fopen(path, "wb+");  /* open-always: make it */
+    if (getenv("HLE_FILETRACE"))     /* bring-up: which data files a title opens */
+        fprintf(stderr, "[CreateFileA] \"%s\" mode=%s -> %s\n", path, mode, f ? "OK" : "FAIL");
     RET(f ? file_open(f) : INVALID_HANDLE, 7);
 }
 

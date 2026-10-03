@@ -158,7 +158,107 @@ static void u_SendMessageA(void) {
     RET(result, 4);
 }
 
+/* --- RECT helpers (a RECT is left,top,right,bottom at +0,+4,+8,+12) --- */
+static void u_CopyRect(void)     { uint32_t d=A32(0), s=A32(1); if(d&&s){MEM32(d)=MEM32(s);MEM32(d+4)=MEM32(s+4);MEM32(d+8)=MEM32(s+8);MEM32(d+12)=MEM32(s+12);} RET(1,2); }
+static void u_SetRectEmpty(void) { uint32_t r=A32(0); if(r){MEM32(r)=0;MEM32(r+4)=0;MEM32(r+8)=0;MEM32(r+12)=0;} RET(1,1); }
+static void u_SetRect(void)      { uint32_t r=A32(0); if(r){MEM32(r)=A32(1);MEM32(r+4)=A32(2);MEM32(r+8)=A32(3);MEM32(r+12)=A32(4);} RET(1,5); }
+static void u_OffsetRect(void)   { uint32_t r=A32(0); int dx=(int)A32(1),dy=(int)A32(2); if(r){MEM32(r)+=dx;MEM32(r+4)+=dy;MEM32(r+8)+=dx;MEM32(r+12)+=dy;} RET(1,3); }
+static void u_InflateRect(void)  { uint32_t r=A32(0); int dx=(int)A32(1),dy=(int)A32(2); if(r){MEM32(r)-=dx;MEM32(r+4)-=dy;MEM32(r+8)+=dx;MEM32(r+12)+=dy;} RET(1,3); }
+static void u_PtInRect(void)     { RET(1,3); }
+
+/* --- WinMain window setup: single-instance check, icons/cursors, metrics --- */
+static void u_FindWindowA(void)      { RET(0, 2); }   /* no existing instance -> we're first */
+static void u_LoadIconA(void)        { RET(0x1C000001u, 2); }
+static void u_LoadCursorA(void)      { RET(0x1C000002u, 2); }
+static void u_LoadImageA(void)       { RET(0x1C000003u, 6); }
+static void u_LoadBitmapA(void)      { RET(0x1C000004u, 2); }
+static void u_LoadAcceleratorsA(void){ RET(0x1C000005u, 2); }  /* nonzero: games treat NULL as fatal */
+static void u_TranslateAcceleratorA(void){ RET(0, 3); }        /* not an accel key -> normal dispatch */
+static void u_LoadMenuA(void)        { RET(0x1C000006u, 2); }
+static void u_SetCursor(void)        { RET(0, 1); }   /* previous cursor */
+static void u_GetDesktopWindow(void) { RET(0x00010000u, 0); }
+static void u_GetParent(void)        { RET(0, 1); }
+static void u_GetFocus(void)         { RET(0, 0); }
+static void u_SetFocus(void)         { RET(0, 1); }
+static void u_EnableWindow(void)     { RET(1, 2); }
+static void u_SetForegroundWindow(void){ RET(1, 1); }
+static void u_BringWindowToTop(void) { RET(1, 1); }
+static void u_SetWindowPos(void)     { RET(1, 7); }
+static void u_MoveWindow(void)       { RET(1, 6); }
+static void u_SetWindowLongA(void)   { RET(0, 3); }
+static void u_GetWindowLongA(void)   { RET(0, 2); }
+
+/* GetSystemMetrics(nIndex): a 1600x960 primary display, standard small metrics. */
+static void u_GetSystemMetrics(void) {
+    switch (A32(0)) {
+        case 0:  RET(1600, 1);          /* SM_CXSCREEN */
+        case 1:  RET(960,  1);          /* SM_CYSCREEN */
+        case 11: RET(32, 1); case 12: RET(32, 1);   /* SM_CX/CYICON */
+        case 13: RET(32, 1); case 14: RET(32, 1);   /* SM_CX/CYCURSOR */
+        case 15: RET(16, 1); case 16: RET(16, 1);   /* SM_CX/CYSMICON */
+        case 4:  RET(19, 1);            /* SM_CYCAPTION */
+        case 5:  RET(1, 1);  case 6: RET(1, 1);     /* SM_CX/CYBORDER */
+        case 32: RET(4, 1);  case 33: RET(4, 1);    /* SM_CX/CYFRAME */
+        default: RET(0, 1);
+    }
+}
+/* client rect = full framebuffer; window rect same; Adjust* leave the rect. */
+static void u_GetClientRect(void) {
+    uint32_t r = A32(1);
+    if (r) { MEM32(r + 0) = 0; MEM32(r + 4) = 0; MEM32(r + 8) = 1600; MEM32(r + 12) = 960; }
+    RET(1, 2);
+}
+static void u_GetWindowRect(void) {
+    uint32_t r = A32(1);
+    if (r) { MEM32(r + 0) = 0; MEM32(r + 4) = 0; MEM32(r + 8) = 1600; MEM32(r + 12) = 960; }
+    RET(1, 2);
+}
+static void u_AdjustWindowRect(void)   { RET(1, 3); }
+static void u_AdjustWindowRectEx(void) { RET(1, 4); }
+static void u_InvalidateRect(void)     { RET(1, 3); }
+static void u_BeginPaint(void)         { RET(0x0DC00010u, 2); }  /* an HDC */
+static void u_EndPaint(void)           { RET(1, 2); }
+static void u_MessageBoxA(void) {                                /* (hwnd,text,caption,type) */
+    fprintf(stderr, "[MessageBox] %s: %s\n", ASTR(2) ? ASTR(2) : "", ASTR(1) ? ASTR(1) : "");
+    RET(1, 4);                                                   /* IDOK */
+}
+
 const win32hle_shim win32hle_user32[] = {
+    { "CopyRect",           u_CopyRect },
+    { "SetRectEmpty",       u_SetRectEmpty },
+    { "SetRect",            u_SetRect },
+    { "OffsetRect",         u_OffsetRect },
+    { "InflateRect",        u_InflateRect },
+    { "PtInRect",           u_PtInRect },
+    { "FindWindowA",        u_FindWindowA },
+    { "LoadIconA",          u_LoadIconA },
+    { "LoadCursorA",        u_LoadCursorA },
+    { "LoadImageA",         u_LoadImageA },
+    { "LoadBitmapA",        u_LoadBitmapA },
+    { "LoadAcceleratorsA",  u_LoadAcceleratorsA },
+    { "TranslateAcceleratorA", u_TranslateAcceleratorA },
+    { "LoadMenuA",          u_LoadMenuA },
+    { "SetCursor",          u_SetCursor },
+    { "GetDesktopWindow",   u_GetDesktopWindow },
+    { "GetParent",          u_GetParent },
+    { "GetFocus",           u_GetFocus },
+    { "SetFocus",           u_SetFocus },
+    { "EnableWindow",       u_EnableWindow },
+    { "SetForegroundWindow",u_SetForegroundWindow },
+    { "BringWindowToTop",   u_BringWindowToTop },
+    { "SetWindowPos",       u_SetWindowPos },
+    { "MoveWindow",         u_MoveWindow },
+    { "SetWindowLongA",     u_SetWindowLongA },
+    { "GetWindowLongA",     u_GetWindowLongA },
+    { "GetSystemMetrics",   u_GetSystemMetrics },
+    { "GetClientRect",      u_GetClientRect },
+    { "GetWindowRect",      u_GetWindowRect },
+    { "AdjustWindowRect",   u_AdjustWindowRect },
+    { "AdjustWindowRectEx", u_AdjustWindowRectEx },
+    { "InvalidateRect",     u_InvalidateRect },
+    { "BeginPaint",         u_BeginPaint },
+    { "EndPaint",           u_EndPaint },
+    { "MessageBoxA",        u_MessageBoxA },
     { "RegisterClassA",   u_RegisterClassA },
     { "CreateWindowExA",  u_CreateWindowExA },
     { "DefWindowProcA",   u_DefWindowProcA },

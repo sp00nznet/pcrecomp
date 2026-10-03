@@ -12,7 +12,41 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 #include "win32hle.h"
+
+/* --- threads ---
+ * A guest thread runs lifted code, so it enters through hle_call_guest, which
+ * takes the machine lock and gives the thread its own guest stack + TIB. The
+ * lifted start routine is stdcall with one argument (lpParameter). Guest
+ * threads interleave cooperatively: a thread holds the machine lock while
+ * running lifted code and only yields it in a blocking shim (Sleep,
+ * WaitForSingleObject), which is enough for a game-loop/mixer thread. */
+struct thread_arg { uint32_t start, param; };
+static void *thread_trampoline(void *p) {
+    struct thread_arg a = *(struct thread_arg *)p; free(p);
+    uint32_t args[1] = { a.param };
+    hle_call_guest(a.start, 1, args);
+    return NULL;
+}
+static void k_CreateThread(void) {             /* (sa, stack, start, param, flags, &tid) */
+    struct thread_arg *a = (struct thread_arg *)malloc(sizeof *a);
+    a->start = A32(2); a->param = A32(3);
+    pthread_t t;
+    if (pthread_create(&t, NULL, thread_trampoline, a) != 0) { free(a); RET(0, 6); }
+    pthread_detach(t);
+    uint32_t tid = (uint32_t)(uintptr_t)t;
+    uint32_t ptid = A32(5); if (ptid) MEM32(ptid) = tid;
+    RET(0x7D000000u | (tid & 0x00FFFFFFu), 6);    /* a nonzero pseudo-handle */
+}
+static void k_SetThreadPriority(void) { RET(1, 2); }
+static void k_GetCurrentThread(void)  { RET(0xFFFFFFFEu, 0); }
+/* WaitForSingleObject: yield the machine lock so another guest thread can run,
+ * wait briefly, then report signalled. A real object wait comes later. */
+static void k_WaitForSingleObject(void) {
+    mach_leave(); usleep(1000); mach_enter();
+    RET(0u, 2);                                   /* WAIT_OBJECT_0 */
+}
 
 /* --- standard handles / file type --- */
 static void k_GetStdHandle(void) {                 /* (nStdHandle) -10..-12 */
@@ -44,16 +78,27 @@ static void k_FreeEnvironmentStringsA(void) { RET(1, 1); }
 static void k_FreeEnvironmentStringsW(void) { RET(1, 1); }
 static void k_GetEnvironmentVariableA(void) { RET(0, 3); }   /* not found */
 
-/* --- module/path --- */
+/* --- module/path ---
+ * The host records the real image path (hle_set_module_path), stored in
+ * backslash form so the guest's own path logic (which splits on '\\' to find
+ * the install directory) works; CreateFileA flips '\\' back to '/'. This is how
+ * a game finds its data (.POD, etc.) relative to the executable. */
+static char g_modpath[512] = "C:\\GAME\\GAME.EXE";
+void hle_set_module_path(const char *real) {
+    size_t i = 0;
+    if (real) for (; real[i] && i + 1 < sizeof g_modpath; i++) g_modpath[i] = real[i] == '/' ? '\\' : real[i];
+    g_modpath[i] = 0;
+}
 static void k_GetModuleFileNameA(void) {           /* (hModule, buf, size) */
     char *buf = ASTR(1); uint32_t size = A32(2);
-    const char *path = "C:\\FURY3X\\FURY3X.EXE";
-    if (buf && size) { strncpy(buf, path, size - 1); buf[size - 1] = 0; }
+    if (buf && size) { strncpy(buf, g_modpath, size - 1); buf[size - 1] = 0; }
     RET(buf ? (uint32_t)strlen(buf) : 0u, 3);
 }
-static void k_GetCurrentDirectoryA(void) {         /* (size, buf) */
+static void k_GetCurrentDirectoryA(void) {         /* (size, buf) -> install dir */
     uint32_t size = A32(0); char *buf = ASTR(1);
-    if (buf && size) { strncpy(buf, "C:\\FURY3X", size - 1); buf[size - 1] = 0; }
+    char dir[512]; strncpy(dir, g_modpath, sizeof dir - 1); dir[sizeof dir - 1] = 0;
+    char *bs = strrchr(dir, '\\'); if (bs) *bs = 0;      /* strip the exe name */
+    if (buf && size) { strncpy(buf, dir, size - 1); buf[size - 1] = 0; }
     RET(buf ? (uint32_t)strlen(buf) : 0u, 2);
 }
 static void k_SetCurrentDirectoryA(void) { RET(1, 1); }
@@ -132,5 +177,9 @@ const win32hle_shim win32hle_kernel32_crt[] = {
     { "FreeLibrary",                  k_FreeLibrary },
     { "GetProcAddress",               k_GetProcAddress },
     { "LoadModule",                   k_LoadModule },
+    { "CreateThread",                 k_CreateThread },
+    { "SetThreadPriority",            k_SetThreadPriority },
+    { "GetCurrentThread",             k_GetCurrentThread },
+    { "WaitForSingleObject",          k_WaitForSingleObject },
     { 0, 0 }
 };
