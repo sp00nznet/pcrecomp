@@ -57,7 +57,9 @@ static uint32_t ticks_ms(void) {
     return (uint32_t)(ts.tv_sec * 1000u + ts.tv_nsec / 1000000u);
 }
 static void k_GetTickCount(void) { RET(ticks_ms(), 0); }
-static void k_Sleep(void)        { uint32_t ms = A32(0); if (ms) usleep(ms * 1000u); RETV(1); }
+/* Sleep yields the machine lock around the wait, so another guest thread (a
+ * mixer, a game-loop thread) can run while this one sleeps. */
+static void k_Sleep(void)        { uint32_t ms = A32(0); mach_leave(); usleep(ms ? ms * 1000u : 0u); mach_enter(); RETV(1); }
 
 /* --- error / debug --- */
 static __thread uint32_t g_last_error;
