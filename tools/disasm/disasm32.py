@@ -275,7 +275,10 @@ class Disassembler:
         rasterizers sit behind such a table, and the common one never ran:
         every vehicle was invisible. The `lea` fillers count as padding, and
         `mov edi, edi` does when one comes right before it; after `int3` or
-        `nop` (a real hot-patch function) it stays the start.
+        `nop` (a real hot-patch function) it stays the start. MSVC uses the
+        same `lea` fillers inside functions, to align a loop head it jumps to
+        and in front of a switch's jump table, so past one the boundary has to
+        open with `push ebp; mov ebp, esp` as well.
         """
         if va & 15 == 0:
             return va
@@ -285,20 +288,22 @@ class Disassembler:
             return va
         behind = self.read_bytes(va - 7, 7) if va - 7 >= self.image_base else b''
         lea = bool(behind) and any(behind.endswith(f) for f in _MASM_FILL)
-        p, end = 0, nxt - va
+        p, end, masm = 0, nxt - va, lea
         while p < end:
             if pad[p] in (0x90, 0xCC):
                 p, lea = p + 1, False
                 continue
             f = next((f for f in _MASM_FILL if pad.startswith(f, p)), None)
             if f:
-                p, lea = p + len(f), True
+                p, lea, masm = p + len(f), True, True
                 continue
             if lea and pad.startswith(b'\x8B\xFF', p):
                 p, lea = p + 2, False
                 continue
             return va
         if p != end or pad[end] in (0x90, 0xCC) or any(pad.startswith(f, end) for f in _MASM_FILL):
+            return va
+        if masm and pad[end:end + 3] != b'\x55\x8B\xEC':
             return va
         return nxt
 
@@ -1457,6 +1462,15 @@ def demo():
     assert pm.past_padding(BASE + 0x1008) == BASE + 0x1010
     assert pm.past_padding(BASE + 0x1022) == BASE + 0x1022, "hot-patch: the mov is the start"
     assert pm.past_padding(BASE + 0x1015) == BASE + 0x1015, "int3 up to a hot-patch mov is not padding"
+    # MSVC's `lea ecx, [ecx]` before a switch's jump table (gamemd.exe
+    # 0x005A004D) or an aligned loop head (MoviesSE.exe 0x007F003D): no
+    # prologue at the boundary, so the candidate stays where it was.
+    for after, want in ((b"\x00\x10\x40\x00" * 8, 0x100D), (b"\x8b\x4c\x24\x40\xc3", 0x100D),
+                        (b"\x55\x8b\xec\xc3", 0x1010)):
+        jt = b"\x8b\xc1" * 5 + b"\xc2\x1c\x00" + b"\x8d\x49\x00" + after
+        pj = Disassembler(b"\x00" * 0x400 + jt + b"\x00" * (0x200 - len(jt)),
+                          BASE, [_Sec(".text", 0x1000, 0x400, 0x200, True)])
+        assert pj.past_padding(BASE + 0x100D) == BASE + want, hex(pj.past_padding(BASE + 0x100D))
 
     # prologue_starts: a plain 55 8B EC starts there; after 8B FF (hot-patch)
     # the function starts two bytes earlier, at the mov.
