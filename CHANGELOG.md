@@ -18,6 +18,11 @@ versions follow [SemVer](https://semver.org/).
   Tournament (Steam, app 13240).
 
 ### Fixed
+- disasm32: a data pointer to an instruction start inside another body is a function entry
+  when it is 16-aligned right after `nop`/`int3` padding: that body ran past a call that
+  never returns, through the padding, into the next function, and the data scan had skipped
+  the pointer as already covered. Unreal Tournament's UWeb.dll lost a static constructor
+  named only by its `_initterm` table that way, and loading the DLL faulted on it.
 - disasm32: straight-line code longer than one scan window (8 KB, 4 KB per block) is decoded
   to its end. The rest of the function used to be dropped. KotOR registers its script commands in
   ~7 KB of `mov [reg+disp], offset`, so 142 functions named only there were never catalogued;

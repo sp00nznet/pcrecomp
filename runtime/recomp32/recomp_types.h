@@ -1046,6 +1046,28 @@ void recomp_trace_enter(uint32_t va);
 #else
 #define RECOMP_ENTER(va) (g_cur_func = (va), RECOMP_FLAGS_IN())
 #endif
+
+/* Guest C++ exceptions (runtime/native32/eh32.c). A lifted function whose
+ * prologue installs an MSVC EH frame gets a host landing pad: on a caught
+ * throw the runtime longjmps here with the guest registers set for the
+ * catch's continuation, and the local dispatch goes to its label.
+ * entry_esp is esp at entry (at the return address): the frame's ebp + 4. */
+#include <setjmp.h>
+typedef struct recomp_ehframe {
+    struct recomp_ehframe* prev;
+    jmp_buf  jb;
+    uint32_t entry_esp;
+    uint32_t resume;
+} recomp_ehframe_t;
+void recomp_eh_push(recomp_ehframe_t* f);
+void recomp_eh_pop(recomp_ehframe_t* f);
+#define RECOMP_EH_ENTER()                                                     \
+    recomp_ehframe_t _ehf;                                                    \
+    _ehf.entry_esp = g_esp;                                                   \
+    recomp_eh_push(&_ehf);                                                    \
+    if (setjmp(_ehf.jb)) { RECOMP_REGS_IN(); _flag_k = FK_NONE;               \
+                           _itail_tgt = _ehf.resume; goto _ljump; }
+#define RECOMP_EH_LEAVE() recomp_eh_pop(&_ehf)
 /* A backward branch in lifted code: a loop. Every RECOMP_YIELD_EVERY of them,
  * hand the machine to other guest threads if the host has a way to
  * (native32_yield). A lifted spin-wait makes no native call, and native32
