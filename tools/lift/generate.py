@@ -332,6 +332,11 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
             lines.append(f"    {call} RECOMP_FLAGS_IN(); goto L_{ret:08X}; /* 0x{insn.address:08X}: push 0x{ret:08X}; jmp 0x{tgt:08X} */")
             skip = True
             continue
+        # A branch back to an earlier instruction of this body is a loop:
+        # give other guest threads a turn now and then (RECOMP_BACKEDGE).
+        tgt = insn.get_branch_target() if insn.is_jump else None
+        if tgt is not None and tgt <= insn.address and tgt in addrs:
+            lines.append('    RECOMP_BACKEDGE();')
         for line in lifter.lift_instruction(insn):
             lines.append(f'    {line}')
         if k in gaps:
@@ -694,6 +699,16 @@ def _selftest():
     assert [i.address - base for i in i5] == [0, 6], [hex(i.address) for i in i5]
     out5 = lift_function_linear(Lifter(iat_map={}), 'sub_00401000', i5, l5, base)
     assert 'RECOMP_ITAIL(0x00401005u); { RECOMP_REGS_OUT(); return; } /* falls through past a gap */' in out5, out5
+
+    # A backward branch is a loop: it gets a RECOMP_BACKEDGE before it, so a
+    # spin-wait cannot keep other guest threads off the machine forever.
+    #   1000 mov eax,[0x2000] / 1005 test eax,eax / 1007 je 1000 / 1009 ret
+    spin = bytes([0xA1, 0x00, 0x20, 0x00, 0x00, 0x85, 0xC0, 0x74, 0xF7, 0xC3])
+    i6, l6 = linear_disassemble_function(md, spin, base, base, base + len(spin))
+    out6 = lift_function_linear(Lifter(iat_map={}), 'sub_00401000', i6, l6, base)
+    assert out6.count('RECOMP_BACKEDGE();') == 1, out6
+    assert out6.index('RECOMP_BACKEDGE();') < out6.index('0x00401007'), out6
+    assert 'RECOMP_BACKEDGE' not in out3, 'a forward branch is not a loop'
 
     # ...and trailing int3 padding still ends the body: the first one is
     # emitted (it lifts to a trap, which is correct for unreachable filler) and
