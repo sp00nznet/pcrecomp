@@ -143,6 +143,7 @@ or IDA, whatever the architecture.
 | `ghidra/*.java` | Headless: decompile everything or by address, export functions, stats, xrefs, range disassembly, function bounds |
 | `ida/ida_funcs.py`, `ida_export.py`, `ida_xrefs.py`, `ida_probe_segs.py` | Headless: function catalog with FLIRT flags, instruction-head code map, call graph + import use + FPU density, segment probe |
 | `drm/safedisc_dump.py`, `inject_and_run.c` | Dump SafeDisc-decrypted `.text` from a running process; a version.dll injector for SafeDiscLoader2 |
+| `drm/steamstub.py` | Remove SteamStub 2.x (x86) statically: header, payload and the embedded `steamdrm.dll` are decoded in Python, then `.text` is AES-decrypted and the OEP restored. No Steam, nothing run |
 | `drm/unlzexe.py` | Undo LZEXE 0.90/0.91 on a DOS MZ executable -- decoded directly, nothing is run; `test_unlzexe.py` packs a file to check it |
 | `drm/emu_unpack.py` | Unpack a compressed PE32 (PECompact 2.x, and Valve's Steam2 wrapper built on it) by running its stub under Unicorn to the OEP, then rebuild the import table. Headless: nothing is launched |
 | `assets/extract_wise.py`, `isextract.py`, `extract_cab.sh`, `pk3_inspect.py`, `bin2iso.js` | Wise and InstallShield installers, CABs, PK3/ZIP, BIN/CUE -> ISO |
@@ -471,6 +472,19 @@ An unknown call from the stub stops the run and names the import; add it to
 `APIS` in the script. Steam2-era titles (2004-2008) call `steam.dll`'s
 `SteamStartup` / `SteamIsAppSubscribed` from the stub, and those are answered.
 
+### "The Steam exe has a `.bind` section"
+
+```bash
+# SteamStub: Steam's DRM wrapper. Version 2.x (around 2004-2010) comes off
+# statically, in under a second, with no Steam running and no process started.
+python tools/drm/steamstub.py game.exe unwrapped.exe
+python tools/drm/steamstub.py --selftest
+```
+
+Each layer is checked: the stub's prologue, the payload checksum, `steamdrm.dll`'s
+MZ, the app id, the OEP's section, and the AES padding. A layout it doesn't know
+stops with the failed check instead of writing a broken file.
+
 ### "The DOS exe says LZ91 at offset 1Ch"
 
 ```bash
@@ -528,7 +542,7 @@ python tools/ne/ne_decode.py GAME.EXE --ida-json code_map.json
 **For runtime:** CMake 3.20+, Visual Studio 2022 or compatible
 
 ```bash
-pip install capstone pefile lief unicorn
+pip install capstone pefile lief unicorn cryptography
 ```
 
 ## Starting a New Project
