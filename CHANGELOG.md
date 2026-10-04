@@ -14,6 +14,9 @@ versions follow [SemVer](https://semver.org/).
   dead `.bind` section is dropped. Needs `cryptography`. Found on KotOR (Steam, app 32370).
 
 ### Fixed
+- native32: the guest's last error survives the bridge in both directions. mach_enter and
+  mach_leave's TlsGetValue reset it to 0, so `GetLastError()` after a native call saw 0.
+  KotOR's resource scan looped forever waiting for ERROR_NO_MORE_FILES. (#49)
 - native32: the bridge's inline asm no longer touches esi or ebp. clang-cl addresses this
   frame's locals off esi (its base pointer), and the bridge's `mov esi, src` sent the first
   native call to 0. Inputs go to registers before esp moves, and arguments are copied by a
