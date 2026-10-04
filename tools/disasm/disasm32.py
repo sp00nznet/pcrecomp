@@ -54,6 +54,14 @@ def decode(md, code, va):
         if n < batch:           # an undecodable byte, or the end of the buffer
             return
         batch = min(batch * 2, 256)
+# The multi-byte no-ops MASM's `align` pads hand-written assembly with
+# (Disassembler.past_padding); `mov edi, edi` closes a run of them.
+_MASM_FILL = (b'\x8D\xA4\x24\x00\x00\x00\x00',    # lea esp, [esp+0x0]
+              b'\x8D\x9B\x00\x00\x00\x00',        # lea ebx, [ebx+0x0]
+              b'\x8D\x64\x24\x00',                # lea esp, [esp+0]
+              b'\x8D\x49\x00')                    # lea ecx, [ecx+0]
+
+
 def prologue_starts(data, code_start):
     """Addresses that open with `push ebp; mov ebp, esp` (55 8B EC).
 
@@ -257,14 +265,47 @@ class Disassembler:
         So: a candidate whose bytes up to the next 16-byte boundary are all
         padding, with something other than padding at the boundary, is that
         boundary. Anything else is returned unchanged.
+
+        Hand-written assembly pads differently: MASM's `align 16` fills with
+        multi-byte no-ops, `lea esp, [esp+0]` (4 or 7 bytes), `lea ebx,
+        [ebx+0]`, `lea ecx, [ecx+0]`, and `mov edi, edi` for the last two
+        bytes. That `8B FF` before `55 8B EC` reads as a hot-patch prologue
+        (prologue_starts), so the function started two bytes early, and the
+        real entry a data table names had no function. Yuri's Revenge's voxel
+        rasterizers sit behind such a table, and the common one never ran:
+        every vehicle was invisible. The `lea` fillers count as padding, and
+        `mov edi, edi` does when one comes right before it; after `int3` or
+        `nop` (a real hot-patch function) it stays the start. MSVC uses the
+        same `lea` fillers inside functions, to align a loop head it jumps to
+        and in front of a switch's jump table, so past one the boundary has to
+        open with `push ebp; mov ebp, esp` as well.
         """
         if va & 15 == 0:
             return va
         nxt = (va + 15) & ~15
-        pad = self.read_bytes(va, nxt - va + 1)
-        if pad and len(pad) == nxt - va + 1 and pad[-1] not in (0x90, 0xCC)                 and all(x in (0x90, 0xCC) for x in pad[:-1]):
-            return nxt
-        return va
+        pad = self.read_bytes(va, nxt - va + 8)          # up to the boundary, and 8 past it
+        if not pad or len(pad) != nxt - va + 8:
+            return va
+        behind = self.read_bytes(va - 7, 7) if va - 7 >= self.image_base else b''
+        lea = bool(behind) and any(behind.endswith(f) for f in _MASM_FILL)
+        p, end, masm = 0, nxt - va, lea
+        while p < end:
+            if pad[p] in (0x90, 0xCC):
+                p, lea = p + 1, False
+                continue
+            f = next((f for f in _MASM_FILL if pad.startswith(f, p)), None)
+            if f:
+                p, lea, masm = p + len(f), True, True
+                continue
+            if lea and pad.startswith(b'\x8B\xFF', p):
+                p, lea = p + 2, False
+                continue
+            return va
+        if p != end or pad[end] in (0x90, 0xCC) or any(pad.startswith(f, end) for f in _MASM_FILL):
+            return va
+        if masm and pad[end:end + 3] != b'\x55\x8B\xEC':
+            return va
+        return nxt
 
     def probes_as_function_body(self, va: int, window: int = 4096) -> bool:
         """Read-only: does the instruction stream at `va` look like code?
@@ -1407,6 +1448,29 @@ def demo():
     assert pd.past_padding(BASE + 0x1010) == BASE + 0x1010, "aligned is a start already"
     assert pd.past_padding(BASE + 0x1000) == BASE + 0x1000, "ret is not padding"
     assert pd.past_padding(BASE + 0x1015) == BASE + 0x1015, "padding up to more padding is not a start"
+
+    # MASM's `align 16`: lea fillers and a closing `mov edi, edi` are padding
+    # (Yuri's Revenge's rasterizers); after int3, `mov edi, edi` is a hot-patch
+    # function's first instruction and stays its start.
+    masm = (b"\xc3" + b"\x8d\xa4\x24\x00\x00\x00\x00" + b"\x8d\x9b\x00\x00\x00\x00" + b"\x8b\xff"
+            + b"\x55\x8b\xec\xc3"                                    # 0x1010: the real start
+            + b"\xc3" + b"\xcc" * 13 + b"\x8b\xff" + b"\x55\x8b\xec\xc3")   # 0x1014; hot-patch fn at 0x1022
+    pm = Disassembler(b"\x00" * 0x400 + masm + b"\x90" * (0x200 - len(masm)),
+                      BASE, [_Sec(".text", 0x1000, 0x400, 0x200, True)])
+    assert pm.past_padding(BASE + 0x100E) == BASE + 0x1010, "mov edi, edi after a lea filler"
+    assert pm.past_padding(BASE + 0x1001) == BASE + 0x1010
+    assert pm.past_padding(BASE + 0x1008) == BASE + 0x1010
+    assert pm.past_padding(BASE + 0x1022) == BASE + 0x1022, "hot-patch: the mov is the start"
+    assert pm.past_padding(BASE + 0x1015) == BASE + 0x1015, "int3 up to a hot-patch mov is not padding"
+    # MSVC's `lea ecx, [ecx]` before a switch's jump table (gamemd.exe
+    # 0x005A004D) or an aligned loop head (MoviesSE.exe 0x007F003D): no
+    # prologue at the boundary, so the candidate stays where it was.
+    for after, want in ((b"\x00\x10\x40\x00" * 8, 0x100D), (b"\x8b\x4c\x24\x40\xc3", 0x100D),
+                        (b"\x55\x8b\xec\xc3", 0x1010)):
+        jt = b"\x8b\xc1" * 5 + b"\xc2\x1c\x00" + b"\x8d\x49\x00" + after
+        pj = Disassembler(b"\x00" * 0x400 + jt + b"\x00" * (0x200 - len(jt)),
+                          BASE, [_Sec(".text", 0x1000, 0x400, 0x200, True)])
+        assert pj.past_padding(BASE + 0x100D) == BASE + want, hex(pj.past_padding(BASE + 0x100D))
 
     # prologue_starts: a plain 55 8B EC starts there; after 8B FF (hot-patch)
     # the function starts two bytes earlier, at the mov.
