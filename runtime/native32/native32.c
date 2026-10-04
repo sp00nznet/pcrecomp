@@ -340,8 +340,13 @@ static void shim_CreateThread(void) {
     g_esp += 4 + 6 * 4;
 }
 
+/* _CxxThrowException: a guest throw is dispatched over the guest's own
+ * frames (eh32.c), so the guest's catch blocks run. */
+void native32_shim_CxxThrowException(void);
+
 static native32_shim_t g_builtin[] = {
     { "CreateThread", shim_CreateThread },
+    { "_CxxThrowException", native32_shim_CxxThrowException },
 };
 
 int native32_bind(uint32_t base, native32_shim_t* shims, int nshims) {
