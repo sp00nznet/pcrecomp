@@ -48,7 +48,7 @@ PROTECTION_SIGS = [
 
 # Section names that themselves indicate a protector/packer.
 SUSPECT_SECTION_NAMES = {
-    '.bind': 'SafeDisc wrapper',
+    '.bind': 'SteamStub (Steam DRM; drm/steamstub.py removes 2.x)',
     'stxt2': 'SafeDisc', 'stxt371': 'SafeDisc',
     '.cms_t': 'SecuROM', '.cms_d': 'SecuROM',
     'UPX0': 'UPX', 'UPX1': 'UPX',

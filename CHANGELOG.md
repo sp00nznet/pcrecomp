@@ -5,7 +5,18 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- `tools/drm/steamstub.py`: removes SteamStub 2.x (x86) without running anything and
+  without Steam. The stub's header and payload are running-XOR decoded. The embedded
+  `steamdrm.dll` is XTEA-CBC decrypted, and the payload offsets it uses (AES key, first
+  block, OEP, code range) are read from its own code. The code section is then
+  AES-256-CBC decrypted, with the IV taken from an ECB-decrypted first block. The
+  dead `.bind` section is dropped. Needs `cryptography`. Found on KotOR (Steam, app 32370).
+
 ### Fixed
+- `pe/analyze_sections.py` called a `.bind` section a SafeDisc wrapper. `.bind` is
+  Steam's SteamStub.
+
 - generate: a gap in the middle of a lifted body falls through to the right
   address. An instruction that can fall through, followed in the emitted list
   by one that is not at its end (the extent walk stops after a `call` that is
