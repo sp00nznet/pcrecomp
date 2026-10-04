@@ -241,7 +241,18 @@ static void native_bridge(void) {
     g_cur_import = native32_name(fn);
     if (!g_cur_import) g_cur_import = "(native)";
     mach_leave();
+    /* Every local is read before esi changes and written after it is back:
+     * clang-cl addresses this function's locals through esi (its base
+     * pointer, since the block moves esp), and rep movsd moves esi. Reading
+     * `this_ecx` and `fn` after the copy called whatever sat past the
+     * arguments (address 0 at the first import). MSVC uses ebp and never
+     * minded. */
     __asm {
+        fnstsw ax
+        mov  sw0, ax             ; x87 TOP before
+        mov  eax, fn
+        mov  edx, this_ecx
+        push esi                 ; clang-cl's base pointer for the locals
         mov  esi, src
         sub  esp, BRIDGE_SLOTS * 4
         mov  edi, esp
@@ -249,16 +260,15 @@ static void native_bridge(void) {
         cld
         rep  movsd
         mov  ebx, esp            ; callee-saved: survives the call
-        fnstsw ax
-        mov  sw0, ax             ; x87 TOP before
-        mov  ecx, this_ecx       ; thiscall / COM 'this'
-        call fn
+        mov  ecx, edx            ; thiscall / COM 'this'
+        call eax
+        mov  ecx, esp
+        sub  ecx, ebx            ; bytes the callee popped
+        lea  esp, [ebx + BRIDGE_SLOTS * 4]
+        pop  esi                 ; locals addressable again
         mov  r_eax, eax
         mov  r_edx, edx
-        mov  eax, esp
-        sub  eax, ebx            ; bytes the callee popped
-        mov  purge, eax
-        lea  esp, [ebx + BRIDGE_SLOTS * 4]
+        mov  purge, ecx
         fxam                     ; C3..C0 classify st(0)
         fnstsw ax
         mov  sw1, ax             ; x87 TOP after
