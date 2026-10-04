@@ -241,24 +241,33 @@ static void native_bridge(void) {
     g_cur_import = native32_name(fn);
     if (!g_cur_import) g_cur_import = "(native)";
     mach_leave();
+    /* The locals are reached through whatever base register the compiler
+     * chose, and the asm must leave it alone. MSVC uses ebp; clang-cl uses
+     * esi (its x86 base pointer, for a frame it realigns), so the old
+     * `mov esi, src` for rep movsd cut the frame off and the next local read
+     * was garbage: the first native call jumped to 0 (KotOR, clang-cl). So:
+     * no esi or ebp, every input in a register before esp moves, and the
+     * arguments copied by pushes, highest slot first. */
     __asm {
-        mov  esi, src
-        sub  esp, BRIDGE_SLOTS * 4
-        mov  edi, esp
-        mov  ecx, BRIDGE_SLOTS
-        cld
-        rep  movsd
-        mov  ebx, esp            ; callee-saved: survives the call
         fnstsw ax
         mov  sw0, ax             ; x87 TOP before
-        mov  ecx, this_ecx       ; thiscall / COM 'this'
-        call fn
+        mov  edx, src
+        mov  eax, fn
+        mov  edi, this_ecx
+        mov  ecx, BRIDGE_SLOTS
+    copy_args:
+        push dword ptr [edx + ecx * 4 - 4]
+        dec  ecx
+        jnz  copy_args
+        mov  ebx, esp            ; callee-saved: survives the call
+        mov  ecx, edi            ; thiscall / COM 'this'
+        call eax
+        mov  ecx, esp
+        sub  ecx, ebx            ; bytes the callee popped
+        lea  esp, [ebx + BRIDGE_SLOTS * 4]
         mov  r_eax, eax
         mov  r_edx, edx
-        mov  eax, esp
-        sub  eax, ebx            ; bytes the callee popped
-        mov  purge, eax
-        lea  esp, [ebx + BRIDGE_SLOTS * 4]
+        mov  purge, ecx
         fxam                     ; C3..C0 classify st(0)
         fnstsw ax
         mov  sw1, ax             ; x87 TOP after
