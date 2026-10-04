@@ -12,6 +12,10 @@ versions follow [SemVer](https://semver.org/).
   block, OEP, code range) are read from its own code. The code section is then
   AES-256-CBC decrypted, with the IV taken from an ECB-decrypted first block. The
   dead `.bind` section is dropped. Needs `cryptography`. Found on KotOR (Steam, app 32370).
+- `tools/drm/steamstub.py`: the older SteamStub 2.0 layout too. It has no `steamdrm.dll`:
+  the stub copies a header whose first dword seeds the running XOR over the rest, and the
+  code section is the same running XOR keyed by a header field. Found on Unreal
+  Tournament (Steam, app 13240).
 
 ### Fixed
 - disasm32: straight-line code longer than one scan window (8 KB, 4 KB per block) is decoded
