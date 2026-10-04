@@ -220,10 +220,18 @@ FPU_CMP = {'EQ': '==', 'NE': '!=', 'B': '<', 'BE': '<=', 'A': '>', 'AE': '>=',
            'L': '<', 'LE': '<=', 'G': '>', 'GE': '>='}
 
 
-def push_return_label(insn, nxt, leaders):
-    """The label of a `push label; jmp func` pair, or None."""
+def push_return_label(insn, nxt, leaders, body=()):
+    """The label of a `push label; jmp func` pair, or None.
+
+    Only when `func` is outside this body. A jump to the body's own code is a
+    jump, and the push is an argument: Yuri's Revenge's control subclass
+    procedure (0x00617250) pushes its own address and jumps to its shared
+    epilogue, which calls CallWindowProcA with it. Read as a call, the
+    epilogue ran as a separate function, came back, and the C restarted the
+    procedure from its entry with the stack scrambled.
+    """
     if (nxt is not None and insn.mnemonic == 'push' and nxt.mnemonic == 'jmp'
-            and nxt.get_branch_target() is not None):
+            and nxt.get_branch_target() is not None and nxt.get_branch_target() not in body):
         t = insn.get_branch_target()      # the push's immediate
         if t is not None and t in leaders:
             return t
@@ -309,6 +317,7 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
                 and cur.mnemonic not in ('int3', 'hlt')):
             gaps[k] = cur.end_address
     leaders = set(leaders) | {a for a in gaps.values() if a in addrs}
+    body_addrs = addrs
 
     skip = False
     for k, insn in enumerate(instructions):
@@ -324,7 +333,7 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
         # returns to its C caller whatever address was pushed, so lifting the
         # jmp as a tail call ended the span loop at the first trailing edge.
         nxt = instructions[k + 1] if k + 1 < len(instructions) else None
-        ret = push_return_label(insn, nxt, leaders)
+        ret = push_return_label(insn, nxt, leaders, body_addrs)
         if ret is not None:
             tgt = nxt.get_branch_target()
             call = (f'RECOMP_CALL(sub_{tgt:08X});' if lifter.lifted is None or tgt in lifter.lifted
@@ -709,6 +718,16 @@ def _selftest():
     assert out6.count('RECOMP_BACKEDGE();') == 1, out6
     assert out6.index('RECOMP_BACKEDGE();') < out6.index('0x00401007'), out6
     assert 'RECOMP_BACKEDGE' not in out3, 'a forward branch is not a loop'
+
+    # `push label; jmp X` is a call returning to `label` only when X is not
+    # this body's own code. Here X (0x1009) is the body's epilogue and the
+    # push is an argument for it: a plain push and a goto, no call.
+    #   1000 push 0x1000 / 1005 jmp 1009 / 1007 nop / 1008 nop / 1009 ret 4
+    own = bytes([0x68, 0x00, 0x10, 0x40, 0x00, 0xEB, 0x02, 0x90, 0x90, 0xC2, 0x04, 0x00])
+    i7, l7 = linear_disassemble_function(md, own, base, base, base + len(own),
+                                         reached={base, base + 5, base + 9})
+    out7 = lift_function_linear(Lifter(iat_map={}), 'sub_00401000', i7, l7, base)
+    assert 'RECOMP_CALL' not in out7 and 'goto L_00401009;' in out7, out7
 
     # ...and trailing int3 padding still ends the body: the first one is
     # emitted (it lifts to a trap, which is correct for unreachable filler) and
