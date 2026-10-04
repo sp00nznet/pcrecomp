@@ -217,6 +217,11 @@ def table_entries(read, table, is_code, limit=256):
 _TABLE_JMP = re.compile(r"dword ptr \[\w+\*4 \+ (0x[0-9a-f]+)\]$")
 
 
+# Bytes decoded per linear scan inside a function. Straight-line code longer
+# than this continues from a new leader at the window's end (disassemble_function).
+SCAN_WINDOW = 8192
+
+
 class Disassembler:
     def __init__(self, pe_data: bytes, image_base: int, sections: list):
         """
@@ -469,8 +474,10 @@ class Disassembler:
                 continue
             visited.add(addr)
 
-            insns = self.disassemble_at(addr, max_bytes=8192)
+            insns = self.disassemble_at(addr, max_bytes=SCAN_WINDOW)
+            last = None
             for insn in insns:
+                last = insn
                 if insn.is_call:
                     target = insn.get_branch_target()
                     if target and self.is_code_address(target):
@@ -520,6 +527,16 @@ class Disassembler:
                 # Check for int 3 (padding/alignment)
                 if insn.mnemonic == 'int3':
                     break
+            else:
+                # The window ran out before a branch, ret or int3: straight-line
+                # code longer than SCAN_WINDOW. Carry on from where it stopped,
+                # as a leader, or everything after it is lost. KotOR registers
+                # its script commands in ~7 KB of `mov [reg+disp], offset`; cut
+                # at the window, ~300 command functions were never harvested
+                # and their dispatches went unresolved.
+                if last is not None and last.end_address not in visited:
+                    block_leaders.add(last.end_address)
+                    work.append(last.end_address)
 
         # Pass 2: build basic blocks
         all_leaders = sorted(block_leaders)
@@ -528,7 +545,9 @@ class Disassembler:
                 continue
 
             block = BasicBlock(start=leader, end=leader)
-            insns = self.disassemble_at(leader, max_bytes=4096)
+            # The same window as pass 1, so a block always reaches the leader
+            # pass 1 left at the end of its window.
+            insns = self.disassemble_at(leader, max_bytes=SCAN_WINDOW)
 
             for insn in insns:
                 # If we hit another block leader (not our start), stop
@@ -1722,6 +1741,16 @@ def demo():
     bounds = {0x1000: 0x8000, 0x1200: 0x100}
     assert clamp_extents(bounds, 0x9000) == 1
     assert bounds == {0x1000: 0x200, 0x1200: 0x100}, bounds
+
+    # A function longer than one scan window with no branch in it (KotOR's
+    # script-command table setup) is decoded through to its ret.
+    run = b"\xc7\x80\x00\x01\x00\x00" + (BASE + 0x1020).to_bytes(4, "little")   # mov [eax+0x100], imm32
+    straight = b"\x90" * 0x20 + run * 1300 + b"\xc3"        # 13 KB, past SCAN_WINDOW
+    sd = Disassembler(b"\x00" * 0x400 + straight + b"\x90" * (0x4000 - len(straight)),
+                      BASE, [_Sec(".text", 0x1000, 0x400, 0x4000, True)])
+    sf = sd.disassemble_function(BASE + 0x1000)
+    assert sf.end == BASE + 0x1000 + len(straight), hex(sf.end)
+    assert sum(len(b.instructions) for b in sf.blocks.values()) == 0x20 + 1300 + 1
 
     # decode() must see exactly what one full md.disasm() does, across batch
     # boundaries (200 nops + a long tail) and stopping at an undecodable byte.

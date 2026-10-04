@@ -14,6 +14,10 @@ versions follow [SemVer](https://semver.org/).
   dead `.bind` section is dropped. Needs `cryptography`. Found on KotOR (Steam, app 32370).
 
 ### Fixed
+- disasm32: straight-line code longer than one scan window (8 KB, 4 KB per block) is decoded
+  to its end. The rest of the function used to be dropped. KotOR registers its script commands in
+  ~7 KB of `mov [reg+disp], offset`, so 142 functions named only there were never catalogued;
+  a script command's unresolved dispatch skipped its `ret 8` and corrupted the VM's esi. (#50)
 - native32: the guest's last error survives the bridge in both directions. mach_enter and
   mach_leave's TlsGetValue reset it to 0, so `GetLastError()` after a native call saw 0.
   KotOR's resource scan looped forever waiting for ERROR_NO_MORE_FILES. (#49)
