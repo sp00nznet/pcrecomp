@@ -215,6 +215,9 @@ static int g_nshims;
 #define IS_SHIM_VA(va) (g_shim_page && (va) >= g_shim_page && (va) < g_shim_page + 0x10000u)
 
 static void native_bridge(void) {
+    /* The guest's last error, as the previous native call left it: the trace
+     * below and mach_leave's TlsGetValue would reset it before this call. */
+    DWORD guest_error = GetLastError();
     uint32_t fn = g_native_target;
     uint32_t* src = (uint32_t*)(uintptr_t)(g_esp + 4);   /* past the dummy ret */
     uint32_t this_ecx = g_ecx, r_eax, r_edx, purge;
@@ -241,6 +244,7 @@ static void native_bridge(void) {
     g_cur_import = native32_name(fn);
     if (!g_cur_import) g_cur_import = "(native)";
     mach_leave();
+    SetLastError(guest_error);
     /* The locals are reached through whatever base register the compiler
      * chose, and the asm must leave it alone. MSVC uses ebp; clang-cl uses
      * esi (its x86 base pointer, for a frame it realigns), so the old
@@ -278,6 +282,13 @@ static void native_bridge(void) {
      * stack (gunman: every later frame rendered NaNs). */
     int st_ret = (((sw0 >> 11) - (sw1 >> 11)) & 7) == 1 && (sw1 & 0x4100) != 0x4100;
     if (st_ret) __asm fstp r_st
+    /* The callee's last error belongs to the guest, but mach_enter's
+     * TlsGetValue resets it to 0 (TlsGetValue always does), and so does
+     * stdio. A guest that loops on FindNextFileA until GetLastError() says
+     * ERROR_NO_MORE_FILES then never stopped (KotOR's resource scan): the
+     * value has to survive both ways across the bridge, into GetLastError
+     * itself and back out of FindNextFileA. */
+    DWORD last_error = GetLastError();
     mach_enter();
     if (st_ret) fp_push_impl(g_st, &g_fp_top, r_st);
     g_cur_import = saved_import;
@@ -285,6 +296,7 @@ static void native_bridge(void) {
     g_edx = r_edx;
     g_esp += 4 + purge;
     if (native32_trace_native) fprintf(stderr, " -> %08X\n", r_eax);
+    SetLastError(last_error);
 }
 
 recomp_func_t recomp_lookup(uint32_t va) {
