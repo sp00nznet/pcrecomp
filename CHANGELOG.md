@@ -14,6 +14,10 @@ versions follow [SemVer](https://semver.org/).
   dead `.bind` section is dropped. Needs `cryptography`. Found on KotOR (Steam, app 32370).
 
 ### Fixed
+- native32: the bridge's inline asm no longer touches esi or ebp. clang-cl addresses this
+  frame's locals off esi (its base pointer), and the bridge's `mov esi, src` sent the first
+  native call to 0. Inputs go to registers before esp moves, and arguments are copied by a
+  push loop. Found on KotOR built with clang-cl. (#48)
 - `pe/analyze_sections.py` called a `.bind` section a SafeDisc wrapper. `.bind` is
   Steam's SteamStub.
 
