@@ -376,6 +376,7 @@ void native32_shim_CxxThrowException(void);
 X87CRT(ftol) X87CRT(CIsqrt) X87CRT(CIsin) X87CRT(CIcos) X87CRT(CItan) X87CRT(CIasin)
 X87CRT(CIacos) X87CRT(CIatan) X87CRT(CIexp) X87CRT(CIlog) X87CRT(CIlog10) X87CRT(CIsinh)
 X87CRT(CIcosh) X87CRT(CItanh) X87CRT(CIpow) X87CRT(CIfmod) X87CRT(CIatan2)
+X87CRT(controlfp) X87CRT(control87)
 
 static native32_shim_t g_builtin[] = {
     { "CreateThread", shim_CreateThread },
@@ -389,6 +390,7 @@ static native32_shim_t g_builtin[] = {
     { "_CIsinh", native32_shim_CIsinh }, { "_CIcosh", native32_shim_CIcosh },
     { "_CItanh", native32_shim_CItanh }, { "_CIpow", native32_shim_CIpow },
     { "_CIfmod", native32_shim_CIfmod }, { "_CIatan2", native32_shim_CIatan2 },
+    { "_controlfp", native32_shim_controlfp }, { "_control87", native32_shim_control87 },
 };
 
 int native32_bind(uint32_t base, native32_shim_t* shims, int nshims) {
