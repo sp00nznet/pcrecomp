@@ -456,7 +456,15 @@ static __declspec(naked) void cb_tramp(void) {
 static LONG CALLBACK native32_veh(EXCEPTION_POINTERS* ep) {
     EXCEPTION_RECORD* er = ep->ExceptionRecord;
     uint32_t pc = (uint32_t)(uintptr_t)er->ExceptionAddress;
-    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->ExceptionInformation[0] == 8 &&
+    /* An instruction fetch: Windows says so (8, execute). Wine on Apple
+     * Silicon (CrossOver, 32-bit code under Rosetta) reports it as a read,
+     * but a read of the faulting instruction's own address is a fetch too:
+     * Wine calling a window procedure in the shim page came through as
+     * "read of 0x032D0170" at 0x032D0170, and the game died creating its
+     * window. */
+    int fetch = er->NumberParameters >= 2 &&
+                (er->ExceptionInformation[0] == 8 || (uint32_t)er->ExceptionInformation[1] == pc);
+    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fetch &&
         (native32_in_guest(pc) || IS_SHIM_VA(pc))) {
         if (recomp_lookup(pc) || IS_SHIM_VA(pc)) {
             ep->ContextRecord->Eax = pc;
@@ -471,6 +479,11 @@ static LONG CALLBACK native32_veh(EXCEPTION_POINTERS* ep) {
 /* ---------------------------------------------------------------- setup */
 
 void native32_init(void) {
+    /* Every Windows -> guest call relies on the guest's code faulting when it
+     * is fetched. Windows enforces that for a /NXCOMPAT exe; Wine does not
+     * unless DEP is asked for, and otherwise answers the first fetch by making
+     * the page executable and running the shipping machine code. */
+    SetProcessDEPPolicy(PROCESS_DEP_ENABLE);
     InitializeCriticalSection(&g_mach);
     recomp_yield_hook = native32_yield;
     g_mach_tls = TlsAlloc();
