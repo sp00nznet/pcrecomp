@@ -36,7 +36,30 @@ void native32_shim_ftol(void) {
     g_esp += 4;
 }
 
-#define UNARY(name, expr)                                                     \
+/* _controlfp(new, mask) and _control87: the FPU's precision and rounding
+ * mode. Run natively they set the real control word, which native code
+ * (an original module, Galaxy's built mixers) does use; but lifted fistp and
+ * frndint round by g_fpu_cw. Unreal sets its mode this way at startup, and
+ * its renderer's rasterisation went wrong without it. So the real call runs,
+ * then the hardware word it left is copied into g_fpu_cw. cdecl: the caller
+ * pops the two arguments. */
+typedef unsigned int (__cdecl *controlfp_t)(unsigned int, unsigned int);
+
+static void control_word(const char* name) {
+    static controlfp_t fn[2];
+    int k = name[8] == '8';                       /* _control87 */
+    if (!fn[k]) fn[k] = (controlfp_t)GetProcAddress(LoadLibraryA("msvcrt.dll"), name);
+    uint16_t cw;
+    g_eax = fn[k](MEM32(g_esp + 4), MEM32(g_esp + 8));
+    __asm fnstcw cw
+    g_fpu_cw = cw;
+    g_esp += 4;
+}
+
+void native32_shim_controlfp(void) { control_word("_controlfp"); }
+void native32_shim_control87(void) { control_word("_control87"); }
+
+#define UNARY(name, expr)                                                   \
     void native32_shim_##name(void) { double x = X87_POP(); X87_PUSH(expr); g_esp += 4; }
 #define BINARY(name, expr)                                                    \
     void native32_shim_##name(void) {                                         \
