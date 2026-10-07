@@ -589,6 +589,11 @@ We've proven this across DOS, Win16, Win32, Win64, MFC, Quake-family engines, Go
 
 Read the full philosophy in [docs/PHILOSOPHY.md](docs/PHILOSOPHY.md).
 
+## Contributors
+
+pcrecomp is built by more than one person. See
+**[CONTRIBUTORS.md](CONTRIBUTORS.md)** for who did what. Thank you, all of you.
+
 ## Credits
 
 Built on other people's tools, and on published reverse-engineering work:

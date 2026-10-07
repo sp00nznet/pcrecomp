@@ -14,6 +14,12 @@ versions follow [SemVer](https://semver.org/).
   dead `.bind` section is dropped. Needs `cryptography`. Found on KotOR (Steam, app 32370).
 
 ### Fixed
+- native32 under Wine (macOS with CrossOver, Linux): `native32_init` turns DEP on,
+  since Wine otherwise answers the first fetch from the guest's code by making it
+  executable and running the original machine code; and the fault handler takes a
+  read of the faulting instruction's own address as a fetch, as Wine under Rosetta
+  reports one. Callbacks into lifted code now arrive under Wine. (#55, by
+  [@cpressland](https://github.com/cpressland))
 - disasm32: straight-line code longer than one scan window (8 KB, 4 KB per block) is decoded
   to its end. The rest of the function used to be dropped. KotOR registers its script commands in
   ~7 KB of `mov [reg+disp], offset`, so 142 functions named only there were never catalogued;
