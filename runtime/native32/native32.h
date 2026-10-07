@@ -78,6 +78,12 @@ const char* native32_name(uint32_t va);
  * not a mapped module. */
 int native32_set_native(uint32_t base);
 
+/* The finer step of the same bisection: these functions of a native module
+ * run lifted after all. Each entry is patched with ud2, and the trap goes
+ * through the callback trampoline to the lifted body. Returns how many were
+ * lifted entries (the rest are skipped). */
+int native32_lift_in_native(const uint32_t* vas, int n);
+
 /* Diagnostics: set before running. */
 extern int native32_trace_native;     /* one line per native call */
 extern int native32_trace_callbacks;  /* one line per Windows -> guest call */
