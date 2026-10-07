@@ -158,6 +158,38 @@ static int native_module_at(uint32_t va) {
     return 0;
 }
 
+/* A call into a guest module outside its code sections: code kept in a data
+ * section, where old hand-written asm patches its own constants. UT's Fire.dll
+ * runs its procedural-texture loops from .data. No static lift can hold code
+ * that rewrites itself, and it was written for this CPU, so it runs natively:
+ * the section is made executable the first time it is called into. Its calls
+ * back into lifted code fault on non-executable pages and take the callback
+ * trampoline. */
+static int data_section_code(uint32_t va) {
+    for (int i = 0; i < g_mod_n; i++) {
+        uint32_t base = g_mods[i].base;
+        if (va < base || va >= base + g_mods[i].span) continue;
+        IMAGE_NT_HEADERS32* nt = (IMAGE_NT_HEADERS32*)(uintptr_t)(base + ((IMAGE_DOS_HEADER*)(uintptr_t)base)->e_lfanew);
+        IMAGE_SECTION_HEADER* s = IMAGE_FIRST_SECTION(nt);
+        for (int k = 0; k < nt->FileHeader.NumberOfSections; k++, s++) {
+            uint32_t lo = base + s->VirtualAddress, hi = lo + s->Misc.VirtualSize;
+            if (va < lo || va >= hi) continue;
+            if (s->Characteristics & IMAGE_SCN_MEM_EXECUTE) return 0;   /* lifted code */
+            MEMORY_BASIC_INFORMATION mbi;
+            DWORD old;
+            VirtualQuery((void*)(uintptr_t)va, &mbi, sizeof mbi);
+            if (mbi.Protect != PAGE_EXECUTE_READWRITE) {
+                VirtualProtect((void*)(uintptr_t)lo, hi - lo, PAGE_EXECUTE_READWRITE, &old);
+                fprintf(stderr, "[native32] %s: code in data section %.8s (0x%08X) runs natively\n",
+                        g_mods[i].name, (const char*)s->Name, va);
+            }
+            return 1;
+        }
+        return 0;
+    }
+    return 0;
+}
+
 static int cmp_u32(const void* a, const void* b) {
     uint32_t x = *(const uint32_t*)a, y = *(const uint32_t*)b;
     return x < y ? -1 : x > y;
@@ -385,7 +417,8 @@ recomp_func_t recomp_lookup_import(uint32_t va) {
             if (g_shims[i].va == va) return g_shims[i].fn;
         return NULL;
     }
-    if (va < 0x10000u || (native32_in_guest(va) && !native_module_at(va))) return NULL;
+    if (va < 0x10000u) return NULL;
+    if (native32_in_guest(va) && !native_module_at(va) && !data_section_code(va)) return NULL;
     g_native_target = va;
     return native_bridge;
 }
