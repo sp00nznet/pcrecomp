@@ -31,6 +31,8 @@
  * A throw nothing in the guest catches goes to the real _CxxThrowException,
  * so the host's crash report sees it as before.
  *
+ * Included at the end of native32.c, so hosts need no change to their build.
+ *
  * ponytail: C++ frames only. A __try/__except (SEH, _except_handler3) frame
  * is skipped, not asked: its filter could catch a C++ throw, and its __finally
  * blocks do not run on the way past. Add when a title catches that way.
@@ -40,9 +42,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define RECOMP_GENERATED_CODE   /* the EH frame type and macros */
 #include "recomp_types.h"
-#undef RECOMP_GENERATED_CODE
 
 #define EH_MAGIC_VC6   0x19930520u
 #define EH_MAGIC_VC7   0x19930521u
