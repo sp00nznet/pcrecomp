@@ -251,24 +251,42 @@ static void native_bridge(void) {
      * `mov esi, src` for rep movsd cut the frame off and the next local read
      * was garbage: the first native call jumped to 0 (KotOR, clang-cl). So:
      * no esi or ebp, every input in a register before esp moves, and the
-     * arguments copied by pushes, highest slot first. */
+     * arguments copied by pushes, highest slot first.
+     *
+     * Nor does the callee have to keep the C ABI. It is usually Windows, but
+     * it can be the guest's own hand-written asm, run natively because no lift
+     * can hold it (code in a data section, a native module), and that was
+     * only ever called from inline asm that saved everything: UT's Fire.dll
+     * returns with ebx and ebp changed. So ebp, esi and ebx are saved on the
+     * stack, and the esp anchor is kept in this thread's TEB
+     * (ArbitraryUserPointer, fs:[0x14], its old value saved and put back, so a
+     * nested bridge through a callback unwinds in order). */
     __asm {
         fnstsw ax
         mov  sw0, ax             ; x87 TOP before
         mov  edx, src
         mov  eax, fn
         mov  edi, this_ecx
+        push ebp
+        push esi
+        push ebx
+        push dword ptr fs:[0x14]
         mov  ecx, BRIDGE_SLOTS
     copy_args:
         push dword ptr [edx + ecx * 4 - 4]
         dec  ecx
         jnz  copy_args
-        mov  ebx, esp            ; callee-saved: survives the call
+        mov  fs:[0x14], esp      ; the anchor: survives any callee
         mov  ecx, edi            ; thiscall / COM 'this'
         call eax
         mov  ecx, esp
-        sub  ecx, ebx            ; bytes the callee popped
-        lea  esp, [ebx + BRIDGE_SLOTS * 4]
+        mov  esp, fs:[0x14]
+        sub  ecx, esp            ; bytes the callee popped
+        add  esp, BRIDGE_SLOTS * 4
+        pop  dword ptr fs:[0x14]
+        pop  ebx
+        pop  esi
+        pop  ebp                 ; the frame is reachable again
         mov  r_eax, eax
         mov  r_edx, edx
         mov  purge, ecx
