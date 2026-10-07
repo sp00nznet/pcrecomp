@@ -133,11 +133,49 @@ static void native32_yield(void) {
 static struct { uint32_t base, span; int native; char name[MAX_PATH]; } g_mods[MAX_MODULES];
 static int g_mod_n;
 
+static recomp_func_t dispatch_find(uint32_t va);
+
+/* Functions inside a native module that still run lifted
+ * (native32_lift_in_native), sorted for bsearch. */
+static uint32_t* g_lin;
+static int g_lin_n;
+
+static int lifted_in_native(uint32_t va) {
+    int lo = 0, hi = g_lin_n;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (g_lin[mid] == va) return 1;
+        if (g_lin[mid] < va) lo = mid + 1; else hi = mid;
+    }
+    return 0;
+}
+
 /* A module running its original machine code (native32_set_native). */
 static int native_module_at(uint32_t va) {
     for (int i = 0; i < g_mod_n; i++)
-        if (g_mods[i].native && va >= g_mods[i].base && va < g_mods[i].base + g_mods[i].span) return 1;
+        if (g_mods[i].native && va >= g_mods[i].base && va < g_mods[i].base + g_mods[i].span)
+            return !lifted_in_native(va);
     return 0;
+}
+
+static int cmp_u32(const void* a, const void* b) {
+    uint32_t x = *(const uint32_t*)a, y = *(const uint32_t*)b;
+    return x < y ? -1 : x > y;
+}
+
+int native32_lift_in_native(const uint32_t* vas, int n) {
+    int done = 0;
+    g_lin = (uint32_t*)realloc(g_lin, (g_lin_n + n) * sizeof *g_lin);
+    for (int i = 0; i < n; i++) {
+        if (!dispatch_find(vas[i])) continue;           /* not a lifted entry */
+        uint8_t* p = (uint8_t*)(uintptr_t)vas[i];
+        p[0] = 0x0F, p[1] = 0x0B;                      /* ud2: the trap is the trampoline */
+        g_lin[g_lin_n++] = vas[i];
+        done++;
+    }
+    qsort(g_lin, g_lin_n, sizeof *g_lin, cmp_u32);
+    FlushInstructionCache(GetCurrentProcess(), NULL, 0);
+    return done;
 }
 
 int native32_set_native(uint32_t base) {
@@ -324,15 +362,19 @@ static void native_bridge(void) {
     SetLastError(last_error);
 }
 
-recomp_func_t recomp_lookup(uint32_t va) {
+static recomp_func_t dispatch_find(uint32_t va) {
     uint32_t lo = 0, hi = recomp_dispatch_count;
-    if (native_module_at(va)) return NULL;    /* its original code runs: recomp_lookup_import */
     while (lo < hi) {
         uint32_t mid = lo + (hi - lo) / 2, m = recomp_dispatch_table[mid].address;
         if (m == va) return recomp_dispatch_table[mid].func;
         if (m < va) lo = mid + 1; else hi = mid;
     }
     return NULL;
+}
+
+recomp_func_t recomp_lookup(uint32_t va) {
+    if (native_module_at(va)) return NULL;    /* its original code runs: recomp_lookup_import */
+    return dispatch_find(va);
 }
 
 /* Anything that is neither a shim nor inside a guest module is native: an
@@ -482,6 +524,11 @@ static __declspec(naked) void cb_tramp(void) {
 static LONG CALLBACK native32_veh(EXCEPTION_POINTERS* ep) {
     EXCEPTION_RECORD* er = ep->ExceptionRecord;
     uint32_t pc = (uint32_t)(uintptr_t)er->ExceptionAddress;
+    if (er->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION && lifted_in_native(pc)) {
+        ep->ContextRecord->Eax = pc;            /* native code reached a lifted one */
+        ep->ContextRecord->Eip = (DWORD)(uintptr_t)cb_tramp;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->ExceptionInformation[0] == 8 &&
         (native32_in_guest(pc) || IS_SHIM_VA(pc))) {
         if (recomp_lookup(pc) || IS_SHIM_VA(pc)) {
