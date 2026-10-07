@@ -501,3 +501,7 @@ void native32_dump_icalls(int n) {
         fprintf(stderr, "  0x%08X  from 0x%08X  %s\n", g_icall_trace[k], g_icall_from[k], nm ? nm : "");
     }
 }
+
+/* Built-in bodies kept in their own files, compiled as part of this one so a
+ * host's build needs no change when one is added. */
+#include "eh32.c"
