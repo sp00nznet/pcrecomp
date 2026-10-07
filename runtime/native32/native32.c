@@ -130,8 +130,33 @@ static void native32_yield(void) {
 /* ---------------------------------------------------------------- modules */
 
 #define MAX_MODULES 32
-static struct { uint32_t base, span; char name[MAX_PATH]; } g_mods[MAX_MODULES];
+static struct { uint32_t base, span; int native; char name[MAX_PATH]; } g_mods[MAX_MODULES];
 static int g_mod_n;
+
+/* A module running its original machine code (native32_set_native). */
+static int native_module_at(uint32_t va) {
+    for (int i = 0; i < g_mod_n; i++)
+        if (g_mods[i].native && va >= g_mods[i].base && va < g_mods[i].base + g_mods[i].span) return 1;
+    return 0;
+}
+
+int native32_set_native(uint32_t base) {
+    for (int i = 0; i < g_mod_n; i++) {
+        if (g_mods[i].base != base) continue;
+        IMAGE_NT_HEADERS32* nt = (IMAGE_NT_HEADERS32*)(uintptr_t)(base + ((IMAGE_DOS_HEADER*)(uintptr_t)base)->e_lfanew);
+        IMAGE_SECTION_HEADER* s = IMAGE_FIRST_SECTION(nt);
+        for (int k = 0; k < nt->FileHeader.NumberOfSections; k++, s++) {
+            DWORD old;
+            /* writable too: old code patches itself (software rasterisers) */
+            if (s->Characteristics & IMAGE_SCN_MEM_EXECUTE)
+                VirtualProtect((void*)(uintptr_t)(base + s->VirtualAddress), s->Misc.VirtualSize,
+                               PAGE_EXECUTE_READWRITE, &old);
+        }
+        g_mods[i].native = 1;
+        return 1;
+    }
+    return 0;
+}
 
 int native32_in_guest(uint32_t va) {
     for (int i = 0; i < g_mod_n; i++)
@@ -301,6 +326,7 @@ static void native_bridge(void) {
 
 recomp_func_t recomp_lookup(uint32_t va) {
     uint32_t lo = 0, hi = recomp_dispatch_count;
+    if (native_module_at(va)) return NULL;    /* its original code runs: recomp_lookup_import */
     while (lo < hi) {
         uint32_t mid = lo + (hi - lo) / 2, m = recomp_dispatch_table[mid].address;
         if (m == va) return recomp_dispatch_table[mid].func;
@@ -317,7 +343,7 @@ recomp_func_t recomp_lookup_import(uint32_t va) {
             if (g_shims[i].va == va) return g_shims[i].fn;
         return NULL;
     }
-    if (va < 0x10000u || native32_in_guest(va)) return NULL;
+    if (va < 0x10000u || (native32_in_guest(va) && !native_module_at(va))) return NULL;
     g_native_target = va;
     return native_bridge;
 }

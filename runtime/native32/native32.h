@@ -69,6 +69,15 @@ void mach_leave(void);
 /* Name for a native address ("kernel32.dll!CreateFileA"), or NULL. */
 const char* native32_name(uint32_t va);
 
+/* Run a mapped module's ORIGINAL machine code instead of its lift: its code
+ * is made executable again and every call into it from lifted code goes
+ * through the native bridge, while its own calls out (imports, vtables) still
+ * reach the lifted modules through the callback trampoline. For bisecting a
+ * lift bug to one module: if the output is right with module X native, the
+ * bug is in X's lift. Call after native32_map, before running. 0 if base is
+ * not a mapped module. */
+int native32_set_native(uint32_t base);
+
 /* Diagnostics: set before running. */
 extern int native32_trace_native;     /* one line per native call */
 extern int native32_trace_callbacks;  /* one line per Windows -> guest call */
