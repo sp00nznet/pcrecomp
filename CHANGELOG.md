@@ -14,6 +14,11 @@ versions follow [SemVer](https://semver.org/).
   dead `.bind` section is dropped. Needs `cryptography`. Found on KotOR (Steam, app 32370).
 
 ### Fixed
+- lift32: a signed or unsigned ordering jcc/setcc after `or` or `xor` (`jge`, `jl`, `jg`,
+  `jle`, `ja`, `jbe`, `jb`, `jae`) tests the result's sign and zero, as after `test`. It
+  compared the result with itself (`xor eax, [b]; jge` was always taken). Unreal
+  Tournament's clipper asks whether an edge crosses a plane that way; its renderer drew
+  stretched, overlapping shards. Four difftest cases.
 - disasm32: straight-line code longer than one scan window (8 KB, 4 KB per block) is decoded
   to its end. The rest of the function used to be dropped. KotOR registers its script commands in
   ~7 KB of `mov [reg+disp], offset`, so 142 functions named only there were never catalogued;
