@@ -340,8 +340,24 @@ static void shim_CreateThread(void) {
     g_esp += 4 + 6 * 4;
 }
 
+/* msvcrt helpers that take their arguments on the x87 stack (x87crt.c): the
+ * bridge passes stack arguments only, and the lifted FPU stack is g_st. */
+#define X87CRT(n) void native32_shim_##n(void);
+X87CRT(ftol) X87CRT(CIsqrt) X87CRT(CIsin) X87CRT(CIcos) X87CRT(CItan) X87CRT(CIasin)
+X87CRT(CIacos) X87CRT(CIatan) X87CRT(CIexp) X87CRT(CIlog) X87CRT(CIlog10) X87CRT(CIsinh)
+X87CRT(CIcosh) X87CRT(CItanh) X87CRT(CIpow) X87CRT(CIfmod) X87CRT(CIatan2)
+
 static native32_shim_t g_builtin[] = {
     { "CreateThread", shim_CreateThread },
+    { "_ftol", native32_shim_ftol },
+    { "_CIsqrt", native32_shim_CIsqrt }, { "_CIsin", native32_shim_CIsin },
+    { "_CIcos", native32_shim_CIcos }, { "_CItan", native32_shim_CItan },
+    { "_CIasin", native32_shim_CIasin }, { "_CIacos", native32_shim_CIacos },
+    { "_CIatan", native32_shim_CIatan }, { "_CIexp", native32_shim_CIexp },
+    { "_CIlog", native32_shim_CIlog }, { "_CIlog10", native32_shim_CIlog10 },
+    { "_CIsinh", native32_shim_CIsinh }, { "_CIcosh", native32_shim_CIcosh },
+    { "_CItanh", native32_shim_CItanh }, { "_CIpow", native32_shim_CIpow },
+    { "_CIfmod", native32_shim_CIfmod }, { "_CIatan2", native32_shim_CIatan2 },
 };
 
 int native32_bind(uint32_t base, native32_shim_t* shims, int nshims) {
@@ -496,3 +512,7 @@ void native32_dump_icalls(int n) {
         fprintf(stderr, "  0x%08X  from 0x%08X  %s\n", g_icall_trace[k], g_icall_from[k], nm ? nm : "");
     }
 }
+
+/* Built-in bodies kept in their own files, compiled as part of this one so a
+ * host's build needs no change when one is added. */
+#include "x87crt.c"
