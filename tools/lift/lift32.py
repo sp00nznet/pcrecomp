@@ -53,6 +53,19 @@ MMX_BINOPS = {
     'packuswb':  'mmx_packuswb({a}, {b})',
     'pcmpeqw':   'mmx_pcmpeqw({a}, {b})',
     'pcmpgtw':   'mmx_pcmpgtw({a}, {b})',
+    'pcmpeqd':   'mmx_pcmpeqd({a}, {b})',
+    'pcmpgtd':   'mmx_pcmpgtd({a}, {b})',
+    'paddb':     'mmx_paddb({a}, {b})',
+    'psubb':     'mmx_psubb({a}, {b})',
+    'paddsb':    'mmx_paddsb({a}, {b})',
+    'psubsb':    'mmx_psubsb({a}, {b})',
+    'paddusb':   'mmx_paddusb({a}, {b})',
+    'psubusb':   'mmx_psubusb({a}, {b})',
+    'paddusw':   'mmx_paddusw({a}, {b})',
+    'psubusw':   'mmx_psubusw({a}, {b})',
+    'pcmpeqb':   'mmx_pcmpeqb({a}, {b})',
+    'pcmpgtb':   'mmx_pcmpgtb({a}, {b})',
+    'packsswb':  'mmx_packsswb({a}, {b})',
 }
 
 # Shifts take their count from an immediate or from another MMX register.

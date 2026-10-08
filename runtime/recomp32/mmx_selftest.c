@@ -81,6 +81,34 @@ int main(void) {
         0xFFFF0000FFFFFFFFULL);
     chk("pcmpgtw", mmx_pcmpgtw(0x0005000500050005ULL, 0x0004000600040006ULL),
         0xFFFF0000FFFF0000ULL);
+    chk("pcmpeqd", mmx_pcmpeqd(0x0000000700000001ULL, 0x0000000700000002ULL),
+        0xFFFFFFFF00000000ULL);
+    chk("pcmpgtd", mmx_pcmpgtd(0x0000000100000001ULL, 0xFFFFFFFF00000002ULL),
+        0xFFFFFFFF00000000ULL);   /* signed: 1 > -1, 1 < 2 */
+
+    /* Bytes. Unsigned saturation stops at 255 and 0; signed at 127 and -128. */
+    chk("paddusb", mmx_paddusb(0xF0F0102000000080ULL, 0x2010101000000080ULL),
+        0xFFFF2030000000FFULL);
+    chk("psubusb", mmx_psubusb(0x1020300000000005ULL, 0x2010100000000003ULL),
+        0x0010200000000002ULL);
+    chk("paddb", mmx_paddb(0xFF01000000000000ULL, 0x0101000000000000ULL),
+        0x0002000000000000ULL);    /* wraps */
+    chk("psubb", mmx_psubb(0x0001000000000000ULL, 0x0101000000000000ULL),
+        0xFF00000000000000ULL);
+    chk("paddsb", mmx_paddsb(0x7F80000000000010ULL, 0x0180000000000010ULL),
+        0x7F80000000000020ULL);
+    chk("psubsb", mmx_psubsb(0x807F000000000000ULL, 0x01FF000000000000ULL),
+        0x807F000000000000ULL);    /* -128-1 -> -128, 127-(-1) -> 127 */
+    chk("paddusw", mmx_paddusw(0xFFF0000100000000ULL, 0x0020000200000000ULL),
+        0xFFFF000300000000ULL);
+    chk("psubusw", mmx_psubusw(0x0010000500000000ULL, 0x0020000300000000ULL),
+        0x0000000200000000ULL);
+    chk("pcmpeqb", mmx_pcmpeqb(0x0102030400000000ULL, 0x0100030500000000ULL),
+        0xFF00FF00FFFFFFFFULL);
+    chk("pcmpgtb", mmx_pcmpgtb(0x0180000000000000ULL, 0xFF7F000000000000ULL),
+        0xFF00000000000000ULL);    /* signed: 1 > -1, -128 < 127 */
+    chk("packsswb", mmx_packsswb(0x0100FF80007FFFFFULL, 0x0000000000020003ULL),
+        0x000002037F807FFFULL);
 
     printf(fails ? "%d FAILURE(S)\n" : "all MMX helpers agree (%d failures)\n", fails);
     return fails != 0;
