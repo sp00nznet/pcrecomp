@@ -129,6 +129,7 @@ static int g_ncls;
 typedef struct {
     int used, cls, kind, destroying;
     uint32_t hwnd, proc, parent, owner, style, exstyle, id, user, hinst, font, menu;
+    uint32_t thread;                     /* the thread that made it: its messages run there */
     int x, y, w, h;                      /* relative to the parent's client area; a top-level's to the screen */
     uint32_t dlgproc, msgresult, dlguser;
     int dlg_ended; uint32_t dlg_result;
@@ -152,7 +153,19 @@ static uint8_t g_keys[256];                      /* bit 7: down, bit 0: toggled 
 static void (*g_pump)(void);
 
 void hle_set_pump_hook(void (*fn)(void)) { g_pump = fn; }
-void hle_set_screen_size(int w, int h) { g_screen_w = w, g_screen_h = h; }
+static void move(win_t *x, int px, int py, int pw, int ph, int do_move, int do_size);
+/* A display mode change: a top-level window that covered the old screen
+ * covers the new one, as an exclusive-mode game's window does on Windows
+ * (the game sizes things, and takes mouse coordinates, by it). */
+void hle_set_screen_size(int w, int h) {
+    int ow = g_screen_w, oh = g_screen_h;
+    g_screen_w = w, g_screen_h = h;
+    for (int i = 0; i < MAX_WIN; i++) {
+        win_t *x = &g_win[i];
+        if (x->used && !x->parent && !x->owner && x->x <= 0 && x->y <= 0 && x->x + x->w >= ow && x->y + x->h >= oh)
+            move(x, 0, 0, w, h, 1, 1);
+    }
+}
 
 #define HWND_OF(i) (0x00010000u | ((uint32_t)(i) << 4))
 static win_t *W(uint32_t h) {
@@ -178,9 +191,39 @@ static uint32_t call_proc(uint32_t proc, uint32_t h, uint32_t m, uint32_t w, uin
     if (x && m != WM_MOUSEMOVE && m != 0x0084u && m != 0x0020u && r) fprintf(stderr, "[msg] %05X     -> %08X\n", h, r);
     return r;
 }
+/* SendMessage across threads, as Windows does it: the message runs on the
+ * window's own thread, when that thread next looks at its queue, and the
+ * sender waits for the result. (A test driver's LB_SETCURSEL run on its own
+ * thread ran the game's list handler there, and the game stopped.) */
+#define MAX_SENT 32
+static struct { uint32_t h, m, w, l, result, thread; volatile int state; } g_sent[MAX_SENT];   /* state: 1 queued, 2 done */
+static void deliver_sent(void) {
+    uint32_t me = hle_thread_id();
+    for (int i = 0; i < MAX_SENT; i++)
+        if (g_sent[i].state == 1 && g_sent[i].thread == me) {
+            win_t *x = W(g_sent[i].h);
+            g_sent[i].state = 3;                         /* running */
+            g_sent[i].result = x ? call_proc(x->proc, g_sent[i].h, g_sent[i].m, g_sent[i].w, g_sent[i].l) : 0;
+            g_sent[i].state = 2;
+        }
+}
 uint32_t hle_send(uint32_t h, uint32_t m, uint32_t w, uint32_t l) {
     win_t *x = W(h);
-    return x ? call_proc(x->proc, h, m, w, l) : 0;
+    if (!x) return 0;
+    if (!x->thread || x->thread == hle_thread_id()) return call_proc(x->proc, h, m, w, l);
+    int i = 0;
+    while (i < MAX_SENT && g_sent[i].state) i++;
+    if (i == MAX_SENT) return call_proc(x->proc, h, m, w, l);   /* ponytail: a full table runs it here */
+    g_sent[i].h = h, g_sent[i].m = m, g_sent[i].w = w, g_sent[i].l = l, g_sent[i].thread = x->thread, g_sent[i].state = 1;
+    while (g_sent[i].state != 2) {
+        deliver_sent();                                  /* sends to this thread meanwhile, as Windows does */
+        hle_block_begin();
+        usleep(200);
+        hle_block_end();
+    }
+    uint32_t r = g_sent[i].result;
+    g_sent[i].state = 0;
+    return r;
 }
 
 /* ---- the queue ---- */
@@ -286,7 +329,7 @@ uint32_t hle_create_window(uint32_t exstyle, const char *cls, const char *title,
     win_t *x = &g_win[i];
     memset(x, 0, sizeof *x);
     x->used = 1, x->hwnd = HWND_OF(i), x->cls = c, x->kind = g_cls[c].kind, x->proc = g_cls[c].proc;
-    x->style = style, x->exstyle = exstyle, x->hinst = hinst, x->seq = ++g_seq;
+    x->style = style, x->exstyle = exstyle, x->hinst = hinst, x->seq = ++g_seq, x->thread = hle_thread_id();
     if (style & WS_CHILD) x->parent = parent, x->id = menu;
     else x->owner = parent, x->menu = menu;
     if ((int)px == (int)0x80000000) px = 0, py = 0;      /* CW_USEDEFAULT */
@@ -389,6 +432,7 @@ static int matches(const msg_t *m, uint32_t hwnd, uint32_t lo, uint32_t hi) {
 }
 
 static int next_message(msg_t *out, uint32_t hwnd, uint32_t lo, uint32_t hi, int remove) {
+    deliver_sent();
     /* drop the dead (messages to destroyed windows) */
     while (g_qn && g_q[0].message == 0xFFFFFFFFu) memmove(g_q, g_q + 1, sizeof g_q[0] * (size_t)--g_qn);
     for (int i = 0; i < g_qn; i++)
@@ -1843,6 +1887,14 @@ const char *hle_window_class(uint32_t h) { win_t *x = W(h); return x ? g_cls[x->
 uint32_t hle_window_parent(uint32_t h) { win_t *x = W(h); return x ? (x->parent ? x->parent : x->owner) : 0; }
 uint32_t hle_dialog_item(uint32_t dlg, uint32_t id) { return dlg_item(dlg, id); }
 uint32_t hle_window_style(uint32_t h) { win_t *x = W(h); return x ? x->style : 0; }
+
+/* What is waiting in the queue, for a test driver's report. */
+void hle_queue_dump(void) {
+    fprintf(stderr, "[user32] %d queued, quit %d, focus %05X capture %05X active %05X\n", g_qn, g_quit, g_focus, g_capture, g_active);
+    for (int i = 0; i < g_qn && i < 16; i++)
+        fprintf(stderr, "  %05X %s#%u <- %04X %08X %08X\n", g_q[i].hwnd, W(g_q[i].hwnd) ? g_cls[W(g_q[i].hwnd)->cls].name : "?",
+                W(g_q[i].hwnd) ? W(g_q[i].hwnd)->id : 0, g_q[i].message, g_q[i].wParam, g_q[i].lParam);
+}
 
 uint32_t hle_first_hwnd(void) {
     for (int i = 0; i < MAX_WIN; i++) if (g_win[i].used && !g_win[i].parent) return g_win[i].hwnd;

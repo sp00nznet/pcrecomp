@@ -175,9 +175,7 @@ static void o_StringFromCLSID(void) {                    /* (clsid, &wide string
 static void o_OleRun(void) { RET(A32(0) ? S_OK : E_FAIL, 1); }
 static void o_notimpl_1(void) { RET(E_NOTIMPL, 1); }
 static void o_notimpl_2(void) { RET(E_NOTIMPL, 2); }
-static void o_notimpl_3(void) { RET(E_NOTIMPL, 3); }
 static void o_notimpl_4(void) { RET(E_NOTIMPL, 4); }
-static void o_notimpl_6(void) { RET(E_NOTIMPL, 6); }
 
 /* ---- OLEAUT32: BSTRs (length-prefixed wide strings) and VARIANTs ---- */
 static void a_SysAllocString(void) {
@@ -210,10 +208,6 @@ const win32hle_shim win32hle_ole32[] = {
     { "StringFromGUID2",       o_StringFromGUID2 },
     { "StringFromCLSID",       o_StringFromCLSID },
     { "OleRun",                o_OleRun },
-    { "OleLoadFromStream",     o_notimpl_3 },
-    { "OleSaveToStream",       o_notimpl_2 },
-    { "StgCreateDocfile",      o_notimpl_4 },
-    { "StgOpenStorage",        o_notimpl_6 },
 #define AUT(ord, name, fn) { "oleaut32.dll#" #ord, fn }, { name, fn }
     AUT(2, "SysAllocString",        a_SysAllocString),
     AUT(6, "SysFreeString",         a_SysFreeString),

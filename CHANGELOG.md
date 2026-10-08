@@ -30,7 +30,16 @@ versions follow [SemVer](https://semver.org/).
     codepage 1252 and an English locale for the CRT.
   - `ole32.c` (COM class factories, the host's and the guest's own),
     `advapi32.c` (an in-memory registry, COMCTL32, VERSION, SHELL32),
-    `wsock32.c` (Winsock 1.1 on BSD sockets), `winmm.c` timers on threads.
+    `wsock32.c` (Winsock 1.1 on BSD sockets, and IPX as IPXEmu puts it on
+    UDP, so a native player and a Windows one share a LAN), `winmm.c` timers
+    on threads.
+  - `storage.c`: structured storage (`StgCreateDocfile`, `IStorage`,
+    `IStream`, `OleSaveToStream`/`OleLoadFromStream`) on compound files in
+    Windows' own format (MS-CFB v3), so saves move between the two; a
+    selftest round-trips one.
+  - `screen.c` scales as a Windows presenter does: sharp-bilinear, smooth,
+    CRT, nearest, integer (F12), blurred bars, fullscreen (F11); an optional
+    2x picture from the host (an HD layer).
   - The machine lock is handed over with the registers saved, at every import
     and loop back-edge when another thread waits; ordinal imports bind as
     `dll#N`; `build_selftests.sh` runs the selftests.

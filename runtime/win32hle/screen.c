@@ -38,9 +38,34 @@ static unsigned g_shown_seq = ~0u;
 static uint32_t g_last_present;
 static int g_headless, g_fullscreen;
 static SDL_Rect g_dst;                                   /* where the picture is in the window */
+static SDL_Texture *g_pre, *g_small;                     /* sharp's integer prescale; the bars' blur */
+static int g_pre_w, g_pre_h;
+
+/* How the picture is scaled, as the Windows presenter offers (F12 cycles):
+ * sharp-bilinear (an integer prescale, nearest, then the rest bilinear),
+ * smooth (bilinear), crt (sharp with scanlines), nearest, integer (whole
+ * multiples only). The bars beside a letterboxed picture are a dark blur of
+ * it, or black. */
+static const char *const k_modes[] = { "sharp", "smooth", "crt", "nearest", "integer" };
+static int g_mode, g_bars = 1;
+void (*hle_screen_settings_hook)(const char *scale, int bars, int fullscreen);   /* to remember them */
+int hle_screen_scale(const char *name) {
+    for (int i = 0; i < 5; i++) if (name && !strcmp(name, k_modes[i])) return g_mode = i, 1;
+    return 0;
+}
+void hle_screen_bars(int blur) { g_bars = blur != 0; }
+static void settings_changed(void) {
+    g_shown_seq = ~0u;
+    if (hle_screen_settings_hook) hle_screen_settings_hook(k_modes[g_mode], g_bars, g_fullscreen);
+}
 static uint32_t *g_conv;                                 /* 8-bit frames converted */
 static size_t g_conv_n;
 void (*hle_screen_frame_hook)(const uint8_t *px, int w, int h, int pitch, int bpp);   /* a recorder, a checksum */
+/* A host's own picture at twice the size (an HD layer): fills out with 2w x
+ * 2h XRGB from the 16-bit frame and returns 1, or returns 0 for the 1x. */
+int (*hle_screen_compose_hook)(const uint8_t *px16, int pitch, int w, int h, uint32_t *out);
+static uint32_t *g_hd;
+static size_t g_hd_n;
 
 static int vk_of(SDL_Scancode s) {
     if (s >= SDL_SCANCODE_A && s <= SDL_SCANCODE_Z) return 'A' + (s - SDL_SCANCODE_A);
@@ -112,10 +137,15 @@ static uint32_t scan_of(SDL_Scancode s) {
     return (unsigned)s < SDL_NUM_SCANCODES ? t[s] : 0;
 }
 
-/* window pixels -> game pixels, clamped to the picture */
+/* window points -> game pixels, clamped to the picture */
 static void to_game(int x, int y, int *gx, int *gy) {
-    int w, h, bpp;
+    int w, h, bpp, pw, ph, ww, wh;
     hle_dd_mode(&w, &h, &bpp);
+    if (g_ren && g_win) {                                /* HiDPI: the renderer counts pixels, events points */
+        SDL_GetRendererOutputSize(g_ren, &pw, &ph);
+        SDL_GetWindowSize(g_win, &ww, &wh);
+        if (ww > 0 && wh > 0) x = x * pw / ww, y = y * ph / wh;
+    }
     if (g_dst.w <= 0 || g_dst.h <= 0) { *gx = x, *gy = y; return; }
     *gx = (int)((long long)(x - g_dst.x) * w / g_dst.w);
     *gy = (int)((long long)(y - g_dst.y) * h / g_dst.h);
@@ -137,13 +167,21 @@ static void present(void) {
     g_shown_seq = seq, g_last_present = now;
     if (hle_screen_frame_hook) hle_screen_frame_hook(px, w, h, pitch, bpp);
     if (!g_ren) return;
-    int fmt = bpp == 16 ? SDL_PIXELFORMAT_RGB565 : SDL_PIXELFORMAT_ARGB8888;
-    if (!g_tex || g_tex_w != w || g_tex_h != h || g_tex_fmt != fmt) {
-        if (g_tex) SDL_DestroyTexture(g_tex);
-        g_tex = SDL_CreateTexture(g_ren, (Uint32)fmt, SDL_TEXTUREACCESS_STREAMING, w, h);
-        g_tex_w = w, g_tex_h = h, g_tex_fmt = fmt;
+    int hd = 0;
+    if (bpp == 16 && hle_screen_compose_hook) {
+        if (g_hd_n < (size_t)w * h * 4) { free(g_hd); g_hd_n = (size_t)w * h * 4; g_hd = (uint32_t *)malloc(g_hd_n * 4); }
+        hd = g_hd && hle_screen_compose_hook(px, pitch, w, h, g_hd);
     }
-    if (bpp == 8) {
+    int fmt = bpp == 16 && !hd ? SDL_PIXELFORMAT_RGB565 : SDL_PIXELFORMAT_RGB888;
+    int tw = hd ? 2 * w : w, th = hd ? 2 * h : h;
+    if (!g_tex || g_tex_w != tw || g_tex_h != th || g_tex_fmt != fmt) {
+        if (g_tex) SDL_DestroyTexture(g_tex);
+        g_tex = SDL_CreateTexture(g_ren, (Uint32)fmt, SDL_TEXTUREACCESS_STREAMING, tw, th);
+        g_tex_w = tw, g_tex_h = th, g_tex_fmt = fmt;
+    }
+    if (hd) {
+        SDL_UpdateTexture(g_tex, NULL, g_hd, tw * 4);
+    } else if (bpp == 8) {
         if (g_conv_n < (size_t)w * h) { free(g_conv); g_conv_n = (size_t)w * h; g_conv = (uint32_t *)malloc(g_conv_n * 4); }
         for (int y = 0; y < h; y++)
             for (int x = 0; x < w; x++) {
@@ -158,10 +196,56 @@ static void present(void) {
     SDL_GetRendererOutputSize(g_ren, &ww, &wh);
     if ((long long)ww * h > (long long)wh * w) g_dst.h = wh, g_dst.w = (int)((long long)wh * w / h);
     else g_dst.w = ww, g_dst.h = (int)((long long)ww * h / w);
+    if (g_mode == 4) {                                   /* integer: whole multiples of the game's size */
+        int k = ww / w < wh / h ? ww / w : wh / h;
+        if (k < 1) k = 1;
+        g_dst.w = w * k, g_dst.h = h * k;
+    }
     g_dst.x = (ww - g_dst.w) / 2, g_dst.y = (wh - g_dst.h) / 2;
     SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 255);
     SDL_RenderClear(g_ren);
-    SDL_RenderCopy(g_ren, g_tex, NULL, &g_dst);
+    if (g_bars && (g_dst.w < ww || g_dst.h < wh)) {     /* the bars: the picture, tiny then stretched, dark */
+        if (!g_small) g_small = SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_RGB888, SDL_TEXTUREACCESS_TARGET, 24, 15);
+        if (g_small) {
+            SDL_SetTextureScaleMode(g_tex, SDL_ScaleModeLinear);
+            SDL_SetRenderTarget(g_ren, g_small);
+            SDL_RenderCopy(g_ren, g_tex, NULL, NULL);
+            SDL_SetRenderTarget(g_ren, NULL);
+            SDL_SetTextureScaleMode(g_small, SDL_ScaleModeLinear);
+            SDL_SetTextureColorMod(g_small, 90, 90, 90);
+            SDL_RenderCopy(g_ren, g_small, NULL, NULL);
+        }
+    }
+    int sharp = g_mode == 0 || g_mode == 2;
+    int k = g_dst.w / tw < g_dst.h / th ? g_dst.w / tw : g_dst.h / th;
+    if (sharp && k >= 1 && (tw * k != g_dst.w || th * k != g_dst.h)) {
+        if (!g_pre || g_pre_w != tw * k || g_pre_h != th * k) {
+            if (g_pre) SDL_DestroyTexture(g_pre);
+            g_pre = SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_RGB888, SDL_TEXTUREACCESS_TARGET, tw * k, th * k);
+            g_pre_w = tw * k, g_pre_h = th * k;
+        }
+    }
+    if (sharp && k >= 1 && g_pre && (tw * k != g_dst.w || th * k != g_dst.h)) {
+        SDL_SetTextureScaleMode(g_tex, SDL_ScaleModeNearest);
+        SDL_SetRenderTarget(g_ren, g_pre);
+        SDL_RenderCopy(g_ren, g_tex, NULL, NULL);
+        SDL_SetRenderTarget(g_ren, NULL);
+        SDL_SetTextureScaleMode(g_pre, SDL_ScaleModeLinear);
+        SDL_RenderCopy(g_ren, g_pre, NULL, &g_dst);
+    } else {
+        SDL_SetTextureScaleMode(g_tex, g_mode == 1 ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+        SDL_RenderCopy(g_ren, g_tex, NULL, &g_dst);
+    }
+    if (g_mode == 2 && g_dst.h >= 2 * h) {                /* crt: the lower third of every game row darker */
+        SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 96);
+        for (int y = 0; y < h; y++) {
+            int y0 = g_dst.y + (int)((long long)(3 * y + 2) * g_dst.h / (3 * h)), y1 = g_dst.y + (int)((long long)(y + 1) * g_dst.h / h);
+            SDL_Rect r = { g_dst.x, y0, g_dst.w, y1 > y0 ? y1 - y0 : 1 };
+            SDL_RenderFillRect(g_ren, &r);
+        }
+        SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_NONE);
+    }
     SDL_RenderPresent(g_ren);
 }
 
@@ -175,10 +259,22 @@ void hle_screen_pump(void) {
             break;
         }
         case SDL_KEYDOWN: case SDL_KEYUP: {
-            if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_RETURN && (e.key.keysym.mod & KMOD_ALT)) {
-                g_fullscreen = !g_fullscreen;
-                SDL_SetWindowFullscreen(g_win, g_fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
-                g_shown_seq = ~0u;
+            SDL_Scancode sc = e.key.keysym.scancode;
+            /* the presenter's keys, the Windows build's: they do not reach the game */
+            if ((sc == SDL_SCANCODE_RETURN && (e.key.keysym.mod & KMOD_ALT)) || sc == SDL_SCANCODE_F11) {
+                if (e.type == SDL_KEYDOWN) {
+                    g_fullscreen = !g_fullscreen;
+                    SDL_SetWindowFullscreen(g_win, g_fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+                    settings_changed();
+                }
+                break;
+            }
+            if (sc == SDL_SCANCODE_F12) {
+                if (e.type == SDL_KEYDOWN) {
+                    g_mode = (g_mode + 1) % 5;
+                    fprintf(stderr, "[screen] scaling: %s\n", k_modes[g_mode]);
+                    settings_changed();
+                }
                 break;
             }
             int vk = vk_of(e.key.keysym.scancode);
@@ -233,6 +329,6 @@ int hle_screen_open(const char *title, int fullscreen, int headless) {
     hle_cursor_hook = warp;
     SDL_RendererInfo ri;
     SDL_GetRendererInfo(g_ren, &ri);
-    fprintf(stderr, "[screen] %s, renderer %s\n", SDL_GetCurrentVideoDriver(), ri.name);
+    fprintf(stderr, "[screen] %s, renderer %s, scaling %s (F12), fullscreen F11\n", SDL_GetCurrentVideoDriver(), ri.name, k_modes[g_mode]);
     return 0;
 }

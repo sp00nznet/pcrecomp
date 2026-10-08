@@ -97,6 +97,14 @@ int hle_dd_frame(const uint8_t **px, int *w, int *h, int *pitch, int *bpp, const
     if (seq) *seq = g_frame_seq;
     return 1;
 }
+/* A surface object's pixels, for a host that reads the game's surfaces
+ * (an HD layer, a recorder): 0 if obj is not one of ours. */
+int hle_dd_surface_pixels(uint32_t obj, uint8_t **px, int *w, int *h, int *pitch, int *bpp) {
+    if (!obj || !g_vt_surf || MEM32(obj) != g_vt_surf) return 0;
+    surf_t *s = S(obj);
+    *px = s->px, *w = s->w, *h = s->h, *pitch = s->pitch, *bpp = s->bpp;
+    return 1;
+}
 void hle_dd_mode(int *w, int *h, int *bpp) { *w = g_mode_w, *h = g_mode_h, *bpp = g_mode_bpp; }
 
 static void masks(int bpp, uint32_t *r, uint32_t *g, uint32_t *b) {
@@ -627,6 +635,7 @@ static void vtables(void) {
     g_vt_clip = hle_com_vtable(cl);
     g_dd = hle_com_new(g_vt_dd, 12);
     g_dd2 = hle_com_new(g_vt_dd2, 12);
+    MEM32(g_dd + 4) = MEM32(g_dd2 + 4) = 0;              /* held by nobody until DirectDrawCreate: the last Release is 0 */
 }
 
 static void x_DirectDrawCreate(void) {                   /* (guid, &out, outer) */

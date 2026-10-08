@@ -135,13 +135,21 @@ void mach_leave(void) {
 /* Give the machine up around a wait (a Sleep, an event, a contended critical
  * section). The registers go with it; nothing between begin and end may touch
  * the register file or guest-shared host state. */
+static __thread unsigned g_block_gen;
 void hle_block_begin(void) {
     if (!g_ms.depth) return;
     regs_save(&g_ms.r);
+    g_block_gen = g_owner_gen;
     pthread_mutex_unlock(&g_mach);
 }
+/* The mutex is not fair: a thread that gives the machine up for a moment
+ * (a wait with no timeout, polled in a loop) took it straight back, and a
+ * timer callback waiting for the machine while holding a game mutex never
+ * ran, so the loop polling that mutex never ended. Coming back, a thread
+ * first lets a waiter have its turn. */
 void hle_block_end(void) {
     if (!g_ms.depth) return;
+    for (int spins = 0; g_waiters && g_owner_gen == g_block_gen && spins < 1000; spins++) sched_yield();
     mach_take();
     regs_load(&g_ms.r);
 }

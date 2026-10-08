@@ -3,9 +3,13 @@
  *
  * Imported by ordinal as often as by name, so each shim is registered under
  * both ("wsock32.dll#115" and "WSAStartup"). A SOCKET is the host descriptor
- * plus 0x1000 (never 0, never INVALID_SOCKET). Internet sockets are real; IPX
- * (AF_IPX) is refused with WSAEAFNOSUPPORT, as on a Windows with no IPX
- * protocol installed, so a game finds no IPX network and goes on.
+ * plus 0x1000 (never 0, never INVALID_SOCKET). Internet sockets are real.
+ *
+ * IPX is IPXEmu's (the IPX-over-UDP wsock32.dll Westwood's games ship with
+ * now), on the wire exactly: an IPX datagram socket is a UDP socket, an IPX
+ * address's socket number is the UDP port and the first four bytes of its
+ * node are the IPv4 address, and the payload goes as it is. So a game on this
+ * host and the same game on Windows with IPXEmu see one LAN.
  *
  * WSAAsyncSelect is served by hle_ws_poll(), which the message pump calls: a
  * socket that has become readable posts its window message, as Winsock's
@@ -54,6 +58,10 @@ static uint32_t wsa_errno(int e) {
     }
 }
 static int fd_of(uint32_t s) { return s >= SOCK_BASE && s < SOCK_BASE + 0x10000u ? (int)(s - SOCK_BASE) : -1; }
+static uint8_t g_ipx[0x10000 / 8];                       /* which descriptors are IPX sockets */
+static int is_ipx(int fd) { return fd >= 0 && fd < 0x10000 && (g_ipx[fd >> 3] >> (fd & 7) & 1); }
+#define AF_IPX_WIN    6
+#define NSPROTO_IPX   1000u
 #define FAIL(n) do { g_wsa_error = wsa_errno(errno); RET(SOCKET_ERROR, n); } while (0)
 
 /* sockaddr_in is laid out the same on both (family is a little-endian u16). */
@@ -68,6 +76,20 @@ static void to_guest(const struct sockaddr_in *h, uint8_t *g) {
     g[0] = 2;
     memcpy(g + 2, &h->sin_port, 2);
     memcpy(g + 4, &h->sin_addr, 4);
+}
+/* sockaddr_ipx: family 6, netnum[4], nodenum[6], socket (network order). */
+static void ipx_to_host(const uint8_t *g, struct sockaddr_in *h, int any) {
+    memset(h, 0, sizeof *h);
+    h->sin_family = AF_INET;
+    memcpy(&h->sin_port, g + 12, 2);
+    if (!any) memcpy(&h->sin_addr, g + 6, 4);
+}
+static void ipx_to_guest(const struct sockaddr_in *h, uint8_t *g, int self) {
+    memset(g, 0, 14);
+    g[0] = AF_IPX_WIN;
+    if (self) g[11] = 1;                                 /* our own node: 00:00:00:00:00:01 */
+    else memcpy(g + 6, &h->sin_addr, 4);                 /* a sender's: its address, then 00 00 */
+    memcpy(g + 12, &h->sin_port, 2);
 }
 
 static void w_WSAStartup(void) {                         /* (version, &WSADATA) */
@@ -88,24 +110,30 @@ static void w_WSASetLastError(void){ g_wsa_error = A32(0); RETV(1); }
 
 static void w_socket(void) {                             /* (af, type, protocol) */
     int af = (int)A32(0), type = (int)A32(1), proto = (int)A32(2);
-    if (af != AF_INET) {
-        fprintf(stderr, "[wsock32] socket(af %d): only AF_INET here (no IPX)\n", af);
+    int ipx = af == AF_IPX_WIN && type == 2 && (uint32_t)proto == NSPROTO_IPX;
+    if (af != AF_INET && !ipx) {
+        fprintf(stderr, "[wsock32] socket(af %d, type %d, protocol %d): not on this host\n", af, type, proto);
         g_wsa_error = WSAEAFNOSUPPORT;
         RET(INVALID_SOCKET, 3);
     }
-    int fd = socket(AF_INET, type == 2 ? SOCK_DGRAM : SOCK_STREAM, proto);
-    if (fd < 0) { g_wsa_error = wsa_errno(errno); RET(INVALID_SOCKET, 3); }
+    int fd = ipx ? socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP) : socket(AF_INET, type == 2 ? SOCK_DGRAM : SOCK_STREAM, proto);
+    if (fd < 0 || fd >= 0x10000) { if (fd >= 0) close(fd); g_wsa_error = wsa_errno(errno); RET(INVALID_SOCKET, 3); }
+    if (ipx) g_ipx[fd >> 3] |= (uint8_t)(1 << (fd & 7));
+    else g_ipx[fd >> 3] &= (uint8_t)~(1 << (fd & 7));
     RET(SOCK_BASE + (uint32_t)fd, 3);
 }
 static void w_closesocket(void) {
     int fd = fd_of(A32(0));
     if (fd < 0 || close(fd) != 0) { g_wsa_error = WSAENOTSOCK; RET(SOCKET_ERROR, 1); }
+    g_ipx[fd >> 3] &= (uint8_t)~(1 << (fd & 7));
     RET(0, 1);
 }
 static void w_bind(void) {                               /* (s, addr, len) */
     struct sockaddr_in a;
-    to_host((const uint8_t *)APTR(1), &a);
-    if (bind(fd_of(A32(0)), (struct sockaddr *)&a, sizeof a) != 0) FAIL(3);
+    int fd = fd_of(A32(0));
+    if (is_ipx(fd)) ipx_to_host((const uint8_t *)APTR(1), &a, 1);   /* any address, the socket's port */
+    else to_host((const uint8_t *)APTR(1), &a);
+    if (bind(fd, (struct sockaddr *)&a, sizeof a) != 0) FAIL(3);
     RET(0, 3);
 }
 static void w_connect(void) {
@@ -115,10 +143,16 @@ static void w_connect(void) {
     RET(0, 3);
 }
 static void w_listen(void) { if (listen(fd_of(A32(0)), (int)A32(1)) != 0) FAIL(2); RET(0, 2); }
+static int nettrace(void) { static int on = -1; if (on < 0) on = getenv("HLE_NETTRACE") != NULL; return on; }
 static void w_sendto(void) {                             /* (s, buf, len, flags, to, tolen) */
     struct sockaddr_in a;
     ssize_t n;
-    if (A32(4)) { to_host((const uint8_t *)APTR(4), &a); n = sendto(fd_of(A32(0)), APTR(1), A32(2), MSG_NOSIGNAL, (struct sockaddr *)&a, sizeof a); }
+    if (A32(4)) {
+        if (is_ipx(fd_of(A32(0)))) ipx_to_host((const uint8_t *)APTR(4), &a, 0);
+        else to_host((const uint8_t *)APTR(4), &a);
+        n = sendto(fd_of(A32(0)), APTR(1), A32(2), MSG_NOSIGNAL, (struct sockaddr *)&a, sizeof a);
+        if (nettrace()) fprintf(stderr, "[net] sendto %s:%u %u bytes -> %d%s\n", inet_ntoa(a.sin_addr), ntohs(a.sin_port), A32(2), (int)n, n < 0 ? strerror(errno) : "");
+    }
     else n = send(fd_of(A32(0)), APTR(1), A32(2), MSG_NOSIGNAL);
     if (n < 0) FAIL(6);
     RET((uint32_t)n, 6);
@@ -129,8 +163,10 @@ static void w_recvfrom(void) {                           /* (s, buf, len, flags,
     socklen_t al = sizeof a;
     ssize_t n = recvfrom(fd_of(A32(0)), APTR(1), A32(2), MSG_DONTWAIT, (struct sockaddr *)&a, &al);
     if (n < 0) FAIL(6);
-    if (A32(4)) to_guest(&a, (uint8_t *)APTR(4));
-    if (A32(5)) MEM32(A32(5)) = 16;
+    if (nettrace()) fprintf(stderr, "[net] recvfrom %s:%u %d bytes\n", inet_ntoa(a.sin_addr), ntohs(a.sin_port), (int)n);
+    int ipx = is_ipx(fd_of(A32(0)));
+    if (A32(4)) { if (ipx) ipx_to_guest(&a, (uint8_t *)APTR(4), 0); else to_guest(&a, (uint8_t *)APTR(4)); }
+    if (A32(5)) MEM32(A32(5)) = ipx ? 14 : 16;
     RET((uint32_t)n, 6);
 }
 static void w_recv(void) { ssize_t n = recv(fd_of(A32(0)), APTR(1), A32(2), MSG_DONTWAIT); if (n < 0) FAIL(4); RET((uint32_t)n, 4); }
@@ -152,6 +188,11 @@ static int host_opt(uint32_t level, uint32_t opt, int *hl, int *ho) {
 }
 static void w_setsockopt(void) {                         /* (s, level, opt, val, len) */
     int hl, ho, v = A32(3) ? (int)MEM32(A32(3)) : 0;
+    if (A32(1) == NSPROTO_IPX) {                         /* the IPX options IPXEmu takes (and ignores) */
+        if (A32(2) >= 0x4000u && A32(2) <= 0x4009u) RET(0, 5);
+        g_wsa_error = 10042u;                            /* WSAENOPROTOOPT */
+        RET(SOCKET_ERROR, 5);
+    }
     if (!host_opt(A32(1), A32(2), &hl, &ho)) RET(0, 5);  /* an option a host lacks: accepted */
     if (setsockopt(fd_of(A32(0)), hl, ho, &v, sizeof v) != 0) FAIL(5);
     RET(0, 5);
@@ -159,6 +200,19 @@ static void w_setsockopt(void) {                         /* (s, level, opt, val,
 static void w_getsockopt(void) {                         /* (s, level, opt, val, &len) */
     int hl, ho, v = 0;
     socklen_t l = sizeof v;
+    if (A32(1) == NSPROTO_IPX) {
+        uint32_t o = A32(3);
+        if (A32(2) == 0x4007u && o) {                    /* IPX_ADDRESS: IPXEmu's one adapter */
+            memset((void *)(uintptr_t)o, 0, 24);
+            MEM8(o + 13) = 1;                            /* node 00:00:00:00:00:01 */
+            MEM8(o + 15) = 1;                            /* status: up */
+            MEM32(o + 16) = 1470, MEM32(o + 20) = 1000000;   /* max packet, link speed */
+            RET(0, 5);
+        }
+        if (A32(2) == 0x400Du && o) { MEM32(o) = 1; RET(0, 5); }   /* IPX_MAX_ADAPTER_NUM */
+        g_wsa_error = 10042u;
+        RET(SOCKET_ERROR, 5);
+    }
     if (host_opt(A32(1), A32(2), &hl, &ho) && getsockopt(fd_of(A32(0)), hl, ho, &v, &l) != 0) FAIL(5);
     if (A32(2) == 0x1008 && v == SOCK_DGRAM) v = 2;
     if (A32(3)) MEM32(A32(3)) = (uint32_t)v;
@@ -186,8 +240,9 @@ static void w_getsockname(void) {
     struct sockaddr_in a;
     socklen_t l = sizeof a;
     if (getsockname(fd_of(A32(0)), (struct sockaddr *)&a, &l) != 0) FAIL(3);
-    to_guest(&a, (uint8_t *)APTR(1));
-    if (A32(2)) MEM32(A32(2)) = 16;
+    int ipx = is_ipx(fd_of(A32(0)));
+    if (ipx) ipx_to_guest(&a, (uint8_t *)APTR(1), 1); else to_guest(&a, (uint8_t *)APTR(1));
+    if (A32(2)) MEM32(A32(2)) = ipx ? 14 : 16;
     RET(0, 3);
 }
 

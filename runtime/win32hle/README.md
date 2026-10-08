@@ -41,10 +41,11 @@ handler.
 | `gdi32.c`, `gdidc.c` | DIBs and `StretchDIBits` into a framebuffer; device contexts, fonts (TrueType through SDL2_ttf, Liberation for Arial/MS Sans Serif) and `TextOutA` into a surface |
 | `ddraw.c` | DirectDraw in software: `IDirectDraw`/`2`, surfaces 1–3 (lock, blit with colour fill, colour key and stretch, flip), palettes, clippers, a virtual display mode |
 | `dsound.c` | DirectSound on SDL2 audio: buffers mixed in software at their rate, volume and pan, with play cursors in real time |
-| `screen.c` | the SDL2 window for a DirectDraw game: the primary surface scaled with its aspect kept, SDL input turned into the messages a mouse and keyboard give |
+| `screen.c` | the SDL2 window for a DirectDraw game: the primary surface scaled (sharp, smooth, CRT, nearest, integer; F12, F11), SDL input turned into the messages a mouse and keyboard give |
 | `winmm.c` | timers (`timeSetEvent` on threads, `timeKillEvent` waiting for a callback under way), joystick, waveOut, MCI |
-| `wsock32.c` | Winsock 1.1 on BSD sockets, by name and ordinal; `WSAAsyncSelect` through the pump; no IPX |
+| `wsock32.c` | Winsock 1.1 on BSD sockets, by name and ordinal; `WSAAsyncSelect` through the pump; IPX as IPXEmu carries it on UDP |
 | `ole32.c` | COM: class factories a host serves and ones the guest registers itself, GUID strings, BSTRs |
+| `storage.c` | structured storage on compound files in Windows' format (`StgCreateDocfile`, `IStorage`, `IStream`, `OleSaveToStream`) |
 | `advapi32.c` | an in-memory registry (seeded by the host, optionally saved to a file); COMCTL32, VERSION, SHELL32 |
 | `present.c` | the plain SDL2 layer for a GDI game: the gdi32 framebuffer in a window |
 | `*_selftest.c` | synthetic lifted guests driving the spine, the loader, the host, the pump and present, headless; `build_selftests.sh` builds and runs them |
@@ -68,8 +69,8 @@ What a title still brings:
   these with `win32hle_register` or `hle_com_register_class`.
 
 Not here: guest SEH and C++ exceptions (`RaiseException` ends the run),
-IPX, DirectX past DirectDraw 2 and DirectSound 1, and drawing anything
-through GDI but text.
+DirectX past DirectDraw 2 and DirectSound 1, and drawing anything through
+GDI but text.
 
 ## Building the selftests
 

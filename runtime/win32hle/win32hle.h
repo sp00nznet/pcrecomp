@@ -120,6 +120,7 @@ const char *hle_window_class(uint32_t h);
 uint32_t    hle_window_parent(uint32_t h);
 uint32_t    hle_window_style(uint32_t h);
 uint32_t    hle_dialog_item(uint32_t dlg, uint32_t id);
+void        hle_queue_dump(void);              /* the queue, to stderr */
 
 /* ---- gdi32 framebuffer, host-callable ---- */
 void            hle_gdi_set_target(uint32_t *pixels, int w, int h); /* the blit destination */
@@ -199,18 +200,24 @@ extern const win32hle_shim win32hle_winmm[];
 extern const win32hle_shim win32hle_wsock32[];        /* by name and by ordinal */
 void hle_ws_poll(void);                                /* the pump: WSAAsyncSelect notifications */
 extern const win32hle_shim win32hle_ole32[];          /* OLE32 + OLEAUT32 */
+extern const win32hle_shim win32hle_storage[];        /* structured storage: compound files */
 extern const win32hle_shim win32hle_dsound[];         /* DirectSound on SDL audio (dsound.c) */
 extern const win32hle_shim win32hle_ddraw[];          /* DirectDraw in software (ddraw.c) */
 /* The primary surface, for a presenter: 0 until there is one. seq changes
  * when its pixels or palette may have. */
 int  hle_dd_frame(const uint8_t **px, int *w, int *h, int *pitch, int *bpp, const uint32_t **palette, unsigned *seq);
 void hle_dd_mode(int *w, int *h, int *bpp);
+int  hle_dd_surface_pixels(uint32_t obj, uint8_t **px, int *w, int *h, int *pitch, int *bpp);   /* 0: not a surface */
 void hle_dsound_set_master(float gain);              /* 0 mutes */
 /* The SDL2 display and input for a DirectDraw game (screen.c): installs
  * itself as the pump hook. headless: no window (a script drives input). */
 int  hle_screen_open(const char *title, int fullscreen, int headless);
 void hle_screen_pump(void);
 extern void (*hle_screen_frame_hook)(const uint8_t *px, int w, int h, int pitch, int bpp);   /* each shown frame */
+extern int (*hle_screen_compose_hook)(const uint8_t *px16, int pitch, int w, int h, uint32_t *out);   /* a 2x picture */
+int  hle_screen_scale(const char *name);   /* sharp, smooth, crt, nearest, integer: 0 if unknown */
+void hle_screen_bars(int blur);            /* the bars beside the picture: a blur of it, or black */
+extern void (*hle_screen_settings_hook)(const char *scale, int bars, int fullscreen);   /* F11/F12 changed them */
 extern const win32hle_shim win32hle_advapi32[];       /* the registry; COMCTL32, VERSION, SHELL32 */
 /* The registry (advapi32.c), in memory: seeded by the host, optionally saved
  * to a file on every write. Roots are the HKEY_ values (HKLM 0x80000002). */
