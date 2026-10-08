@@ -163,6 +163,7 @@ static void mix(void *ud, Uint8 *stream, int len) {
 static int audio_open(void) {
     if (g_audio_ok >= 0) return g_audio_ok;
     g_audio_ok = 0;
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");      /* SIGINT and SIGTERM end the process, not WM_CLOSE */
     if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) { fprintf(stderr, "[dsound] no audio: %s\n", SDL_GetError()); return 0; }
     SDL_AudioSpec want, have;
     SDL_zero(want);
