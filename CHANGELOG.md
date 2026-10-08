@@ -33,6 +33,12 @@ versions follow [SemVer](https://semver.org/).
   compared the result with itself (`xor eax, [b]; jge` was always taken). Unreal
   Tournament's clipper asks whether an edge crosses a plane that way; its renderer drew
   stretched, overlapping shards. Four difftest cases.
+- lift32: MMX's byte and unsigned-saturating ops (`paddusb`, `psubusb`, `paddusw`, `psubusw`,
+  `paddb`, `psubb`, `paddsb`, `psubsb`, `pcmpeqb`, `pcmpgtb`, `pcmpeqd`, `pcmpgtd`,
+  `packsswb`) are lifted. They were emitted as an `UNIMPLEMENTED` comment and the lift
+  still counted 0 errors. Unreal Tournament's software renderer blends every translucent
+  pixel with one `paddusb`, so its HUD panels were drawn opaque, solid black when faded
+  out. `mmx_selftest.c` covers each one.
 - disasm32: straight-line code longer than one scan window (8 KB, 4 KB per block) is decoded
   to its end. The rest of the function used to be dropped. KotOR registers its script commands in
   ~7 KB of `mov [reg+disp], offset`, so 142 functions named only there were never catalogued;
