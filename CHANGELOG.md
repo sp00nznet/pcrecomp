@@ -6,6 +6,34 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- `runtime/win32hle/`: enough of Win32 for a DirectDraw game to run on Linux,
+  driven by Tiberian Sun (tiberiansun-recomp `src/linux`), which now boots,
+  plays its movies and music, runs its menus and dialogs, and plays a
+  skirmish with no Windows and no Wine:
+  - `ddraw.c`: DirectDraw in software (`IDirectDraw`/`2`, surfaces 1–3,
+    palettes, clippers; blits with colour fill, colour key and stretch, flips),
+    with a 64 KB tail behind every surface for blitters that run past the end;
+    `screen.c` shows the primary in an SDL2 window and turns SDL input into
+    window messages.
+  - `dsound.c`: DirectSound on SDL2 audio, a software mixer with real-time
+    play cursors.
+  - `user32.c`: a window manager — windows, classes, the queue with `WM_PAINT`
+    and `WM_TIMER` generated, focus/capture/activation, dialogs from their
+    templates, and the standard controls with owner-draw (combo boxes sized
+    from `WM_MEASUREITEM` as Windows does, which the game's layout depends on).
+  - `gdidc.c`: device contexts on surfaces, fonts on SDL2_ttf, `TextOutA`.
+  - `module.c`, `hle_path.c`: `LoadLibraryA` and resources (`LoadStringA`,
+    dialog templates in a resource DLL), Windows paths on a case-sensitive
+    disk.
+  - `kernel32*.c`: files on descriptors and the directory search, sized heap
+    blocks, virtual memory, critical sections, events, mutexes, waits, TLS,
+    codepage 1252 and an English locale for the CRT.
+  - `ole32.c` (COM class factories, the host's and the guest's own),
+    `advapi32.c` (an in-memory registry, COMCTL32, VERSION, SHELL32),
+    `wsock32.c` (Winsock 1.1 on BSD sockets), `winmm.c` timers on threads.
+  - The machine lock is handed over with the registers saved, at every import
+    and loop back-edge when another thread waits; ordinal imports bind as
+    `dll#N`; `build_selftests.sh` runs the selftests.
 - `tools/drm/steamstub.py`: removes SteamStub 2.x (x86) without running anything and
   without Steam. The stub's header and payload are running-XOR decoded. The embedded
   `steamdrm.dll` is XTEA-CBC decrypted, and the payload offsets it uses (AES key, first
@@ -37,6 +65,9 @@ versions follow [SemVer](https://semver.org/).
   runtime gap). `HLE_FILETRACE=1` logs the data files a title opens. (#45)
 
 ### Fixed
+- `recomp_types.h`: gcc and clang get `__rdtsc` from `<x86intrin.h>`, as MSVC
+  gets it from `<intrin.h>`, so generated code that reads the timestamp
+  counter compiles off Windows.
 - disasm32: straight-line code longer than one scan window (8 KB, 4 KB per block) is decoded
   to its end. The rest of the function used to be dropped. KotOR registers its script commands in
   ~7 KB of `mov [reg+disp], offset`, so 142 functions named only there were never catalogued;
