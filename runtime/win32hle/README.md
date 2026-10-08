@@ -41,6 +41,7 @@ handler.
 | `gdi32.c`, `gdidc.c` | DIBs and `StretchDIBits` into a framebuffer; device contexts, fonts (TrueType through SDL2_ttf, Liberation for Arial/MS Sans Serif) and `TextOutA` into a surface |
 | `ddraw.c` | DirectDraw in software: `IDirectDraw`/`2`, surfaces 1–3 (lock, blit with colour fill, colour key and stretch, flip), palettes, clippers, a virtual display mode |
 | `dsound.c` | DirectSound on SDL2 audio: buffers mixed in software at their rate, volume and pan, with play cursors in real time |
+| `bink.c` | `binkw32.dll` on ffmpeg (`HLE_WITH_FFMPEG`): `BinkOpen` on a name or on the game's open file, frames decoded and converted into the game's surface, the soundtrack into a `dsound.c` stream |
 | `screen.c` | the SDL2 window for a DirectDraw game: the primary surface scaled (sharp, smooth, CRT, nearest, integer; F12, F11), SDL input turned into the messages a mouse and keyboard give |
 | `winmm.c` | timers (`timeSetEvent` on threads, `timeKillEvent` waiting for a callback under way), joystick, waveOut, MCI |
 | `wsock32.c` | Winsock 1.1 on BSD sockets, by name and ordinal; `WSAAsyncSelect` through the pump; IPX as IPXEmu carries it on UDP |
@@ -52,10 +53,11 @@ handler.
 
 ## State (what's real, what's next)
 
-Two titles run on it: Fury³ (its CRT and `WinMain`, the first census), and
+Three titles run on it: Fury³ (its CRT and `WinMain`, the first census);
 Tiberian Sun, which boots, plays its movies and music, runs its menus (the
 game's own and the Win32 dialogs behind them) and plays a skirmish on Linux,
-with no Windows and no Wine (tiberiansun-recomp, `src/linux`).
+with no Windows and no Wine (tiberiansun-recomp, `src/linux`); and Red Alert
+2 and Yuri's Revenge, with their Bink movies (redalert2-recomp, `src/linux`).
 
 What a title still brings:
 

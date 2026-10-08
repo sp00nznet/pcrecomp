@@ -416,6 +416,18 @@ static void k_GetSystemInfo(void) {                /* SYSTEM_INFO, 36 bytes */
     }
     RETV(1);
 }
+static void k_GetLogicalDriveStringsA(void) {          /* (n, buf): "C:\" "Z:\" */
+    static const char s[] = "C:\\\0Z:\\\0";
+    if (A32(0) < sizeof s) RET((uint32_t)sizeof s, 2);
+    memcpy(APTR(1), s, sizeof s);
+    RET((uint32_t)sizeof s - 1, 2);
+}
+static void k_GetTempFileNameA(void) {                   /* (dir, prefix, unique, out) */
+    static unsigned n;
+    unsigned u = A32(2) ? A32(2) : (++n & 0xFFFF);
+    snprintf(ASTR(3), 260, "%s\\%.3s%04X.TMP", ASTR(0) ? ASTR(0) : ".", ASTR(1) ? ASTR(1) : "", u);
+    RET(u, 4);
+}
 static void k_GetLogicalDrives(void){ RET(0x4u | (1u << 25), 0); } /* C: and Z: */
 static void k_GetWindowsDirectoryA(void) { snprintf(ASTR(0), A32(1), "C:\\WINDOWS"); RET(10, 2); }
 static void k_GetSystemDirectoryA(void)  { snprintf(ASTR(0), A32(1), "C:\\WINDOWS\\SYSTEM32"); RET(19, 2); }
@@ -470,6 +482,8 @@ const win32hle_shim win32hle_kernel32_crt[] = {
     { "GlobalMemoryStatus",           k_GlobalMemoryStatus },
     { "GetSystemInfo",                k_GetSystemInfo },
     { "GetLogicalDrives",             k_GetLogicalDrives },
+    { "GetLogicalDriveStringsA",      k_GetLogicalDriveStringsA },
+    { "GetTempFileNameA",             k_GetTempFileNameA },
     { "GetWindowsDirectoryA",         k_GetWindowsDirectoryA },
     { "GetSystemDirectoryA",          k_GetSystemDirectoryA },
     { "GetTempPathA",                 k_GetTempPathA },

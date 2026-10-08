@@ -28,6 +28,7 @@ void recomp_host_init(void) {
     win32hle_register(win32hle_advapi32);
     win32hle_register(win32hle_dsound);
     win32hle_register(win32hle_ddraw);
+    win32hle_register(win32hle_bink);
 }
 
 static int boot(const char *path, uint32_t (*resolve)(const char *)) {

@@ -209,6 +209,15 @@ int  hle_dd_frame(const uint8_t **px, int *w, int *h, int *pitch, int *bpp, cons
 void hle_dd_mode(int *w, int *h, int *bpp);
 int  hle_dd_surface_pixels(uint32_t obj, uint8_t **px, int *w, int *h, int *pitch, int *bpp);   /* 0: not a surface */
 void hle_dsound_set_master(float gain);              /* 0 mutes */
+/* A host's own sound (a movie's), mixed with the game's buffers: interleaved
+ * s16 pushed at its own rate. */
+int  hle_audio_stream_open(int rate, int channels);   /* an id, or -1 with no audio */
+void hle_audio_stream_push(int id, const int16_t *pcm, int frames);
+int  hle_audio_stream_queued(int id);                 /* frames pushed and not yet played */
+void hle_audio_stream_gain(int id, float gain);
+void hle_audio_stream_close(int id);
+int  hle_file_fd(uint32_t handle);                    /* a file HANDLE's descriptor, or -1 */
+extern const win32hle_shim win32hle_bink[];           /* binkw32 on ffmpeg (bink.c; stubs without HLE_WITH_FFMPEG) */
 /* The SDL2 display and input for a DirectDraw game (screen.c): installs
  * itself as the pump hook. headless: no window (a script drives input). */
 int  hle_screen_open(const char *title, int fullscreen, int headless);

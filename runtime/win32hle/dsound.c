@@ -68,6 +68,55 @@ static inline float sample(const dsbuf *b, uint32_t frame, int ch) {
     return b->bits == 16 ? (float)*(const int16_t *)p / 32768.0f : ((float)*p - 128.0f) / 128.0f;
 }
 
+static int audio_open(void);
+static int audio_open_once(void) { return audio_open(); }
+
+/* Host streams: PCM a host pushes (a movie's sound), mixed with the
+ * buffers. A ring of interleaved s16 at the stream's rate, played at that
+ * rate. */
+#define MAX_STREAMS 4
+#define STREAM_FRAMES (1 << 17)
+static struct { int used, channels, rate; float gain; int16_t *ring; uint32_t rd, wr; double pos; } g_stream[MAX_STREAMS];
+int hle_audio_stream_open(int rate, int channels) {
+    if (!audio_open_once()) return -1;
+    pthread_mutex_lock(&g_mix);
+    int id = -1;
+    for (int i = 0; i < MAX_STREAMS && id < 0; i++)
+        if (!g_stream[i].used) {
+            id = i;
+            g_stream[i].ring = (int16_t *)calloc(STREAM_FRAMES * 2, 2);
+            g_stream[i].used = 1, g_stream[i].channels = channels, g_stream[i].rate = rate, g_stream[i].gain = 1.0f;
+            g_stream[i].rd = g_stream[i].wr = 0, g_stream[i].pos = 0;
+        }
+    pthread_mutex_unlock(&g_mix);
+    return id;
+}
+void hle_audio_stream_push(int id, const int16_t *pcm, int frames) {
+    if (id < 0 || id >= MAX_STREAMS) return;
+    pthread_mutex_lock(&g_mix);
+    for (int f = 0; f < frames && g_stream[id].wr - g_stream[id].rd < STREAM_FRAMES - 1; f++, g_stream[id].wr++) {
+        uint32_t k = g_stream[id].wr % STREAM_FRAMES;
+        g_stream[id].ring[2 * k] = pcm[f * g_stream[id].channels];
+        g_stream[id].ring[2 * k + 1] = pcm[f * g_stream[id].channels + (g_stream[id].channels > 1)];
+    }
+    pthread_mutex_unlock(&g_mix);
+}
+int hle_audio_stream_queued(int id) {                    /* frames not yet played */
+    if (id < 0 || id >= MAX_STREAMS) return 0;
+    pthread_mutex_lock(&g_mix);
+    int n = (int)(g_stream[id].wr - g_stream[id].rd);
+    pthread_mutex_unlock(&g_mix);
+    return n;
+}
+void hle_audio_stream_gain(int id, float gain) { if (id >= 0 && id < MAX_STREAMS) g_stream[id].gain = gain; }
+void hle_audio_stream_close(int id) {
+    if (id < 0 || id >= MAX_STREAMS) return;
+    pthread_mutex_lock(&g_mix);
+    free(g_stream[id].ring);
+    memset(&g_stream[id], 0, sizeof g_stream[id]);
+    pthread_mutex_unlock(&g_mix);
+}
+
 static void mix(void *ud, Uint8 *stream, int len) {
     (void)ud;
     int frames = len / 4;
@@ -90,6 +139,17 @@ static void mix(void *ud, Uint8 *stream, int len) {
             acc[2 * f] += l * b->gl;
             acc[2 * f + 1] += r * b->gr;
             b->pos += step;
+        }
+    }
+    for (int i = 0; i < MAX_STREAMS; i++) {
+        if (!g_stream[i].used) continue;
+        double step = (double)g_stream[i].rate / OUT_RATE;
+        for (int f = 0; f < frames && g_stream[i].rd < g_stream[i].wr; f++) {
+            uint32_t k = g_stream[i].rd % STREAM_FRAMES;
+            acc[2 * f] += g_stream[i].ring[2 * k] / 32768.0f * g_stream[i].gain;
+            acc[2 * f + 1] += g_stream[i].ring[2 * k + 1] / 32768.0f * g_stream[i].gain;
+            g_stream[i].pos += step;
+            while (g_stream[i].pos >= 1.0 && g_stream[i].rd < g_stream[i].wr) g_stream[i].pos -= 1.0, g_stream[i].rd++;
         }
     }
     pthread_mutex_unlock(&g_mix);

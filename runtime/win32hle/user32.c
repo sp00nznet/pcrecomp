@@ -1586,11 +1586,9 @@ static void u_SetWindowPos(void) {                       /* (h, after, x, y, cx,
 }
 static void u_BringWindowToTop(void) { RET(W(A32(0)) != NULL, 1); }
 static void u_WindowFromPoint(void) { RET(hle_window_at((int)A32(0), (int)A32(1), NULL, NULL), 2); }
-static void u_ChildWindowFromPoint(void) {               /* (parent, x, y) in the parent's client coordinates */
-    win_t *p = W(A32(0));
-    if (!p) RET(0, 3);
-    int px = (int)A32(1), py = (int)A32(2);
-    if (px < 0 || py < 0 || px >= p->w || py >= p->h) RET(0, 3);
+static uint32_t child_at(uint32_t parent, int px, int py) {
+    win_t *p = W(parent);
+    if (!p || px < 0 || py < 0 || px >= p->w || py >= p->h) return 0;
     uint32_t best = p->hwnd;
     int bseq = 0x7FFFFFFF;
     for (int i = 0; i < MAX_WIN; i++) {
@@ -1598,22 +1596,38 @@ static void u_ChildWindowFromPoint(void) {               /* (parent, x, y) in th
         if (c->used && c->parent == p->hwnd && px >= c->x && py >= c->y && px < c->x + c->w && py < c->y + c->h && c->seq < bseq)
             best = c->hwnd, bseq = c->seq;
     }
-    RET(best, 3);
+    return best;
 }
+static void u_ChildWindowFromPoint(void) { RET(child_at(A32(0), (int)A32(1), (int)A32(2)), 3); }     /* (parent, x, y) */
+static void u_ChildWindowFromPointEx(void) { RET(child_at(A32(0), (int)A32(1), (int)A32(2)), 4); }   /* the flags' skips are not kept */
 
 /* painting */
+/* Add (l,t)-(r,b), client coordinates, to a window's update region. Without
+ * WS_CLIPCHILDREN the children under it are part of what the parent paints
+ * over, so they are invalidated too, as on Windows: a dialog that repaints
+ * its background has its buttons repaint after it (Red Alert 2's menu
+ * captions were drawn and then painted over). */
+static void invalidate_rect(win_t *x, int l, int t, int r, int b) {
+    if (r <= l || b <= t) return;
+    if (!x->inval) x->ix0 = l, x->iy0 = t, x->ix1 = r, x->iy1 = b;
+    else { if (l < x->ix0) x->ix0 = l; if (t < x->iy0) x->iy0 = t; if (r > x->ix1) x->ix1 = r; if (b > x->iy1) x->iy1 = b; }
+    x->inval = 1;
+    if (x->style & 0x02000000u) return;                  /* WS_CLIPCHILDREN */
+    for (int i = 0; i < MAX_WIN; i++) {
+        win_t *c = &g_win[i];
+        if (!c->used || c->parent != x->hwnd || !(c->style & WS_VISIBLE)) continue;
+        int cl = l > c->x ? l : c->x, ct = t > c->y ? t : c->y;
+        int cr = r < c->x + c->w ? r : c->x + c->w, cb = b < c->y + c->h ? b : c->y + c->h;
+        if (cr > cl && cb > ct) invalidate_rect(c, cl - c->x, ct - c->y, cr - c->x, cb - c->y);
+    }
+}
 static void u_InvalidateRect(void) {                     /* (h, rect, erase) */
     win_t *x = W(A32(0));
     if (!A32(0)) { for (int i = 0; i < MAX_WIN; i++) if (g_win[i].used && !g_win[i].parent) invalidate(&g_win[i], 1); RET(1, 3); }
     if (!x) RET(0, 3);
     uint32_t r = A32(1);
-    if (!r) { x->inval = 1, x->ix0 = 0, x->iy0 = 0, x->ix1 = x->w, x->iy1 = x->h; }
-    else {
-        int l = (int)MEM32(r), t = (int)MEM32(r + 4), rr = (int)MEM32(r + 8), b = (int)MEM32(r + 12);
-        if (!x->inval) x->ix0 = l, x->iy0 = t, x->ix1 = rr, x->iy1 = b;
-        else { if (l < x->ix0) x->ix0 = l; if (t < x->iy0) x->iy0 = t; if (rr > x->ix1) x->ix1 = rr; if (b > x->iy1) x->iy1 = b; }
-        x->inval = 1;
-    }
+    if (!r) invalidate_rect(x, 0, 0, x->w, x->h);
+    else invalidate_rect(x, (int)MEM32(r), (int)MEM32(r + 4), (int)MEM32(r + 8), (int)MEM32(r + 12));
     RET(1, 3);
 }
 static void u_ValidateRect(void) { win_t *x = W(A32(0)); if (x) x->inval = 0; RET(x != NULL, 2); }
@@ -1767,6 +1781,17 @@ static void u_TranslateAcceleratorA(void) { RET(0, 3); }
 static void u_WinHelpA(void) { RET(0, 4); }
 static void u_WaitForInputIdle(void) { RET(0, 2); }
 static void u_MessageBeep(void) { RET(1, 1); }
+static void u_LockWindowUpdate(void) { RET(1, 1); }
+static void u_GetSysColor(void) {                        /* the classic scheme's grey and black */
+    uint32_t i = A32(0);
+    RET(i == 5 || i == 8 ? (i == 5 ? 0xFFFFFFu : 0) : i == 1 ? 0x808000u : 0xC0C0C0u, 1);
+}
+/* IMM32: no input method here; a game asks and goes on. */
+static void m_ret0_1(void) { RET(0, 1); }
+static void m_ret0_2(void) { RET(0, 2); }
+static void m_ret0_4(void) { RET(0, 4); }
+static void m_ret1_2(void) { RET(1, 2); }
+static void m_ret0_5(void) { RET(0, 5); }
 
 /* GetSystemMetrics: the screen is the game's display mode. */
 static void u_GetSystemMetrics(void) {
@@ -1956,6 +1981,11 @@ const win32hle_shim win32hle_user32[] = {
     { "CharUpperA", u_CharUpperA }, { "CharLowerA", u_CharLowerA },
     { "RegisterHotKey", u_RegisterHotKey }, { "UnregisterHotKey", u_UnregisterHotKey },
     { "WinHelpA", u_WinHelpA }, { "WaitForInputIdle", u_WaitForInputIdle }, { "MessageBeep", u_MessageBeep },
+    { "LockWindowUpdate", u_LockWindowUpdate }, { "GetSysColor", u_GetSysColor },
+    { "ChildWindowFromPointEx", u_ChildWindowFromPointEx },
+    { "ImmGetContext", m_ret0_1 }, { "ImmAssociateContext", m_ret0_2 }, { "ImmNotifyIME", m_ret0_4 },
+    { "ImmSetOpenStatus", m_ret1_2 }, { "ImmGetCompositionStringA", m_ret0_4 }, { "ImmGetCandidateListA", m_ret0_4 },
+    { "ImmReleaseContext", m_ret1_2 },
     { "DrawTextA", u_DrawTextA }, { "wsprintfA", u_wsprintfA }, { "wvsprintfA", u_wvsprintfA },
     { 0, 0 }
 };

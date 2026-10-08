@@ -73,6 +73,27 @@ static void k_CreateProcessA(void) {
     g_last_error = 2;
     RET(0, 10);
 }
+static void k_MulDiv(void) {                            /* (a, b, c): a*b/c rounded, -1 on c == 0 */
+    int64_t a = (int32_t)A32(0), b = (int32_t)A32(1), c = (int32_t)A32(2);
+    if (!c) RET(0xFFFFFFFFu, 3);
+    int64_t p = a * b, q = (p >= 0) == (c >= 0) ? (p + (c >= 0 ? c : -c) / 2) / c : (p - (c >= 0 ? c : -c) / 2) / c;
+    RET((uint32_t)(int32_t)q, 3);
+}
+/* FormatMessageA: a message for an error number, which is all a game asks. */
+static void k_FormatMessageA(void) {                     /* (flags, source, id, lang, buf, size, args) */
+    char text[64];
+    snprintf(text, sizeof text, "Error %u.\r\n", A32(2));
+    uint32_t n = (uint32_t)strlen(text);
+    if (A32(0) & 0x100u) {                               /* FORMAT_MESSAGE_ALLOCATE_BUFFER */
+        char *p = (char *)hle_alloc(n + 1);
+        memcpy(p, text, n + 1);
+        if (A32(4)) MEM32(A32(4)) = (uint32_t)(uintptr_t)p;
+        RET(n, 7);
+    }
+    if (!A32(4) || A32(5) <= n) RET(0, 7);
+    memcpy(APTR(4), text, n + 1);
+    RET(n, 7);
+}
 static void k_GetExitCodeProcess(void) { if (A32(1)) MEM32(A32(1)) = 0; RET(1, 2); }
 
 /* Thread ids: small and stable per host thread (pthread_self is a pointer). */
@@ -337,6 +358,7 @@ static void k_CreateEventA(void) {                       /* (sa, manual, initial
     RET(h, 4);
 }
 void hle_set_event(uint32_t h) { hevent *e = (hevent *)hle_handle_obj(h, HLE_H_EVENT); if (e) e->signaled = 1; }
+static void k_OpenEventA(void) { uint32_t h = named_find(ASTR(2)); if (!h) g_last_error = 2; RET(h, 3); }
 static void k_SetEvent(void)   { hevent *e = (hevent *)hle_handle_obj(A32(0), HLE_H_EVENT); if (e) e->signaled = 1; RET(e ? 1u : 0u, 1); }
 static void k_ResetEvent(void) { hevent *e = (hevent *)hle_handle_obj(A32(0), HLE_H_EVENT); if (e) e->signaled = 0; RET(e ? 1u : 0u, 1); }
 static void k_PulseEvent(void) { hevent *e = (hevent *)hle_handle_obj(A32(0), HLE_H_EVENT); if (e) e->signaled = 0; RET(e ? 1u : 0u, 1); }
@@ -479,6 +501,9 @@ const win32hle_shim win32hle_kernel32[] = {
     { "FatalAppExitA",      k_FatalAppExitA },
     { "CreateProcessA",     k_CreateProcessA },
     { "GetExitCodeProcess", k_GetExitCodeProcess },
+    { "MulDiv",             k_MulDiv },
+    { "FormatMessageA",     k_FormatMessageA },
+    { "OpenEventA",         k_OpenEventA },
     { "GetVersion",         k_GetVersion },
     { "GetVersionExA",      k_GetVersionExA },
     { "HeapCreate",         k_HeapCreate },

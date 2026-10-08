@@ -60,6 +60,8 @@ static int fd_of(uint32_t h) {
     return f ? f->fd : -1;
 }
 
+int hle_file_fd(uint32_t h) { return fd_of(h); }   /* a file HANDLE's descriptor, for a host (Bink reads the game's) */
+
 static uint32_t new_file(int fd) {
     static int closer_set;
     if (!closer_set) hle_handle_set_closer(HLE_H_FILE, file_closer), closer_set = 1;

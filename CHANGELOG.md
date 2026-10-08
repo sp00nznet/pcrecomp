@@ -43,6 +43,16 @@ versions follow [SemVer](https://semver.org/).
   - The machine lock is handed over with the registers saved, at every import
     and loop back-edge when another thread waits; ordinal imports bind as
     `dll#N`; `build_selftests.sh` runs the selftests.
+  - `bink.c`: `binkw32.dll` on ffmpeg, built with `HLE_WITH_FFMPEG`: a movie
+    opened by name or from the game's own file handle at its offset
+    (`BINKFILEHANDLE`), frames converted to 565, 555 or 32-bit into the
+    game's buffer, the audio played through a host stream that `dsound.c`
+    mixes. Red Alert 2 and Yuri's Revenge (redalert2-recomp `src/linux`) run
+    on the layer with it, with the calls they added (`MulDiv`,
+    `FormatMessageA`, `OpenEventA`, `GetLogicalDriveStringsA`,
+    `GetTempFileNameA`, `ChildWindowFromPointEx`, `GetSysColor`, IMM32's
+    no-ops, `EnumProtocolsA`); invalidating a window without
+    `WS_CLIPCHILDREN` repaints its children as Windows does.
 - `tools/drm/steamstub.py`: removes SteamStub 2.x (x86) without running anything and
   without Steam. The stub's header and payload are running-XOR decoded. The embedded
   `steamdrm.dll` is XTEA-CBC decrypted, and the payload offsets it uses (AES key, first

@@ -308,8 +308,22 @@ void hle_ws_poll(void) {
     }
 }
 
+/* EnumProtocolsA(protocols, buffer, &length): what IPXEmu answers, the IPX
+ * entry (when IPX is asked for, or everything is), as a PROTOCOL_INFOA. */
+static void w_EnumProtocolsA(void) {
+    static char ipx_name[] = "IPX";
+    uint32_t list = A32(0), buf = A32(1), lenp = A32(2), want = !list;
+    for (uint32_t p = list; p && MEM32(p); p += 4) if (MEM32(p) == NSPROTO_IPX) want = 1;
+    if (!want) RET(0, 3);
+    if (!lenp || MEM32(lenp) < 32) { if (lenp) MEM32(lenp) = 32; g_wsa_error = 10055u /* WSAENOBUFS */; RET(SOCKET_ERROR, 3); }
+    MEM32(buf) = 0x609, MEM32(buf + 4) = AF_IPX_WIN, MEM32(buf + 8) = 16, MEM32(buf + 12) = 14;
+    MEM32(buf + 16) = 2, MEM32(buf + 20) = NSPROTO_IPX, MEM32(buf + 24) = 576, MEM32(buf + 28) = (uint32_t)(uintptr_t)ipx_name;
+    RET(1, 3);
+}
+
 #define SHIM2(ord, name, fn) { "wsock32.dll#" #ord, fn }, { name, fn }
 const win32hle_shim win32hle_wsock32[] = {
+    SHIM2(1111, "EnumProtocolsA", w_EnumProtocolsA),
     SHIM2(2, "bind", w_bind),
     SHIM2(3, "closesocket", w_closesocket),
     SHIM2(4, "connect", w_connect),
