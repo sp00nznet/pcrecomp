@@ -83,7 +83,7 @@ void hle_com_Release(void) {
 /* Class objects the guest registered itself (CoRegisterClassObject): a game
  * that serves its own classes in process (Tiberian Sun's locomotors) creates
  * them through COM, so CoCreateInstance has to find its factories. */
-#define MAX_GUEST_CLASSES 64
+#define MAX_GUEST_CLASSES 512                    /* Red Alert 2: past 64, its saved classes and locomotors */
 static struct { uint8_t clsid[16]; uint32_t unk, cookie; } g_guest_class[MAX_GUEST_CLASSES];
 static uint32_t g_next_cookie = 0x100;
 static const uint8_t IID_IClassFactory[16] = { 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -128,7 +128,8 @@ static void o_CoRegisterClassObject(void) {              /* (clsid, unk, ctx, fl
             if (A32(4)) MEM32(A32(4)) = g_guest_class[i].cookie;
             RET(S_OK, 5);
         }
-    RET(E_FAIL, 5);
+    fprintf(stderr, "[ole32] CoRegisterClassObject: more than %d classes\n", MAX_GUEST_CLASSES);
+    RET(0x8007000Eu, 5);                                 /* E_OUTOFMEMORY */
 }
 static void o_CoRevokeClassObject(void) {
     for (int i = 0; i < MAX_GUEST_CLASSES; i++)
