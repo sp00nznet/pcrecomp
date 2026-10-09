@@ -112,6 +112,10 @@ uint32_t hle_focus_window(void);
 uint32_t hle_send(uint32_t hwnd, uint32_t msg, uint32_t wParam, uint32_t lParam);   /* SendMessageA */
 extern void (*hle_dialog_hook)(uint32_t hwnd, uint32_t resource_id);   /* a dialog made from a resource */
 extern void (*hle_cursor_hook)(int x, int y);                          /* the guest moved the cursor */
+/* A cursor from the guest's resources (LoadCursorA), 32x32 monochrome, rows top-down. */
+typedef struct { uint32_t handle; int hot_x, hot_y; uint8_t and_mask[128], xor_mask[128]; } hle_cursor_image_t;
+const hle_cursor_image_t *hle_cursor_image(uint32_t handle);   /* NULL: not one of those (show the system arrow) */
+uint32_t hle_current_cursor(void);                              /* the last SetCursor; 0 if none */
 extern void (*hle_proc_hook)(uint32_t hwnd, uint32_t msg, uint32_t wParam, uint32_t lParam);   /* every message delivered */
 extern volatile int hle_lbutton_reads;   /* GetKeyState/GetAsyncKeyState(VK_LBUTTON) calls so far */
 int         hle_is_window(uint32_t h);
@@ -222,6 +226,7 @@ extern const win32hle_shim win32hle_bink[];           /* binkw32 on ffmpeg (bink
  * itself as the pump hook. headless: no window (a script drives input). */
 int  hle_screen_open(const char *title, int fullscreen, int headless);
 void hle_screen_pump(void);
+extern int (*hle_screen_cursor_hook)(void);   /* nonzero: show the cursor the guest set (its Win32 menus); unset: the game draws its own */
 extern void (*hle_screen_frame_hook)(const uint8_t *px, int w, int h, int pitch, int bpp);   /* each shown frame */
 extern int (*hle_screen_compose_hook)(const uint8_t *px16, int pitch, int w, int h, uint32_t *out);   /* a 2x picture */
 int  hle_screen_scale(const char *name);   /* sharp, smooth, crt, nearest, integer: 0 if unknown */

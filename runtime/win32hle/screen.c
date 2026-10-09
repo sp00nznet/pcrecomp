@@ -249,8 +249,46 @@ static void present(void) {
     SDL_RenderPresent(g_ren);
 }
 
+/* Who shows the cursor. A DirectDraw game draws its own into the picture, so
+ * by default the window has none. A game whose menus are Win32 dialogs (Red
+ * Alert 2) uses the Windows cursor there: its host's hook says when, and the
+ * window shows the cursor the game set, built from its resources. */
+int (*hle_screen_cursor_hook)(void);
+
+static SDL_Cursor *sdl_cursor_from(const hle_cursor_image_t *img) {
+    /* Windows' AND/XOR masks to SDL's mask/data: AND 0 is opaque (XOR 0 black,
+     * 1 white); AND 1 is transparent (XOR 1 inverts). */
+    uint8_t data[128], mask[128];
+    for (int i = 0; i < 128; i++) {
+        mask[i] = (uint8_t)~img->and_mask[i];
+        data[i] = (uint8_t)((~img->xor_mask[i] & mask[i]) | (img->xor_mask[i] & img->and_mask[i]));
+    }
+    return SDL_CreateCursor(data, mask, 32, 32, img->hot_x, img->hot_y);
+}
+
+static void update_cursor(void) {
+    static int was_shown = 0;
+    static uint32_t was_handle;
+    static SDL_Cursor *made;
+    int show = hle_screen_cursor_hook && hle_screen_cursor_hook();
+    uint32_t handle = hle_current_cursor();
+    if (show == was_shown && (!show || handle == was_handle)) return;
+    if (show && handle != was_handle) {
+        const hle_cursor_image_t *img = hle_cursor_image(handle);
+        SDL_Cursor *c = img ? sdl_cursor_from(img) : NULL;
+        SDL_SetCursor(c ? c : SDL_GetDefaultCursor());
+        if (made) SDL_FreeCursor(made);
+        made = c;
+        was_handle = handle;
+    }
+    if (show != was_shown) SDL_ShowCursor(show ? SDL_ENABLE : SDL_DISABLE);
+    fprintf(stderr, "[screen] cursor: %s\n", !show ? "drawn by the game" : made ? "the game's, from its resources" : "the system arrow");
+    was_shown = show;
+}
+
 void hle_screen_pump(void) {
     SDL_Event e;
+    if (g_win) update_cursor();
     while (g_win && SDL_PollEvent(&e)) {
         switch (e.type) {
         case SDL_QUIT: {

@@ -1729,7 +1729,15 @@ static void u_SetCursorPos(void) {
     RET(1, 2);
 }
 static void u_ShowCursor(void) { RET((uint32_t)(A32(0) ? ++g_cursor_shown : --g_cursor_shown), 1); }
-static void u_SetCursor(void) { RET(0, 1); }
+/* The cursor the guest last set. Shown only where a host says the game does
+ * not draw its own (screen.c, hle_screen_cursor_hook). */
+static uint32_t g_current_cursor;
+uint32_t hle_current_cursor(void) { return g_current_cursor; }
+static void u_SetCursor(void) {
+    uint32_t previous = g_current_cursor;
+    g_current_cursor = A32(0);
+    RET(previous, 1);
+}
 static void u_ClipCursor(void) { RET(1, 1); }
 static void u_MapVirtualKeyA(void) {                     /* (code, type) */
     static const uint8_t scan_of[256] = {
@@ -1816,7 +1824,53 @@ static void u_GetSystemMetrics(void) {
 
 /* resources the presenter does not draw: handles that are not NULL */
 static void u_LoadIconA(void)        { RET(0x1C000001u, 2); }
-static void u_LoadCursorA(void)      { RET(0x1C000002u, 2); }
+/* Cursors from the guest's own resources: a 32x32 monochrome cursor, as the
+ * Westwood games ship, is kept as its masks so screen.c can show it. Any
+ * other cursor (a system one, colour, another size) is the stand-in handle,
+ * which screen.c shows as the system arrow. */
+#define CURSOR_STANDIN 0x1C000002u
+#define RT_CURSOR_ID 1u
+#define RT_GROUP_CURSOR_ID 12u
+#define MAX_CURSORS 16
+static hle_cursor_image_t g_cursors[MAX_CURSORS];
+static int g_ncursors;
+
+static uint32_t load_mono_cursor(uint32_t hinst, uint32_t id) {
+    uint32_t group = hle_find_resource(hinst, id, RT_GROUP_CURSOR_ID), size = 0;
+    if (!group) return 0;
+    const uint8_t *dir = (const uint8_t *)(uintptr_t)hle_resource_data(hinst, group, &size);
+    if (!dir || size < 6 + 14) return 0;
+    uint16_t first_entry_id = (uint16_t)(dir[6 + 12] | dir[6 + 13] << 8);   /* NEWHEADER, then CURSORDIRENTRY's nID */
+    uint32_t res = hle_find_resource(hinst, first_entry_id, RT_CURSOR_ID);
+    const uint8_t *cur = res ? (const uint8_t *)(uintptr_t)hle_resource_data(hinst, res, &size) : NULL;
+    if (!cur || size < 4 + 40 + 8 + 2 * 128) return 0;
+    const uint8_t *bih = cur + 4;                         /* after the hot spot: a BITMAPINFOHEADER */
+    int32_t w = (int32_t)(bih[4] | bih[5] << 8 | bih[6] << 16 | (uint32_t)bih[7] << 24);
+    int32_t h2 = (int32_t)(bih[8] | bih[9] << 8 | bih[10] << 16 | (uint32_t)bih[11] << 24);   /* XOR and AND masks */
+    uint16_t bpp = (uint16_t)(bih[14] | bih[15] << 8);
+    if (w != 32 || h2 != 64 || bpp != 1 || g_ncursors == MAX_CURSORS) return 0;
+    hle_cursor_image_t *c = &g_cursors[g_ncursors];
+    c->hot_x = cur[0] | cur[1] << 8, c->hot_y = cur[2] | cur[3] << 8;
+    const uint8_t *xor_bits = bih + 40 + 8, *and_bits = xor_bits + 128;   /* after two palette entries */
+    for (int row = 0; row < 32; row++) {                  /* the DIB is bottom-up */
+        memcpy(c->xor_mask + row * 4, xor_bits + (31 - row) * 4, 4);
+        memcpy(c->and_mask + row * 4, and_bits + (31 - row) * 4, 4);
+    }
+    c->handle = 0x1C100000u + (uint32_t)g_ncursors++;
+    return c->handle;
+}
+
+const hle_cursor_image_t *hle_cursor_image(uint32_t handle) {
+    for (int i = 0; i < g_ncursors; i++)
+        if (g_cursors[i].handle == handle) return &g_cursors[i];
+    return NULL;
+}
+
+static void u_LoadCursorA(void) {                        /* (hinst, name): an id, or a system cursor with hinst NULL */
+    uint32_t hinst = A32(0), name = A32(1), h = 0;
+    if (hinst && name < 0x10000u) h = load_mono_cursor(hinst, name);
+    RET(h ? h : CURSOR_STANDIN, 2);
+}
 static void u_LoadImageA(void)       { RET(0x1C000003u, 6); }
 static void u_LoadBitmapA(void)      { RET(0x1C000004u, 2); }
 static void u_LoadAcceleratorsA(void){ RET(0x1C000005u, 2); }  /* nonzero: games treat NULL as fatal */
