@@ -72,7 +72,98 @@ static int join_component(char *out, size_t n, const char *comp, size_t clen) {
     return found;
 }
 
+/* ---- an overlay: a mod's folder laid over the game's ----
+ *
+ * With hle_set_overlay(base, overlay), a file under base is looked for in
+ * overlay first (at the same relative path, without case), so a mod's
+ * rules.ini or map is read instead of the game's. Writes to files under base
+ * go to the overlay (hle_host_path_for_write), so playing a mod never changes
+ * the game's own files; FindFirstFileA lists both, the overlay's first. */
+static char *g_overlay_base, *g_overlay;
+
+void hle_set_overlay(const char *base, const char *overlay) {
+    free(g_overlay_base), free(g_overlay);
+    g_overlay_base = base && overlay ? realpath(base, NULL) : NULL;
+    g_overlay = base && overlay ? realpath(overlay, NULL) : NULL;
+    if (!g_overlay_base || !g_overlay) free(g_overlay_base), free(g_overlay), g_overlay_base = g_overlay = NULL;
+}
+
+/* host as an absolute path, if it is relative (to the cwd). */
+static void absolute(const char *host, char *out, size_t n) {
+    char cwd[768];
+    if (host[0] == '/' || !getcwd(cwd, sizeof cwd)) snprintf(out, n, "%s", host);
+    else snprintf(out, n, "%s/%s", cwd, strcmp(host, ".") ? host : "");
+    size_t l = strlen(out);
+    while (l > 1 && out[l - 1] == '/') out[--l] = 0;
+}
+
+static int under(const char *path, const char *dir) {
+    size_t l = strlen(dir);
+    return !strncmp(path, dir, l) && (path[l] == '/' || !path[l]);
+}
+
+int hle_overlay_of(const char *host, char *out, size_t n) {
+    char abs[1024];
+    out[0] = 0;
+    if (!g_overlay) return -1;
+    absolute(host, abs, sizeof abs);
+    if (under(abs, g_overlay) || !under(abs, g_overlay_base)) return -1;
+    snprintf(out, n, "%s", g_overlay);
+    const char *p = abs + strlen(g_overlay_base);
+    int exists = 1;
+    while (*p) {
+        while (*p == '/') p++;
+        const char *e = p;
+        while (*e && *e != '/') e++;
+        if (e > p) exists = join_component(out, n, p, (size_t)(e - p)) && exists;
+        p = e;
+    }
+    return exists;
+}
+
+/* The path a write to guest should go to: the overlay's copy when the file is
+ * the game's (its directories made; with keep, the game's file copied there
+ * first, so a write into the middle of it keeps the rest). */
+int hle_host_path_for_write(const char *guest, char *out, size_t n, int keep) {
+    int exists = hle_host_path(guest, out, n);
+    char ov[1024];
+    if (hle_overlay_of(out, ov, sizeof ov) < 0) return exists;
+    for (char *s = ov + strlen(g_overlay); *s && (s = strchr(s + 1, '/')); ) {   /* mkdir -p its directory */
+        *s = 0;
+        mkdir(ov, 0755);
+        *s = '/';
+    }
+    if (keep && exists) {
+        FILE *in = fopen(out, "rb"), *to = in ? fopen(ov, "wb") : NULL;
+        char buf[65536];
+        size_t r;
+        while (to && (r = fread(buf, 1, sizeof buf, in)) > 0) fwrite(buf, 1, r, to);
+        if (in) fclose(in);
+        if (to) fclose(to);
+    }
+    snprintf(out, n, "%s", ov);
+    return keep && exists;
+}
+
+static int host_path_plain(const char *guest, char *out, size_t n);
+
 int hle_host_path(const char *guest, char *out, size_t n) {
+    int exists = host_path_plain(guest, out, n);
+    char ov[1024];
+    struct stat st;
+    /* A file only: a directory stays the game's (the cwd is set through here,
+     * and FindFirstFileA lists both) */
+    if (g_overlay && hle_overlay_of(out, ov, sizeof ov) == 1 && stat(ov, &st) == 0 && !S_ISDIR(st.st_mode)) {
+        snprintf(out, n, "%s", ov);
+        return 1;
+    }
+    return exists;
+}
+
+/* The game's own path for guest, ignoring any overlay. */
+int hle_host_path_base(const char *guest, char *out, size_t n) { return host_path_plain(guest, out, n); }
+
+static int host_path_plain(const char *guest, char *out, size_t n) {
     out[0] = 0;
     if (!guest) return 0;
     const char *p = guest;

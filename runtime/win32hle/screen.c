@@ -254,6 +254,10 @@ static void present(void) {
  * Alert 2) uses the Windows cursor there: its host's hook says when, and the
  * window shows the cursor the game set, built from its resources. */
 int (*hle_screen_cursor_hook)(void);
+int (*hle_screen_key_hook)(int sdl_scancode, int down);
+
+/* The window's title, for a host that shows what is playing (a mod). */
+void hle_screen_title(const char *title) { if (g_win) SDL_SetWindowTitle(g_win, title); }
 
 static SDL_Cursor *sdl_cursor_from(const hle_cursor_image_t *img) {
     /* Windows' AND/XOR masks to SDL's mask/data: AND 0 is opaque (XOR 0 black,
@@ -298,6 +302,8 @@ void hle_screen_pump(void) {
         }
         case SDL_KEYDOWN: case SDL_KEYUP: {
             SDL_Scancode sc = e.key.keysym.scancode;
+            /* a key the host keeps for itself (a mod switch): the game never sees it */
+            if (hle_screen_key_hook && hle_screen_key_hook((int)sc, e.type == SDL_KEYDOWN)) break;
             /* the presenter's keys, the Windows build's: they do not reach the game */
             if ((sc == SDL_SCANCODE_RETURN && (e.key.keysym.mod & KMOD_ALT)) || sc == SDL_SCANCODE_F11) {
                 if (e.type == SDL_KEYDOWN) {

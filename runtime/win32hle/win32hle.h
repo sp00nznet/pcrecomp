@@ -158,6 +158,12 @@ void     hle_handle_set_closer(int type, void (*fn)(void *));
  * hle_host_path returns 1 when the path exists. */
 void hle_set_drive(char letter, const char *host_root);
 int  hle_host_path(const char *guest, char *out, size_t n);
+/* A mod's folder over the game's: reads look in overlay first, writes go
+ * there, directory listings show both (hle_path.c). NULL turns it off. */
+void hle_set_overlay(const char *base, const char *overlay);
+int  hle_overlay_of(const char *host, char *out, size_t n);       /* -1: not under base; else whether it exists there */
+int  hle_host_path_for_write(const char *guest, char *out, size_t n, int keep);
+int  hle_host_path_base(const char *guest, char *out, size_t n);  /* ignoring the overlay */
 void hle_guest_path(const char *host, char *out, size_t n);
 
 /* ---- host services a shim may need (kernel32.c) ---- */
@@ -226,6 +232,8 @@ extern const win32hle_shim win32hle_bink[];           /* binkw32 on ffmpeg (bink
  * itself as the pump hook. headless: no window (a script drives input). */
 int  hle_screen_open(const char *title, int fullscreen, int headless);
 void hle_screen_pump(void);
+extern int (*hle_screen_key_hook)(int sdl_scancode, int down);   /* nonzero: the host took the key */
+void hle_screen_title(const char *title);
 extern int (*hle_screen_cursor_hook)(void);   /* nonzero: show the cursor the guest set (its Win32 menus); unset: the game draws its own */
 extern void (*hle_screen_frame_hook)(const uint8_t *px, int w, int h, int pitch, int bpp);   /* each shown frame */
 extern int (*hle_screen_compose_hook)(const uint8_t *px16, int pitch, int w, int h, uint32_t *out);   /* a 2x picture */

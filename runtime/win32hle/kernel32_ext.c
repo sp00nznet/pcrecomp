@@ -100,6 +100,13 @@ static void k_CreateFileA(void) {
     if (is_device(name, path, sizeof path)) {
         if (!path[0]) { hle_set_last_error(ERROR_FILE_NOT_FOUND); RET(INVALID_HANDLE, 7); }
         exists = 1;
+    } else if ((access & 0x40000000u) || disp == 1 || disp == 2 || disp == 4) {
+        /* a write or a create: under a mod's overlay, into the overlay (a file
+         * opened to change in place is copied there first) */
+        int keep = (access & 0x40000000u) && (disp == 3 || disp == 4);
+        struct stat there;
+        hle_host_path_for_write(name, path, sizeof path, keep);
+        exists = stat(path, &there) == 0;
     } else {
         exists = hle_host_path(name, path, sizeof path);
     }
@@ -330,7 +337,7 @@ static void k_GetFileAttributesA(void) {
 static void k_SetFileAttributesA(void) { char path[1024]; RET(hle_host_path(ASTR(0), path, sizeof path) ? 1u : 0u, 2); }
 static void k_CreateDirectoryA(void) {
     char path[1024];
-    hle_host_path(ASTR(0), path, sizeof path);
+    hle_host_path_for_write(ASTR(0), path, sizeof path, 0);
     if (mkdir(path, 0755) == 0) RET(1, 2);
     hle_set_last_error(errno == EEXIST ? ERROR_ALREADY_EXISTS : errno_to_win(errno));
     RET(0, 2);
@@ -361,6 +368,7 @@ static void k_CopyFileA(void) {                          /* (src, dst, failIfExi
     int ok = 0;
     hle_host_path(ASTR(0), a, sizeof a);
     int dst_exists = hle_host_path(ASTR(1), b, sizeof b);
+    hle_host_path_for_write(ASTR(1), b, sizeof b, 0);
     if (A32(2) && dst_exists) { hle_set_last_error(ERROR_FILE_EXISTS); RET(0, 3); }
     int in = open(a, O_RDONLY | O_CLOEXEC), out = in >= 0 ? open(b, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644) : -1;
     if (in >= 0 && out >= 0) {
@@ -377,8 +385,22 @@ static void k_CopyFileA(void) {                          /* (src, dst, failIfExi
 }
 
 /* ---- FindFirstFileA / FindNextFileA ---- */
-typedef struct { DIR *d; char dir[1024], mask[260]; int dots; } hfind;
-static void find_closer(void *o) { hfind *f = (hfind *)o; if (f->d) closedir(f->d); free(f); }
+/* A directory search. Under a mod's overlay it lists the overlay's directory
+ * first (d), then the game's (base) without the names the overlay had. */
+typedef struct {
+    DIR *d, *base;
+    char dir[1024], base_dir[1024], mask[260];
+    int dots;
+    char (*shown)[260];
+    int nshown;
+} hfind;
+static void find_closer(void *o) {
+    hfind *f = (hfind *)o;
+    if (f->d) closedir(f->d);
+    if (f->base) closedir(f->base);
+    free(f->shown);
+    free(f);
+}
 
 /* Windows wildcard match, without case: * any run, ? one character; "*.*"
  * matches a name with no dot too. */
@@ -414,12 +436,29 @@ static void fill_find(uint32_t o, const char *dir, const char *name) {
     strncpy((char *)(uintptr_t)(o + 44), name, 259);
 }
 
+static int shown_already(hfind *f, const char *name) {
+    for (int i = 0; i < f->nshown; i++)
+        if (!strcasecmp(f->shown[i], name)) return 1;
+    return 0;
+}
+
 static int find_next(hfind *f, uint32_t out) {
     struct dirent *e;
     while (f->d && (e = readdir(f->d))) {
         int dot = !strcmp(e->d_name, ".") || !strcmp(e->d_name, "..");
         if (dot && !f->dots) continue;
-        if (wild(f->mask, e->d_name)) { fill_find(out, f->dir, e->d_name); return 1; }
+        if (!wild(f->mask, e->d_name)) continue;
+        if (f->base) {                                   /* remember it: the game's copy is hidden */
+            if (f->nshown % 64 == 0) f->shown = realloc(f->shown, sizeof *f->shown * (size_t)(f->nshown + 64));
+            snprintf(f->shown[f->nshown++], 260, "%s", e->d_name);
+        }
+        fill_find(out, f->dir, e->d_name);
+        return 1;
+    }
+    while (f->base && (e = readdir(f->base))) {
+        if (!wild(f->mask, e->d_name) || shown_already(f, e->d_name)) continue;
+        fill_find(out, f->base_dir, e->d_name);
+        return 1;
     }
     return 0;
 }
@@ -435,7 +474,12 @@ static void k_FindFirstFileA(void) {                     /* (pattern, &data) */
     char gdir[1024];
     snprintf(gdir, sizeof gdir, "%.*s", (int)(sl - pat), pat);
     if (!gdir[0]) snprintf(gdir, sizeof gdir, ".");
-    hle_host_path(gdir, f->dir, sizeof f->dir);
+    hle_host_path_base(gdir, f->dir, sizeof f->dir);
+    char overlay_dir[1024];
+    if (hle_overlay_of(f->dir, overlay_dir, sizeof overlay_dir) == 1 && (f->base = opendir(f->dir))) {
+        snprintf(f->base_dir, sizeof f->base_dir, "%s", f->dir);
+        snprintf(f->dir, sizeof f->dir, "%s", overlay_dir);
+    }
     snprintf(f->mask, sizeof f->mask, "%s", sl);
     f->dots = strchr(f->mask, '*') || strchr(f->mask, '?');
     /* no wildcard: the one name, found without case */
@@ -443,8 +487,9 @@ static void k_FindFirstFileA(void) {                     /* (pattern, &data) */
         char one[1024];
         struct stat st;
         if (hle_host_path(pat, one, sizeof one) && stat(one, &st) == 0) {
-            const char *b = strrchr(one, '/');
-            fill_find(A32(1), f->dir, b ? b + 1 : one);
+            char *b = strrchr(one, '/');                 /* the overlay's or the game's, wherever it is */
+            if (b) *b = 0;
+            fill_find(A32(1), b ? (one[0] ? one : "/") : ".", b ? b + 1 : one);
             uint32_t h = hle_handle_alloc(HLE_H_FIND, f);
             RET(h ? h : INVALID_HANDLE, 2);
         }
