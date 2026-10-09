@@ -6,6 +6,18 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- `tools/lift/name_lift.py`: readable names for a finished lift, and a header on
+  every function saying what it is, from what the binary itself says. Virtual
+  methods are named by their class and slot from RTTI (COM's own slots by name:
+  `UnitClass__QueryInterface`, `OverlayClass__Load`); MSVC's scalar deleting
+  destructors and `operator delete` by their shape; constructors and destructors
+  by the vtables they store; functions that print `Class::Method` in a debug
+  message by it. The header lists the strings a function uses, the Windows calls
+  it makes, its source file where a message names one, its `this` class and how
+  many places call it; a constant that is a string's or a vtable's address gets
+  a comment. Nothing comes from outside the binary. 7,167 of Red Alert 2: Yuri's
+  Revenge's 24,954 functions are named and 5,602 of Tiberian Sun's 18,559; both
+  build and play as before. `--demo` checks it on a synthetic lift.
 - `tools/drm/steamstub.py`: removes SteamStub 2.x (x86) without running anything and
   without Steam. The stub's header and payload are running-XOR decoded. The embedded
   `steamdrm.dll` is XTEA-CBC decrypted, and the payload offsets it uses (AES key, first
