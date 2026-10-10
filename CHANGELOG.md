@@ -6,6 +6,13 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- `tools/le/le_parse.py`: the LE front end, for 32-bit DOS-extender programs
+  (DOS/4GW, PMODE/W, DOS/32A: most Watcom-built DOS games of 1993-97). It lays
+  the objects out at a chosen base with every fixup applied, as the extender
+  would have, and re-wraps the result as a PE32 (`--pe`, one section per
+  object, the fixups as `.reloc`) so disasm32 and lift32 run on it unchanged.
+  `--seeds` lists the code addresses the fixup tables name, minus data kept in
+  code. Theme Park's MAIN.EXE: 3 objects, 19,728 fixups. (#PR)
 - native32 eh32: guest C++ exceptions for lifted x86-32 code. `_CxxThrowException` is a
   built-in that dispatches over the guest's own `fs:[0]` chain and FuncInfo tables, runs the
   unwind and catch funclets as guest code, and longjmps into a landing pad the lifter gives
