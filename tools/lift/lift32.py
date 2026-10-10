@@ -1106,11 +1106,17 @@ class Lifter:
                 a = self._fmt_read(ops[0])
                 b, bn = self._shift_count(ops[1])
                 w = op_bits(ops[0])
-                res = f"((uint32_t)((int32_t){a} >> {b}))"
+                # Sign-extend from the operand's own width first: a narrow read
+                # is unsigned (LO16, MEM16), so `(int32_t)` alone made `sar word`
+                # a logical shift for every negative value. Theme Park halves
+                # its sprite offsets with `sar word ptr [x], 1` and drew every
+                # sprite 32768 pixels away.
+                sa = a if w == 32 else f"(int32_t)(int{w}_t)({a})"
+                res = f"((uint32_t)((int32_t){sa} >> {b}))"
                 # sar must publish CF for a following rcr (the clip's `sar;rcr` lerp).
                 lines.append(f"if ({b}) _cf = {self._shift_out_cf(a, b, bn, w, 'arith')}; {comment}")
                 lines.append(self._shift_flags(res, b, w))
-                lines.append(f"{self._fmt_write(ops[0], f'(uint32_t)((int32_t){a} >> {b})')};")
+                lines.append(f"{self._fmt_write(ops[0], f'(uint32_t)((int32_t){sa} >> {b})')};")
                 self._flag_state = None
 
         # shld/shrd: double-precision shift (64-bit window across dst:src). Used pervasively
