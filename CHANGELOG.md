@@ -59,6 +59,10 @@ versions follow [SemVer](https://semver.org/).
   block, OEP, code range) are read from its own code. The code section is then
   AES-256-CBC decrypted, with the IV taken from an ECB-decrypted first block. The
   dead `.bind` section is dropped. Needs `cryptography`. Found on KotOR (Steam, app 32370).
+- `tools/drm/steamstub.py`: the older SteamStub 2.0 layout too. It has no `steamdrm.dll`:
+  the stub copies a header whose first dword seeds the running XOR over the rest, and the
+  code section is the same running XOR keyed by a header field. Found on Unreal
+  Tournament (Steam, app 13240).
 - `runtime/win32hle/` WinMain bring-up, driven by running a lifted Fury³ under
   the permissive host and implementing each import it reached:
   - `user32.c`: the window-setup and RECT surface a GUI WinMain needs —
