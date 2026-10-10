@@ -241,6 +241,15 @@ FUNCTION_LOCALS = (
 )
 
 
+def _is_far_indirect(insn) -> bool:
+    """call/jmp m16:32: opcode FF with ModRM reg 3 (call) or 5 (jmp)."""
+    b = bytes(insn.bytes)
+    i = 0
+    while i < len(b) and b[i] in (0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65, 0x66, 0x67, 0xF2, 0xF3):
+        i += 1
+    return i + 1 < len(b) and b[i] == 0xFF and ((b[i + 1] >> 3) & 7) in (3, 5)
+
+
 # Lifted only with Lifter(dos=True); see Lifter._lift_dos.
 DOS_OPS = {'int', 'iretd', 'in', 'out', 'insb', 'insw', 'insd', 'outsb', 'outsw', 'outsd',
            'cli', 'sti', 'hlt'}
@@ -1481,7 +1490,13 @@ class Lifter:
                     lines.append(f"RECOMP_CALL(sub_{target:08X}); {comment}")
             else:
                 # Indirect call
-                if ops and ops[0].type == X86_OP_MEM:
+                if ops and ops[0].type == X86_OP_MEM and self.dos and _is_far_indirect(insn):
+                    # call m16:32: CS goes on the stack under the return
+                    # address, and the callee's retf takes both off. A DOS
+                    # extender's timer and driver callbacks are called this way.
+                    addr = self._fmt_mem_addr(ops[0].mem)
+                    lines.append(f"PUSH32(esp, _seg_cs); RECOMP_ICALL(MEM32({addr})); {comment}")
+                elif ops and ops[0].type == X86_OP_MEM:
                     addr = self._fmt_mem_addr(ops[0].mem)
                     lines.append(f"RECOMP_ICALL(MEM32({addr})); {comment}")
                 elif ops and ops[0].type == X86_OP_REG:
@@ -1512,7 +1527,13 @@ class Lifter:
                 lines.append(f"RECOMP_FLAGS_OUT(); esp += 4; return; {comment}")
 
         elif m == 'retf':
-            lines.append(f"return; /* far return */ {comment}")
+            if self.dos:
+                # Pops EIP and CS (and an immediate's worth): the far call
+                # above pushed both. Outside DOS mode nothing pushes a CS.
+                n = ops[0].imm if ops and ops[0].type == X86_OP_IMM else 0
+                lines.append(f"RECOMP_FLAGS_OUT(); esp += {8 + n}; return; /* far return */ {comment}")
+            else:
+                lines.append(f"return; /* far return */ {comment}")
 
         elif m == 'jmp':
             target = insn.get_branch_target()
