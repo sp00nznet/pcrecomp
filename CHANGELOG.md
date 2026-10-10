@@ -6,6 +6,9 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- lift16: `jmp reg` whose arms the project found (`mov bx, [bx+table] / jmp bx`)
+  lifts as a switch of gotos, like `jmp word [bx+table]` already did, instead of
+  a dispatch by address.
 - dos32: `dos32_config.overlay`, a folder laid over drive C: for files opened
   read-only, so a host can offer mods without touching the game's files.
   (#73)

@@ -707,7 +707,21 @@ class Lifter:
                 else:
                     self._emit(f'/* indirect jmp via {_read(op1)} - needs dispatch */', orig)
             else:
-                if getattr(self, 'dispatch', False) and op1 and op1.type == OpType.REG16:
+                arms = getattr(self, 'jump_tables', {}).get(inst.address)
+                if getattr(self, 'dispatch', False) and op1 and op1.type == OpType.REG16 and arms:
+                    # `mov bx, [bx+table] / jmp bx`: the project found the
+                    # table, so the arms inside this function are gotos.
+                    seg16 = int(_CODE_SEG, 16) * 16 if _CODE_SEG else 0
+                    self._emit('{ uint16_t _t = ' + _read(op1) + ';', orig)
+                    self._emit('  switch (_t) {')
+                    for _t in dict.fromkeys(arms):
+                        _rel = _t - func_start
+                        if _rel in self.valid_addrs:
+                            self._emit('    case 0x%04X: goto %s;'
+                                       % (_t - seg16, _label(_rel, self.func_name)))
+                    self._emit('    default: recomp_dispatch(cpu, ' + _cseg() + ', _t); return;')
+                    self._emit('  } }')
+                elif getattr(self, 'dispatch', False) and op1 and op1.type == OpType.REG16:
                     self._emit(f'recomp_dispatch(cpu, {_cseg()}, {_read(op1)}); return;', orig)
                 else:
                     self._emit(f'/* jmp {repr(op1)} */', orig)
