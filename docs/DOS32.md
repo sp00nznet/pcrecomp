@@ -81,8 +81,13 @@ That grain is coarser than hardware's and is what makes it safe.
   delivering a storm.
 - Keyboard: scancodes go to the program's IRQ 1 handler if it hooked vector 9,
   else into the BIOS buffer for int 16h and DOS input.
-- Mouse: int 33h, including the `0Ch` event handler. The pointer is absolute:
-  the window position maps onto the range the program set with `07h`/`08h`.
+- Mouse: int 33h, including the `0Ch` event handler. `dos32_mouse` is an
+  absolute pointer: the window position maps onto the range the program set
+  with `07h`/`08h`. `dos32_mouse_move` is relative, as a real driver moves:
+  from wherever the cursor is, including where the program put it with `04h`,
+  and on past the edge of the window. A game that reads motion and puts the
+  cursor back itself (Theme Park) needs it; the host captures the pointer to
+  feed it.
 
 ## Video
 

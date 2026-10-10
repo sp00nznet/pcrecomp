@@ -6,6 +6,12 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- dos32: `dos32_mouse_move`, the mouse as relative motion. The absolute
+  pointer overrides every `int 33h AX=04h`: Theme Park reads how far the
+  driver's position moved from where it last put its own cursor, so each
+  host move dragged the cursor back toward the window position (drift while
+  laying paths), and nothing moved past the window's edge (no edge
+  scrolling). (#PR)
 - lift16: `jmp reg` whose arms the project found (`mov bx, [bx+table] / jmp bx`)
   lifts as a switch of gotos, like `jmp word [bx+table]` already did, instead of
   a dispatch by address. (#75)

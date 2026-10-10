@@ -365,13 +365,23 @@ static struct {
     uint32_t handler, mask;           /* int 33h AX=0Ch */
     int pending;                      /* event bits not yet delivered */
     int px, py, pbuttons;             /* last raw input, screen pixels */
+    int rel;                          /* 1: the last input was dos32_mouse_move */
+    double rdx, rdy;                  /* motion not yet taken, screen pixels */
+    double fx, fy;                    /* fractions of a virtual unit carried over */
     int scr_w, scr_h;
 } mouse;
 static volatile LONG mouse_dirty;
 
 void dos32_mouse(int x, int y, int buttons) {
     EnterCriticalSection(&input_lock);
-    mouse.px = x; mouse.py = y; mouse.pbuttons = buttons;
+    mouse.px = x; mouse.py = y; mouse.pbuttons = buttons; mouse.rel = 0;
+    LeaveCriticalSection(&input_lock);
+    InterlockedExchange(&mouse_dirty, 1);
+}
+
+void dos32_mouse_move(double dx, double dy, int buttons) {
+    EnterCriticalSection(&input_lock);
+    mouse.rdx += dx; mouse.rdy += dy; mouse.pbuttons = buttons; mouse.rel = 1;
     LeaveCriticalSection(&input_lock);
     InterlockedExchange(&mouse_dirty, 1);
 }
@@ -472,7 +482,9 @@ static void poll_input(void) {
     int n = 0;
     EnterCriticalSection(&input_lock);
     while (scq_r != scq_w && n < 64) q[n++] = scq[scq_r++ & 255];
-    int px = mouse.px, py = mouse.py, pb = mouse.pbuttons;
+    int px = mouse.px, py = mouse.py, pb = mouse.pbuttons, rel = mouse.rel;
+    double rdx = mouse.rdx, rdy = mouse.rdy;
+    mouse.rdx = mouse.rdy = 0;
     LeaveCriticalSection(&input_lock);
     for (int i = 0; i < n; i++) {
         port60 = (uint8_t)q[i];
@@ -487,6 +499,17 @@ static void poll_input(void) {
         int sw = vmode <= 0x13 ? 320 : vw, sh = vmode <= 0x13 ? 200 : vh;
         int vx = mouse.minx + px * (mouse.maxx - mouse.minx + 1) / sw;
         int vy = mouse.miny + py * (mouse.maxy - mouse.miny + 1) / sh;
+        int mx = vx - mouse.x, my = vy - mouse.y;
+        if (rel) {
+            /* A relative pointer, as a real driver moves: from wherever the
+             * cursor is, including where the program put it with AX=04h.
+             * Mickeys count the whole motion, clamped at the edge or not. */
+            mouse.fx += rdx * (mouse.maxx - mouse.minx + 1) / sw;
+            mouse.fy += rdy * (mouse.maxy - mouse.miny + 1) / sh;
+            mx = (int)mouse.fx; my = (int)mouse.fy;
+            mouse.fx -= mx; mouse.fy -= my;
+            vx = mouse.x + mx; vy = mouse.y + my;
+        }
         if (vx < mouse.minx) vx = mouse.minx;
         if (vx > mouse.maxx) vx = mouse.maxx;
         if (vy < mouse.miny) vy = mouse.miny;
@@ -497,8 +520,8 @@ static void poll_input(void) {
         if (chg & 1) ev |= (pb & 1) ? 2 : 4;
         if (chg & 2) ev |= (pb & 2) ? 8 : 16;
         if (chg & 4) ev |= (pb & 4) ? 32 : 64;
-        mouse.mick_x += vx - mouse.x;
-        mouse.mick_y += (vy - mouse.y) * 2;
+        mouse.mick_x += mx;
+        mouse.mick_y += my * 2;
         mouse.x = vx; mouse.y = vy; mouse.buttons = pb;
         mouse.pending |= ev;
     }
