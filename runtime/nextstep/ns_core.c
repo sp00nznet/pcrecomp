@@ -20,6 +20,8 @@ double   g_st[8];
 int      g_fp_top;
 uint16_t g_fpu_cw = 0x037F;
 uint64_t g_mm[8];
+xmm_t    g_xmm[8];
+uint32_t g_mxcsr = 0x1F80;
 ptrdiff_t g_mem_base;
 uint32_t g_cur_func;
 uint32_t g_icall_trace[ICALL_TRACE_SIZE], g_icall_from[ICALL_TRACE_SIZE];
