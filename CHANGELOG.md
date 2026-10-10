@@ -88,6 +88,12 @@ versions follow [SemVer](https://semver.org/).
   runtime gap). `HLE_FILETRACE=1` logs the data files a title opens. (#45)
 
 ### Fixed
+- lift32: MMX's byte and unsigned-saturating ops (`paddusb`, `psubusb`, `paddusw`, `psubusw`,
+  `paddb`, `psubb`, `paddsb`, `psubsb`, `pcmpeqb`, `pcmpgtb`, `pcmpeqd`, `pcmpgtd`,
+  `packsswb`) are lifted. They were emitted as an `UNIMPLEMENTED` comment and the lift
+  still counted 0 errors. Unreal Tournament's software renderer blends every translucent
+  pixel with one `paddusb`, so its HUD panels were drawn opaque, solid black when faded
+  out. `mmx_selftest.c` covers each one.
 - native32 under Wine (macOS with CrossOver, Linux): `native32_init` turns DEP on,
   since Wine otherwise answers the first fetch from the guest's code by making it
   executable and running the original machine code; and the fault handler takes a
