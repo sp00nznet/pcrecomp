@@ -459,6 +459,20 @@ static void shim_CreateThread(void) {
     g_esp += 4 + 6 * 4;
 }
 
+/* RaiseException(0x406D1388): MSVC's SetThreadName, which only an attached
+ * debugger is meant to see. The guest wraps it in
+ *     __try { RaiseException(0x406D1388, ...); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+ * but its __try frame is on the guest's SEH chain, which Windows never walks
+ * (eh32.c handles C++ frames only), so the exception went unhandled and ended
+ * the process with that code: Tiberium Wars, naming its first worker thread.
+ * Returning is what the empty __except does. Any other code is raised for real. */
+static void shim_RaiseException(void) {
+    uint32_t* a = (uint32_t*)(uintptr_t)(g_esp + 4);
+    if (a[0] != 0x406D1388u)
+        RaiseException(a[0], a[1], a[2], (const ULONG_PTR*)(uintptr_t)a[3]);
+    g_esp += 4 + 4 * 4;
+}
+
 /* _CxxThrowException: a guest throw is dispatched over the guest's own
  * frames (eh32.c), so the guest's catch blocks run. */
 void native32_shim_CxxThrowException(void);
@@ -473,6 +487,7 @@ X87CRT(controlfp) X87CRT(control87)
 
 static native32_shim_t g_builtin[] = {
     { "CreateThread", shim_CreateThread },
+    { "RaiseException", shim_RaiseException },
     { "_CxxThrowException", native32_shim_CxxThrowException },
     { "_ftol", native32_shim_ftol },
     { "_CIsqrt", native32_shim_CIsqrt }, { "_CIsin", native32_shim_CIsin },
