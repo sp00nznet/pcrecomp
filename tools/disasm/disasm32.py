@@ -84,6 +84,37 @@ def prologue_starts(data, code_start):
     return found
 
 
+def thunk_tables(data, code_start, min_run=16):
+    """Runs of `jmp rel32` (E9) slots into the code, back to back: [(lo, hi)].
+
+    An incrementally linked image (/INCREMENTAL, MSVC 2.x-4.x debug and many
+    shipped retail builds) routes every function through a 5-byte thunk in one
+    table, and every call and function pointer names the thunk. Each slot is a
+    function start by construction, and nothing else can start inside one. A
+    pointer-shaped value naming a byte in the middle of a slot otherwise decodes
+    across the next one and hides it: in Monster Truck Madness 2, 0x00402733
+    (the last byte of `jmp 0x43B7E0`) took out the thunk at 0x00402734, and the
+    game's first call through that pointer was `ICALL: unresolved`.
+
+    Sixteen slots in a row whose every target lands in the code is not what
+    compiled code or a switch table looks like.
+    """
+    end = code_start + len(data)
+    runs = []
+    at = data.find(b'\xE9')
+    while at >= 0:
+        j = at
+        while (j + 5 <= len(data) and data[j] == 0xE9 and
+               code_start <= code_start + j + 5 + int.from_bytes(data[j + 1:j + 5], 'little', signed=True) < end):
+            j += 5
+        if (j - at) // 5 >= min_run:
+            runs.append((code_start + at, code_start + j))
+            at = data.find(b'\xE9', j)
+        else:
+            at = data.find(b'\xE9', at + 1)
+    return runs
+
+
 @dataclass
 class Instruction:
     address: int
@@ -741,6 +772,14 @@ class Disassembler:
 
         print(f"[*] Found {len(prologue_targets)} prologue patterns")
 
+        # Every slot of an incremental-link thunk table is a function start,
+        # with the same standing as a seed (thunk_tables).
+        tables = thunk_tables(data, code_start) if data else []
+        slots = {a for lo, hi in tables for a in range(lo, hi, 5)}
+        if tables:
+            print(f"[*] {len(slots)} thunk-table slots in {len(tables)} table(s)")
+        seeds = set(seeds) | slots
+
         # Merge targets
         all_targets = call_targets | prologue_targets | set(seeds)
         # Filter to code range
@@ -932,6 +971,13 @@ class Disassembler:
 
         print(f"[*] Successfully disassembled {len(functions)} functions"
               f" ({round_no} discovery rounds)")
+        # Nothing starts inside a thunk slot, so an entry off the slot grid is
+        # a decode the table disproves.
+        torn = [a for a in functions for lo, hi in tables if lo <= a < hi and (a - lo) % 5]
+        for a in torn:
+            del functions[a]
+        if torn:
+            print(f"[*] Dropped {len(torn)} entries inside a thunk-table slot")
         sizes = {a: f.size for a, f in functions.items()}
         callers = {}
         for a, f in functions.items():
@@ -1701,6 +1747,17 @@ def demo():
     cat = {0x1000: 5, 0x1003: 6, 0x1005: 5}
     drop_mid_instruction_entries(_readt, cat, 0x1000, 0x1000 + len(thunks), verbose=False)
     assert sorted(cat) == [0x1000, 0x1005], cat
+
+    # thunk_tables: 16 slots back to back are a table, each slot a start;
+    # 15 are not, and a slot whose target leaves the code ends the run.
+    def _slots(n):
+        return b''.join(b'\xE9' + (0x10 - 5 * (k + 1)).to_bytes(4, 'little', signed=True)
+                        for k in range(n))
+    tbl = b'\x90' + _slots(16) + b'\xC3' * 0x40
+    assert thunk_tables(tbl, 0x1000) == [(0x1001, 0x1001 + 80)], thunk_tables(tbl, 0x1000)
+    assert thunk_tables(b'\x90' + _slots(15) + b'\xC3' * 0x40, 0x1000) == []
+    out = _slots(16) + b'\xE9\x00\x00\x00\x40' + b'\xC3' * 0x40     # 17th slot jumps out
+    assert thunk_tables(out, 0x1000) == [(0x1000, 0x1050)]
 
     # eh_entries: a handler stub `mov eax, FuncInfo; jmp`, the FuncInfo's
     # unwind action and catch handler, and nothing without the magic.
