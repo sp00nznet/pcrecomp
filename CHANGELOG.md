@@ -6,6 +6,11 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- native32 eh32: guest C++ exceptions for lifted x86-32 code. `_CxxThrowException` is a
+  built-in that dispatches over the guest's own `fs:[0]` chain and FuncInfo tables, runs the
+  unwind and catch funclets as guest code, and longjmps into a landing pad the lifter gives
+  every function with catch blocks (`tools/lift/eh32.py`, `generate.lift_function_linear`
+  `eh_resume=`). Found on Unreal Tournament, whose `StaticLoadObject` catches its own throws.
 - `tools/lift/name_lift.py`: readable names for a finished lift, and a header on
   every function saying what it is, from what the binary itself says. Virtual
   methods are named by their class and slot from RTTI (COM's own slots by name:

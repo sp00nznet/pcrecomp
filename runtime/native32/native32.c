@@ -358,6 +358,10 @@ static void shim_CreateThread(void) {
     g_esp += 4 + 6 * 4;
 }
 
+/* _CxxThrowException: a guest throw is dispatched over the guest's own
+ * frames (eh32.c), so the guest's catch blocks run. */
+void native32_shim_CxxThrowException(void);
+
 /* msvcrt helpers that take their arguments on the x87 stack (x87crt.c): the
  * bridge passes stack arguments only, and the lifted FPU stack is g_st. */
 #define X87CRT(n) void native32_shim_##n(void);
@@ -368,6 +372,7 @@ X87CRT(controlfp) X87CRT(control87)
 
 static native32_shim_t g_builtin[] = {
     { "CreateThread", shim_CreateThread },
+    { "_CxxThrowException", native32_shim_CxxThrowException },
     { "_ftol", native32_shim_ftol },
     { "_CIsqrt", native32_shim_CIsqrt }, { "_CIsin", native32_shim_CIsin },
     { "_CIcos", native32_shim_CIcos }, { "_CItan", native32_shim_CItan },
@@ -548,4 +553,5 @@ void native32_dump_icalls(int n) {
 
 /* Built-in bodies kept in their own files, compiled as part of this one so a
  * host's build needs no change when one is added. */
+#include "eh32.c"
 #include "x87crt.c"
