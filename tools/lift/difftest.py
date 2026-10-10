@@ -638,6 +638,15 @@ CASES = [
                'Lifter(precise_carry=True) derives it (off by default: Fury3)'),
     Case('lock.inc', bytes.fromhex('f0ff06'),                       # lock inc dword [esi]
          mem={SCRATCH: (41).to_bytes(4, 'little')}),
+    # lock xadd [esi], ecx: the old value comes back in ecx, flags as add
+    Case('lock.xadd', bytes.fromhex('f00fc10e'), regs={'ecx': 0xFFFFFFFF},
+         mem={SCRATCH: (1).to_bytes(4, 'little')}),
+    Case('xadd.byte', bytes.fromhex('0fc0c8'), regs={'eax': 0x7F, 'ecx': 0x01}),   # xadd al, cl
+    # lock cmpxchg [esi], ecx: equal -> [esi] = ecx; not equal -> eax = [esi]
+    Case('lock.cmpxchg.equal', bytes.fromhex('f00fb10e'), regs={'eax': 5, 'ecx': 9},
+         mem={SCRATCH: (5).to_bytes(4, 'little')}),
+    Case('lock.cmpxchg.differ', bytes.fromhex('f00fb10e'), regs={'eax': 4, 'ecx': 9},
+         mem={SCRATCH: (5).to_bytes(4, 'little')}),
 ]
 
 # Every x87 register form, i = 1 and 2, from a stack of three distinct values
