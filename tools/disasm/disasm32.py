@@ -665,7 +665,7 @@ class Disassembler:
         codegen on decoded garbage.
         """
         found = set()
-        probed = rejected = mid = 0
+        probed = rejected = mid = padded = 0
         for s in self.sections:
             if s.is_code:
                 continue
@@ -677,7 +677,18 @@ class Disassembler:
                 va = int.from_bytes(data[off:off + 4], 'little')
                 if not (code_start <= va < code_end):
                     continue
-                if va in covered or va in queued or va in found:
+                if va in queued or va in found:
+                    continue
+                if va in covered:
+                    # An instruction some body already decoded. Normally a
+                    # label in that body; but when it is 16-aligned right
+                    # after alignment padding, the body ran on past a call
+                    # that never returns, through the padding, into the next
+                    # function. UT's UWeb.dll: a static constructor named only
+                    # by the _initterm table, behind `call <throw>; nop x12`.
+                    if va % 16 == 0 and self.read_bytes(va - 1, 1) in (b'\x90', b'\xcc'):
+                        padded += 1
+                        found.add(va)
                     continue
                 if interior is not None and interior[va - code_start]:
                     mid += 1
@@ -687,6 +698,9 @@ class Disassembler:
                     rejected += 1
                     continue
                 found.add(va)
+        if padded:
+            print(f"[*] Data scan: {padded} pointer targets start a function after padding "
+                  f"that another body ran through")
         if probed or mid:
             print(f"[*] Data scan: probed {probed} pointer targets, "
                   f"rejected {rejected} that do not decode as code "

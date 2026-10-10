@@ -88,6 +88,11 @@ versions follow [SemVer](https://semver.org/).
   runtime gap). `HLE_FILETRACE=1` logs the data files a title opens. (#45)
 
 ### Fixed
+- disasm32: a data pointer to an instruction start inside another body is a function entry
+  when it is 16-aligned right after `nop`/`int3` padding: that body ran past a call that
+  never returns, through the padding, into the next function, and the data scan had skipped
+  the pointer as already covered. Unreal Tournament's UWeb.dll lost a static constructor
+  named only by its `_initterm` table that way, and loading the DLL faulted on it.
 - `recomp_types.h`: gcc and clang get `__rdtsc` from `<x86intrin.h>`, as MSVC
   gets it from `<intrin.h>`, so generated code that reads the timestamp
   counter compiles off Windows.
