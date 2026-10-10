@@ -793,6 +793,12 @@ class Lifter:
         # under one machine lock.
         if m.startswith('lock'):
             m = m[4:].strip() or (insn.op_str.split() or [''])[0]
+        # `repz ret` (F3 C3) is a plain ret: AMD's branch-prediction idiom,
+        # which MSVC 2005 and later emit, __security_check_cookie among them.
+        # Unlifted, every /GS-checked function fell through into
+        # __report_gsfailure (Tiberium Wars). `bnd ret` (F2 C3) is MPX's.
+        if m.split()[-1] in ('ret', 'retn') and m.split()[0] in ('rep', 'repz', 'repe', 'bnd'):
+            m = m.split()[-1]
         ops = insn.operands if insn.operands else []
         lines = []
 
