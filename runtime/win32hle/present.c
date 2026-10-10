@@ -31,6 +31,7 @@ static SDL_Surface *g_winsurf;
 static int          g_w, g_h;
 
 int hle_present_open(const char *title, int w, int h) {
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");      /* SIGINT and SIGTERM end the process */
     if (SDL_Init(SDL_INIT_VIDEO) != 0) { fprintf(stderr, "[present] SDL_Init: %s\n", SDL_GetError()); return -1; }
     g_win = SDL_CreateWindow(title ? title : "win32hle",
                              SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,

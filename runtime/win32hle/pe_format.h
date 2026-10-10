@@ -73,6 +73,7 @@ typedef struct { uint32_t VirtualAddress, SizeOfBlock; } pe_base_reloc;
 #pragma pack(pop)
 
 #define PE_DIR_IMPORT    1
+#define PE_DIR_RESOURCE  2
 #define PE_DIR_BASERELOC 5
 #define PE_REL_HIGHLOW   3
 #define PE_ORDINAL_FLAG  0x80000000u
