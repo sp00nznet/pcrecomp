@@ -88,6 +88,12 @@ versions follow [SemVer](https://semver.org/).
   runtime gap). `HLE_FILETRACE=1` logs the data files a title opens. (#45)
 
 ### Fixed
+- native32 under Wine (macOS with CrossOver, Linux): `native32_init` turns DEP on,
+  since Wine otherwise answers the first fetch from the guest's code by making it
+  executable and running the original machine code; and the fault handler takes a
+  read of the faulting instruction's own address as a fetch, as Wine under Rosetta
+  reports one. Callbacks into lifted code now arrive under Wine. (#55, by
+  [@cpressland](https://github.com/cpressland))
 - lift32: a signed or unsigned ordering jcc/setcc after `or` or `xor` (`jge`, `jl`, `jg`,
   `jle`, `ja`, `jbe`, `jb`, `jae`) tests the result's sign and zero, as after `test`. It
   compared the result with itself (`xor eax, [b]; jge` was always taken). Unreal
