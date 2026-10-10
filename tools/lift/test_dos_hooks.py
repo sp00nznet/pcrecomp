@@ -15,13 +15,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import capstone
 
+from generate import LinearInstruction
 from lift32 import Lifter
 
 
 def emit(encoding, dos=True):
     md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
     md.detail = True
-    insn = next(iter(md.disasm(encoding, 0x1000)))
+    insn = LinearInstruction(next(iter(md.disasm(encoding, 0x1000))))   # as generate.py hands it over
     return " ".join(Lifter(dos=dos).lift_instruction(insn))
 
 
@@ -39,6 +40,10 @@ def main():
         (b"\xfb", "recomp_sti()"),
         (b"\xf4", "recomp_hlt()"),
         (b"\xcf", "esp += 12; return;"),
+        (b"\xc3", "RECOMP_RET_JUMP(_rt)"),                  # push x; ret is a jump
+        (b"\xff\x18", "PUSH32(esp, _seg_cs); RECOMP_ICALL(MEM32("),  # call far [eax]
+        (b"\xcb", "esp += 8; return;"),                     # retf
+        (b"\xca\x04\x00", "esp += 12; return;"),            # retf 4
         # Segment loads keep the host's base in step; es: reads through it.
         (b"\x8e\xe8", "recomp_set_seg(5, "),                # mov gs, ax
         (b"\x07", "recomp_set_seg(0, POP32_VAL(esp))"),     # pop es
