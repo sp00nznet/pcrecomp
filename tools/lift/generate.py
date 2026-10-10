@@ -54,7 +54,7 @@ class LinearInstruction:
         self.bytes = bytes(insn.bytes)
         self.operands = list(insn.operands) if insn.operands else []
         self.is_call = insn.mnemonic == 'call'
-        self.is_ret = insn.mnemonic in ('ret', 'retn', 'retf')
+        self.is_ret = insn.mnemonic.split()[-1] in ('ret', 'retn', 'retf')   # and `repz ret`
         self.is_cond_jump = insn.mnemonic in COND_JUMPS
         self.is_uncond_jump = insn.mnemonic == 'jmp'
         self.is_jump = self.is_cond_jump or self.is_uncond_jump
@@ -555,6 +555,8 @@ def true_extent(md, code, code_start, start, hard_end, entries, reached=None, be
                 seen.add(ins.address)
                 top = max(top, ins.address + ins.size)
                 m = ins.mnemonic
+                if m.split()[-1] in ('ret', 'retn'):   # `repz ret` ends a body too
+                    m = m.split()[-1]
                 t = None
                 if ins.operands and ins.operands[0].type == X86_OP_IMM:
                     t = ins.operands[0].imm & 0xFFFFFFFF
