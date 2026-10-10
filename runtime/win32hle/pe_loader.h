@@ -13,12 +13,17 @@ typedef struct {
     uint32_t span;        /* SizeOfImage, page-rounded */
     uint32_t entry;       /* entry point VA (base + AddressOfEntryPoint) */
     uint32_t import_rva;  /* import directory RVA (0 if none) */
+    uint32_t resource_rva, resource_size;  /* resource directory (0 if none) */
+    uint32_t stamp;       /* FileHeader.TimeDateStamp: which build this is */
 } pe_image;
 
 /* Map `path` at its preferred ImageBase (MAP_FIXED): sections to their VAs,
  * .bss zero-filled, relocations applied if the base ended up different. Returns
  * 0 and fills *img on success, nonzero on failure (prints why). */
 int recomp_pe_map(const char *path, pe_image *img);
+
+/* Map `path` wherever there is room and relocate it there: a DLL. */
+int recomp_pe_map_any(const char *path, pe_image *img);
 
 /* Walk the import directory and write each IAT slot's resolved address, using
  * resolve(name) (hle_resolve for win32hle). Returns the count left unresolved. */

@@ -8,6 +8,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
 #include "win32hle.h"
 
 #define ENTRY_VA 0x00401000u
@@ -112,6 +114,36 @@ int main(void) {
     ok("file write then read round-trips", mem_eq);
     ok("GlobalAlloc/Lock write-through",    g_global_ptr);
     ok(".ini write then read round-trips",  ini_ok);
+
+    /* A mod's overlay: its file read instead of the game's, the game's where
+     * it has none, writes into the overlay (the game's file copied first when
+     * kept), and the game's files untouched. */
+    {
+        char p[1024], q[1024];
+        FILE *f;
+        system("rm -rf /tmp/hleov && mkdir -p /tmp/hleov/game/maps /tmp/hleov/mod");
+        f = fopen("/tmp/hleov/game/rules.ini", "w"); fputs("base", f); fclose(f);
+        f = fopen("/tmp/hleov/game/maps/a.map", "w"); fputs("map", f); fclose(f);
+        f = fopen("/tmp/hleov/mod/RULES.INI", "w"); fputs("mod", f); fclose(f);
+        hle_set_drive('C', "/tmp/hleov/game");
+        hle_set_overlay("/tmp/hleov/game", "/tmp/hleov/mod");
+        ok("overlay: the mod's file is read", hle_host_path("C:\\rules.ini", p, sizeof p) && strstr(p, "/mod/RULES.INI"));
+        ok("overlay: the game's where the mod has none", hle_host_path("C:\\maps\\a.map", p, sizeof p) && strstr(p, "/game/maps/a.map"));
+        hle_host_path_for_write("C:\\saves\\one.sav", p, sizeof p, 0);
+        ok("overlay: a new file goes to the mod, its directory made", !strcmp(p, "/tmp/hleov/mod/saves/one.sav") &&
+           access("/tmp/hleov/mod/saves", F_OK) == 0);
+        hle_host_path_for_write("C:\\maps\\a.map", p, sizeof p, 1);
+        f = fopen(p, "r");
+        ok("overlay: a kept file is copied into the mod first", f && fgets(q, sizeof q, f) && !strcmp(q, "map") &&
+           strstr(p, "/mod/maps/a.map"));
+        if (f) fclose(f);
+        ok("overlay: the game's files untouched", access("/tmp/hleov/game/saves", F_OK) != 0);
+        ok("overlay: a directory stays the game's (the cwd)", hle_host_path("C:\\", p, sizeof p) && !strcmp(p, "/tmp/hleov/game"));
+        chdir("/tmp/hleov/game");
+        ok("overlay: a name relative to the game's folder", hle_host_path("rules.ini", p, sizeof p) && strstr(p, "/mod/RULES.INI"));
+        hle_set_overlay(NULL, NULL);
+        ok("overlay off: the game's file again", hle_host_path("C:\\rules.ini", p, sizeof p) && strstr(p, "/game/rules.ini"));
+    }
 
     if (fails == 0) printf("kernel32_ext_selftest: all checks passed\n");
     return fails != 0;

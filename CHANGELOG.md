@@ -6,6 +6,53 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- `runtime/win32hle/`: enough of Win32 for a DirectDraw game to run on Linux,
+  driven by Tiberian Sun (tiberiansun-recomp `src/linux`), which now boots,
+  plays its movies and music, runs its menus and dialogs, and plays a
+  skirmish with no Windows and no Wine:
+  - `ddraw.c`: DirectDraw in software (`IDirectDraw`/`2`, surfaces 1–3,
+    palettes, clippers; blits with colour fill, colour key and stretch, flips),
+    with a 64 KB tail behind every surface for blitters that run past the end;
+    `screen.c` shows the primary in an SDL2 window and turns SDL input into
+    window messages.
+  - `dsound.c`: DirectSound on SDL2 audio, a software mixer with real-time
+    play cursors.
+  - `user32.c`: a window manager — windows, classes, the queue with `WM_PAINT`
+    and `WM_TIMER` generated, focus/capture/activation, dialogs from their
+    templates, and the standard controls with owner-draw (combo boxes sized
+    from `WM_MEASUREITEM` as Windows does, which the game's layout depends on).
+  - `gdidc.c`: device contexts on surfaces, fonts on SDL2_ttf, `TextOutA`.
+  - `module.c`, `hle_path.c`: `LoadLibraryA` and resources (`LoadStringA`,
+    dialog templates in a resource DLL), Windows paths on a case-sensitive
+    disk.
+  - `kernel32*.c`: files on descriptors and the directory search, sized heap
+    blocks, virtual memory, critical sections, events, mutexes, waits, TLS,
+    codepage 1252 and an English locale for the CRT.
+  - `ole32.c` (COM class factories, the host's and the guest's own),
+    `advapi32.c` (an in-memory registry, COMCTL32, VERSION, SHELL32),
+    `wsock32.c` (Winsock 1.1 on BSD sockets, and IPX as IPXEmu puts it on
+    UDP, so a native player and a Windows one share a LAN), `winmm.c` timers
+    on threads.
+  - `storage.c`: structured storage (`StgCreateDocfile`, `IStorage`,
+    `IStream`, `OleSaveToStream`/`OleLoadFromStream`) on compound files in
+    Windows' own format (MS-CFB v3), so saves move between the two; a
+    selftest round-trips one.
+  - `screen.c` scales as a Windows presenter does: sharp-bilinear, smooth,
+    CRT, nearest, integer (F12), blurred bars, fullscreen (F11); an optional
+    2x picture from the host (an HD layer).
+  - The machine lock is handed over with the registers saved, at every import
+    and loop back-edge when another thread waits; ordinal imports bind as
+    `dll#N`; `build_selftests.sh` runs the selftests.
+  - `bink.c`: `binkw32.dll` on ffmpeg, built with `HLE_WITH_FFMPEG`: a movie
+    opened by name or from the game's own file handle at its offset
+    (`BINKFILEHANDLE`), frames converted to 565, 555 or 32-bit into the
+    game's buffer, the audio played through a host stream that `dsound.c`
+    mixes. Red Alert 2 and Yuri's Revenge (redalert2-recomp `src/linux`) run
+    on the layer with it, with the calls they added (`MulDiv`,
+    `FormatMessageA`, `OpenEventA`, `GetLogicalDriveStringsA`,
+    `GetTempFileNameA`, `ChildWindowFromPointEx`, `GetSysColor`, IMM32's
+    no-ops, `EnumProtocolsA`); invalidating a window without
+    `WS_CLIPCHILDREN` repaints its children as Windows does.
 - `tools/drm/steamstub.py`: removes SteamStub 2.x (x86) without running anything and
   without Steam. The stub's header and payload are running-XOR decoded. The embedded
   `steamdrm.dll` is XTEA-CBC decrypted, and the payload offsets it uses (AES key, first
@@ -16,8 +63,34 @@ versions follow [SemVer](https://semver.org/).
   the stub copies a header whose first dword seeds the running XOR over the rest, and the
   code section is the same running XOR keyed by a header field. Found on Unreal
   Tournament (Steam, app 13240).
+- `runtime/win32hle/` WinMain bring-up, driven by running a lifted Fury³ under
+  the permissive host and implementing each import it reached:
+  - `user32.c`: the window-setup and RECT surface a GUI WinMain needs —
+    `FindWindowA` (single-instance), `LoadIcon/Cursor/Image/Bitmap/Accelerators/
+    Menu` (non-NULL handles; a NULL accelerator table is fatal to some games),
+    `TranslateAcceleratorA`, `GetSystemMetrics` (a 1600×960 desktop),
+    `GetClientRect`/`GetWindowRect`/`Adjust*`, `BeginPaint`/`EndPaint`,
+    `MessageBoxA` (to stderr), the focus/z-order setters, and the `*Rect`
+    helpers (`CopyRect`/`OffsetRect`/`SetRect*`/`InflateRect`).
+  - `winmm.c` (new): WINMM — multimedia timers, no-joystick, and a silent
+    waveOut device that retires every buffer immediately (so a mixer thread
+    keeps cycling without a sound card), MCI stubbed.
+  - `kernel32_crt.c`: `CreateThread` runs the lifted start routine on a pthread
+    via `hle_call_guest` (each guest thread already gets its own stack+TIB);
+    guest threads interleave cooperatively, yielding the machine lock in the
+    blocking shims (`Sleep` now yields, `WaitForSingleObject`).
+  - `kernel32_ext.c` `CreateFileA` translates Windows `\\` to `/`, and
+    `GetModuleFileNameA`/`GetCurrentDirectoryA` return the real image location
+    (`hle_set_module_path`) so a title finds its data relative to the exe.
+  With these a lifted Fury³ runs its whole CRT **and WinMain** on Linux —
+  through window creation, its worker thread, and timing — into its own asset
+  loader (it then wants its `.POD` data manifest, which is game packaging, not a
+  runtime gap). `HLE_FILETRACE=1` logs the data files a title opens. (#45)
 
 ### Fixed
+- `recomp_types.h`: gcc and clang get `__rdtsc` from `<x86intrin.h>`, as MSVC
+  gets it from `<intrin.h>`, so generated code that reads the timestamp
+  counter compiles off Windows.
 - disasm32: straight-line code longer than one scan window (8 KB, 4 KB per block) is decoded
   to its end. The rest of the function used to be dropped. KotOR registers its script commands in
   ~7 KB of `mov [reg+disp], offset`, so 142 functions named only there were never catalogued;
