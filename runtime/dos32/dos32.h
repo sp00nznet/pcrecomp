@@ -23,6 +23,9 @@ extern "C" {
 
 typedef struct {
     const char* root;      /* host folder that is drive C: */
+    const char* overlay;   /* optional: a folder laid over root for files opened
+                            * read-only (mods); same layout, missing files fall
+                            * through to root */
     const char* cwd;       /* DOS current directory, e.g. "\\GAME" */
     const char* progname;  /* DOS path of the program, e.g. "C:\\GAME\\MAIN.EXE" */
     const char* args;      /* command tail, without the program name */
