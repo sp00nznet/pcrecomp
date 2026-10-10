@@ -53,6 +53,8 @@ double   g_st[8];
 int      g_fp_top;
 uint16_t g_fpu_cw = 0x037F;
 uint64_t g_mm[8];
+xmm_t    g_xmm[8];
+uint32_t g_mxcsr = 0x1F80;
 uint16_t g_seg_cs, g_seg_ds, g_seg_es, g_seg_fs, g_seg_gs, g_seg_ss;
 uint32_t g_fs_base, g_gs_base, g_es_base;
 ptrdiff_t g_mem_base;

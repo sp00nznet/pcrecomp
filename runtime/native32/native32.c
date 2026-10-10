@@ -24,6 +24,8 @@ int       g_fp_top;
 uint16_t  g_fpu_cw = 0x027F;
 uint16_t  g_seg_cs, g_seg_ds, g_seg_es, g_seg_fs, g_seg_gs, g_seg_ss;
 uint64_t  g_mm[8];
+xmm_t     g_xmm[8];
+uint32_t  g_mxcsr = 0x1F80;
 uint32_t  g_fs_base, g_gs_base;
 ptrdiff_t g_mem_base = 0;
 uint32_t  g_cur_func;
@@ -38,6 +40,8 @@ typedef struct {
     int      fp_top;
     uint16_t fpu_cw;
     uint64_t mm[8];
+    xmm_t    xmm[8];
+    uint32_t mxcsr;
 } regs_t;
 
 static void regs_save(regs_t* r) {
@@ -46,6 +50,7 @@ static void regs_save(regs_t* r) {
     r->fs = g_fs_base; r->cur = g_cur_func;
     memcpy(r->st, g_st, sizeof g_st); r->fp_top = g_fp_top; r->fpu_cw = g_fpu_cw;
     memcpy(r->mm, g_mm, sizeof g_mm);
+    memcpy(r->xmm, g_xmm, sizeof g_xmm); r->mxcsr = g_mxcsr;
 }
 
 static void regs_load(const regs_t* r) {
@@ -54,6 +59,7 @@ static void regs_load(const regs_t* r) {
     g_fs_base = r->fs; g_cur_func = r->cur;
     memcpy(g_st, r->st, sizeof g_st); g_fp_top = r->fp_top; g_fpu_cw = r->fpu_cw;
     memcpy(g_mm, r->mm, sizeof g_mm);
+    memcpy(g_xmm, r->xmm, sizeof g_xmm); g_mxcsr = r->mxcsr;
 }
 
 /* ------------------------------------------------------------- machine lock */
@@ -105,6 +111,7 @@ void mach_enter(void) {
         m->r.esp = lo + GUEST_STACK - BRIDGE_SLOTS * 4 - 64;
         m->r.fs = make_tib(lo, lo + GUEST_STACK);
         m->r.fpu_cw = 0x027F;
+        m->r.mxcsr = 0x1F80;              /* exceptions masked, round to nearest */
         TlsSetValue(g_mach_tls, m);
     }
     if (m->depth++ == 0) regs_load(&m->r);

@@ -129,6 +129,8 @@ extern const uint32_t recomp_dispatch_count;
 /* MMX file is global too. The lifter emits _mm[n] (see lift32.MMX_REGS), so the
  * alias has to exist alongside the others or every MMX body fails to compile. */
 #define _mm g_mm
+/* And the SSE file (lift32_sse.py emits _xmm[n]). */
+#define _xmm g_xmm
 #define _seg_cs g_seg_cs
 #define _seg_ds g_seg_ds
 #define _seg_es g_seg_es
@@ -852,6 +854,82 @@ static inline uint64_t mmx_packsswb(uint64_t a, uint64_t b) {
     for (int i = 0; i < 4; i++) r |= MM_PUT_B(4 + i, mmx_clamp(MM_W(b,i), -128, 127));
     return r;
 }
+
+/* ============================================================
+ * SSE / SSE2
+ *
+ * Eight 128-bit registers, global like the rest of the register file; the
+ * lifter emits _xmm[n] (tools/lift/lift32_sse.py has the instruction side).
+ * Lanes are read through the union, so a register holds whatever bits were
+ * put in it and a float lane never passes through the x87.
+ *
+ * MXCSR is kept for ldmxcsr/stmxcsr and its rounding field drives cvtss2si,
+ * cvtsd2si and cvtps2pi. Exceptions stay masked, FTZ/DAZ are not modelled.
+ * ============================================================ */
+
+typedef union {
+    float    f32[4];
+    double   f64[2];
+    uint64_t u64[2];
+    uint32_t u32[4];
+    int32_t  i32[4];
+    uint16_t u16[8];
+    int16_t  i16[8];
+    uint8_t  u8[16];
+} xmm_t;
+
+extern xmm_t    g_xmm[8];
+extern uint32_t g_mxcsr;
+
+static inline xmm_t xmm_ld(uint32_t a) { xmm_t v; memcpy(&v, (const void*)ADDR(a), 16); return v; }
+static inline void  xmm_st(uint32_t a, xmm_t v) { memcpy((void*)ADDR(a), &v, 16); }
+static inline float    sse_f32(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
+static inline uint32_t sse_u32(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+static inline double   sse_f64(uint64_t u) { double d; memcpy(&d, &u, 8); return d; }
+static inline uint64_t sse_u64(double d) { uint64_t u; memcpy(&u, &d, 8); return u; }
+
+/* float/double -> int32 as cvt(t)ss2si does: NaN or out of range gives the
+ * "integer indefinite" 0x80000000. Rounding is MXCSR's (bits 13-14), or
+ * toward zero for the cvtt forms. */
+static inline int32_t sse_cvt_i32(double v, int chop) {
+    if (!chop)
+        switch ((g_mxcsr >> 13) & 3) {
+        case 0: v = nearbyint(v); break;            /* the host's default: nearest-even */
+        case 1: v = floor(v); break;
+        case 2: v = ceil(v); break;
+        default: v = trunc(v); break;
+        }
+    if (!(v > -2147483649.0 && v < 2147483648.0)) return (int32_t)0x80000000u;
+    return (int32_t)v;
+}
+
+/* minss/maxss: the SECOND operand whenever the compare is false, NaN or
+ * equal (+0 vs -0) included. A C fminf/fmaxf would not. */
+static inline float  sse_minf(float a, float b) { return a < b ? a : b; }
+static inline float  sse_maxf(float a, float b) { return a > b ? a : b; }
+static inline double sse_mind(double a, double b) { return a < b ? a : b; }
+static inline double sse_maxd(double a, double b) { return a > b ? a : b; }
+
+/* comiss/ucomiss/comisd/ucomisd and fcomi: the EFLAGS word, ZF PF CF, with
+ * OF SF AF clear. Unordered sets all three. */
+#define SSE_COMI(a, b) ((a) < (b) ? 0x01u : (a) > (b) ? 0x00u : (a) == (b) ? 0x40u : 0x45u)
+
+/* cmpXXps/ss predicates 0-7: eq lt le unord neq nlt nle ord. */
+static inline uint32_t sse_cmp_pred(double a, double b, int p) {
+    int r;
+    switch (p & 7) {
+    case 0: r = a == b; break;
+    case 1: r = a < b; break;
+    case 2: r = a <= b; break;
+    case 3: r = a != a || b != b; break;
+    case 4: r = !(a == b); break;
+    case 5: r = !(a < b); break;
+    case 6: r = !(a <= b); break;
+    default: r = a == a && b == b; break;
+    }
+    return r ? 0xFFFFFFFFu : 0;
+}
+
 /* ============================================================
  * FPU Stack Helpers
  * ============================================================ */

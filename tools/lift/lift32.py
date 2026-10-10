@@ -9,6 +9,10 @@ generation from flag-setters to flag-consumers.
 
 from dataclasses import dataclass, field
 from typing import Optional
+try:                                    # as tools.lift.lift32 (difftest) or from tools/lift
+    from .lift32_sse import lift_sse
+except ImportError:
+    from lift32_sse import lift_sse
 from capstone.x86 import (
     X86_OP_REG, X86_OP_IMM, X86_OP_MEM,
     X86_REG_EAX, X86_REG_ECX, X86_REG_EDX, X86_REG_EBX,
@@ -804,6 +808,12 @@ class Lifter:
 
         # Address comment
         comment = f"/* 0x{insn.address:08X}: {insn.mnemonic} {insn.op_str} */"
+
+        # SSE/SSE2 first: pxor, movd and movq with an xmm operand are not the
+        # MMX forms further down (lift32_sse.py).
+        sse = lift_sse(self, m, ops, comment)
+        if sse is not None:
+            return sse
 
         # --- Data Movement ---
         if m == 'mov':
@@ -1751,14 +1761,23 @@ class Lifter:
         # compare never ran (so _fpu_cmp kept its last value) and its two pops
         # never happened, leaking two x87 slots per call. The Movies has 3,244
         # of them; its audio code read every position/length ratio as 1.0.
-        elif m in ('fcomip', 'fucomip', 'fcompp', 'fucompp'):
+        elif m in ('fcompp', 'fucompp'):
             lines.append(f"_fpu_cmp = FPU_CMP(_st[0], _st[1]); {comment}")
-            if m in ('fcompp', 'fucompp'):
-                lines.append(f"fp_pop(); fp_pop();")
-            else:
-                lines.append(f"fp_pop();")
+            lines.append(f"fp_pop(); fp_pop();")
             lines.append("_flag_a = (uint32_t)_fpu_cmp; _flag_b = 0;")
             self._flag_state = ('fcom', '_fpu_cmp')
+            self._flag_seq += 1
+
+        # fcomi and friends compare st(0) with st(i) straight into EFLAGS (ZF PF
+        # CF, as comiss does); the x87 condition codes are left alone. Capstone
+        # spells the popping forms fcompi/fucompi, so the fcomip/fucomip names
+        # this used to match never came up: Tiberium Wars had 1,596 unlifted.
+        elif m in ('fcomi', 'fucomi', 'fcompi', 'fucompi', 'fcomip', 'fucomip'):
+            lines.append(f"_flag_a = SSE_COMI(_st[0], {self._fmt_fpu_src(ops)}); _flag_b = 0; "
+                         f"_cf = _flag_a & 1u; {comment}")
+            if m in ('fcompi', 'fucompi', 'fcomip', 'fucomip'):
+                lines.append("fp_pop();")
+            self._flag_state = ('eflags', '_flag_a, _flag_b')
             self._flag_seq += 1
 
         elif m in ('fcom', 'fcomp', 'fucom', 'fucomp'):
@@ -1816,6 +1835,23 @@ class Lifter:
             # The flag state is left alone on purpose: `fnstsw` changes no
             # flags, so a following `sahf` (2 sites in Focom.exe) still finds
             # the 'fcom' state and the unsigned jcc after it maps correctly.
+
+        elif m == 'lahf':
+            # ah <- SF ZF 0 AF 0 PF 1 CF, from whatever the lazy state holds.
+            # MSVC's NaN test is `ucomiss; lahf; test ah, 0x44; jp`.
+            lines.append(f"SET_HI8(eax, (recomp_eflags(_flag_k, _flag_a, _flag_b, _cf, _df) & 0xD5u) | 2u); "
+                         f"{comment}")
+
+        elif m in ('bsf', 'bsr') and len(ops) == 2:
+            # The index of the lowest/highest set bit; ZF says the source was 0,
+            # and then the destination is left as it was (what CPUs do).
+            src = self._fmt_read(ops[1])
+            scan = ("for (_i = 0; !((_v >> _i) & 1u); _i++) ;" if m == 'bsf'
+                    else "for (_i = 31; !((_v >> _i) & 1u); _i--) ;")
+            lines.append(f"{{ uint32_t _v = {src}, _i; if (_v) {{ {scan} "
+                         f"{self._fmt_write(ops[0], '_i')}; }} _flag_a = _flag_b = _v; }} _cf = 0; {comment}")
+            self._flag_state = ('test', '_flag_a, _flag_b')
+            self._flag_seq += 1
 
         elif m == 'sahf':
             # SF ZF AF PF CF <- ah bits 7 6 4 2 0. This was a comment, so a
@@ -1940,12 +1976,6 @@ class Lifter:
             # ceil(0.3) came out 0, and Gunman's engine computed zero-sized
             # surface extents at map load ("D_SCAlloc: bad cache size 0").
             lines.append(f"_st[0] = fp_round_cw(_st[0], _fpu_cw); /* frndint */ {comment}")
-
-        # --- SSE scalar float ---
-        elif m == 'movss':
-            if len(ops) == 2:
-                lines.append(f"/* {m} */ {comment}")  # TODO: XMM support
-                lines.append(f"/* SSE movss not yet implemented */")
 
         # --- Misc ---
         elif m == 'nop' or m.startswith('nop'):
