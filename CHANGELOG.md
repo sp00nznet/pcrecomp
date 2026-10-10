@@ -88,6 +88,11 @@ versions follow [SemVer](https://semver.org/).
   runtime gap). `HLE_FILETRACE=1` logs the data files a title opens. (#45)
 
 ### Fixed
+- lift32: a signed or unsigned ordering jcc/setcc after `or` or `xor` (`jge`, `jl`, `jg`,
+  `jle`, `ja`, `jbe`, `jb`, `jae`) tests the result's sign and zero, as after `test`. It
+  compared the result with itself (`xor eax, [b]; jge` was always taken). Unreal
+  Tournament's clipper asks whether an edge crosses a plane that way; its renderer drew
+  stretched, overlapping shards. Four difftest cases.
 - disasm32: a data pointer to an instruction start inside another body is a function entry
   when it is 16-aligned right after `nop`/`int3` padding: that body ran past a call that
   never returns, through the padding, into the next function, and the data scan had skipped
