@@ -76,6 +76,17 @@ void     dos32_heap_free(uint32_t va);
 extern int dos32_virtual_clock;
 void dos32_advance(double seconds);
 
+/* Save states: the whole machine to a file and back (about 8 MB for a game
+ * that grabbed 64 MB, as all-zero pages are left out). Call both on the guest
+ * thread, from the same function of a host hook the program calls every frame:
+ * lifted code runs on the host's own call stack, so a state only loads where
+ * it was saved. `where` names the hook; a load also needs the host's stack
+ * depth and the guest's stack pointer to match. Returns 0; -1 for a missing,
+ * foreign or unwritable file; -2 for a state saved somewhere else (nothing is
+ * changed). */
+int dos32_state_save(const char* path, uint32_t where);
+int dos32_state_load(const char* path, uint32_t where);
+
 /* Called on the guest thread at every retrace the program waits for:
  * frame capture for --record, scripted input. May be NULL. */
 extern void (*dos32_on_retrace)(void);

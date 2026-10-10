@@ -42,6 +42,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <intrin.h>
 
 #include "recomp_types.h"
 #include "dos32.h"
@@ -1235,7 +1236,98 @@ static LONG CALLBACK on_fault(EXCEPTION_POINTERS* ep) {
 /* ---- start -------------------------------------------------------------- */
 static void put_str(uint32_t at, const char* s) { while (*s) R8(at++) = (uint8_t)*s++; R8(at) = 0; }
 
+/* ---- save states -------------------------------------------------------- */
+/* Everything the program can see: its registers, the host's tables for it
+ * (selectors, vectors, the heaps, the video and timer chips), and memory up
+ * to the top of the heap plus video memory, with all-zero pages left out.
+ * Host-side things are not in it: guest time runs on, input queues start
+ * empty, and open files stay as they are now. */
+#define STATE_VARS(X) \
+    X(g_eax) X(g_ecx) X(g_edx) X(g_esp) X(g_ebx) X(g_esi) X(g_edi) X(g_ebp) \
+    X(g_st) X(g_fp_top) X(g_fpu_cw) X(g_mm) X(g_flag_k) X(g_flag_a) X(g_flag_b) X(g_flag_cf) \
+    X(g_seg_cs) X(g_seg_ds) X(g_seg_es) X(g_seg_fs) X(g_seg_gs) X(g_seg_ss) \
+    X(g_fs_base) X(g_gs_base) X(g_es_base) \
+    X(sel) X(heap) X(conv) X(pmvec) X(rmvec) X(pic_mask) \
+    X(pit_div) X(pit_latch) X(pit_lohi) X(pit_mode_byte) X(shift_flags) \
+    X(vmode) X(vw) X(vh) X(vpitch) X(vesa_lfb) X(vbank) \
+    X(dac) X(dac_w) X(dac_r) X(dac_c) X(dac_rc) \
+    X(seq_idx) X(seq) X(crtc_idx) X(crtc) X(gc_idx) X(gc) X(cwd) X(dta) X(mouse)
+#define STATE_SIZE_OF(v) + sizeof(v)
+static const uint32_t state_size = 0 STATE_VARS(STATE_SIZE_OF);
+#define STATE_PAGE 4096u
+static char* run_frame;          /* dos32_run's frame: host stack depth is measured from it */
+
+/* Where the host's call stack was when the caller called us, as a depth
+ * below dos32_run: the same at the same place in the program from run to run,
+ * unlike the address itself (Windows moves a thread's stack about). */
+#define STACK_DEPTH() ((uint32_t)(run_frame - (char*)_AddressOfReturnAddress()))
+
+static int pages_out(FILE* f, const uint8_t* p, uint32_t bytes) {
+    static const uint8_t zero[STATE_PAGE];
+    for (uint32_t o = 0; o < bytes; o += STATE_PAGE) {
+        uint8_t used = memcmp(p + o, zero, STATE_PAGE) != 0;
+        if (fwrite(&used, 1, 1, f) != 1 || (used && fwrite(p + o, STATE_PAGE, 1, f) != 1)) return 0;
+    }
+    return 1;
+}
+
+static int pages_in(FILE* f, uint8_t* p, uint32_t bytes) {
+    for (uint32_t o = 0; o < bytes; o += STATE_PAGE) {
+        uint8_t used;
+        if (fread(&used, 1, 1, f) != 1) return 0;
+        if (!used) memset(p + o, 0, STATE_PAGE);
+        else if (fread(p + o, STATE_PAGE, 1, f) != 1) return 0;
+    }
+    return 1;
+}
+
+int dos32_state_save(const char* path, uint32_t where) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return -1;
+    uint32_t head[5] = { 0x53323344u /* "D32S" */, 1, state_size, where, STACK_DEPTH() };
+    int ok = fwrite(head, sizeof head, 1, f) == 1;
+#define STATE_OUT(v) ok = ok && fwrite(&(v), sizeof(v), 1, f) == 1;
+    STATE_VARS(STATE_OUT)
+    EnterCriticalSection(&video_lock);
+    ok = ok && pages_out(f, M, HEAP_HI) && pages_out(f, LIN(LFB_VA), VRAM_SIZE) && pages_out(f, vram, VRAM_SIZE);
+    LeaveCriticalSection(&video_lock);
+    if (fclose(f) != 0) ok = 0;
+    if (!ok) remove(path);
+    return ok ? 0 : -1;
+}
+
+int dos32_state_load(const char* path, uint32_t where) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return -1;
+    uint32_t head[5], esp_now = g_esp, esp_then, depth = STACK_DEPTH();
+    if (fread(head, sizeof head, 1, f) != 1 || head[0] != 0x53323344u || head[1] != 1 || head[2] != state_size) {
+        fclose(f); return -1;
+    }
+    /* Saved at a different place in the program (or the host's own call
+     * stack is a different depth there): the lifted code above the hook
+     * would return into frames that are not the ones the state expects. */
+    fseek(f, sizeof head + 12, SEEK_SET);   /* g_esp, the fourth of STATE_VARS */
+    if (fread(&esp_then, 4, 1, f) != 1) { fclose(f); return -1; }
+    if (head[3] != where || head[4] != depth || esp_then != esp_now) { fclose(f); return -2; }
+    fseek(f, sizeof head, SEEK_SET);
+    EnterCriticalSection(&input_lock);
+    EnterCriticalSection(&video_lock);
+    int ok = 1;
+#define STATE_IN(v) ok = ok && fread(&(v), sizeof(v), 1, f) == 1;
+    STATE_VARS(STATE_IN)
+    ok = ok && pages_in(f, M, HEAP_HI) && pages_in(f, LIN(LFB_VA), VRAM_SIZE) && pages_in(f, vram, VRAM_SIZE);
+    scq_r = scq_w = 0; kb_r = kb_w = 0;
+    mouse.pending = 0; mouse.rdx = mouse.rdy = 0;
+    LeaveCriticalSection(&video_lock);
+    LeaveCriticalSection(&input_lock);
+    fclose(f);
+    if (!ok) { fprintf(stderr, "dos32: %s is cut short; the program's memory is now half loaded\n", path); dos32_quit = 1; }
+    return ok ? 0 : -1;
+}
+
 int dos32_run(const dos32_config* cfg) {
+    char frame;
+    run_frame = &frame;
     C = cfg;
     InitializeCriticalSection(&input_lock);
     InitializeCriticalSection(&video_lock);

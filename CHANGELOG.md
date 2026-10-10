@@ -6,6 +6,12 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- dos32: save states. `dos32_state_save` / `dos32_state_load` write the whole
+  machine to a file and back: registers, the host's tables, the chips, and
+  memory with all-zero pages left out (about 8 MB for Theme Park). A state
+  loads only at the hook and host-stack depth where it was saved, since lifted
+  code is the host's own call stack; anywhere else the load refuses and changes
+  nothing (docs/DOS32.md). (#77)
 - dos32: `dos32_mouse_move`, the mouse as relative motion. The absolute
   pointer overrides every `int 33h AX=04h`: Theme Park reads how far the
   driver's position moved from where it last put its own cursor, so each
