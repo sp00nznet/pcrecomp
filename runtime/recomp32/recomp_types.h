@@ -179,6 +179,26 @@ extern uint32_t g_gs_base;
 #define FS_BASE  g_fs_base
 #define GS_BASE  g_gs_base
 
+/* DOS-extender hooks: what Lifter(dos=True) emits for int, port I/O, cli/sti,
+ * hlt and segment loads (tools/lift/lift32.py _lift_dos). A DOS host such as
+ * runtime/dos32 defines them; nothing else references them. Under DOS/4GW es
+ * is a real selector (the PSP, the environment), so es: overrides get a base. */
+extern uint32_t g_es_base;
+#define ES_BASE  g_es_base
+void     recomp_int(int n);
+uint8_t  recomp_in8(uint32_t port);
+uint16_t recomp_in16(uint32_t port);
+uint32_t recomp_in32(uint32_t port);
+void     recomp_out8(uint32_t port, uint8_t v);
+void     recomp_out16(uint32_t port, uint16_t v);
+void     recomp_out32(uint32_t port, uint32_t v);
+void     recomp_ins(uint32_t port, uint32_t va, int size, uint32_t count, int dir);
+void     recomp_outs(uint32_t port, uint32_t va, int size, uint32_t count, int dir);
+void     recomp_cli(void);
+void     recomp_sti(void);
+void     recomp_hlt(void);
+void     recomp_set_seg(int sreg, uint32_t selector);
+
 #define MEM8(addr)   (*(volatile uint8_t  *)ADDR(addr))
 #define MEM16(addr)  (*(volatile uint16_t *)ADDR(addr))
 #define MEM32(addr)  (*(volatile uint32_t *)ADDR(addr))
@@ -1060,6 +1080,10 @@ recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
         to the saved return address; that is a return, not a missing target. */ } \
     else { fprintf(stderr, "ITAIL: unresolved VA 0x%08X from 0x%08X\n", _va, g_cur_func); } \
 } while(0)
+
+/* `push target; ret` (Lifter dos=True): a jump to a computed address. Its own
+ * name, so generate.py does not take it for an intra-function indirect jump. */
+#define RECOMP_RET_JUMP(target_va) RECOMP_ITAIL(target_va)
 
 /* ============================================================
  * Optional function-entry tracer (enable with -DRECOMP_TRACE).

@@ -241,13 +241,20 @@ FUNCTION_LOCALS = (
 )
 
 
+# Lifted only with Lifter(dos=True); see Lifter._lift_dos.
+DOS_OPS = {'int', 'iretd', 'in', 'out', 'insb', 'insw', 'insd', 'outsb', 'outsw', 'outsd',
+           'cli', 'sti', 'hlt'}
+# Segment registers whose base the DOS host tracks, by x86 sreg number. The
+# host keeps g_seg_* and the matching *_BASE in step (recomp_set_seg).
+DOS_SEG_IDX = {X86_REG_ES: 0, X86_REG_FS: 4, X86_REG_GS: 5}
+
 class Lifter:
     """Lifts x86 instructions to C code using a global register model."""
 
     def __init__(self, iat_map: dict = None, func_names: dict = None,
                  lifted: set = None, precise_sbb: bool = False,
                  patch_sites: set = None, precise_carry: bool = False,
-                 reloc=None):
+                 reloc=None, dos: bool = False, call_pop: set = None):
         """
         iat_map: VA -> (dll, func_name) for import resolution
         func_names: VA -> name for known function names
@@ -276,6 +283,11 @@ class Lifter:
         # instruction whose trailing imm32 sits on one of these is patched at
         # runtime, so its constant in the file is a placeholder.
         self.patch_sites = patch_sites or set()
+        # A DOS-extender program (LE, see tools/le/): int, port I/O, cli/sti,
+        # hlt and iretd call into the host instead of being dropped.
+        self.dos = dos
+        # Call targets whose first instruction is `pop r32` (see the call case).
+        self.call_pop = call_pop or set()
         self._patched_imm = None
         self._patched_disp = None   # (placeholder, expr) for a patched disp32
         self._labels = None        # block starts of the function being lifted
@@ -352,6 +364,8 @@ class Lifter:
             # Segment registers and FPU ST(i) - use as comment
             if X86_REG_ST0 <= r <= X86_REG_ST0 + 7:
                 return f"_st[{r - X86_REG_ST0}] = {value}"
+            if self.dos and r in DOS_SEG_IDX:
+                return f"recomp_set_seg({DOS_SEG_IDX[r]}, {value})"
             # Segment registers - no-op in flat mode
             if r in (11, 17, 28, 29, 30, 49):
                 return f"(void)({value}) /* seg reg write */"
@@ -393,6 +407,12 @@ class Lifter:
             return f"FS_BASE + ({addr})"
         if seg == X86_REG_GS:
             return f"GS_BASE + ({addr})"
+        # Under a DOS extender es is a real selector: the startup code reads
+        # the PSP and environment through it. ds/ss/cs stay flat (base 0).
+        # ponytail: explicit es: overrides only; stos/movs still write flat
+        # through edi, which holds while the program keeps es == ds for them.
+        if seg == X86_REG_ES and self.dos:
+            return f"ES_BASE + ({addr})"
         return addr
 
     def _fmt_mem_read(self, mem, size: int) -> str:
@@ -841,6 +861,9 @@ class Lifter:
                     if ops[0].type == X86_OP_REG:
                         r = reg_name(ops[0].reg)
                         lines[-1] = f"{r} = POP32_VAL(esp); {comment}"
+                        if self.dos and ops[0].reg in DOS_SEG_IDX:
+                            lines[-1] = (f"recomp_set_seg({DOS_SEG_IDX[ops[0].reg]}, POP32_VAL(esp));"
+                                         f" {comment}")
 
         elif m in ('pushad', 'pushal'):   # Capstone spells PUSHAD as 'pushal' in 32-bit
             lines.append(f"PUSHAD(); {comment}")
@@ -1434,6 +1457,14 @@ class Lifter:
             self._flag_seq += 1
 
         # --- Control Flow ---
+        elif m == 'call' and insn.get_branch_target() in self.call_pop:
+            # The callee's first instruction pops the return address: a jump
+            # that hands over where it came from (get-EIP, or code that patches
+            # its caller). Push the real address and jump; there is no return.
+            target = insn.get_branch_target()
+            lines.append(f"PUSH32(esp, 0x{insn.address + insn.size:08X}u); RECOMP_FLAGS_OUT();"
+                         f" RECOMP_ITAIL(0x{target:08X}u); return; {comment}")
+
         elif m == 'call':
             target = insn.get_branch_target()
             if target:
@@ -1467,6 +1498,13 @@ class Lifter:
             # any stdcall callee-cleanup bytes (ret N -> esp += 4 + N). Without the
             # +4 the simulated ESP drifts down 4 bytes per call and eventually the
             # 0xDEAD0000 dummy return address gets read as a function argument.
+            if self.dos:
+                # `push target; ret` is a computed jump, and Watcom's int386x
+                # makes one into its table of `int N; ret` stubs. A return
+                # address the caller did not push is not ours to pop: it is
+                # where control goes, with the stack as it was before the push.
+                lines.append(f"if (MEM32(esp) != RECOMP_RETADDR) {{ uint32_t _rt = MEM32(esp); esp += 4;"
+                             f" RECOMP_FLAGS_OUT(); RECOMP_RET_JUMP(_rt); return; }}")
             if ops and ops[0].type == X86_OP_IMM:
                 n = ops[0].imm
                 lines.append(f"RECOMP_FLAGS_OUT(); esp += {4 + n}; return; {comment}")
@@ -1962,8 +2000,16 @@ class Lifter:
             # only so code that saves and restores it round-trips.
             if len(ops) >= 2 and ops[1].type == X86_OP_MEM:
                 addr = self._fmt_mem_addr(ops[1].mem)
-                lines.append(f"{self._fmt_write(ops[0], f'MEM32({addr})')}; "
-                             f"_seg_{m[1:]} = MEM16({addr} + 4); {comment}")
+                seg = {'les': X86_REG_ES, 'lfs': X86_REG_FS, 'lgs': X86_REG_GS}.get(m)
+                if self.dos and seg:
+                    lines.append(f"recomp_set_seg({DOS_SEG_IDX[seg]}, MEM16({addr} + 4)); "
+                                 f"{self._fmt_write(ops[0], f'MEM32({addr})')}; {comment}")
+                else:
+                    lines.append(f"{self._fmt_write(ops[0], f'MEM32({addr})')}; "
+                                 f"_seg_{m[1:]} = MEM16({addr} + 4); {comment}")
+
+        elif self.dos and (m.split()[-1] in DOS_OPS):
+            lines.extend(self._lift_dos(insn, m.split()[-1], ops, comment))
 
         elif m == 'out' or m == 'outsb' or m == 'outsd' or m == 'in':
             lines.append(f"/* {m}: no port I/O under Win32 */ {comment}")
@@ -2021,6 +2067,52 @@ class Lifter:
             # after a label, and C requires a label to be followed by a statement.
             lines.append(f"; /* UNIMPLEMENTED: {insn.mnemonic} {insn.op_str} */ {comment}")
 
+        return lines
+
+    def _lift_dos(self, insn, m, ops, comment) -> list:
+        """The instructions a DOS-extender program uses and Win32 code never does.
+
+        Each becomes a call into the host (see runtime/dos32/dos32.h): `int n`
+        is the whole DOS/DPMI/BIOS surface, in/out reach the emulated VGA,
+        timer, keyboard and sound ports, and cli/sti/hlt tell the host when an
+        IRQ may be delivered. Registers and flags are published around `int`
+        so the handler reads and writes the guest state directly, and it hands
+        back EFLAGS (CF is how DOS reports failure).
+        """
+        lines = []
+        if m == 'int':
+            n = ops[0].imm & 0xFF
+            lines.append(f"RECOMP_FLAGS_OUT(); RECOMP_REGS_OUT(); recomp_int({n:#04x});"
+                         f" RECOMP_REGS_IN(); RECOMP_FLAGS_IN(); {comment}")
+            self._flag_state = None
+        elif m == 'iretd':
+            # The host delivers an IRQ by pushing EFLAGS, CS and the dummy
+            # return address, as the CPU would, and calling the handler.
+            lines.append(f"RECOMP_FLAGS_OUT(); esp += 12; return; {comment}")
+        elif m in ('in', 'out'):
+            data, port = (ops[0], ops[1]) if m == 'in' else (ops[1], ops[0])
+            bits = op_bits(data)
+            p = f"{port.imm & 0xFFFF}u" if port.type == X86_OP_IMM else "(edx & 0xFFFFu)"
+            if m == 'in':
+                lines.append(f"{self._fmt_write(data, f'recomp_in{bits}({p})')}; {comment}")
+            else:
+                lines.append(f"recomp_out{bits}({p}, {self._fmt_read(data)}); {comment}")
+        elif m in ('insb', 'insw', 'insd', 'outsb', 'outsw', 'outsd'):
+            esz = {'b': 1, 'w': 2, 'd': 4}[m[-1]]
+            rep = any(b in (0xF2, 0xF3) for b in bytes(insn.bytes[:4]))
+            n = 'ecx' if rep else '1u'
+            if m.startswith('ins'):
+                lines.append(f"recomp_ins(edx & 0xFFFFu, edi, {esz}, {n}, _df); edi += _df * {esz} * {n};"
+                             f"{' ecx = 0;' if rep else ''} {comment}")
+            else:
+                lines.append(f"recomp_outs(edx & 0xFFFFu, esi, {esz}, {n}, _df); esi += _df * {esz} * {n};"
+                             f"{' ecx = 0;' if rep else ''} {comment}")
+        elif m == 'cli':
+            lines.append(f"recomp_cli(); {comment}")
+        elif m == 'sti':
+            lines.append(f"recomp_sti(); {comment}")
+        elif m == 'hlt':
+            lines.append(f"RECOMP_REGS_OUT(); recomp_hlt(); RECOMP_REGS_IN(); {comment}")
         return lines
 
     def _fmt_fpu_src(self, ops) -> str:
