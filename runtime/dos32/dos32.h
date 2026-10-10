@@ -50,6 +50,11 @@ int dos32_video_mode(void);
  * keys carry 0xE0 in bits 8-15. Mouse position is in screen pixels. */
 void dos32_key(int scancode, int down);
 void dos32_mouse(int x, int y, int buttons);
+/* The mouse as relative motion (screen pixels, fractions kept): what a game
+ * that reads motion and moves the cursor itself (int 33h AX=04h) needs, and
+ * what keeps working at the edge of the screen. The host captures the
+ * pointer to feed it. dos32_mouse switches back to absolute. */
+void dos32_mouse_move(double dx, double dy, int buttons);
 
 /* Pace: the guest thread calls this between frames when it waits on the
  * retrace; the platform layer may set it to throttle or to speed up. */
