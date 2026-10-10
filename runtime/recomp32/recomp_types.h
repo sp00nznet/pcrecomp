@@ -798,6 +798,40 @@ static inline uint64_t mmx_pcmpgtw(uint64_t a, uint64_t b) {
     for (int i = 0; i < 4; i++) r |= MM_PUT_W(i, MM_W(a,i) > MM_W(b,i) ? 0xFFFF : 0);
     return r;
 }
+static inline uint64_t mmx_pcmpeqd(uint64_t a, uint64_t b) {
+    return MM_PUT_D(0, MM_D(a,0) == MM_D(b,0) ? -1 : 0) | MM_PUT_D(1, MM_D(a,1) == MM_D(b,1) ? -1 : 0);
+}
+static inline uint64_t mmx_pcmpgtd(uint64_t a, uint64_t b) {
+    return MM_PUT_D(0, MM_D(a,0) > MM_D(b,0) ? -1 : 0) | MM_PUT_D(1, MM_D(a,1) > MM_D(b,1) ? -1 : 0);
+}
+
+/* Bytes, and the unsigned-saturating forms. A software renderer's translucency
+ * is one paddusb per pixel: the texel's colour added to the screen's, each
+ * channel stopping at 255. */
+#define MM_B(v, i)     ((int8_t)((uint64_t)(v) >> ((i) * 8)))
+#define MM_UB(v, i)    ((uint8_t)((uint64_t)(v) >> ((i) * 8)))
+#define MM_UW(v, i)    ((uint16_t)((uint64_t)(v) >> ((i) * 16)))
+#define MM_PUT_B(i, x) ((uint64_t)(uint8_t)(x) << ((i) * 8))
+#define MMX_LANES(n, put, expr) do { for (int i = 0; i < (n); i++) r |= put(i, (expr)); } while (0)
+static inline int mmx_clamp(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+static inline uint64_t mmx_paddb(uint64_t a, uint64_t b)   { uint64_t r = 0; MMX_LANES(8, MM_PUT_B, MM_UB(a,i) + MM_UB(b,i)); return r; }
+static inline uint64_t mmx_psubb(uint64_t a, uint64_t b)   { uint64_t r = 0; MMX_LANES(8, MM_PUT_B, MM_UB(a,i) - MM_UB(b,i)); return r; }
+static inline uint64_t mmx_paddsb(uint64_t a, uint64_t b)  { uint64_t r = 0; MMX_LANES(8, MM_PUT_B, mmx_clamp(MM_B(a,i) + MM_B(b,i), -128, 127)); return r; }
+static inline uint64_t mmx_psubsb(uint64_t a, uint64_t b)  { uint64_t r = 0; MMX_LANES(8, MM_PUT_B, mmx_clamp(MM_B(a,i) - MM_B(b,i), -128, 127)); return r; }
+static inline uint64_t mmx_paddusb(uint64_t a, uint64_t b) { uint64_t r = 0; MMX_LANES(8, MM_PUT_B, mmx_clamp(MM_UB(a,i) + MM_UB(b,i), 0, 255)); return r; }
+static inline uint64_t mmx_psubusb(uint64_t a, uint64_t b) { uint64_t r = 0; MMX_LANES(8, MM_PUT_B, mmx_clamp(MM_UB(a,i) - MM_UB(b,i), 0, 255)); return r; }
+static inline uint64_t mmx_paddusw(uint64_t a, uint64_t b) { uint64_t r = 0; MMX_LANES(4, MM_PUT_W, mmx_clamp(MM_UW(a,i) + MM_UW(b,i), 0, 65535)); return r; }
+static inline uint64_t mmx_psubusw(uint64_t a, uint64_t b) { uint64_t r = 0; MMX_LANES(4, MM_PUT_W, mmx_clamp(MM_UW(a,i) - MM_UW(b,i), 0, 65535)); return r; }
+static inline uint64_t mmx_pcmpeqb(uint64_t a, uint64_t b) { uint64_t r = 0; MMX_LANES(8, MM_PUT_B, MM_UB(a,i) == MM_UB(b,i) ? 0xFF : 0); return r; }
+static inline uint64_t mmx_pcmpgtb(uint64_t a, uint64_t b) { uint64_t r = 0; MMX_LANES(8, MM_PUT_B, MM_B(a,i) > MM_B(b,i) ? 0xFF : 0); return r; }
+/* Signed words to signed bytes with saturation, a's elements low. */
+static inline uint64_t mmx_packsswb(uint64_t a, uint64_t b) {
+    uint64_t r = 0;
+    MMX_LANES(4, MM_PUT_B, mmx_clamp(MM_W(a,i), -128, 127));
+    for (int i = 0; i < 4; i++) r |= MM_PUT_B(4 + i, mmx_clamp(MM_W(b,i), -128, 127));
+    return r;
+}
 /* ============================================================
  * FPU Stack Helpers
  * ============================================================ */
