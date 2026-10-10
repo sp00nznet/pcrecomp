@@ -6,6 +6,10 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- dos32: `dos32_heap_alloc` / `dos32_heap_free`, the DPMI heap for the host,
+  so a host can hold memory back from a program that grabs everything it can.
+  Theme Park's memory manager takes every block down to 16 bytes and leaves its
+  C library nothing for `fopen`. (#PR)
 - `runtime/dos32/` and `Lifter(dos=True)`: lifted DOS-extender programs run.
   The lifter turns `int`, port I/O, cli/sti/hlt, `iretd` and segment loads into
   host calls, gives `es:` a real base, and dispatches a `ret` to an address the
