@@ -17,12 +17,25 @@ void recomp_host_init(void) {
     win32hle_register(win32hle_kernel32);
     win32hle_register(win32hle_kernel32_ext);
     win32hle_register(win32hle_kernel32_crt);
+    win32hle_register(win32hle_module);
+    win32hle_register(win32hle_gdidc);
     win32hle_register(win32hle_gdi32);
     win32hle_register(win32hle_user32);
+    win32hle_register(win32hle_winmm);
+    win32hle_register(win32hle_wsock32);
+    win32hle_register(win32hle_ole32);
+    win32hle_register(win32hle_storage);
+    win32hle_register(win32hle_advapi32);
+    win32hle_register(win32hle_dsound);
+    win32hle_register(win32hle_ddraw);
+    win32hle_register(win32hle_bink);
 }
 
 static int boot(const char *path, uint32_t (*resolve)(const char *)) {
     if (recomp_pe_map(path, &g_img) != 0) return 1;
+    char guest[1024];
+    hle_guest_path(path, guest, sizeof guest);
+    hle_module_add(guest, g_img.base, g_img.resource_rva, g_img.resource_size, 1);
     int unresolved = recomp_pe_bind(&g_img, resolve);
     g_booted = 1;
     fprintf(stderr, "[host] %s booted: entry 0x%08X, %d unresolved imports\n",

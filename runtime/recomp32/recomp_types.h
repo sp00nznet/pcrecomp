@@ -19,6 +19,8 @@
 
 #ifdef _MSC_VER
 #include <intrin.h>
+#elif defined(__i386__) || defined(__x86_64__)
+#include <x86intrin.h>   /* __rdtsc, as <intrin.h> gives MSVC */
 #endif
 
 /* ============================================================
