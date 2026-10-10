@@ -6,6 +6,16 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- `runtime/dos32/` and `Lifter(dos=True)`: lifted DOS-extender programs run.
+  The lifter turns `int`, port I/O, cli/sti/hlt, `iretd` and segment loads into
+  host calls, gives `es:` a real base, and dispatches a `ret` to an address the
+  caller never pushed (`push x; ret`); `call_pop=` makes a call into a function
+  that pops its own return address a jump. dos32 provides what DOS/4GW, DOS and
+  the BIOS did: a 4 GB guest address space (64-bit hosts work), DPMI, DOS files,
+  VGA and VESA video, int 16h and IRQ 1 keyboard, int 33h mouse with event
+  handlers, the PIT and IRQ 0, a virtual clock for reproducible headless runs,
+  crash reports and a hardware write watchpoint (`DOS32_BREAK`). Theme Park
+  boots, plays its menus and runs a park. See docs/DOS32.md. (#69)
 - `tools/le/le_parse.py`: the LE front end, for 32-bit DOS-extender programs
   (DOS/4GW, PMODE/W, DOS/32A: most Watcom-built DOS games of 1993-97). It lays
   the objects out at a chosen base with every fixup applied, as the extender

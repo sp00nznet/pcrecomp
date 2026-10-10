@@ -43,6 +43,8 @@ pcrecomp/
     win16/         16-bit Windows NE: CPU header + link-on-day-one stubs
     recomp32/      32-bit, global registers: memory, dispatch, loader, crash report
     recomp32_cpu/  32-bit, explicit CPU struct (reentrant)
+    dos32/         a DOS/4GW host for lifted LE programs: DPMI, DOS, BIOS,
+                   VGA/VESA, mouse, timer and keyboard IRQs (docs/DOS32.md)
     native32/      a 32-bit host for recomp32 code: imports, COM and callbacks
                    go to real Windows with no shims (MSVC x86)
     nextstep/      a NeXTSTEP 3.x host for recomp32 code: Mach-O + shlib
@@ -111,7 +113,7 @@ or IDA, whatever the architecture.
 |------|--------------|
 | `lift16.py` | x86-16 -> C for DOS MZ; a library (`from lift16 import Lifter`) |
 | `ne_lift.py` | NE-aware x86-16 -> C: far calls through relocations, Win16 imports as `MODULE_API(cpu)`, x87, segment-aware memory |
-| `lift32.py` | x86-32 -> C against global registers (`recomp32`); a library |
+| `lift32.py` | x86-32 -> C against global registers (`recomp32`); a library. `dos=True` turns `int`, port I/O, cli/sti and segment loads into calls to a DOS host (`runtime/dos32`, [docs/DOS32.md](docs/DOS32.md)) |
 | `lift32_cpu.py` | x86-32 -> C against an explicit CPU struct, reentrant, needed for hybrid builds. x87 (80-bit operands, `fprem`, `fcmov`), MMX, packed SSE/SSE2, `lock`, bit-string ops, `bswap` |
 | `lift64_cpu.py` | x86-64 -> C: 32-bit writes zero-extend, RIP-relative operands rebuilt, 16 GPRs + 16 XMM, SSE2 packed integer, quadword string ops, `cpuid` forwarded. x87 and MMX deliberately emit `RECOMP_TODO` |
 | `translator.py` | `python -m tools`: the default 32-bit pipeline, analyse -> disassemble -> lift -> split into files |
