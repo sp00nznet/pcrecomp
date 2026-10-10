@@ -151,6 +151,11 @@ versions follow [SemVer](https://semver.org/).
   runtime gap). `HLE_FILETRACE=1` logs the data files a title opens. (#45)
 
 ### Fixed
+- lift32: `repz ret` (F3 C3) lifts as a `ret`, and generate.py's extent walk
+  ends a body at it. It was UNIMPLEMENTED, so MSVC 2005's
+  `__security_check_cookie` fell through into `__report_gsfailure` and every
+  `/GS`-checked function exited with 0xC0000409 (Tiberium Wars, in its CRT
+  startup). `bnd ret` likewise. (#78)
 - lift32: `sar` on a byte or word is arithmetic. The narrow read (`LO16`,
   `MEM16`, `LO8`) is unsigned, and casting it straight to `int32_t` made the
   shift logical for every negative value: `sar ax, 1` took -10 to 0x7FFB, not
