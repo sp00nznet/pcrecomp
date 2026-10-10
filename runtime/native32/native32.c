@@ -130,8 +130,103 @@ static void native32_yield(void) {
 /* ---------------------------------------------------------------- modules */
 
 #define MAX_MODULES 32
-static struct { uint32_t base, span; char name[MAX_PATH]; } g_mods[MAX_MODULES];
+static struct { uint32_t base, span; int native; char name[MAX_PATH]; } g_mods[MAX_MODULES];
 static int g_mod_n;
+
+static recomp_func_t dispatch_find(uint32_t va);
+
+/* Functions inside a native module that still run lifted
+ * (native32_lift_in_native), sorted for bsearch. */
+static uint32_t* g_lin;
+static int g_lin_n;
+
+static int lifted_in_native(uint32_t va) {
+    int lo = 0, hi = g_lin_n;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (g_lin[mid] == va) return 1;
+        if (g_lin[mid] < va) lo = mid + 1; else hi = mid;
+    }
+    return 0;
+}
+
+/* A module running its original machine code (native32_set_native). */
+static int native_module_at(uint32_t va) {
+    for (int i = 0; i < g_mod_n; i++)
+        if (g_mods[i].native && va >= g_mods[i].base && va < g_mods[i].base + g_mods[i].span)
+            return !lifted_in_native(va);
+    return 0;
+}
+
+/* A call into a guest module outside its code sections: code kept in a data
+ * section, where old hand-written asm patches its own constants. UT's Fire.dll
+ * runs its procedural-texture loops from .data. No static lift can hold code
+ * that rewrites itself, and it was written for this CPU, so it runs natively:
+ * the section is made executable the first time it is called into. Its calls
+ * back into lifted code fault on non-executable pages and take the callback
+ * trampoline. */
+static int data_section_code(uint32_t va) {
+    for (int i = 0; i < g_mod_n; i++) {
+        uint32_t base = g_mods[i].base;
+        if (va < base || va >= base + g_mods[i].span) continue;
+        IMAGE_NT_HEADERS32* nt = (IMAGE_NT_HEADERS32*)(uintptr_t)(base + ((IMAGE_DOS_HEADER*)(uintptr_t)base)->e_lfanew);
+        IMAGE_SECTION_HEADER* s = IMAGE_FIRST_SECTION(nt);
+        for (int k = 0; k < nt->FileHeader.NumberOfSections; k++, s++) {
+            uint32_t lo = base + s->VirtualAddress, hi = lo + s->Misc.VirtualSize;
+            if (va < lo || va >= hi) continue;
+            if (s->Characteristics & IMAGE_SCN_MEM_EXECUTE) return 0;   /* lifted code */
+            MEMORY_BASIC_INFORMATION mbi;
+            DWORD old;
+            VirtualQuery((void*)(uintptr_t)va, &mbi, sizeof mbi);
+            if (mbi.Protect != PAGE_EXECUTE_READWRITE) {
+                VirtualProtect((void*)(uintptr_t)lo, hi - lo, PAGE_EXECUTE_READWRITE, &old);
+                fprintf(stderr, "[native32] %s: code in data section %.8s (0x%08X) runs natively\n",
+                        g_mods[i].name, (const char*)s->Name, va);
+            }
+            return 1;
+        }
+        return 0;
+    }
+    return 0;
+}
+
+static int cmp_u32(const void* a, const void* b) {
+    uint32_t x = *(const uint32_t*)a, y = *(const uint32_t*)b;
+    return x < y ? -1 : x > y;
+}
+
+int native32_lift_in_native(const uint32_t* vas, int n) {
+    int done = 0;
+    g_lin = (uint32_t*)realloc(g_lin, (g_lin_n + n) * sizeof *g_lin);
+    for (int i = 0; i < n; i++) {
+        if (!dispatch_find(vas[i])) continue;           /* not a lifted entry */
+        uint8_t* p = (uint8_t*)(uintptr_t)vas[i];
+        p[0] = 0x0F, p[1] = 0x0B;                      /* ud2: the trap is the trampoline */
+        g_lin[g_lin_n++] = vas[i];
+        done++;
+    }
+    qsort(g_lin, g_lin_n, sizeof *g_lin, cmp_u32);
+    FlushInstructionCache(GetCurrentProcess(), NULL, 0);
+    return done;
+}
+
+int native32_set_native(uint32_t base) {
+    for (int i = 0; i < g_mod_n; i++) {
+        if (g_mods[i].base != base) continue;
+        IMAGE_NT_HEADERS32* nt = (IMAGE_NT_HEADERS32*)(uintptr_t)(base + ((IMAGE_DOS_HEADER*)(uintptr_t)base)->e_lfanew);
+        IMAGE_SECTION_HEADER* s = IMAGE_FIRST_SECTION(nt);
+        for (int k = 0; k < nt->FileHeader.NumberOfSections; k++, s++) {
+            DWORD old;
+            /* writable too: old code patches itself (software rasterisers) */
+            if (s->Characteristics & IMAGE_SCN_MEM_EXECUTE)
+                VirtualProtect((void*)(uintptr_t)(base + s->VirtualAddress), s->Misc.VirtualSize,
+                               PAGE_EXECUTE_READWRITE, &old);
+        }
+        g_mods[i].native = 1;
+        return 1;
+    }
+    return 0;
+}
 
 int native32_in_guest(uint32_t va) {
     for (int i = 0; i < g_mod_n; i++)
@@ -317,7 +412,7 @@ static void native_bridge(void) {
     SetLastError(last_error);
 }
 
-recomp_func_t recomp_lookup(uint32_t va) {
+static recomp_func_t dispatch_find(uint32_t va) {
     uint32_t lo = 0, hi = recomp_dispatch_count;
     while (lo < hi) {
         uint32_t mid = lo + (hi - lo) / 2, m = recomp_dispatch_table[mid].address;
@@ -325,6 +420,11 @@ recomp_func_t recomp_lookup(uint32_t va) {
         if (m < va) lo = mid + 1; else hi = mid;
     }
     return NULL;
+}
+
+recomp_func_t recomp_lookup(uint32_t va) {
+    if (native_module_at(va)) return NULL;    /* its original code runs: recomp_lookup_import */
+    return dispatch_find(va);
 }
 
 /* Anything that is neither a shim nor inside a guest module is native: an
@@ -335,7 +435,8 @@ recomp_func_t recomp_lookup_import(uint32_t va) {
             if (g_shims[i].va == va) return g_shims[i].fn;
         return NULL;
     }
-    if (va < 0x10000u || native32_in_guest(va)) return NULL;
+    if (va < 0x10000u) return NULL;
+    if (native32_in_guest(va) && !native_module_at(va) && !data_section_code(va)) return NULL;
     g_native_target = va;
     return native_bridge;
 }
@@ -497,6 +598,11 @@ static __declspec(naked) void cb_tramp(void) {
 static LONG CALLBACK native32_veh(EXCEPTION_POINTERS* ep) {
     EXCEPTION_RECORD* er = ep->ExceptionRecord;
     uint32_t pc = (uint32_t)(uintptr_t)er->ExceptionAddress;
+    if (er->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION && lifted_in_native(pc)) {
+        ep->ContextRecord->Eax = pc;            /* native code reached a lifted one */
+        ep->ContextRecord->Eip = (DWORD)(uintptr_t)cb_tramp;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     /* An instruction fetch: Windows says so (8, execute). Wine on Apple
      * Silicon (CrossOver, 32-bit code under Rosetta) reports it as a read,
      * but a read of the faulting instruction's own address is a fetch too:
