@@ -131,7 +131,7 @@ versions follow [SemVer](https://semver.org/).
   shift logical for every negative value: `sar ax, 1` took -10 to 0x7FFB, not
   -5. Every title with 8- or 16-bit `sar` was affected (93 functions in
   SimCity 2000). Theme Park halves its sprite offsets that way in 640x480 and
-  drew no sprites at all. (#PR)
+  drew no sprites at all. (#72)
 - lift32 `dos=True`: far calls and `retf`. `call m16:32` (FF /3) pushes CS
   under the return address, and `retf` pops both (plus its immediate); both
   were lifted as near, so each far call left 4 bytes on the stack. HMI SOS's
