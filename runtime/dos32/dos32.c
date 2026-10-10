@@ -221,6 +221,9 @@ static uint32_t arena_free_bytes(arena_t* a) {
     return a->hi - a->lo - used;
 }
 
+uint32_t dos32_heap_alloc(uint32_t bytes) { return arena_alloc(&heap, bytes, 4096); }
+void dos32_heap_free(uint32_t va) { arena_free(&heap, va); }
+
 /* ---- interrupt state ---------------------------------------------------- */
 static struct { uint16_t sel; uint32_t off; } pmvec[256];
 static uint32_t rmvec[256];

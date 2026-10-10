@@ -58,6 +58,11 @@ extern volatile int dos32_quit;   /* set to ask the program to stop */
  * out on the CPUs of its day. */
 void dos32_idle(double seconds);
 
+/* The DPMI heap (int 31h 0501h), for a host that needs to hold memory back
+ * from a program that grabs all it can. 0 if there is none. */
+uint32_t dos32_heap_alloc(uint32_t bytes);
+void     dos32_heap_free(uint32_t va);
+
 /* Virtual clock: guest time moves only by dos32_advance (and a fixed sliver
  * per read), never by the host's clock. For reproducible headless runs. */
 extern int dos32_virtual_clock;
