@@ -28,58 +28,59 @@ handler.
 
 | File | What |
 |---|---|
-| `win32hle.h` | the shim ABI (`A32`/`RET`/…), the registry, `hle_call_guest` |
-| `host_lite.c` | the spine: register file, machine lock (pthread), per-thread simulated TIB (`g_fs_base`), dispatch lookups, shim registry. "lite" = no PE loader |
-| `kernel32.c` | process/module, heap, `VirtualAlloc`, time, error, `lstr*` — on libc/POSIX |
-| `gdi32.c` | the software-renderer seam: `CreateDIBSection` + `StretchDIBits` blit into a host framebuffer (32bpp, nearest-neighbour). No SDL — pure pixels |
-| `user32.c` | the message core, SDL-free: class/window registries, the message queue, `GetMessage`/`PeekMessage`/`DispatchMessage` (calls the `WndProc` via `hle_call_guest`) |
-| `pe_format.h` | the 32-bit PE structures, portably (no windows.h) |
-| `pe_loader.c` | `recomp_pe_map` (mmap sections at their VAs, zero `.bss`), `recomp_pe_bind` (IAT → shims), `recomp_pe_relocate` (HIGHLOW) |
+| `win32hle.h` | the shim ABI (`A32`/`RET`/…), the registry, `hle_call_guest`, and every module's host-facing API |
+| `host_lite.c` | the spine: register file, the machine lock (taken and given back with the registers saved: `hle_block_begin`/`_end`, `hle_yield`; every import and every loop back-edge is a hand-over point when another thread waits), per-thread simulated TIB (`g_fs_base`), dispatch lookups, shim registry, kernel object handles |
 | `host.c` | the full host: `recomp_host_init`/`_boot`/`_run`/`_main` — register the shim modules, map+bind a PE, call its lifted entry |
-| `present.c` | the optional SDL2 layer: shows the gdi32 framebuffer in a window and turns SDL input into `WM_*` messages. The only file that needs a display; wires itself as user32's pump hook so a guest's own message loop drives it |
-| `win32hle_selftest.c` | a synthetic lifted guest driving the shims + a callback, headless |
-| `pe_loader_selftest.c` | builds a minimal PE (2 imports, a reloc), maps/binds/relocates it, headless |
-| `host_selftest.c` | a full boot: a synthetic lifted GUI app (entry → class → window → message loop → `WndProc` paints) driven through the host, headless |
-| `pump_selftest.c` | the pump hook drives a guest `GetMessage` loop (SDL-free) |
-| `present_selftest.c` | the SDL2 present/input layer under the dummy video driver (headless) |
+| `pe_format.h`, `pe_loader.c` | the 32-bit PE structures; map an image at its base (or a DLL anywhere, relocated), bind its IAT by name or ordinal (`dll#N`) |
+| `hle_path.c` | Windows paths on a POSIX disk: drive letters to host directories, either slash, components matched without case |
+| `module.c` | modules and resources: `LoadLibraryA` (resource DLLs mapped, system DLLs as pseudo-modules), `GetProcAddress`, `FindResourceA`/`LoadResource`/`LoadStringA`, the current directory |
+| `kernel32.c` | process, heap (sized blocks), virtual memory, time, critical sections, events, mutexes, waits, TLS, the console/serial calls a game links |
+| `kernel32_ext.c` | files on descriptors, `FindFirstFileA`, attributes, file times, disks, `.ini` profiles |
+| `kernel32_crt.c` | what an MSVC CRT asks on its way to `WinMain`: std handles, codepage 1252, locale (the wide calls answer `ERROR_CALL_NOT_IMPLEMENTED`, as on Windows 95), environment, threads |
+| `user32.c` | a window manager without a display: windows, classes, the message queue with `WM_PAINT`/`WM_TIMER` generated, focus/capture/activation, dialogs from templates (modal and not), and the standard controls (button, static, edit, list and combo boxes with owner-draw, trackbar, progress, hotkey) |
+| `gdi32.c`, `gdidc.c` | DIBs and `StretchDIBits` into a framebuffer; device contexts, fonts (TrueType through SDL2_ttf, Liberation for Arial/MS Sans Serif) and `TextOutA` into a surface |
+| `ddraw.c` | DirectDraw in software: `IDirectDraw`/`2`, surfaces 1–3 (lock, blit with colour fill, colour key and stretch, flip), palettes, clippers, a virtual display mode |
+| `dsound.c` | DirectSound on SDL2 audio: buffers mixed in software at their rate, volume and pan, with play cursors in real time |
+| `bink.c` | `binkw32.dll` on ffmpeg (`HLE_WITH_FFMPEG`): `BinkOpen` on a name or on the game's open file, frames decoded and converted into the game's surface, the soundtrack into a `dsound.c` stream |
+| `screen.c` | the SDL2 window for a DirectDraw game: the primary surface scaled (sharp, smooth, CRT, nearest, integer; F12, F11), SDL input turned into the messages a mouse and keyboard give |
+| `winmm.c` | timers (`timeSetEvent` on threads, `timeKillEvent` waiting for a callback under way), joystick, waveOut, MCI |
+| `wsock32.c` | Winsock 1.1 on BSD sockets, by name and ordinal; `WSAAsyncSelect` through the pump; IPX as IPXEmu carries it on UDP |
+| `ole32.c` | COM: class factories a host serves and ones the guest registers itself, GUID strings, BSTRs |
+| `storage.c` | structured storage on compound files in Windows' format (`StgCreateDocfile`, `IStorage`, `IStream`, `OleSaveToStream`) |
+| `advapi32.c` | an in-memory registry (seeded by the host, optionally saved to a file); COMCTL32, VERSION, SHELL32 |
+| `present.c` | the plain SDL2 layer for a GDI game: the gdi32 framebuffer in a window |
+| `*_selftest.c` | synthetic lifted guests driving the spine, the loader, the host, the pump and present, headless; `build_selftests.sh` builds and runs them |
 
 ## State (what's real, what's next)
 
-Implemented and tested headless, under gcc `-m32`:
+Three titles run on it: Fury³ (its CRT and `WinMain`, the first census);
+Tiberian Sun, which boots, plays its movies and music, runs its menus (the
+game's own and the Win32 dialogs behind them) and plays a skirmish on Linux,
+with no Windows and no Wine (tiberiansun-recomp, `src/linux`); and Red Alert
+2 and Yuri's Revenge, with their Bink movies (redalert2-recomp, `src/linux`).
 
-- the guest ↔ native ↔ guest spine, the machine lock, the simulated TIB
-- a kernel32 startup/heap/time subset
-- the gdi32 DIB-and-blit frame path into a framebuffer
-- the PE loader: map an image at its VAs, bind its IAT to the shims, relocate
-- the full host: map + bind + call the lifted entry, with a real Win32 message
-  loop (`GetMessage`/`DispatchMessage` → `WndProc` via `hle_call_guest`) and the
-  gdi32 paint path, driven end to end by a synthetic lifted GUI app
-- SDL2 present + input: the gdi32 framebuffer shown in a window, SDL input
-  turned into `WM_*` messages, wired as user32's pump hook so a guest's own
-  message loop drives it — all exercisable headless under the SDL dummy driver
+What a title still brings:
 
-So the host now **maps, binds, runs, draws, and takes input** for a lifted
-32-bit Windows GUI program on Linux. What a specific title still needs:
+- its own **lift** (the generated C — per game, never in this repo);
+- the **breadth** of the API it happens to call, filled in as it hits a gap:
+  a permissive bind (`recomp_host_boot_permissive`, or `recomp_pe_bind` with
+  `hle_resolve_or_stub`) turns each unanswered import into a stub that names
+  itself when called;
+- its own answers where Windows would have found a DLL's code (Tiberian Sun's
+  Blowfish cipher, a COM server in the game folder), registered ahead of
+  these with `win32hle_register` or `hle_com_register_class`.
 
-- its own **lift** (the generated C — per game, never in this repo), and
-- the **breadth** of kernel32/user32/gdi32 it happens to call, filled in as it
-  hits gaps (the shim registry makes each one a few lines). The first real
-  census drove the current set: Fury³ imports 157 functions across 5 DLLs, of
-  which win32hle now answers 46 — the universally-needed file-I/O / `Global*` /
-  `.ini` / device-caps batch (`kernel32_ext.c`); the rest (WINMM audio, the
-  common dialogs, the window/menu/dialog breadth of USER32) land as a lift
-  actually calls them. Plus
-- 8/16/24bpp DIBs and the palette-animation emulator (generalised from SC2K),
-  as titles need them.
+Not here: guest SEH and C++ exceptions (`RaiseException` ends the run),
+DirectX past DirectDraw 2 and DirectSound 1, and drawing anything through
+GDI but text.
 
-## Building the selftest
+## Building the selftests
 
 ```
-gcc -m32 -O1 -Wall -Wno-unused-but-set-variable \
-    -Iruntime/recomp32 -Iruntime/win32hle \
-    runtime/win32hle/host_lite.c runtime/win32hle/kernel32.c \
-    runtime/win32hle/gdi32.c runtime/win32hle/win32hle_selftest.c \
-    -lpthread -lm -o /tmp/win32hle_selftest && /tmp/win32hle_selftest
+runtime/win32hle/build_selftests.sh
 ```
 
-Expected: `win32hle_selftest: all checks passed`. Prereq: `gcc-multilib`.
+builds every `*_selftest.c` with the whole layer under gcc `-m32` and runs
+it (SDL's dummy drivers: no display or sound card needed). Prereqs on
+Debian/Ubuntu: `dpkg --add-architecture i386; apt install gcc-multilib
+libsdl2-dev:i386 libsdl2-ttf-dev:i386`.
