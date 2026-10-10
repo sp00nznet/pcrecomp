@@ -46,9 +46,9 @@ static void g_CreateDIBSection(void) {
     const uint8_t *bmi = (const uint8_t *)APTR(1);
     uint32_t *ppv = (uint32_t *)APTR(3);
     int w = bi_w(bmi), h = bi_h(bmi), bpp = bi_bpp(bmi);
-    if (bpp != 32) hle_fatal("CreateDIBSection: only 32bpp supported for now, got %d", bpp);
     int hab = h < 0 ? -h : h;
-    uint32_t *bits = (uint32_t *)calloc((size_t)w * hab, 4);
+    /* any depth gets its pixels (rows are DWORD-aligned); only 32bpp blits */
+    uint32_t *bits = (uint32_t *)calloc((size_t)((w * bpp + 31) / 32) * hab + 1, 4);
     if (g_dib_n < MAX_DIBS) {
         g_dibs[g_dib_n].h = g_next_handle;
         g_dibs[g_dib_n].bits = bits; g_dibs[g_dib_n].w = w;
@@ -90,18 +90,14 @@ static void g_StretchDIBits(void) {
     RET((uint32_t)hab, 13);
 }
 
-/* GetDC/ReleaseDC/CreateCompatibleDC/DeleteDC/DeleteObject: handle bookkeeping.
- * HDCs are opaque to this layer (the framebuffer is the only real surface). */
-static void g_GetDC(void)             { RET(0x0DC00001u, 1); }
-static void g_ReleaseDC(void)         { RET(1, 2); }
+/* CreateCompatibleDC/DeleteDC: handle bookkeeping; the DCs that draw text
+ * are gdidc.c's. DeleteObject is gdidc.c's too, and hands DIBs back here. */
 static void g_CreateCompatibleDC(void){ RET(0x0DC00002u, 1); }
 static void g_DeleteDC(void)          { RET(1, 1); }
-static void g_DeleteObject(void) {
-    uint32_t h = A32(0);
-    for (int i = 0; i < g_dib_n; i++) if (g_dibs[i].h == h) { free(g_dibs[i].bits); g_dibs[i].bits = NULL; }
-    RET(1, 1);
+int hle_gdi_dib_delete(uint32_t h) {
+    for (int i = 0; i < g_dib_n; i++) if (g_dibs[i].h == h && g_dibs[i].bits) { free(g_dibs[i].bits); g_dibs[i].bits = NULL; return 1; }
+    return 0;
 }
-static void g_SelectObject(void)      { RET(A32(1), 2); }   /* return "previous"; stateless for now */
 
 /* GetDeviceCaps(hdc, index): report a plain 32bpp desktop the size of the
  * framebuffer. A software renderer reads these to size its backbuffer and to
@@ -120,18 +116,12 @@ static void g_GetDeviceCaps(void) {
     }
     RET(v, 2);
 }
-static void g_GetStockObject(void) { RET(0x0DB00001u + A32(0), 1); }  /* a distinct nonzero handle */
 
 const win32hle_shim win32hle_gdi32[] = {
     { "GetDeviceCaps",      g_GetDeviceCaps },
-    { "GetStockObject",     g_GetStockObject },
     { "CreateDIBSection",   g_CreateDIBSection },
     { "StretchDIBits",      g_StretchDIBits },
-    { "GetDC",              g_GetDC },
-    { "ReleaseDC",          g_ReleaseDC },
     { "CreateCompatibleDC", g_CreateCompatibleDC },
     { "DeleteDC",           g_DeleteDC },
-    { "DeleteObject",       g_DeleteObject },
-    { "SelectObject",       g_SelectObject },
     { 0, 0 }
 };

@@ -19,6 +19,8 @@
 
 #ifdef _MSC_VER
 #include <intrin.h>
+#elif defined(__i386__) || defined(__x86_64__)
+#include <x86intrin.h>   /* __rdtsc, as <intrin.h> gives MSVC */
 #endif
 
 /* ============================================================
@@ -796,6 +798,40 @@ static inline uint64_t mmx_pcmpgtw(uint64_t a, uint64_t b) {
     for (int i = 0; i < 4; i++) r |= MM_PUT_W(i, MM_W(a,i) > MM_W(b,i) ? 0xFFFF : 0);
     return r;
 }
+static inline uint64_t mmx_pcmpeqd(uint64_t a, uint64_t b) {
+    return MM_PUT_D(0, MM_D(a,0) == MM_D(b,0) ? -1 : 0) | MM_PUT_D(1, MM_D(a,1) == MM_D(b,1) ? -1 : 0);
+}
+static inline uint64_t mmx_pcmpgtd(uint64_t a, uint64_t b) {
+    return MM_PUT_D(0, MM_D(a,0) > MM_D(b,0) ? -1 : 0) | MM_PUT_D(1, MM_D(a,1) > MM_D(b,1) ? -1 : 0);
+}
+
+/* Bytes, and the unsigned-saturating forms. A software renderer's translucency
+ * is one paddusb per pixel: the texel's colour added to the screen's, each
+ * channel stopping at 255. */
+#define MM_B(v, i)     ((int8_t)((uint64_t)(v) >> ((i) * 8)))
+#define MM_UB(v, i)    ((uint8_t)((uint64_t)(v) >> ((i) * 8)))
+#define MM_UW(v, i)    ((uint16_t)((uint64_t)(v) >> ((i) * 16)))
+#define MM_PUT_B(i, x) ((uint64_t)(uint8_t)(x) << ((i) * 8))
+#define MMX_LANES(n, put, expr) do { for (int i = 0; i < (n); i++) r |= put(i, (expr)); } while (0)
+static inline int mmx_clamp(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+static inline uint64_t mmx_paddb(uint64_t a, uint64_t b)   { uint64_t r = 0; MMX_LANES(8, MM_PUT_B, MM_UB(a,i) + MM_UB(b,i)); return r; }
+static inline uint64_t mmx_psubb(uint64_t a, uint64_t b)   { uint64_t r = 0; MMX_LANES(8, MM_PUT_B, MM_UB(a,i) - MM_UB(b,i)); return r; }
+static inline uint64_t mmx_paddsb(uint64_t a, uint64_t b)  { uint64_t r = 0; MMX_LANES(8, MM_PUT_B, mmx_clamp(MM_B(a,i) + MM_B(b,i), -128, 127)); return r; }
+static inline uint64_t mmx_psubsb(uint64_t a, uint64_t b)  { uint64_t r = 0; MMX_LANES(8, MM_PUT_B, mmx_clamp(MM_B(a,i) - MM_B(b,i), -128, 127)); return r; }
+static inline uint64_t mmx_paddusb(uint64_t a, uint64_t b) { uint64_t r = 0; MMX_LANES(8, MM_PUT_B, mmx_clamp(MM_UB(a,i) + MM_UB(b,i), 0, 255)); return r; }
+static inline uint64_t mmx_psubusb(uint64_t a, uint64_t b) { uint64_t r = 0; MMX_LANES(8, MM_PUT_B, mmx_clamp(MM_UB(a,i) - MM_UB(b,i), 0, 255)); return r; }
+static inline uint64_t mmx_paddusw(uint64_t a, uint64_t b) { uint64_t r = 0; MMX_LANES(4, MM_PUT_W, mmx_clamp(MM_UW(a,i) + MM_UW(b,i), 0, 65535)); return r; }
+static inline uint64_t mmx_psubusw(uint64_t a, uint64_t b) { uint64_t r = 0; MMX_LANES(4, MM_PUT_W, mmx_clamp(MM_UW(a,i) - MM_UW(b,i), 0, 65535)); return r; }
+static inline uint64_t mmx_pcmpeqb(uint64_t a, uint64_t b) { uint64_t r = 0; MMX_LANES(8, MM_PUT_B, MM_UB(a,i) == MM_UB(b,i) ? 0xFF : 0); return r; }
+static inline uint64_t mmx_pcmpgtb(uint64_t a, uint64_t b) { uint64_t r = 0; MMX_LANES(8, MM_PUT_B, MM_B(a,i) > MM_B(b,i) ? 0xFF : 0); return r; }
+/* Signed words to signed bytes with saturation, a's elements low. */
+static inline uint64_t mmx_packsswb(uint64_t a, uint64_t b) {
+    uint64_t r = 0;
+    MMX_LANES(4, MM_PUT_B, mmx_clamp(MM_W(a,i), -128, 127));
+    for (int i = 0; i < 4; i++) r |= MM_PUT_B(4 + i, mmx_clamp(MM_W(b,i), -128, 127));
+    return r;
+}
 /* ============================================================
  * FPU Stack Helpers
  * ============================================================ */
@@ -1046,6 +1082,28 @@ void recomp_trace_enter(uint32_t va);
 #else
 #define RECOMP_ENTER(va) (g_cur_func = (va), RECOMP_FLAGS_IN())
 #endif
+
+/* Guest C++ exceptions (runtime/native32/eh32.c). A lifted function whose
+ * prologue installs an MSVC EH frame gets a host landing pad: on a caught
+ * throw the runtime longjmps here with the guest registers set for the
+ * catch's continuation, and the local dispatch goes to its label.
+ * entry_esp is esp at entry (at the return address): the frame's ebp + 4. */
+#include <setjmp.h>
+typedef struct recomp_ehframe {
+    struct recomp_ehframe* prev;
+    jmp_buf  jb;
+    uint32_t entry_esp;
+    uint32_t resume;
+} recomp_ehframe_t;
+void recomp_eh_push(recomp_ehframe_t* f);
+void recomp_eh_pop(recomp_ehframe_t* f);
+#define RECOMP_EH_ENTER()                                                     \
+    recomp_ehframe_t _ehf;                                                    \
+    _ehf.entry_esp = g_esp;                                                   \
+    recomp_eh_push(&_ehf);                                                    \
+    if (setjmp(_ehf.jb)) { RECOMP_REGS_IN(); _flag_k = FK_NONE;               \
+                           _itail_tgt = _ehf.resume; goto _ljump; }
+#define RECOMP_EH_LEAVE() recomp_eh_pop(&_ehf)
 /* A backward branch in lifted code: a loop. Every RECOMP_YIELD_EVERY of them,
  * hand the machine to other guest threads if the host has a way to
  * (native32_yield). A lifted spin-wait makes no native call, and native32

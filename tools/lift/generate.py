@@ -239,7 +239,7 @@ def push_return_label(insn, nxt, leaders, body=()):
 
 
 def lift_function_linear(lifter, name, instructions, leaders, func_start,
-                         indirect_targets=None):
+                         indirect_targets=None, eh_resume=None):
     """Lift a linearly-disassembled function to C code.
 
     The preamble comes from `lift32.FUNCTION_LOCALS`, not from a list written
@@ -259,6 +259,11 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
         across the image and jumps between them, and each block addresses the
         same frame through ebp. Lifted as separate bodies, a private ebp starts
         each at 0 and the first `[ebp-0x20]` reads 0xFFFFFFE0.
+
+    `eh_resume`: where this function continues after one of its own catch
+    blocks (eh32.resume_points). Those become labels in the local dispatch and
+    the body gets a landing pad (RECOMP_EH_ENTER) that the runtime longjmps to
+    on a caught guest throw (runtime/native32/eh32.c).
     """
     va = func_start & 0xFFFFFFFF
     lines = [f'void {name}(void) {{']
@@ -266,6 +271,10 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
         lines.append(f'    {decl}')
     lines.append('    RECOMP_REGS_LOCALS')   # empty unless RECOMP_LOCAL_REGS
     lines.append(f'    RECOMP_ENTER(0x{va:08X}u);')
+    eh = sorted(a for a in (eh_resume or ()) if a in {i.address for i in instructions})
+    if eh:
+        lines.append('    RECOMP_EH_ENTER();')
+        leaders = set(leaders) | set(eh)
     lines.append('')
 
     lifter._flag_state = None
@@ -298,7 +307,7 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
     # TEST_Z of an unrelated `and` just above it (Nocturne's window procedure
     # never saw a WM_CHAR). Forget it there; the jcc reads _flag_k at runtime.
     targets = {t for i in instructions if i.is_jump
-               for t in [i.get_branch_target()] if t is not None}
+               for t in [i.get_branch_target()] if t is not None} | set(eh)
 
     # A gap inside the body: instruction k can fall through, but the next one
     # emitted is not at its end, because the extent walk stopped there (a
@@ -376,7 +385,7 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
     defined = sorted(set(re.findall(r'(?m)^\s*(L_[0-9A-Fa-f]{8})\s*:', body)))
     indirect = [i for i, l in enumerate(lines)
                 if 'RECOMP_ITAIL(' in l and 'RECOMP_ITAIL(0x' not in l]
-    if indirect and defined:
+    if (indirect or eh) and defined:
         for i in indirect:
             m = re.search(r'RECOMP_ITAIL\((.+?)\);\s*return;', lines[i])
             if m:
@@ -384,8 +393,9 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
                             % m.group(1))
         lines.append('  _ljump:')
         lines.append('    switch (_itail_tgt) {')
-        cases = (defined if indirect_targets is None else
+        cases = ([] if not indirect else defined if indirect_targets is None else
                  [lbl for lbl in defined if int(lbl[2:], 16) in indirect_targets])
+        cases = sorted(set(cases) | {f'L_{a:08X}' for a in eh})
         for lbl in cases:
             lines.append(f'      case 0x{int(lbl[2:], 16):08X}u: goto {lbl};')
         lines.append('      default: RECOMP_ITAIL(_itail_tgt); return;')
@@ -399,9 +409,10 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
 
     # With RECOMP_LOCAL_REGS every exit writes the registers back (the macro
     # is empty otherwise), including a body that runs off its closing brace.
-    lines.append('    RECOMP_REGS_OUT();')
+    leave = 'RECOMP_EH_LEAVE(); ' if eh else ''
+    lines.append(f'    {leave}RECOMP_REGS_OUT();')
     lines.append('}')
-    out = re.sub(r'\breturn;', '{ RECOMP_REGS_OUT(); return; }', '\n'.join(lines))
+    out = re.sub(r'\breturn;', '{ %sRECOMP_REGS_OUT(); return; }' % leave, '\n'.join(lines))
     return re.sub(r'CMP_(\w+)\(_fpu_cmp\)',
                   lambda m: f'((_fpu_cmp) {FPU_CMP.get(m.group(1), "==")} 0)', out)
 
