@@ -85,7 +85,8 @@ def _mem_addr(op: Operand) -> tuple:
     if op.base:
         parts.append(f'cpu->{op.base}')
     if op.index:
-        parts.append(f'cpu->{op.index}')
+        scale = getattr(op, 'scale', 1)
+        parts.append(f'cpu->{op.index}' + (f' * {scale}' if scale > 1 else ''))
 
     if op.disp:
         if op.disp < 0:
@@ -241,6 +242,10 @@ class Lifter:
         op2 = inst.op2
         op3 = inst.op3
 
+        # 67h makes loop/loopz/loopnz/jcxz count in ECX (the MASI mixer's
+        # inner loops do: `67 E2 xx`).
+        _cx = 'cpu->ecx' if getattr(inst, 'addr32', False) else 'cpu->cx'
+
         # Relocation fixup: if this instruction's trailing 16-bit word was an MZ
         # relocation target, its immediate operand is a segment value. Rebase it
         # by the load segment, exactly as the DOS loader would.
@@ -294,6 +299,14 @@ class Lifter:
         raw_hex = ' '.join(f'{b:02X}' for b in inst.raw[:6])
         orig = repr(inst)
 
+        # 67h on a string op makes it walk ESI/EDI and count ECX, which the
+        # forms below do not model. Say so rather than lift its 16-bit twin.
+        if getattr(inst, 'addr32', False) and (
+                m[:4] in ('movs', 'stos', 'lods', 'scas', 'cmps', 'outs') or m[:3] == 'ins'
+                or m == 'xlat'):
+            self._emit(f'/* UNHANDLED: addr32 {m} */', orig)
+            return
+
         # ─── Data movement ───
 
         if m == 'mov':
@@ -305,9 +318,18 @@ class Lifter:
                        f'{_write(op2, "_t")} }}', orig)
 
         elif m == 'lea':
-            # LEA computes effective address without memory access
-            _, off = _mem_addr(op2)
-            self._emit(_write(op1, off), orig)
+            # LEA computes effective address without memory access. With 67h
+            # into a 32-bit register it is plain 32-bit arithmetic
+            # (`lea eax, [ebx+ebx*2]`), not an offset: no 16-bit wrap.
+            if getattr(inst, 'addr32', False) and op1.type == OpType.REG32:
+                terms = [f'cpu->{op2.base}'] if op2.base else []
+                if op2.index:
+                    terms.append(f'cpu->{op2.index} * {op2.scale}')
+                terms.append(f'0x{op2.disp & 0xFFFFFFFF:X}u')
+                self._emit(_write(op1, f'(uint32_t)({" + ".join(terms)})'), orig)
+            else:
+                _, off = _mem_addr(op2)
+                self._emit(_write(op1, off), orig)
 
         elif m in ('lds', 'les', 'lss', 'lfs', 'lgs'):
             # Load far pointer: reg = [mem], SREG = [mem+2]. The destination
@@ -761,42 +783,42 @@ class Lifter:
             if target in self.valid_addrs:
                 self.labels_needed.add(target)
                 self._tick_back_edge(inst, target)
-                self._emit(f'cpu->cx--; if (cpu->cx != 0) goto {_label(target, self.func_name)};', orig)
+                self._emit(f'{_cx}--; if ({_cx} != 0) goto {_label(target, self.func_name)};', orig)
             else:
                 abs_t = func_start + target; tail = self._tail_jump(abs_t)
-                self._emit(f'cpu->cx--; if (cpu->cx != 0) {{ {tail} }} /* loop tail 0x{abs_t:06X} */', orig)
+                self._emit(f'{_cx}--; if ({_cx} != 0) {{ {tail} }} /* loop tail 0x{abs_t:06X} */', orig)
 
         elif m == 'loopz':
             target = op1.disp
             if target in self.valid_addrs:
                 self.labels_needed.add(target)
                 self._tick_back_edge(inst, target)
-                self._emit(f'cpu->cx--; if (cpu->cx != 0 && zf(cpu)) '
+                self._emit(f'{_cx}--; if ({_cx} != 0 && zf(cpu)) '
                            f'goto {_label(target, self.func_name)};', orig)
             else:
                 abs_t = func_start + target; tail = self._tail_jump(abs_t)
-                self._emit(f'cpu->cx--; if (cpu->cx != 0 && zf(cpu)) {{ {tail} }} /* loopz tail 0x{abs_t:06X} */', orig)
+                self._emit(f'{_cx}--; if ({_cx} != 0 && zf(cpu)) {{ {tail} }} /* loopz tail 0x{abs_t:06X} */', orig)
 
         elif m == 'loopnz':
             target = op1.disp
             if target in self.valid_addrs:
                 self.labels_needed.add(target)
                 self._tick_back_edge(inst, target)
-                self._emit(f'cpu->cx--; if (cpu->cx != 0 && !zf(cpu)) '
+                self._emit(f'{_cx}--; if ({_cx} != 0 && !zf(cpu)) '
                            f'goto {_label(target, self.func_name)};', orig)
             else:
                 abs_t = func_start + target; tail = self._tail_jump(abs_t)
-                self._emit(f'cpu->cx--; if (cpu->cx != 0 && !zf(cpu)) {{ {tail} }} /* loopnz tail 0x{abs_t:06X} */', orig)
+                self._emit(f'{_cx}--; if ({_cx} != 0 && !zf(cpu)) {{ {tail} }} /* loopnz tail 0x{abs_t:06X} */', orig)
 
         elif m == 'jcxz':
             target = op1.disp
             if target in self.valid_addrs:
                 self.labels_needed.add(target)
                 self._tick_back_edge(inst, target)
-                self._emit(f'if (cpu->cx == 0) goto {_label(target, self.func_name)};', orig)
+                self._emit(f'if ({_cx} == 0) goto {_label(target, self.func_name)};', orig)
             else:
                 abs_t = func_start + target; tail = self._tail_jump(abs_t)
-                self._emit(f'if (cpu->cx == 0) {{ {tail} }} /* jcxz tail 0x{abs_t:06X} */', orig)
+                self._emit(f'if ({_cx} == 0) {{ {tail} }} /* jcxz tail 0x{abs_t:06X} */', orig)
 
         elif m == 'call':
             if op1 and op1.type == OpType.REL16:

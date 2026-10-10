@@ -9,6 +9,13 @@ versions follow [SemVer](https://semver.org/).
 - lift16: `jmp reg` whose arms the project found (`mov bx, [bx+table] / jmp bx`)
   lifts as a switch of gotos, like `jmp word [bx+table]` already did, instead of
   a dispatch by address. (#75)
+- decode16/lift16: 32-bit addressing (the 67h prefix) in 16-bit code -- ModR/M
+  with SIB (`[ebx*4+7A4h]`, `[eax+ecx*8+100h]`), disp32 and `moffs32` operands,
+  `lea` into a 32-bit register as plain 32-bit arithmetic, and ECX as the counter
+  of `loop`/`loopz`/`loopnz`/`jcxz`. String ops with 67h are flagged `UNHANDLED`
+  rather than lifted as their 16-bit twins. Found on Epic Pinball's MASI Sound
+  Blaster driver; Blake Stone's two lifts are byte-identical before and after.
+  `tools/lift/test_addr32_16.py`. (#74)
 - dos32: `dos32_config.overlay`, a folder laid over drive C: for files opened
   read-only, so a host can offer mods without touching the game's files.
   (#73)
