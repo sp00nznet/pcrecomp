@@ -112,6 +112,29 @@ timeout in frames and paces nothing, so natively its name prompt timed out in
 a fraction of a second. The host has to choose where to pace; Theme Park does it
 on its per-frame input poll.
 
+## Save states
+
+`dos32_state_save(path, where)` writes the whole machine to a file, and
+`dos32_state_load` puts it back. That covers:
+
+- the registers and FPU;
+- the selector, vector, heap and conventional-memory tables;
+- the PIC, PIT, VGA and DAC state;
+- the mouse driver;
+- memory up to the top of the heap, plus video memory, leaving out all-zero
+  pages (about 8 MB for Theme Park, which grabs 64 MB).
+
+Some host-side state is not restored. Guest time runs on, the input queues
+start empty, and open files stay as they are now.
+
+Lifted code runs on the host's own call stack, so a state can only load where
+it was saved. A host calls both functions from one function of a hook the
+program calls every frame. The load checks the hook (`where`), the host
+stack's depth below `dos32_run`, and the guest stack pointer; if any differs,
+it refuses with -2 and changes nothing. For Theme Park that means a state saved
+in a park loads in a park, in this run or a later one, but not from the main
+menu, and not into a different build.
+
 ## Debugging
 
 - `cfg.log`: every `int` (except the noisy mouse and keyboard ones), file opens,
@@ -135,6 +158,9 @@ Deliberate shortcuts, each with what would lift it:
 - ds is assumed flat. A program that loads ds with a non-zero-based selector
   and reads through it needs ds tracked in the lifter.
 - The environment must fit in 128 bytes (the low-memory trick above).
+- Save states keep the files that are open at load time, not the ones open at
+  save time. That is fine for a game that keeps no files open between frames;
+  otherwise record each handle's path and position and reopen them.
 - Implicit es (`stos`, `movs` destination) is flat; only explicit `es:` has a base.
 - No unchained VGA (mode X) and no planar EGA: reported once if a program
   turns chain-4 off.
