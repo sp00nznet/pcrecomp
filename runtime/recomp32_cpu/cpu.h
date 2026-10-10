@@ -23,6 +23,15 @@
 #include <string.h>
 #if defined(_MSC_VER)
 #include <intrin.h>   /* __readfsdword/__writefsdword: TIB-relative (fs:) access for SEH */
+#if defined(__clang__) && defined(_M_IX86)
+/* clang-cl has __readfsdword but not __writefsdword on x86: the call links as
+ * an undefined ___writefsdword. MSVC has both. */
+static __inline void pcrecomp_writefsdword(unsigned long off, unsigned long v)
+{
+    __asm__ volatile("movl %1, %%fs:(%0)" : : "r"(off), "r"(v) : "memory");
+}
+#define __writefsdword pcrecomp_writefsdword
+#endif
 #endif
 
 /* ---- SSE register file ----
