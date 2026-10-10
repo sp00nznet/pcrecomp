@@ -143,7 +143,7 @@ or IDA, whatever the architecture.
 | `ghidra/*.java` | Headless: decompile everything or by address, export functions, stats, xrefs, range disassembly, function bounds |
 | `ida/ida_funcs.py`, `ida_export.py`, `ida_xrefs.py`, `ida_probe_segs.py` | Headless: function catalog with FLIRT flags, instruction-head code map, call graph + import use + FPU density, segment probe |
 | `drm/safedisc_dump.py`, `inject_and_run.c` | Dump SafeDisc-decrypted `.text` from a running process; a version.dll injector for SafeDiscLoader2 |
-| `drm/steamstub.py` | Remove SteamStub 2.x (x86) statically: header, payload and the embedded `steamdrm.dll` are decoded in Python, then `.text` is AES-decrypted and the OEP restored. No Steam, nothing run |
+| `drm/steamstub.py` | Remove SteamStub 2.0 and 2.x (x86) statically: header, payload and the embedded `steamdrm.dll` are decoded in Python, then `.text` is decrypted (AES, or 2.0's running XOR) and the OEP restored. No Steam, nothing run |
 | `drm/unlzexe.py` | Undo LZEXE 0.90/0.91 on a DOS MZ executable -- decoded directly, nothing is run; `test_unlzexe.py` packs a file to check it |
 | `drm/emu_unpack.py` | Unpack a compressed PE32 (PECompact 2.x, and Valve's Steam2 wrapper built on it) by running its stub under Unicorn to the OEP, then rebuild the import table. Headless: nothing is launched |
 | `assets/extract_wise.py`, `isextract.py`, `extract_cab.sh`, `pk3_inspect.py`, `bin2iso.js` | Wise and InstallShield installers, CABs, PK3/ZIP, BIN/CUE -> ISO |
