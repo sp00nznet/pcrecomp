@@ -90,7 +90,12 @@ uint32_t recomp_load_image(const char* path, uint32_t image_base) {
         if (sec[i].roff == 0) continue;
         uint32_t va = image_base + sec[i].vaddr;
         uint32_t n  = sec[i].rsize;
-        if (sec[i].vsize && sec[i].vsize < n) n = sec[i].vsize;
+        /* Windows maps a section's file data up to its VirtualSize rounded up
+         * to the page, not to the VirtualSize itself: bytes past it in the last
+         * page come from the file. Tiberian Sun's Game.exe keeps a patch's code
+         * there (0x006C9A10, past .text's 0x006C9A0D), and cut at VirtualSize
+         * it ran as zeroes, `add [eax], al`, and faulted. */
+        if (sec[i].vsize && ((sec[i].vsize + 0xFFFu) & ~0xFFFu) < n) n = (sec[i].vsize + 0xFFFu) & ~0xFFFu;
         /* Never read past what the file actually holds: these headers come from
          * disk and a truncated or hostile one must not turn into an overread. */
         if (sec[i].roff >= (uint32_t)sz) continue;

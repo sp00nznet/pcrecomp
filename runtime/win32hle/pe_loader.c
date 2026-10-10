@@ -49,7 +49,11 @@ void recomp_pe_relocate(uint32_t base, uint32_t reloc_rva, uint32_t reloc_size, 
     }
 }
 
-int recomp_pe_map(const char *path, pe_image *img) {
+static int pe_map_at(const char *path, pe_image *img, int anywhere);
+int recomp_pe_map(const char *path, pe_image *img)     { return pe_map_at(path, img, 0); }
+int recomp_pe_map_any(const char *path, pe_image *img) { return pe_map_at(path, img, 1); }
+
+static int pe_map_at(const char *path, pe_image *img, int anywhere) {
     size_t flen;
     uint8_t *file = slurp(path, &flen);
     if (!file) { fprintf(stderr, "[pe] cannot read %s\n", path); return 1; }
@@ -66,10 +70,18 @@ int recomp_pe_map(const char *path, pe_image *img) {
     uint32_t span = round_up(opt->SizeOfImage, PAGE);
 
     /* Reserve the image's VA range, fixed. On a 32-bit host the VA is a real
-     * host address, so a 1:1 map means every MEM32(va) in lifted code lands. */
-    void *p = mmap((void *)(uintptr_t)image_base, span, PROT_READ | PROT_WRITE,
-                   MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (p == MAP_FAILED) { free(file); fprintf(stderr, "[pe] mmap @ 0x%08X failed\n", image_base); return 1; }
+     * host address, so a 1:1 map means every MEM32(va) in lifted code lands.
+     * NOREPLACE: a range the host already uses (its heap, a library) fails the
+     * map instead of being silently replaced under it. A DLL (anywhere) goes
+     * wherever there is room and is relocated. */
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+    void *p = mmap(anywhere ? NULL : (void *)(uintptr_t)image_base, span, PROT_READ | PROT_WRITE,
+                   (anywhere ? 0 : MAP_FIXED_NOREPLACE) | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED || (!anywhere && (uint32_t)(uintptr_t)p != image_base)) {
+        free(file); fprintf(stderr, "[pe] mmap @ 0x%08X failed (the range is in use)\n", image_base); return 1;
+    }
     uint32_t base = (uint32_t)(uintptr_t)p;
 
     /* headers, then each section's raw data (the rest of VirtualSize is the
@@ -92,6 +104,9 @@ int recomp_pe_map(const char *path, pe_image *img) {
     img->span = span;
     img->entry = base + opt->AddressOfEntryPoint;
     img->import_rva = opt->DataDirectory[PE_DIR_IMPORT].VirtualAddress;
+    img->resource_rva = opt->DataDirectory[PE_DIR_RESOURCE].VirtualAddress;
+    img->resource_size = opt->DataDirectory[PE_DIR_RESOURCE].Size;
+    img->stamp = nt->FileHeader.TimeDateStamp;
     free(file);
     fprintf(stderr, "[pe] %s mapped at 0x%08X, span 0x%X\n", path, base, span);
     return 0;
@@ -109,9 +124,18 @@ int recomp_pe_bind(const pe_image *img, uint32_t (*resolve)(const char *name)) {
         for (; *ilt; ilt++, iat++) {
             uint32_t va = 0;
             if (*ilt & PE_ORDINAL_FLAG) {
-                /* by ordinal: win32hle keys shims by name, so leave it for the
-                 * resolver to answer by "DLL#N" if it chooses. */
-                va = 0;
+                /* by ordinal: win32hle keys shims by name, so the resolver is
+                 * asked for "dll#N" (the DLL's name in lower case), which a
+                 * module registers as an alias (dsound.dll#1 is
+                 * DirectSoundCreate). The name outlives the bind: a permissive
+                 * resolver keeps it for its stub. */
+                char nm[96];
+                size_t k = 0;
+                for (; dll[k] && k < 80; k++) nm[k] = (char)(dll[k] >= 'A' && dll[k] <= 'Z' ? dll[k] + 32 : dll[k]);
+                snprintf(nm + k, sizeof nm - k, "#%u", *ilt & 0xFFFFu);
+                char *name = strdup(nm);
+                va = resolve(name);
+                if (!va) fprintf(stderr, "[pe] unresolved import %s\n", name);
             } else {
                 const char *name = (const char *)(uintptr_t)(base + *ilt + 2); /* skip hint word */
                 va = resolve(name);
