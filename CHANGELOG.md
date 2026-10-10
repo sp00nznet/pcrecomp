@@ -129,7 +129,7 @@ versions follow [SemVer](https://semver.org/).
 - lift32 `dos=True`: far calls and `retf`. `call m16:32` (FF /3) pushes CS
   under the return address, and `retf` pops both (plus its immediate); both
   were lifted as near, so each far call left 4 bytes on the stack. HMI SOS's
-  timer calls its events this way. (#PR)
+  timer calls its events this way. (#71)
 - disasm32: data kept in a code section no longer becomes a function start.
   The body probe (`probes_as_function_body`) now fails a candidate whose decode
   meets an instruction no 32-bit compiler emits (`arpl`, `bound`, BCD, `sldt`,
