@@ -1817,6 +1817,34 @@ class Lifter:
             # flags, so a following `sahf` (2 sites in Focom.exe) still finds
             # the 'fcom' state and the unsigned jcc after it maps correctly.
 
+        # xadd and cmpxchg, nearly always behind `lock`: the inlined
+        # InterlockedExchangeAdd / InterlockedCompareExchange of reference
+        # counts and spin locks. lift32 had neither, so a release never
+        # dropped its count (Tiberium Wars: 21 sites). Lifted code runs under
+        # one machine lock, so the plain read-modify-write is already atomic.
+        elif m == 'xadd' and len(ops) == 2:
+            a = self._fmt_read(ops[0])
+            b = self._fmt_read(ops[1])
+            lines.append(self._flag_capture(a, b, op_bits(ops[0])))
+            lines.append("_cf = (uint32_t)((uint32_t)(_flag_a + _flag_b) < (uint32_t)_flag_a);")
+            lines.append(f"{{ uint32_t _old = {a}, _sum = {a} + {b}; {self._fmt_write(ops[1], '_old')}; "
+                         f"{self._fmt_write(ops[0], '_sum')}; }} {comment}")
+            self._flag_state = ('add', "_flag_a, _flag_b")
+
+        elif m == 'cmpxchg' and len(ops) == 2:
+            # Compare the accumulator with the destination (flags as cmp);
+            # equal: the destination takes the source, else the accumulator
+            # takes the destination.
+            bits = op_bits(ops[0])
+            acc, acc_w = {32: ('eax', 'eax = _d'), 16: ('LO16(eax)', 'SET_LO16(eax, _d)'),
+                          8: ('LO8(eax)', 'SET_LO8(eax, _d)')}[bits]
+            d = self._fmt_read(ops[0])
+            lines.append(self._flag_capture(acc, d, bits))
+            lines.append("_cf = (uint32_t)((uint32_t)_flag_a < (uint32_t)_flag_b);")
+            lines.append(f"{{ uint32_t _d = {d}; if ({acc} == _d) {{ {self._fmt_write(ops[0], self._fmt_read(ops[1]))}; }} "
+                         f"else {{ {acc_w}; }} }} {comment}")
+            self._flag_state = ('cmp', "_flag_a, _flag_b")
+
         elif m == 'sahf':
             # SF ZF AF PF CF <- ah bits 7 6 4 2 0. This was a comment, so a
             # `jp` after it read the parity of whatever compare came before:
