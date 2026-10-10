@@ -52,6 +52,7 @@ class Operand:
     disp: int = 0          # Displacement or immediate value
     size: int = 0          # Operand size in bytes (1 or 2)
     far_seg: int = 0       # Far pointer segment value
+    scale: int = 1         # index multiplier: 2/4/8 only in 32-bit (67h) addressing
 
     def __repr__(self):
         if self.type == OpType.REG8:
@@ -75,7 +76,7 @@ class Operand:
             sz = 'byte ' if self.size == 1 else 'word ' if self.size == 2 else 'dword ' if self.size == 4 else ''
             parts = []
             if self.base: parts.append(self.base)
-            if self.index: parts.append(self.index)
+            if self.index: parts.append(self.index + (f'*{self.scale}' if self.scale > 1 else ''))
             if self.disp or not parts:
                 if self.disp < 0 and parts:
                     parts.append(f'-0x{(-self.disp) & 0xFFFF:X}')
@@ -106,6 +107,7 @@ class Instruction:
     seg_override: str = ''  # Segment override prefix (es/cs/ss/ds)
     fpu: bytes = b''        # x87: ESC opcode + modrm/disp (emulator INTs normalised)
     emu87_int: int = 0      # 0x34..0x3D when this came from an 8087-emulator INT
+    addr32: bool = False    # 67h: 32-bit addressing -- ECX/ESI/EDI for loops and strings
 
     # For overlay calls (INT 3Fh)
     overlay_num: int = -1
@@ -248,6 +250,8 @@ class Decoder:
                 rm_op = Operand(type=wtype, reg=rm, size=wsize)
             else:
                 rm_op = Operand(type=OpType.REG8, reg=rm, size=1)
+        elif getattr(self, 'addr32', False):
+            rm_op = self._modrm32(mod, rm, seg_override, wsize if wide else 1)
         else:
             # Memory
             base_r, idx_r = EA_BASES[rm]
@@ -278,6 +282,35 @@ class Decoder:
             )
 
         return reg_op, rm_op, reg
+
+    def _modrm32(self, mod: int, rm: int, seg: str, size: int) -> 'Operand':
+        """A memory operand in 32-bit addressing (the 67h prefix): a 32-bit
+        base, an optional scaled index from the SIB byte, a disp8 or disp32.
+        Real-mode code uses it for scaled table lookups -- the MASI sound
+        drivers index per-channel arrays as `[ebx*4+7A4h]`. The address still
+        lands in a 64K segment; the lifter truncates the sum to 16 bits, which
+        is what any offset that does not fault comes to."""
+        base, index, scale, disp = REG32_NAMES[rm], '', 1, 0
+        if rm == 4:
+            sib = self._u8()
+            scale, i, b = 1 << (sib >> 6), (sib >> 3) & 7, sib & 7
+            index = REG32_NAMES[i] if i != 4 else ''
+            base = REG32_NAMES[b]
+            if b == 5 and mod == 0:
+                base, disp = '', self._s32()
+        elif rm == 5 and mod == 0:
+            base, disp = '', self._s32()
+        if mod == 1:
+            disp = self._s8()
+        elif mod == 2:
+            disp = self._s32()
+        if not seg:
+            seg = 'ss' if base in ('ebp', 'esp') else 'ds'
+        return Operand(type=OpType.MEM, base=base, index=index, scale=scale, disp=disp,
+                       seg=seg, size=size)
+
+    def _moffs(self) -> int:
+        return self._u32() if getattr(self, 'addr32', False) else self._u16()
 
     def _safe(self, n: int = 1) -> bool:
         """Check if n bytes remain."""
@@ -584,20 +617,20 @@ class Decoder:
         elif opcode == 0xA0:
             inst.mnemonic = 'mov'
             inst.op1 = Operand(type=OpType.REG8, reg=0, size=1)
-            inst.op2 = Operand(type=OpType.MOFFS, disp=self._u16(), seg=seg_override or 'ds', size=1)
+            inst.op2 = Operand(type=OpType.MOFFS, disp=self._moffs(), seg=seg_override or 'ds', size=1)
         elif opcode == 0xA1:
             inst.mnemonic = 'mov'
             inst.op1 = self._wreg(0)
-            inst.op2 = Operand(type=OpType.MOFFS, disp=self._u16(), seg=seg_override or 'ds', size=self._wbytes())
+            inst.op2 = Operand(type=OpType.MOFFS, disp=self._moffs(), seg=seg_override or 'ds', size=self._wbytes())
 
         # MOV moffs, AL/AX
         elif opcode == 0xA2:
             inst.mnemonic = 'mov'
-            inst.op1 = Operand(type=OpType.MOFFS, disp=self._u16(), seg=seg_override or 'ds', size=1)
+            inst.op1 = Operand(type=OpType.MOFFS, disp=self._moffs(), seg=seg_override or 'ds', size=1)
             inst.op2 = Operand(type=OpType.REG8, reg=0, size=1)
         elif opcode == 0xA3:
             inst.mnemonic = 'mov'
-            inst.op1 = Operand(type=OpType.MOFFS, disp=self._u16(), seg=seg_override or 'ds', size=self._wbytes())
+            inst.op1 = Operand(type=OpType.MOFFS, disp=self._moffs(), seg=seg_override or 'ds', size=self._wbytes())
             inst.op2 = self._wreg(0)
 
         # Port string ops (386). INS/OUTS move between DX and ES:DI / DS:SI.
@@ -987,6 +1020,7 @@ class Decoder:
 
         inst.length = self.pos - start
         inst.raw = self.data[start:self.pos]
+        inst.addr32 = self.addr32
         return inst
 
     def decode_range(self, start: int, end: int):
