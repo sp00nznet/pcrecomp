@@ -519,7 +519,10 @@ int native32_bind(uint32_t base, native32_shim_t* shims, int nshims) {
          * in the dispatch table. LoadLibrary would load the original binary as
          * native code, or fail. */
         uint32_t guest = native32_module(dll);
-        HMODULE h = guest ? NULL : LoadLibraryA(dll);
+        /* Loaded at its first import the host did not shim: a DLL every one
+         * of whose imports is shimmed (a host that stubs a whole library out)
+         * is never loaded, so its DllMain never runs. */
+        HMODULE h = NULL;
         uint32_t* ilt = (uint32_t*)(b + (d->OriginalFirstThunk ? d->OriginalFirstThunk : d->FirstThunk));
         uint32_t* iat = (uint32_t*)(b + d->FirstThunk);
         for (; *ilt; ilt++, iat++) {
@@ -532,6 +535,7 @@ int native32_bind(uint32_t base, native32_shim_t* shims, int nshims) {
                     shimmed++;
                 }
             if (!va) {
+                if (!guest && !h) h = LoadLibraryA(dll);
                 va = guest ? native32_export(guest, nm)
                    : h ? (uint32_t)(uintptr_t)GetProcAddress(h, nm) : 0;
                 if (va && guest) guested++;

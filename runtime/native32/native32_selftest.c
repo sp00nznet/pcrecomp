@@ -113,6 +113,28 @@ int main(void) {
         CHECK(recomp_lookup_import(va1) == (recomp_func_t)add3);
     }
 
+    /* A DLL every one of whose imports the host shims is never loaded:
+     * version.dll's first import descriptor renamed to a DLL this process
+     * has not loaded, and all its imports shimmed. */
+    {
+        IMAGE_NT_HEADERS32* nt = (IMAGE_NT_HEADERS32*)(uintptr_t)(base + ((IMAGE_DOS_HEADER*)(uintptr_t)base)->e_lfanew);
+        IMAGE_IMPORT_DESCRIPTOR* d = (IMAGE_IMPORT_DESCRIPTOR*)(uintptr_t)(base +
+            nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
+        uint32_t* ilt = (uint32_t*)(uintptr_t)(base + (d->OriginalFirstThunk ? d->OriginalFirstThunk : d->FirstThunk));
+        char* name = (char*)(uintptr_t)(base + d->Name);
+        static native32_shim_t shims[256];
+        int n = 0;
+        for (; *ilt && n < 256; ilt++)
+            if (!(*ilt & 0x80000000u)) {
+                shims[n].name = (const char*)(uintptr_t)(base + *ilt + 2);
+                shims[n++].fn = (recomp_func_t)add3;
+            }
+        CHECK(GetModuleHandleA("icm32.dll") == NULL && strlen(name) >= strlen("icm32.dll"));
+        strcpy(name, "icm32.dll");
+        native32_bind(base, shims, n);
+        CHECK(GetModuleHandleA("icm32.dll") == NULL);
+    }
+
     printf("native32 selftest: %s\n", fails ? "FAILED" : "ok");
     return fails != 0;
 }
