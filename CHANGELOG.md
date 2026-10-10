@@ -15,7 +15,7 @@ versions follow [SemVer](https://semver.org/).
   VGA and VESA video, int 16h and IRQ 1 keyboard, int 33h mouse with event
   handlers, the PIT and IRQ 0, a virtual clock for reproducible headless runs,
   crash reports and a hardware write watchpoint (`DOS32_BREAK`). Theme Park
-  boots, plays its menus and runs a park. See docs/DOS32.md. (#PR)
+  boots, plays its menus and runs a park. See docs/DOS32.md. (#69)
 - `tools/le/le_parse.py`: the LE front end, for 32-bit DOS-extender programs
   (DOS/4GW, PMODE/W, DOS/32A: most Watcom-built DOS games of 1993-97). It lays
   the objects out at a chosen base with every fixup applied, as the extender
