@@ -11,7 +11,7 @@ versions follow [SemVer](https://semver.org/).
   driver's position moved from where it last put its own cursor, so each
   host move dragged the cursor back toward the window position (drift while
   laying paths), and nothing moved past the window's edge (no edge
-  scrolling). (#PR)
+  scrolling). (#76)
 - lift16: `jmp reg` whose arms the project found (`mov bx, [bx+table] / jmp bx`)
   lifts as a switch of gotos, like `jmp word [bx+table]` already did, instead of
   a dispatch by address. (#75)
