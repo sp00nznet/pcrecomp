@@ -33,6 +33,11 @@ COND_JUMPS = {
     'je', 'jne', 'jz', 'jnz', 'ja', 'jae', 'jb', 'jbe',
     'jg', 'jge', 'jl', 'jle', 'js', 'jns', 'jo', 'jno',
     'jp', 'jnp', 'jcxz', 'jecxz',
+    # loop branches too. Without these its target was no block leader, the
+    # lifted `goto` found no label, and the fallback tail-jumped to an address
+    # nothing lifted: Theme Park's sprite blitter (hand-written, a `loop` per
+    # run) skipped its inner loops and drew off the end of the screen.
+    'loop', 'loope', 'loopne',
 }
 
 
@@ -652,6 +657,12 @@ def _selftest():
     """
     md = Cs(CS_ARCH_X86, CS_MODE_32)
     md.detail = True
+
+    # A loop's target is a block leader, so its goto has a label to land on.
+    #   0x1000: inc eax / 0x1001: loop 0x1000 / 0x1003: ret
+    code = bytes([0x40, 0xE2, 0xFD, 0xC3])
+    _, lead = linear_disassemble_function(md, code, 0x1000, 0x1000, 0x1004)
+    assert 0x1000 in lead and 0x1003 in lead, lead
 
     #   push ebp / mov ebp,esp / mov eax,[ebp+8] / jmp eax   (indirect tail)
     code = bytes([0x55, 0x8B, 0xEC, 0x8B, 0x45, 0x08, 0xFF, 0xE0])

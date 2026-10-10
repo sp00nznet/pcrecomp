@@ -105,6 +105,12 @@ versions follow [SemVer](https://semver.org/).
   runtime gap). `HLE_FILETRACE=1` logs the data files a title opens. (#45)
 
 ### Fixed
+- generate: `loop`, `loope` and `loopne` are block leaders. They were missing from
+  `COND_JUMPS`, so a loop's target got no label, its `goto` fell to the
+  missing-label fallback, and that tail-jumped to an address nothing lifted: the
+  loop body ran once and the function carried on. Hand-written asm uses `loop`
+  in every inner loop; Theme Park's sprite blitter drew its runs off the end of
+  the screen. MSVC rarely emits it, which is why no Win32 title showed it. (#66)
 - lift32: MMX's byte and unsigned-saturating ops (`paddusb`, `psubusb`, `paddusw`, `psubusw`,
   `paddb`, `psubb`, `paddsb`, `psubsb`, `pcmpeqb`, `pcmpgtb`, `pcmpeqd`, `pcmpgtd`,
   `packsswb`) are lifted. They were emitted as an `UNIMPLEMENTED` comment and the lift
