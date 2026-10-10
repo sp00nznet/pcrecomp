@@ -105,6 +105,16 @@ versions follow [SemVer](https://semver.org/).
   runtime gap). `HLE_FILETRACE=1` logs the data files a title opens. (#45)
 
 ### Fixed
+- disasm32: data kept in a code section no longer becomes a function start.
+  The body probe (`probes_as_function_body`) now fails a candidate whose decode
+  meets an instruction no 32-bit compiler emits (`arpl`, `bound`, BCD, `sldt`,
+  `lsl`, ...): a string or a byte table decodes that way, and used to pass as
+  long as a `ret` turned up first. The code-immediate harvest runs that probe,
+  and ignores an immediate that points into a hole inside the very function
+  loading it (a table it jumps over). Watcom keeps both in its code object:
+  Theme Park's startup `mov edx, offset "con"` straddled the real entry, and a
+  `mov edi, offset keys; repne scasw` switch split its function in two. SimCity
+  2000 against IDA: precision 87.40% -> 87.43%, recall unchanged. (#67)
 - generate: `loop`, `loope` and `loopne` are block leaders. They were missing from
   `COND_JUMPS`, so a loop's target got no label, its `goto` fell to the
   missing-label fallback, and that tail-jumped to an address nothing lifted: the

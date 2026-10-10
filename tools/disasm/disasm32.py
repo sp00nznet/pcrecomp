@@ -33,6 +33,10 @@ CALLS = {'call'}
 
 # Return instructions
 RETS = {'ret', 'retn', 'retf'}
+# Instructions no 32-bit compiler emits. A candidate whose decode meets one
+# before its terminator is data: a string decodes as `arpl`, `bound`, BCD.
+NOT_COMPILED = {"arpl", "bound", "into", "salc", "sldt", "str", "lsl", "lar", "ud2",
+                "daa", "das", "aaa", "aas"}
 
 
 def decode(md, code, va):
@@ -353,6 +357,8 @@ class Disassembler:
         for insn in decode(self._probe_md, data, va):
             if insn.mnemonic in RETS or insn.mnemonic in UNCOND_JUMPS:
                 return True
+            if insn.mnemonic in NOT_COMPILED:
+                return False
             end = insn.address + insn.size
 
         # The decode stopped short of the window: a byte that is not an
@@ -854,6 +860,11 @@ class Disassembler:
               # data table, so neither the call scan nor the data scan finds it;
               # it surfaces at runtime as a callback that cannot be dispatched.
               for func in new_funcs:
+                  # The body's own span: an immediate into a hole inside it
+                  # is the function's data, a table it jumps over (Theme
+                  # Park's `mov edi, offset keys; repne scasw` switch).
+                  own = {i.address for b in func.blocks.values() for i in b.instructions}
+                  own_lo, own_hi = (min(own), max(own)) if own else (0, 0)
                   for b in func.blocks.values():
                       for ins in b.instructions:
                           if ins.is_call or ins.is_jump or not ins.operands:
@@ -865,6 +876,14 @@ class Disassembler:
                               if tgt in queued or tgt in functions:
                                   continue
                               if not self.is_code_address(tgt):
+                                  continue
+                              if own_lo < tgt < own_hi and tgt not in own:
+                                  continue
+                              # Data kept in code is loaded the same way: Theme
+                              # Park's startup does `mov edx, offset "con"` for
+                              # a device name in its code object, and decoding
+                              # that as a body straddled the real entry.
+                              if not self.probes_as_function_body(tgt):
                                   continue
                               if tgt in covered:
                                   # Inside another body: a function after a
