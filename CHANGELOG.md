@@ -8,7 +8,7 @@ versions follow [SemVer](https://semver.org/).
 ### Added
 - dos32: `dos32_config.overlay`, a folder laid over drive C: for files opened
   read-only, so a host can offer mods without touching the game's files.
-  (#PR)
+  (#73)
 - dos32: `dos32_heap_alloc` / `dos32_heap_free`, the DPMI heap for the host,
   so a host can hold memory back from a program that grabs everything it can.
   Theme Park's memory manager takes every block down to 16 bytes and leaves its
