@@ -1992,8 +1992,15 @@ class Lifter:
             expr = f"{MMX_SHIFTS[m]}({self._mm_read(ops[0])}, {self._mm_count(ops[1])})"
             lines.append(f"{self._mm_write(ops[0], expr)}; {comment}")
 
-        elif m == 'movq':
+        elif m in ('movq', 'movntq'):
+            # movntq is movq to memory with a non-temporal hint: the store
+            # itself is the same, and the hint means nothing to lifted code.
             lines.append(f"{self._mm_write(ops[0], self._mm_read(ops[1]))}; {comment}")
+
+        elif m in ('sfence', 'lfence', 'mfence') or m.startswith('prefetch'):
+            # Ordering and cache hints. The lifted code runs on one thread's
+            # view of plain memory, so there is nothing for them to do.
+            lines.append(f"/* {m} */ {comment}")
 
         elif m == 'movd':
             # 32 bits between an MMX register and a GPR or memory, zero-extended
