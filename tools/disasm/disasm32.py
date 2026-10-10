@@ -918,9 +918,12 @@ class Disassembler:
         for a, f in functions.items():
             for t in f.calls_to:
                 callers.setdefault(t, set()).add(a)
+        # Seeds stay: an export or a vtable slot is a start on outside evidence,
+        # so a body that decodes over one is the wrong one (the self-test has
+        # Killing Floor's case).
         gone = drop_mid_instruction_entries(
             lambda va, n: self.read_bytes(va, n), sizes, code_start, code_end,
-            callers=callers, weak=weak & set(sizes))
+            keep=set(seeds) & set(sizes), callers=callers, weak=weak & set(sizes))
         for a in list(functions):
             if a not in sizes:
                 del functions[a]
@@ -1774,6 +1777,21 @@ def demo():
     got = [(i.address, i.size) for i in decode(md, buf, 0x401000)]
     assert got == want, "decode() diverged from md.disasm()"
     assert len(want) == 320     # 200 nops + 60 x (mov, ret), then ff ff stops it
+
+    # A seed is never dropped as mid-instruction: an export, the entry point
+    # or an RTTI vtable slot is a function start on outside evidence, and a
+    # body decoding over it is the one that is wrong. Killing Floor's Core:
+    # a throw the catalog took for a returning call, then a switch table read
+    # as code, straddled UStructProperty::ImportText -- an export, reached
+    # only through its vtable, and the game's first virtual call to it was an
+    # unresolved ICALL. Here the seed is the `ret` inside mov's immediate.
+    sk = (b"\x55\x8b\xec"               # push ebp; mov ebp, esp
+          b"\xb8\xc3\x90\x90\x90"       # mov eax, 0x909090C3 -- C3 at +4
+          b"\x5d\xc3")                  # pop ebp; ret
+    kd = Disassembler(b"\x00" * 0x400 + sk + b"\xcc" * (0x200 - len(sk)),
+                      BASE, [_Sec(".text", 0x1000, 0x400, 0x200, True)])
+    kf = kd.find_functions(BASE + 0x1000, BASE + 0x1200, {}, seeds={BASE + 0x1004})
+    assert BASE + 0x1000 in kf and BASE + 0x1004 in kf, sorted(map(hex, kf))
 
     print("disasm32.py self-test OK")
 
