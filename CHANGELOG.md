@@ -6,6 +6,11 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- disasm32: every slot of an incremental-link thunk table is a function. Runs
+  of 16+ back-to-back `jmp rel32` slots into the code are found up front; each
+  slot is a seed and an entry off the slot grid is dropped. A thunk reached
+  only through a runtime pointer was otherwise hidden by a decode straddling
+  it (Monster Truck Madness 2: 4,623 slots, 914 missing). (#81)
 - dos32: save states. `dos32_state_save` / `dos32_state_load` write the whole
   machine to a file and back: registers, the host's tables, the chips, and
   memory with all-zero pages left out (about 8 MB for Theme Park). A state
