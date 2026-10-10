@@ -687,7 +687,14 @@ static void int21(regs_t* r) {
         host_path(name, path, sizeof path);
         int fl = AH(r) == 0x3D ? ((AL(r) & 3) == 0 ? _O_RDONLY : (AL(r) & 3) == 1 ? _O_WRONLY : _O_RDWR)
                               : (_O_RDWR | _O_CREAT | (AH(r) == 0x5B ? _O_EXCL : _O_TRUNC));
-        int fd = _open(path, fl | _O_BINARY, _S_IREAD | _S_IWRITE);
+        int fd = -1;
+        if (C->overlay && fl == _O_RDONLY) {   /* a mod's copy of the file wins, for reading */
+            char opath[600];
+            snprintf(opath, sizeof opath, "%s%s", C->overlay, path + strlen(C->root));
+            fd = _open(opath, fl | _O_BINARY);
+            if (fd >= 0) LOG("dos32: open %s (overlay) -> %d\n", opath, fd);
+        }
+        if (fd < 0) fd = _open(path, fl | _O_BINARY, _S_IREAD | _S_IWRITE);
         LOG("dos32: open %s -> %d\n", path, fd);
         if (fd < 0) { FAIL(r, errno == ENOENT ? 2 : 5); break; }
         int h = alloc_handle(fd);
