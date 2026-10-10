@@ -24,6 +24,8 @@ pcrecomp/
     pe/            PE: headers, imports, resources, protection, symbol recovery
     ne/            NE (16-bit Windows / OS-2): parse, disassemble, Win16 imports,
                    and the generators that close lift -> compile -> link
+    le/            LE (32-bit DOS extenders: DOS/4GW, PMODE/W, ...): lay the
+                   objects out with fixups applied, re-wrap as PE for disasm32
     macho/         Mach-O (NeXTSTEP): UFS disk reader, fat slices, shlib
                    imports, ObjC survey; feeds disasm32/lift32 the i386 slice
     disasm/        Disassemblers, call graphs, and scoring a catalog
@@ -118,6 +120,12 @@ or IDA, whatever the architecture.
 | `difftest.py` | Lifted C vs Unicorn for x86-32, every register, flag and byte compared |
 | `difftest16.py` | The same for x86-16, on raw bytes or a real NE segment (`--ne`) |
 | `difftest64.py` | Lifted C vs the **host CPU** running the original bytes (`difftest64.asm`): registers, memory operands, `lock` atomics |
+
+**DOS extenders: LE** (`tools/le/`)
+
+| Tool | What it does |
+|------|--------------|
+| `le_parse.py` | An LE image (the MZ stub + LE that DOS/4GW, PMODE/W and DOS/32A load) laid out at a chosen base with every fixup applied. `--pe` re-wraps it as a PE32 so disasm32 and lift32 run unchanged; `--seeds` lists the code addresses its fixup tables name, for `disasm32 --seed-functions`. `test_le_parse.py` checks it on a hand-built image |
 
 **Win16 NE** (`tools/ne/`, see [tools/ne/README.md](tools/ne/README.md))
 
