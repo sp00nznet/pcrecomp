@@ -11,14 +11,125 @@ versions follow [SemVer](https://semver.org/).
   unwind and catch funclets as guest code, and longjmps into a landing pad the lifter gives
   every function with catch blocks (`tools/lift/eh32.py`, `generate.lift_function_linear`
   `eh_resume=`). Found on Unreal Tournament, whose `StaticLoadObject` catches its own throws.
+- `tools/lift/name_lift.py`: readable names for a finished lift, and a header on
+  every function saying what it is, from what the binary itself says. Virtual
+  methods are named by their class and slot from RTTI (COM's own slots by name:
+  `UnitClass__QueryInterface`, `OverlayClass__Load`); MSVC's scalar deleting
+  destructors and `operator delete` by their shape; constructors and destructors
+  by the vtables they store; functions that print `Class::Method` in a debug
+  message by it. The header lists the strings a function uses, the Windows calls
+  it makes, its source file where a message names one, its `this` class and how
+  many places call it; a constant that is a string's or a vtable's address gets
+  a comment. Nothing comes from outside the binary. 7,167 of Red Alert 2: Yuri's
+  Revenge's 24,954 functions are named and 5,602 of Tiberian Sun's 18,559; both
+  build and play as before. `--demo` checks it on a synthetic lift.
+- `runtime/win32hle/`: enough of Win32 for a DirectDraw game to run on Linux,
+  driven by Tiberian Sun (tiberiansun-recomp `src/linux`), which now boots,
+  plays its movies and music, runs its menus and dialogs, and plays a
+  skirmish with no Windows and no Wine:
+  - `ddraw.c`: DirectDraw in software (`IDirectDraw`/`2`, surfaces 1–3,
+    palettes, clippers; blits with colour fill, colour key and stretch, flips),
+    with a 64 KB tail behind every surface for blitters that run past the end;
+    `screen.c` shows the primary in an SDL2 window and turns SDL input into
+    window messages.
+  - `dsound.c`: DirectSound on SDL2 audio, a software mixer with real-time
+    play cursors.
+  - `user32.c`: a window manager — windows, classes, the queue with `WM_PAINT`
+    and `WM_TIMER` generated, focus/capture/activation, dialogs from their
+    templates, and the standard controls with owner-draw (combo boxes sized
+    from `WM_MEASUREITEM` as Windows does, which the game's layout depends on).
+  - `gdidc.c`: device contexts on surfaces, fonts on SDL2_ttf, `TextOutA`.
+  - `module.c`, `hle_path.c`: `LoadLibraryA` and resources (`LoadStringA`,
+    dialog templates in a resource DLL), Windows paths on a case-sensitive
+    disk.
+  - `kernel32*.c`: files on descriptors and the directory search, sized heap
+    blocks, virtual memory, critical sections, events, mutexes, waits, TLS,
+    codepage 1252 and an English locale for the CRT.
+  - `ole32.c` (COM class factories, the host's and the guest's own),
+    `advapi32.c` (an in-memory registry, COMCTL32, VERSION, SHELL32),
+    `wsock32.c` (Winsock 1.1 on BSD sockets, and IPX as IPXEmu puts it on
+    UDP, so a native player and a Windows one share a LAN), `winmm.c` timers
+    on threads.
+  - `storage.c`: structured storage (`StgCreateDocfile`, `IStorage`,
+    `IStream`, `OleSaveToStream`/`OleLoadFromStream`) on compound files in
+    Windows' own format (MS-CFB v3), so saves move between the two; a
+    selftest round-trips one.
+  - `screen.c` scales as a Windows presenter does: sharp-bilinear, smooth,
+    CRT, nearest, integer (F12), blurred bars, fullscreen (F11); an optional
+    2x picture from the host (an HD layer).
+  - The machine lock is handed over with the registers saved, at every import
+    and loop back-edge when another thread waits; ordinal imports bind as
+    `dll#N`; `build_selftests.sh` runs the selftests.
+  - `bink.c`: `binkw32.dll` on ffmpeg, built with `HLE_WITH_FFMPEG`: a movie
+    opened by name or from the game's own file handle at its offset
+    (`BINKFILEHANDLE`), frames converted to 565, 555 or 32-bit into the
+    game's buffer, the audio played through a host stream that `dsound.c`
+    mixes. Red Alert 2 and Yuri's Revenge (redalert2-recomp `src/linux`) run
+    on the layer with it, with the calls they added (`MulDiv`,
+    `FormatMessageA`, `OpenEventA`, `GetLogicalDriveStringsA`,
+    `GetTempFileNameA`, `ChildWindowFromPointEx`, `GetSysColor`, IMM32's
+    no-ops, `EnumProtocolsA`); invalidating a window without
+    `WS_CLIPCHILDREN` repaints its children as Windows does.
 - `tools/drm/steamstub.py`: removes SteamStub 2.x (x86) without running anything and
   without Steam. The stub's header and payload are running-XOR decoded. The embedded
   `steamdrm.dll` is XTEA-CBC decrypted, and the payload offsets it uses (AES key, first
   block, OEP, code range) are read from its own code. The code section is then
   AES-256-CBC decrypted, with the IV taken from an ECB-decrypted first block. The
   dead `.bind` section is dropped. Needs `cryptography`. Found on KotOR (Steam, app 32370).
+- `tools/drm/steamstub.py`: the older SteamStub 2.0 layout too. It has no `steamdrm.dll`:
+  the stub copies a header whose first dword seeds the running XOR over the rest, and the
+  code section is the same running XOR keyed by a header field. Found on Unreal
+  Tournament (Steam, app 13240).
+- `runtime/win32hle/` WinMain bring-up, driven by running a lifted Fury³ under
+  the permissive host and implementing each import it reached:
+  - `user32.c`: the window-setup and RECT surface a GUI WinMain needs —
+    `FindWindowA` (single-instance), `LoadIcon/Cursor/Image/Bitmap/Accelerators/
+    Menu` (non-NULL handles; a NULL accelerator table is fatal to some games),
+    `TranslateAcceleratorA`, `GetSystemMetrics` (a 1600×960 desktop),
+    `GetClientRect`/`GetWindowRect`/`Adjust*`, `BeginPaint`/`EndPaint`,
+    `MessageBoxA` (to stderr), the focus/z-order setters, and the `*Rect`
+    helpers (`CopyRect`/`OffsetRect`/`SetRect*`/`InflateRect`).
+  - `winmm.c` (new): WINMM — multimedia timers, no-joystick, and a silent
+    waveOut device that retires every buffer immediately (so a mixer thread
+    keeps cycling without a sound card), MCI stubbed.
+  - `kernel32_crt.c`: `CreateThread` runs the lifted start routine on a pthread
+    via `hle_call_guest` (each guest thread already gets its own stack+TIB);
+    guest threads interleave cooperatively, yielding the machine lock in the
+    blocking shims (`Sleep` now yields, `WaitForSingleObject`).
+  - `kernel32_ext.c` `CreateFileA` translates Windows `\\` to `/`, and
+    `GetModuleFileNameA`/`GetCurrentDirectoryA` return the real image location
+    (`hle_set_module_path`) so a title finds its data relative to the exe.
+  With these a lifted Fury³ runs its whole CRT **and WinMain** on Linux —
+  through window creation, its worker thread, and timing — into its own asset
+  loader (it then wants its `.POD` data manifest, which is game packaging, not a
+  runtime gap). `HLE_FILETRACE=1` logs the data files a title opens. (#45)
 
 ### Fixed
+- lift32: MMX's byte and unsigned-saturating ops (`paddusb`, `psubusb`, `paddusw`, `psubusw`,
+  `paddb`, `psubb`, `paddsb`, `psubsb`, `pcmpeqb`, `pcmpgtb`, `pcmpeqd`, `pcmpgtd`,
+  `packsswb`) are lifted. They were emitted as an `UNIMPLEMENTED` comment and the lift
+  still counted 0 errors. Unreal Tournament's software renderer blends every translucent
+  pixel with one `paddusb`, so its HUD panels were drawn opaque, solid black when faded
+  out. `mmx_selftest.c` covers each one.
+- native32 under Wine (macOS with CrossOver, Linux): `native32_init` turns DEP on,
+  since Wine otherwise answers the first fetch from the guest's code by making it
+  executable and running the original machine code; and the fault handler takes a
+  read of the faulting instruction's own address as a fetch, as Wine under Rosetta
+  reports one. Callbacks into lifted code now arrive under Wine. (#55, by
+  [@cpressland](https://github.com/cpressland))
+- lift32: a signed or unsigned ordering jcc/setcc after `or` or `xor` (`jge`, `jl`, `jg`,
+  `jle`, `ja`, `jbe`, `jb`, `jae`) tests the result's sign and zero, as after `test`. It
+  compared the result with itself (`xor eax, [b]; jge` was always taken). Unreal
+  Tournament's clipper asks whether an edge crosses a plane that way; its renderer drew
+  stretched, overlapping shards. Four difftest cases.
+- disasm32: a data pointer to an instruction start inside another body is a function entry
+  when it is 16-aligned right after `nop`/`int3` padding: that body ran past a call that
+  never returns, through the padding, into the next function, and the data scan had skipped
+  the pointer as already covered. Unreal Tournament's UWeb.dll lost a static constructor
+  named only by its `_initterm` table that way, and loading the DLL faulted on it.
+- `recomp_types.h`: gcc and clang get `__rdtsc` from `<x86intrin.h>`, as MSVC
+  gets it from `<intrin.h>`, so generated code that reads the timestamp
+  counter compiles off Windows.
 - disasm32: straight-line code longer than one scan window (8 KB, 4 KB per block) is decoded
   to its end. The rest of the function used to be dropped. KotOR registers its script commands in
   ~7 KB of `mov [reg+disp], offset`, so 142 functions named only there were never catalogued;

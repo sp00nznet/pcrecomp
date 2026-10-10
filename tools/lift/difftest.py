@@ -507,6 +507,16 @@ CASES = [
     # failed on every call, which is what kept the campaign from loading.
     #
     # The sign of the register is the whole point, so each is run three ways.
+    # `xor a, b; jge` asks "same sign?". It mapped to CMP_GE(r, r) -- always
+    # true -- so Unreal's clipper never saw an edge cross a plane.
+    Case('setge.after-xor.signs-differ', bytes.fromhex('31c80f9dc3'),   # xor eax,ecx; setge bl
+         regs={'eax': 0xBF800000, 'ecx': 0x3F800000}),
+    Case('setge.after-xor.signs-same', bytes.fromhex('31c80f9dc3'),
+         regs={'eax': 0xBF800000, 'ecx': 0xC0000000}),
+    Case('setl.after-or.negative', bytes.fromhex('09c80f9cc3'),         # or eax,ecx; setl bl
+         regs={'eax': 0x80000000, 'ecx': 1}),
+    Case('setg.after-or.zero', bytes.fromhex('09c80f9fc3'),             # or eax,ecx; setg bl
+         regs={'eax': 0, 'ecx': 0}),
     Case('setle.after-test.positive', bytes.fromhex('85db0f9ec0'),  # test ebx,ebx; setle al
          {'ebx': 0x0000002C, 'eax': 0}),
     Case('setle.after-test.zero', bytes.fromhex('85db0f9ec0'),

@@ -251,24 +251,42 @@ static void native_bridge(void) {
      * `mov esi, src` for rep movsd cut the frame off and the next local read
      * was garbage: the first native call jumped to 0 (KotOR, clang-cl). So:
      * no esi or ebp, every input in a register before esp moves, and the
-     * arguments copied by pushes, highest slot first. */
+     * arguments copied by pushes, highest slot first.
+     *
+     * Nor does the callee have to keep the C ABI. It is usually Windows, but
+     * it can be the guest's own hand-written asm, run natively because no lift
+     * can hold it (code in a data section, a native module), and that was
+     * only ever called from inline asm that saved everything: UT's Fire.dll
+     * returns with ebx and ebp changed. So ebp, esi and ebx are saved on the
+     * stack, and the esp anchor is kept in this thread's TEB
+     * (ArbitraryUserPointer, fs:[0x14], its old value saved and put back, so a
+     * nested bridge through a callback unwinds in order). */
     __asm {
         fnstsw ax
         mov  sw0, ax             ; x87 TOP before
         mov  edx, src
         mov  eax, fn
         mov  edi, this_ecx
+        push ebp
+        push esi
+        push ebx
+        push dword ptr fs:[0x14]
         mov  ecx, BRIDGE_SLOTS
     copy_args:
         push dword ptr [edx + ecx * 4 - 4]
         dec  ecx
         jnz  copy_args
-        mov  ebx, esp            ; callee-saved: survives the call
+        mov  fs:[0x14], esp      ; the anchor: survives any callee
         mov  ecx, edi            ; thiscall / COM 'this'
         call eax
         mov  ecx, esp
-        sub  ecx, ebx            ; bytes the callee popped
-        lea  esp, [ebx + BRIDGE_SLOTS * 4]
+        mov  esp, fs:[0x14]
+        sub  ecx, esp            ; bytes the callee popped
+        add  esp, BRIDGE_SLOTS * 4
+        pop  dword ptr fs:[0x14]
+        pop  ebx
+        pop  esi
+        pop  ebp                 ; the frame is reachable again
         mov  r_eax, eax
         mov  r_edx, edx
         mov  purge, ecx
@@ -344,9 +362,27 @@ static void shim_CreateThread(void) {
  * frames (eh32.c), so the guest's catch blocks run. */
 void native32_shim_CxxThrowException(void);
 
+/* msvcrt helpers that take their arguments on the x87 stack (x87crt.c): the
+ * bridge passes stack arguments only, and the lifted FPU stack is g_st. */
+#define X87CRT(n) void native32_shim_##n(void);
+X87CRT(ftol) X87CRT(CIsqrt) X87CRT(CIsin) X87CRT(CIcos) X87CRT(CItan) X87CRT(CIasin)
+X87CRT(CIacos) X87CRT(CIatan) X87CRT(CIexp) X87CRT(CIlog) X87CRT(CIlog10) X87CRT(CIsinh)
+X87CRT(CIcosh) X87CRT(CItanh) X87CRT(CIpow) X87CRT(CIfmod) X87CRT(CIatan2)
+X87CRT(controlfp) X87CRT(control87)
+
 static native32_shim_t g_builtin[] = {
     { "CreateThread", shim_CreateThread },
     { "_CxxThrowException", native32_shim_CxxThrowException },
+    { "_ftol", native32_shim_ftol },
+    { "_CIsqrt", native32_shim_CIsqrt }, { "_CIsin", native32_shim_CIsin },
+    { "_CIcos", native32_shim_CIcos }, { "_CItan", native32_shim_CItan },
+    { "_CIasin", native32_shim_CIasin }, { "_CIacos", native32_shim_CIacos },
+    { "_CIatan", native32_shim_CIatan }, { "_CIexp", native32_shim_CIexp },
+    { "_CIlog", native32_shim_CIlog }, { "_CIlog10", native32_shim_CIlog10 },
+    { "_CIsinh", native32_shim_CIsinh }, { "_CIcosh", native32_shim_CIcosh },
+    { "_CItanh", native32_shim_CItanh }, { "_CIpow", native32_shim_CIpow },
+    { "_CIfmod", native32_shim_CIfmod }, { "_CIatan2", native32_shim_CIatan2 },
+    { "_controlfp", native32_shim_controlfp }, { "_control87", native32_shim_control87 },
 };
 
 int native32_bind(uint32_t base, native32_shim_t* shims, int nshims) {
@@ -461,7 +497,15 @@ static __declspec(naked) void cb_tramp(void) {
 static LONG CALLBACK native32_veh(EXCEPTION_POINTERS* ep) {
     EXCEPTION_RECORD* er = ep->ExceptionRecord;
     uint32_t pc = (uint32_t)(uintptr_t)er->ExceptionAddress;
-    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->ExceptionInformation[0] == 8 &&
+    /* An instruction fetch: Windows says so (8, execute). Wine on Apple
+     * Silicon (CrossOver, 32-bit code under Rosetta) reports it as a read,
+     * but a read of the faulting instruction's own address is a fetch too:
+     * Wine calling a window procedure in the shim page came through as
+     * "read of 0x032D0170" at 0x032D0170, and the game died creating its
+     * window. */
+    int fetch = er->NumberParameters >= 2 &&
+                (er->ExceptionInformation[0] == 8 || (uint32_t)er->ExceptionInformation[1] == pc);
+    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fetch &&
         (native32_in_guest(pc) || IS_SHIM_VA(pc))) {
         if (recomp_lookup(pc) || IS_SHIM_VA(pc)) {
             ep->ContextRecord->Eax = pc;
@@ -476,6 +520,11 @@ static LONG CALLBACK native32_veh(EXCEPTION_POINTERS* ep) {
 /* ---------------------------------------------------------------- setup */
 
 void native32_init(void) {
+    /* Every Windows -> guest call relies on the guest's code faulting when it
+     * is fetched. Windows enforces that for a /NXCOMPAT exe; Wine does not
+     * unless DEP is asked for, and otherwise answers the first fetch by making
+     * the page executable and running the shipping machine code. */
+    SetProcessDEPPolicy(PROCESS_DEP_ENABLE);
     InitializeCriticalSection(&g_mach);
     recomp_yield_hook = native32_yield;
     g_mach_tls = TlsAlloc();
@@ -505,3 +554,4 @@ void native32_dump_icalls(int n) {
 /* Built-in bodies kept in their own files, compiled as part of this one so a
  * host's build needs no change when one is added. */
 #include "eh32.c"
+#include "x87crt.c"
