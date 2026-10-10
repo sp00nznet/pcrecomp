@@ -648,11 +648,18 @@ class Lifter:
 
         if setter == 'cmp':
             return f"{cmp_macro}({ops})"
-        elif setter in ('test', 'and'):
+        elif setter in ('test', 'and', 'or', 'xor'):
             # After `test` (and `and`, whose result is the same value), CF=0 and
             # OF=0, so the unsigned/signed-ordering jccs reduce to ZF/SF tests
             # against the AND result -- NOT cmp(a,b), which would compare the two
             # operands as if subtracted. Map them directly.
+            #
+            # `or` and `xor` capture their RESULT in both slots, so TEST_*(r, r)
+            # tests exactly r and the same table is exact for them too. They used
+            # to fall to cmp_macro: `xor eax, [b]; jge` ("same sign?") became
+            # CMP_GE(r, r), always true. Unreal's clipper asks whether an edge
+            # crosses a plane that way, never saw one cross, and drew every
+            # clipped polygon as stretched shards.
             test_only = {
                 'jbe': f"TEST_Z({ops})",  'ja':  f"TEST_NZ({ops})",   # CF=0: jbe==je, ja==jne
                 'jb':  "0",               'jae': "1",                 # CF=0: jb never, jae always
@@ -668,15 +675,6 @@ class Lifter:
             # sub and cmp leave the same flags, and the CMP_* macros are written
             # as a subtraction, so the pairing is exact.
             return f"/* sub result */ {cmp_macro}({ops})"
-        elif setter in ('or', 'xor'):
-            # Logical ops clear CF and set ZF/SF from the result. `and` is
-            # handled above, where the TEST_* macros compute exactly its result.
-            # ponytail: or/xor keep the old pairing -- TEST_* computes `a & b`,
-            # which is NOT their result, so an ordering jcc after one of them is
-            # still approximate. Give them their own macros if one ever shows up.
-            if test_macro:
-                return f"/* {setter} result */ {test_macro}({ops})"
-            return f"/* {setter} result */ {cmp_macro}({ops})"
         elif setter == 'dec':
             # dec's operands are (value, 1) and its result is value - 1, which
             # is what a CMP_* macro computes. Same as sub.

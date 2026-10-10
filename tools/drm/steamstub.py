@@ -32,9 +32,13 @@ wrapper -- the stub calls through it -- so nothing needs rebuilding.
     python tools/drm/steamstub.py swkotor.exe swkotor_unwrapped.exe
     python tools/drm/steamstub.py --selftest
 
-Only the 2.x x86 layout seen in KotOR (2004 build, steamdrm.dll from
-`s3_main`) is known. Any other layout fails one of the checks below with a
-message saying which, rather than writing a broken file. emu_unpack.py is the
+Two x86 layouts are known. The 2.x one above, seen in KotOR (2004 build,
+steamdrm.dll from `s3_main`); and the older one on Unreal Tournament's Steam
+build (unwrap_v20): no steamdrm.dll at all, the stub copies its header with
+`rep movsd`, the header's first dword is its own XOR seed, and the code section
+is the same running XOR again, keyed by a header field. Any other layout fails
+one of the checks below with a message saying which, rather than writing a
+broken file. emu_unpack.py is the
 fallback for a wrapper this cannot parse: it gets as far as SteamAPI_Init.
 """
 import argparse
@@ -141,6 +145,60 @@ def drm_field_offsets(dll, checksum):
     raise StubError('found %d of the %d payload fields in steamdrm.dll' % (len(found), len(DRM_FIELDS)))
 
 
+# The older stub: `mov esi, header; mov ecx, dwords; lea edi, [ebp-x]; rep movsd`
+# right after the common prologue. Its header's first dword seeds the XOR over
+# the rest; fields below are offsets into that decoded rest.
+V20_COPY = re.compile(rb'\xBE(.{4})\xB9(.{4})\x8D\xBD.{4}\xF3\xA5', re.S)
+V20_FLAGS, V20_OEP, V20_CODE_VA, V20_CODE_SIZE, V20_CODE_KEY, V20_APPID = 0x14, 0x28, 0x2C, 0x30, 0x34, 0x38
+V20_FLAG_CODE_XORED = 4             # the stub runs the XOR over the code only when set
+
+
+def unwrap_v20(raw, pe, entry_bytes):
+    """(unwrapped file bytes, info dict) for the older stub, or None if it is not one."""
+    m = V20_COPY.match(entry_bytes, len(STUB_PROLOGUE))
+    if not entry_bytes.startswith(STUB_PROLOGUE) or not m:
+        return None
+    base = pe.OPTIONAL_HEADER.ImageBase
+    hdr_va, ndw = struct.unpack('<I', m.group(1))[0], struct.unpack('<I', m.group(2))[0]
+    off = pe.get_offset_from_rva(hdr_va - base)
+    if off is None or not 2 <= ndw <= 0x1000 or off + 4 * ndw > len(raw):
+        raise StubError('header 0x%08X (%d dwords) is not backed by the file' % (hdr_va, ndw))
+    seed = struct.unpack_from('<I', raw, off)[0]
+    hdr = xor_chain(raw[off + 4:off + 4 * ndw], seed)
+    word = lambda o: struct.unpack_from('<I', hdr, o)[0]   # noqa: E731
+    f = {k: word(o) for k, o in (('flags', V20_FLAGS), ('oep', V20_OEP), ('code_va', V20_CODE_VA),
+                                 ('code_size', V20_CODE_SIZE), ('appid', V20_APPID))}
+    code = next((s for s in pe.sections if s.VirtualAddress == f['code_va'] - base), None)
+    if code is None:
+        raise StubError('code VA 0x%08X is not the start of a section' % f['code_va'])
+    if not f['code_va'] <= f['oep'] < f['code_va'] + code.Misc_VirtualSize:
+        raise StubError('OEP 0x%08X is outside the code section' % f['oep'])
+    if f['code_size'] > code.SizeOfRawData:
+        raise StubError('code size 0x%X is larger than the section on disk' % f['code_size'])
+    out = bytearray(raw)
+    if f['flags'] & V20_FLAG_CODE_XORED:
+        lo = code.PointerToRawData
+        out[lo:lo + f['code_size'] // 4 * 4] = xor_chain(raw[lo:lo + f['code_size']], word(V20_CODE_KEY))
+    finish(out, pe, f['oep'])
+    return bytes(out), dict(f, variant='2.0', header_va=hdr_va, section=code.Name.rstrip(b'\0').decode(),
+                            encryption='XOR chain' if f['flags'] & V20_FLAG_CODE_XORED else None)
+
+
+def finish(out, pe, oep):
+    """Point the entry at the OEP and drop .bind when nothing follows it in the file:
+    left in, it is an executable section full of dead stub for every later tool."""
+    opt = pe.OPTIONAL_HEADER.get_file_offset()
+    struct.pack_into('<I', out, opt + 16, oep - pe.OPTIONAL_HEADER.ImageBase)   # AddressOfEntryPoint
+    struct.pack_into('<I', out, opt + 64, 0)                                    # CheckSum: stale now
+    bind = pe.sections[-1]
+    if bind.Name.rstrip(b'\0') == b'.bind' and bind.PointerToRawData + bind.SizeOfRawData >= len(out):
+        hdr = bind.get_file_offset()
+        out[hdr:hdr + 40] = bytes(40)
+        struct.pack_into('<H', out, pe.FILE_HEADER.get_file_offset() + 2, len(pe.sections) - 1)
+        struct.pack_into('<I', out, opt + 56, bind.VirtualAddress)   # SizeOfImage
+        del out[bind.PointerToRawData:]
+
+
 def unwrap(raw):
     """(unwrapped file bytes, info dict) for a SteamStub 2.x x86 executable."""
     pe = pefile.PE(data=raw, fast_load=True)
@@ -153,6 +211,9 @@ def unwrap(raw):
         return raw[off:off + n]
 
     entry = base + pe.OPTIONAL_HEADER.AddressOfEntryPoint
+    older = unwrap_v20(raw, pe, file_at(entry, 0x60))
+    if older:
+        return older
     hdr_va, ndw, seed = stub_constants(file_at(entry, 0x60))
     hdr = xor_chain(file_at(hdr_va, 4 * ndw), seed)
     word = lambda b, o: struct.unpack_from('<I', b, o)[0]   # noqa: E731
@@ -200,19 +261,9 @@ def unwrap(raw):
             raise StubError('code section did not decrypt (bad padding): wrong key or layout')
         out[code.PointerToRawData:code.PointerToRawData + f['code_size']] = plain[:-pad]
 
-    opt = pe.OPTIONAL_HEADER.get_file_offset()
-    struct.pack_into('<I', out, opt + 16, f['oep'] - base)    # AddressOfEntryPoint
-    struct.pack_into('<I', out, opt + 64, 0)                  # CheckSum: stale now
-    # Drop .bind when it is the last section and nothing follows it in the file:
-    # left in, it is an executable section full of dead stub for every later tool.
-    bind = pe.sections[-1]
-    if bind.Name.rstrip(b'\0') == b'.bind' and bind.PointerToRawData + bind.SizeOfRawData >= len(raw):
-        hdr = bind.get_file_offset()
-        out[hdr:hdr + 40] = bytes(40)
-        struct.pack_into('<H', out, pe.FILE_HEADER.get_file_offset() + 2, len(pe.sections) - 1)
-        struct.pack_into('<I', out, opt + 56, bind.VirtualAddress)   # SizeOfImage
-        del out[bind.PointerToRawData:]
-    info = dict(f, header_va=hdr_va, checksum=checksum, payload_va=payload_va,
+    finish(out, pe, f['oep'])
+    info = dict(f, variant='2.x', encryption=None if f['flags'] & FLAG_CODE_NOT_ENCRYPTED else 'AES-256-CBC',
+                header_va=hdr_va, checksum=checksum, payload_va=payload_va,
                 drm_va=drm_va, drm_size=drm_size, section=code.Name.rstrip(b'\0').decode())
     return bytes(out), info
 
@@ -258,6 +309,11 @@ def selftest():
         raise AssertionError('accepted a plain prologue')
     except StubError:
         pass
+    # The older stub's header copy, from Unreal Tournament's bytes (header 0x10964380, 0xDD dwords).
+    ut = STUB_PROLOGUE + bytes.fromhex('be80439610b9dd0000008dbdd0f8fffff3a5')
+    m = V20_COPY.match(ut, len(STUB_PROLOGUE))
+    assert m and struct.unpack('<2I', m.group(1) + m.group(2)) == (0x10964380, 0xDD)
+    assert not V20_COPY.match(stub, len(STUB_PROLOGUE))     # KotOR's stub is not the older one
     print('steamstub selftest: ok')
 
 
@@ -273,12 +329,14 @@ def main():
         out, info = unwrap(raw)
     except StubError as e:
         sys.exit('steamstub: %s' % e)
-    print('SteamStub 2.x: app %d, header 0x%08X, steamdrm.dll 0x%08X (0x%X bytes)'
-          % (info['appid'], info['header_va'], info['drm_va'], info['drm_size']))
+    if info['variant'] == '2.x':
+        print('SteamStub 2.x: app %d, header 0x%08X, steamdrm.dll 0x%08X (0x%X bytes)'
+              % (info['appid'], info['header_va'], info['drm_va'], info['drm_size']))
+    else:
+        print('SteamStub %s: app %d, header 0x%08X' % (info['variant'], info['appid'], info['header_va']))
     print('  %s 0x%08X+0x%X %s; OEP 0x%08X' % (
         info['section'], info['code_va'], info['code_size'],
-        'not encrypted' if info['flags'] & FLAG_CODE_NOT_ENCRYPTED else 'decrypted (AES-256-CBC)',
-        info['oep']))
+        'decrypted (%s)' % info['encryption'] if info['encryption'] else 'not encrypted', info['oep']))
     with open(args.out, 'wb') as f:
         f.write(out)
     print('wrote %s' % args.out)

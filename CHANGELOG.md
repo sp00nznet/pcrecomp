@@ -59,6 +59,10 @@ versions follow [SemVer](https://semver.org/).
   block, OEP, code range) are read from its own code. The code section is then
   AES-256-CBC decrypted, with the IV taken from an ECB-decrypted first block. The
   dead `.bind` section is dropped. Needs `cryptography`. Found on KotOR (Steam, app 32370).
+- `tools/drm/steamstub.py`: the older SteamStub 2.0 layout too. It has no `steamdrm.dll`:
+  the stub copies a header whose first dword seeds the running XOR over the rest, and the
+  code section is the same running XOR keyed by a header field. Found on Unreal
+  Tournament (Steam, app 13240).
 - `runtime/win32hle/` WinMain bring-up, driven by running a lifted Fury³ under
   the permissive host and implementing each import it reached:
   - `user32.c`: the window-setup and RECT surface a GUI WinMain needs —
@@ -90,6 +94,22 @@ versions follow [SemVer](https://semver.org/).
   still counted 0 errors. Unreal Tournament's software renderer blends every translucent
   pixel with one `paddusb`, so its HUD panels were drawn opaque, solid black when faded
   out. `mmx_selftest.c` covers each one.
+- native32 under Wine (macOS with CrossOver, Linux): `native32_init` turns DEP on,
+  since Wine otherwise answers the first fetch from the guest's code by making it
+  executable and running the original machine code; and the fault handler takes a
+  read of the faulting instruction's own address as a fetch, as Wine under Rosetta
+  reports one. Callbacks into lifted code now arrive under Wine. (#55, by
+  [@cpressland](https://github.com/cpressland))
+- lift32: a signed or unsigned ordering jcc/setcc after `or` or `xor` (`jge`, `jl`, `jg`,
+  `jle`, `ja`, `jbe`, `jb`, `jae`) tests the result's sign and zero, as after `test`. It
+  compared the result with itself (`xor eax, [b]; jge` was always taken). Unreal
+  Tournament's clipper asks whether an edge crosses a plane that way; its renderer drew
+  stretched, overlapping shards. Four difftest cases.
+- disasm32: a data pointer to an instruction start inside another body is a function entry
+  when it is 16-aligned right after `nop`/`int3` padding: that body ran past a call that
+  never returns, through the padding, into the next function, and the data scan had skipped
+  the pointer as already covered. Unreal Tournament's UWeb.dll lost a static constructor
+  named only by its `_initterm` table that way, and loading the DLL faulted on it.
 - `recomp_types.h`: gcc and clang get `__rdtsc` from `<x86intrin.h>`, as MSVC
   gets it from `<intrin.h>`, so generated code that reads the timestamp
   counter compiles off Windows.
