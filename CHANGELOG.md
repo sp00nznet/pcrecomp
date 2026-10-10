@@ -12,7 +12,7 @@ versions follow [SemVer](https://semver.org/).
   of `loop`/`loopz`/`loopnz`/`jcxz`. String ops with 67h are flagged `UNHANDLED`
   rather than lifted as their 16-bit twins. Found on Epic Pinball's MASI Sound
   Blaster driver; Blake Stone's two lifts are byte-identical before and after.
-  `tools/lift/test_addr32_16.py`.
+  `tools/lift/test_addr32_16.py`. (#74)
 - dos32: `dos32_config.overlay`, a folder laid over drive C: for files opened
   read-only, so a host can offer mods without touching the game's files.
   (#73)
