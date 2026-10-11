@@ -10,7 +10,7 @@ versions follow [SemVer](https://semver.org/).
   Win32 it used (the 4 GB reservation, locks, the clock, the fault handler, the
   CRT's file calls) has POSIX stand-ins, and guest paths match names on disk
   whatever their case. Theme Park's guest memory after a 58-second scripted
-  run is identical on both systems (docs/DOS32.md). (#PR)
+  run is identical on both systems (docs/DOS32.md). (#84)
 - dos32: save states. `dos32_state_save` / `dos32_state_load` write the whole
   machine to a file and back: registers, the host's tables, the chips, and
   memory with all-zero pages left out (about 8 MB for Theme Park). A state
