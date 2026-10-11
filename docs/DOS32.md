@@ -18,6 +18,24 @@ MAIN.EXE (MZ + LE)
 The relocated image goes into the build as data (the game's `run_lift.py`
 writes it next to the lifted C), and `dos32_run` copies it into guest memory.
 
+## Windows and Linux
+
+`dos32.c` builds with clang-cl or MSVC on Windows and with gcc or clang on
+Linux, from the same source. The Win32 it uses sits behind a short block of
+POSIX stand-ins at the top: the 4 GB reservation is `mmap` with `PROT_NONE`
+and `mprotect` for what is used, the locks are recursive pthread mutexes,
+guest faults are `sigaction` on an alternate stack, and the time comes from
+`CLOCK_MONOTONIC`. Linux file names have case and DOS names do not, so each
+part of a guest path is matched to the name on disk whatever its case; `int 21h
+4Eh` searches with `fnmatch`, case-blind. Theme Park's guest memory after the
+same 58-second scripted run is byte for byte the same on both.
+
+Lifted code compiled by gcc needs `-foptimize-sibling-calls` (on at `-O2`,
+off at `-O1`): a guest `jmp` to another function is a C tail call, and
+without the optimisation every one keeps a host stack frame. The host stack
+then grows for as long as the program runs, and save states refuse to load
+because the host's stack depth no longer matches where they were saved.
+
 ## What the lifter does in DOS mode
 
 `Lifter(dos=True)` turns the instructions Win32 code never uses into host
@@ -142,8 +160,8 @@ menu, and not into a different build.
 - Anything unhandled is reported once, always: `dos32: unhandled int 21h 0x44 ...`.
 - A guest fault prints the guest address, the lifted function, the registers,
   the last indirect calls and the top of the guest stack.
-- `DOS32_BREAK=addr`: a hardware write watchpoint on a guest word. Each write
-  logs the lifted function and the value. This found Theme Park's attract-mode
+- `DOS32_BREAK=addr` (Windows): a hardware write watchpoint on a guest word.
+  Each write logs the lifted function and the value. This found Theme Park's attract-mode
   timeout in one run:
 
   ```

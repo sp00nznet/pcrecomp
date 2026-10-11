@@ -28,10 +28,15 @@
  * read), with every register and flag saved around the handler. That is a
  * coarser grain than the hardware's, and it is what makes delivery safe.
  */
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <mmsystem.h>
 #include <io.h>
+#include <intrin.h>
+#else
+#define _GNU_SOURCE              /* REG_ERR, FNM_CASEFOLD */
+#endif
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <ctype.h>
@@ -42,7 +47,106 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <intrin.h>
+
+#ifndef _WIN32
+/* Linux (any POSIX host with gcc or clang): the few Win32 and MSVC CRT names
+ * this file uses, so the host itself reads the same on both. */
+#include <dirent.h>
+#include <fnmatch.h>
+#include <pthread.h>
+#include <sched.h>
+#include <signal.h>
+#include <strings.h>
+#include <sys/mman.h>
+#include <ucontext.h>
+#include <unistd.h>
+typedef pthread_mutex_t CRITICAL_SECTION;
+static void InitializeCriticalSection(CRITICAL_SECTION* m) {   /* recursive, as Windows' are */
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a);
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(m, &a);
+}
+#define EnterCriticalSection pthread_mutex_lock
+#define LeaveCriticalSection pthread_mutex_unlock
+typedef int LONG;
+#define InterlockedExchange(p, v) __atomic_exchange_n((p), (v), __ATOMIC_SEQ_CST)
+#define Sleep(ms) usleep((ms) * 1000u)
+#define SwitchToThread() sched_yield()
+#define _AddressOfReturnAddress() ((char*)__builtin_frame_address(0) + sizeof(void*))
+#define _open open
+#define _read read
+#define _write write
+#define _close close
+#define _lseek lseek
+#define _unlink unlink
+#define _chsize ftruncate
+#define _O_RDONLY O_RDONLY
+#define _O_WRONLY O_WRONLY
+#define _O_RDWR O_RDWR
+#define _O_CREAT O_CREAT
+#define _O_EXCL O_EXCL
+#define _O_TRUNC O_TRUNC
+#define _O_BINARY 0
+#define _S_IREAD 0444
+#define _S_IWRITE 0222
+#define _A_SUBDIR 0x10
+
+/* DOS names have no case and Linux's do: each part of the path as it is
+ * spelt on disk, where one is there. A part that is not (a file about to be
+ * made) is left as the program wrote it. */
+static void fix_case(char* path) {
+    for (char* p = path + 1;; p++) {
+        char c = *p;
+        if (c != '/' && c) continue;
+        *p = 0;
+        struct stat st;
+        if (stat(path, &st) != 0) {
+            char* s = strrchr(path, '/');
+            *s = 0;
+            DIR* d = opendir(s == path ? "/" : path);
+            *s = '/';
+            for (struct dirent* e; d && (e = readdir(d)) != NULL; )
+                if (!strcasecmp(e->d_name, s + 1)) { memcpy(s + 1, e->d_name, strlen(s + 1)); break; }
+            if (d) closedir(d);
+        }
+        *p = c;
+        if (!c) break;
+    }
+}
+
+/* int 21h 4Eh/4Fh: one search at a time, as the MSVC CRT's _findfirst is
+ * used here. Case-blind; "*.*" is everything, as DOS has it.
+ * ponytail: fnmatch, not DOS's 8.3 rules ("A*.*" misses a name with no dot). */
+struct _finddata_t { unsigned attrib; time_t time_write; long size; char name[260]; };
+static DIR* find_dir;
+static char find_path[600], find_pat[64];
+static int _findnext(intptr_t h, struct _finddata_t* fd) {
+    (void)h;
+    for (struct dirent* e; find_dir && (e = readdir(find_dir)) != NULL; ) {
+        if (fnmatch(find_pat, e->d_name, FNM_CASEFOLD) != 0) continue;
+        char p[900];
+        struct stat st;
+        snprintf(p, sizeof p, "%s/%s", find_path, e->d_name);
+        if (stat(p, &st) != 0) continue;
+        fd->attrib = S_ISDIR(st.st_mode) ? _A_SUBDIR : 0;
+        fd->time_write = st.st_mtime;
+        fd->size = (long)st.st_size;
+        snprintf(fd->name, sizeof fd->name, "%s", e->d_name);
+        return 0;
+    }
+    return -1;
+}
+static int _findclose(intptr_t h) { (void)h; if (find_dir) closedir(find_dir); find_dir = NULL; return 0; }
+static intptr_t _findfirst(const char* path, struct _finddata_t* fd) {
+    _findclose(0);
+    const char* s = strrchr(path, '/');
+    snprintf(find_pat, sizeof find_pat, "%s", strcmp(s + 1, "*.*") ? s + 1 : "*");
+    snprintf(find_path, sizeof find_path, "%.*s", (int)(s - path), path);
+    find_dir = opendir(find_path);
+    return _findnext(0, fd) == 0 ? 1 : -1;
+}
+#endif
 
 #include "recomp_types.h"
 #include "dos32.h"
@@ -290,12 +394,21 @@ static void irq(int v) {
 }
 
 /* ---- timer -------------------------------------------------------------- */
+#ifdef _WIN32
 static LARGE_INTEGER qpf, t0;
 static double now_s(void) {
     LARGE_INTEGER t;
+    if (!qpf.QuadPart) { QueryPerformanceFrequency(&qpf); QueryPerformanceCounter(&t0); }
     QueryPerformanceCounter(&t);
     return (double)(t.QuadPart - t0.QuadPart) / (double)qpf.QuadPart;
 }
+#else
+static double now_s(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + t.tv_nsec * 1e-9;
+}
+#endif
 static uint32_t pit_div = 65536;
 static int pit_latch, pit_lohi, pit_mode_byte;
 static double pit_next, bios_next;
@@ -609,7 +722,12 @@ static void host_path(const char* dos, char* out, size_t n) {
     if (*p == '\\' || *p == '/') snprintf(tmp, sizeof tmp, "%s", p);
     else snprintf(tmp, sizeof tmp, "%s\\%s", cwd, p);
     snprintf(out, n, "%s%s", C->root, tmp);
+#ifdef _WIN32
     for (char* q = out; *q; q++) if (*q == '/') *q = '\\';
+#else
+    for (char* q = out; *q; q++) if (*q == '\\') *q = '/';
+    fix_case(out);
+#endif
 }
 
 static void guest_str(uint32_t va, char* out, size_t n) {
@@ -660,16 +778,14 @@ static uint32_t dsdx(regs_t* r) { return ds_ptr(r, r->rm ? DX(r) : r->edx); }
 /* The DOS clock: the host's time at start, plus guest time since. A program
  * that times itself by the DOS clock then keeps pace with everything else
  * (the speed control, the virtual clock of a headless run). */
-static FILETIME start_ft;
-static void guest_clock(SYSTEMTIME* t) {
-    ULARGE_INTEGER u;
-    if (!start_ft.dwLowDateTime && !start_ft.dwHighDateTime) {
-        SYSTEMTIME now; GetLocalTime(&now); SystemTimeToFileTime(&now, &start_ft);
-    }
-    u.LowPart = start_ft.dwLowDateTime; u.HighPart = start_ft.dwHighDateTime;
-    u.QuadPart += (ULONGLONG)(gtime() * 1e7);
-    FILETIME ft = { u.LowPart, u.HighPart };
-    FileTimeToSystemTime(&ft, t);
+static time_t start_time;
+static int guest_clock(struct tm* t) {   /* returns hundredths of a second */
+    if (!start_time) start_time = time(NULL);
+    double g = gtime();
+    time_t s = start_time + (time_t)g;
+    struct tm* l = localtime(&s);
+    if (l) *t = *l; else memset(t, 0, sizeof *t);
+    return (int)((g - (double)(long long)g) * 100);
 }
 
 /* ---- int 21h ------------------------------------------------------------ */
@@ -691,11 +807,11 @@ static void int21(regs_t* r) {
     case 0x25: pmvec[AL(r)].sel = r->ds; pmvec[AL(r)].off = r->edx;
                LOG("dos32: int 21h set vector %02X -> %08X\n", AL(r), r->edx); break;
     case 0x35: r->es = pmvec[AL(r)].sel; r->ebx = pmvec[AL(r)].off; break;
-    case 0x2A: { SYSTEMTIME t; guest_clock(&t);
-        SET16(r->ecx, t.wYear); SET8H(r->edx, t.wMonth); SET8L(r->edx, t.wDay); SET8L(r->eax, t.wDayOfWeek); break; }
-    case 0x2C: { SYSTEMTIME t; guest_clock(&t);
-        SET8H(r->ecx, t.wHour); SET8L(r->ecx, t.wMinute); SET8H(r->edx, t.wSecond);
-        SET8L(r->edx, t.wMilliseconds / 10); break; }
+    case 0x2A: { struct tm t; guest_clock(&t);
+        SET16(r->ecx, t.tm_year + 1900); SET8H(r->edx, t.tm_mon + 1); SET8L(r->edx, t.tm_mday); SET8L(r->eax, t.tm_wday); break; }
+    case 0x2C: { struct tm t; int cs = guest_clock(&t);
+        SET8H(r->ecx, t.tm_hour); SET8L(r->ecx, t.tm_min); SET8H(r->edx, t.tm_sec);
+        SET8L(r->edx, cs); break; }
     case 0x30: SET16(r->eax, 0x0006); r->ebx &= 0xFFFF0000u; r->ecx &= 0xFFFF0000u; break;  /* DOS 6.0 */
     case 0x33: SET8L(r->edx, 0); break;
     case 0x36: SET16(r->eax, 64); SET16(r->ebx, 0x7FFF); SET16(r->ecx, 512); SET16(r->edx, 0xFFFF); break;
@@ -715,6 +831,9 @@ static void int21(regs_t* r) {
         if (C->overlay && fl == _O_RDONLY) {   /* a mod's copy of the file wins, for reading */
             char opath[600];
             snprintf(opath, sizeof opath, "%s%s", C->overlay, path + strlen(C->root));
+#ifndef _WIN32
+            fix_case(opath);
+#endif
             fd = _open(opath, fl | _O_BINARY);
             if (fd >= 0) LOG("dos32: open %s (overlay) -> %d\n", opath, fd);
         }
@@ -750,9 +869,9 @@ static void int21(regs_t* r) {
         if (pos < 0) { FAIL(r, 25); break; }
         SET16(r->eax, pos & 0xFFFF); SET16(r->edx, (uint32_t)pos >> 16); OK(r); break; }
     case 0x43: guest_str(dsdx(r), name, sizeof name); host_path(name, path, sizeof path);
-        if (AL(r) == 0) { DWORD a = GetFileAttributesA(path);
-            if (a == INVALID_FILE_ATTRIBUTES) { FAIL(r, 2); break; }
-            SET16(r->ecx, (a & FILE_ATTRIBUTE_DIRECTORY) ? 0x10 : 0x20); }
+        if (AL(r) == 0) { struct stat st;
+            if (stat(path, &st) != 0) { FAIL(r, 2); break; }
+            SET16(r->ecx, (st.st_mode & S_IFDIR) ? 0x10 : 0x20); }
         OK(r); break;
     case 0x44:
         if (AL(r) == 0x00) { int h = BX(r);
@@ -1182,6 +1301,33 @@ void recomp_hlt(void) { Sleep(1); dos32_poll(); }
  * write logs the lifted function that made it and the new value. The guest
  * thread cannot set its own debug registers, so a helper thread suspends it
  * and sets them. */
+/* The report, whatever the system: the guest address, the registers, the
+ * indirect calls that led there and the top of the guest's stack. access: 0
+ * no address, 1 read, 2 write, -1 an address of unknown kind. */
+static void fault_report(const char* what, uintptr_t a, int access) {
+    fprintf(stderr, "\ndos32: guest fault %s in sub_%08X", what, g_cur_func);
+    if (access) {
+        if (a - (uintptr_t)M < 0x100000000ull) fprintf(stderr, " at guest %08X", (uint32_t)(a - (uintptr_t)M));
+        else fprintf(stderr, " at host %p", (void*)a);
+        if (access > 0) fprintf(stderr, " (%s)", access == 2 ? "write" : "read");
+    }
+    fprintf(stderr, "\n  eax=%08X ebx=%08X ecx=%08X edx=%08X esi=%08X edi=%08X ebp=%08X esp=%08X\n",
+            g_eax, g_ebx, g_ecx, g_edx, g_esi, g_edi, g_ebp, g_esp);
+    fprintf(stderr, "  last indirect calls (newest first):\n");
+    for (int i = 1; i <= 12 && i <= (int)g_icall_trace_idx; i++) {
+        uint32_t k = (g_icall_trace_idx - i) & (ICALL_TRACE_SIZE - 1);
+        fprintf(stderr, "    %08X from %08X\n", g_icall_trace[k], g_icall_from[k]);
+    }
+    fprintf(stderr, "  guest stack:");
+    for (int i = 0; i < 16; i++) {
+        uint32_t v = g_esp + i * 4;
+        if (v - 0x1000u < 0x0F000000u) fprintf(stderr, "%s%08X", i % 8 ? " " : "\n    ", R32(v));
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
+#ifdef _WIN32
 static uint32_t brk_va;
 static HANDLE brk_thread;
 static DWORD WINAPI set_watchpoint(LPVOID p) {
@@ -1208,30 +1354,55 @@ static LONG CALLBACK on_fault(EXCEPTION_POINTERS* ep) {
         code != EXCEPTION_ILLEGAL_INSTRUCTION && code != EXCEPTION_STACK_OVERFLOW &&
         code != EXCEPTION_INT_OVERFLOW)
         return EXCEPTION_CONTINUE_SEARCH;
-    uintptr_t a = code == EXCEPTION_ACCESS_VIOLATION ? (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1] : 0;
-    fprintf(stderr, "\ndos32: guest fault %08lX in sub_%08X", code, g_cur_func);
-    if (code == EXCEPTION_ACCESS_VIOLATION) {
-        if (a - (uintptr_t)M < 0x100000000ull) fprintf(stderr, " at guest %08X", (uint32_t)(a - (uintptr_t)M));
-        else fprintf(stderr, " at host %p", (void*)a);
-        fprintf(stderr, " (%s)", ep->ExceptionRecord->ExceptionInformation[0] ? "write" : "read");
-    }
-    fprintf(stderr, "\n  eax=%08X ebx=%08X ecx=%08X edx=%08X esi=%08X edi=%08X ebp=%08X esp=%08X\n",
-            g_eax, g_ebx, g_ecx, g_edx, g_esi, g_edi, g_ebp, g_esp);
-    fprintf(stderr, "  last indirect calls (newest first):\n");
-    for (int i = 1; i <= 12 && i <= (int)g_icall_trace_idx; i++) {
-        uint32_t k = (g_icall_trace_idx - i) & (ICALL_TRACE_SIZE - 1);
-        fprintf(stderr, "    %08X from %08X\n", g_icall_trace[k], g_icall_from[k]);
-    }
-    fprintf(stderr, "  guest stack:");
-    for (int i = 0; i < 16; i++) {
-        uint32_t v = g_esp + i * 4;
-        if (v - 0x1000u < 0x0F000000u) fprintf(stderr, "%s%08X", i % 8 ? " " : "\n    ", R32(v));
-    }
-    fprintf(stderr, "\n");
-    fflush(stderr);
+    char what[16];
+    int av = code == EXCEPTION_ACCESS_VIOLATION;
+    snprintf(what, sizeof what, "%08lX", code);
+    fault_report(what, av ? (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1] : 0,
+                 av ? (ep->ExceptionRecord->ExceptionInformation[0] ? 2 : 1) : 0);
     TerminateProcess(GetCurrentProcess(), 3);
     return EXCEPTION_CONTINUE_SEARCH;
 }
+
+/* On the guest thread, before it runs anything. */
+static void watch_faults(void) {
+    timeBeginPeriod(1);
+    AddVectoredExceptionHandler(1, on_fault);
+    if (getenv("DOS32_BREAK")) {
+        brk_va = strtoul(getenv("DOS32_BREAK"), NULL, 16);
+        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &brk_thread, 0, FALSE,
+                        DUPLICATE_SAME_ACCESS);
+        WaitForSingleObject(CreateThread(NULL, 0, set_watchpoint, NULL, 0, NULL), INFINITE);
+    }
+}
+#else
+static void on_signal(int sig, siginfo_t* si, void* uc) {
+    int access = sig == SIGSEGV || sig == SIGBUS ? -1 : 0;
+#if defined(__x86_64__) && defined(REG_ERR)
+    if (access) access = (((ucontext_t*)uc)->uc_mcontext.gregs[REG_ERR] & 2) ? 2 : 1;
+#else
+    (void)uc;
+#endif
+    fault_report(strsignal(sig), (uintptr_t)si->si_addr, access);
+    _exit(3);
+}
+
+/* On the guest thread, before it runs anything: an alternate signal stack,
+ * so overflowing the host's stack (deep guest recursion) is reported too.
+ * ponytail: no DOS32_BREAK watchpoint here; it sets the debug registers
+ * through Windows. */
+static void watch_faults(void) {
+    static char alt[64 * 1024];
+    stack_t ss = { .ss_sp = alt, .ss_size = sizeof alt };
+    sigaltstack(&ss, NULL);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = on_signal;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    int sigs[] = { SIGSEGV, SIGBUS, SIGFPE, SIGILL };
+    for (int i = 0; i < 4; i++) sigaction(sigs[i], &sa, NULL);
+    if (getenv("DOS32_BREAK")) fprintf(stderr, "dos32: DOS32_BREAK is Windows only\n");
+}
+#endif
 
 /* ---- start -------------------------------------------------------------- */
 static void put_str(uint32_t at, const char* s) { while (*s) R8(at++) = (uint8_t)*s++; R8(at) = 0; }
@@ -1331,13 +1502,10 @@ int dos32_run(const dos32_config* cfg) {
     C = cfg;
     InitializeCriticalSection(&input_lock);
     InitializeCriticalSection(&video_lock);
-    QueryPerformanceFrequency(&qpf);
-    QueryPerformanceCounter(&t0);
-    timeBeginPeriod(1);
-    AddVectoredExceptionHandler(1, on_fault);
 
     /* 4 GB of address space, so every 32-bit guest address is ours; only what
      * is used is committed. */
+#ifdef _WIN32
     M = VirtualAlloc(NULL, 0x100000000ull, MEM_RESERVE, PAGE_NOACCESS);
     if (!M || !VirtualAlloc(M, COMMIT_SIZE, MEM_COMMIT, PAGE_READWRITE) ||
         !VirtualAlloc(M + LFB_VA, VRAM_SIZE, MEM_COMMIT, PAGE_READWRITE) ||
@@ -1345,6 +1513,15 @@ int dos32_run(const dos32_config* cfg) {
         fprintf(stderr, "dos32: cannot reserve guest memory (%lu)\n", GetLastError());
         return 255;
     }
+#else
+    M = mmap(NULL, 0x100000000ull, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (M == MAP_FAILED || mprotect(M, COMMIT_SIZE, PROT_READ | PROT_WRITE) ||
+        mprotect(M + LFB_VA, VRAM_SIZE, PROT_READ | PROT_WRITE) ||
+        mprotect(M + HOSTVEC_VA, 0x10000, PROT_READ | PROT_WRITE)) {
+        fprintf(stderr, "dos32: cannot reserve guest memory (%s)\n", strerror(errno));
+        return 255;
+    }
+#endif
     g_mem_base = (ptrdiff_t)M;
     vram = calloc(1, VRAM_SIZE);
     memcpy(LIN(cfg->image_base), cfg->image, cfg->image_size);
@@ -1395,12 +1572,7 @@ int dos32_run(const dos32_config* cfg) {
     g_flag_k = FK_EFLAGS; g_flag_a = 0x202;
     push32(RECOMP_RETADDR);
 
-    if (getenv("DOS32_BREAK")) {
-        brk_va = strtoul(getenv("DOS32_BREAK"), NULL, 16);
-        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &brk_thread, 0, FALSE,
-                        DUPLICATE_SAME_ACCESS);
-        WaitForSingleObject(CreateThread(NULL, 0, set_watchpoint, NULL, 0, NULL), INFINITE);
-    }
+    watch_faults();
     recomp_func_t entry = recomp_lookup(cfg->entry);
     if (!entry) { fprintf(stderr, "dos32: entry 0x%08X not lifted\n", cfg->entry); return 255; }
     if (!setjmp(exit_jmp)) {
