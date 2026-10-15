@@ -18,8 +18,10 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <sched.h>
-#include <sys/mman.h>
 #include "win32hle.h"
+#ifdef __APPLE__
+#include <mach-o/dyld.h>   /* _NSGetExecutablePath */
+#endif
 
 #define HEAP_ZERO_MEMORY            0x00000008u
 #define HEAP_REALLOC_IN_PLACE_ONLY  0x00000010u
@@ -42,6 +44,20 @@ static void k_SetLastError(void)      { g_last_error = A32(0); RETV(1); }
 static void k_OutputDebugStringA(void){ fprintf(stderr, "[guest] %s", ASTR(0) ? ASTR(0) : ""); RETV(1); }
 
 /* --- process --- */
+int hle_exe_path(char *out, size_t n) {
+#ifdef __APPLE__
+    char raw[4096], real[4096];
+    uint32_t len = sizeof raw;
+    if (!n || _NSGetExecutablePath(raw, &len) != 0 || !realpath(raw, real) || strlen(real) >= n) return 0;
+    memcpy(out, real, strlen(real) + 1);
+    return 1;
+#else
+    ssize_t len = n ? readlink("/proc/self/exe", out, n - 1) : -1;
+    if (len <= 0) return 0;
+    out[len] = 0;
+    return 1;
+#endif
+}
 static const char g_default_cmdline[] = "game.exe";
 static const char *g_cmdline = g_default_cmdline;
 void hle_set_command_line(const char *cmdline) { g_cmdline = cmdline; }
@@ -58,7 +74,14 @@ void hle_exit(int code) {
 }
 
 static void k_GetProcessHeap(void)      { RET(0x00000001u, 0); }        /* every heap is the one heap */
-static void k_GetCommandLineA(void)     { RETP(g_cmdline, 0); }
+/* The guest keeps the pointer, so it gets a copy in its own memory, made once
+ * per command line. */
+static void k_GetCommandLineA(void) {
+    static const char *copied_from;
+    static uint32_t va;
+    if (copied_from != g_cmdline) va = hle_guest_strdup(g_cmdline), copied_from = g_cmdline;
+    RET(va, 0);
+}
 static void k_GetCurrentProcess(void)   { RET(0xFFFFFFFFu, 0); }        /* pseudo-handle */
 static void k_GetCurrentProcessId(void) { RET((uint32_t)getpid(), 0); }
 static void k_ExitProcess(void)         { fprintf(stderr, "[win32hle] ExitProcess(%u)\n", A32(0)); hle_exit((int)A32(0)); }
@@ -87,7 +110,7 @@ static void k_FormatMessageA(void) {                     /* (flags, source, id, 
     if (A32(0) & 0x100u) {                               /* FORMAT_MESSAGE_ALLOCATE_BUFFER */
         char *p = (char *)hle_alloc(n + 1);
         memcpy(p, text, n + 1);
-        if (A32(4)) MEM32(A32(4)) = (uint32_t)(uintptr_t)p;
+        if (A32(4)) MEM32(A32(4)) = hle_va(p);
         RET(n, 7);
     }
     if (!A32(4) || A32(5) <= n) RET(0, 7);
@@ -99,8 +122,10 @@ static void k_GetExitCodeProcess(void) { if (A32(1)) MEM32(A32(1)) = 0; RET(1, 2
 /* Thread ids: small and stable per host thread (pthread_self is a pointer). */
 static __thread uint32_t g_tid;
 static volatile uint32_t g_next_tid = 0x100;
+uint32_t hle_thread_id_new(void) { return __sync_add_and_fetch(&g_next_tid, 4); }
+void hle_thread_id_adopt(uint32_t tid) { g_tid = tid; }
 uint32_t hle_thread_id(void) {
-    if (!g_tid) g_tid = __sync_add_and_fetch(&g_next_tid, 4);
+    if (!g_tid) g_tid = hle_thread_id_new();
     return g_tid;
 }
 static void k_GetCurrentThreadId(void) { RET(hle_thread_id(), 0); }
@@ -112,40 +137,18 @@ static void k_GetVersionExA(void) {                      /* OSVERSIONINFOA: size
     uint32_t v = A32(0);
     if (!v) RET(0, 1);
     MEM32(v + 4) = 5, MEM32(v + 8) = 1, MEM32(v + 12) = 2600, MEM32(v + 16) = 2;
-    snprintf((char *)(uintptr_t)(v + 20), 128, "Service Pack 3");
+    snprintf((char *)hle_ptr(v + 20), 128, "Service Pack 3");
     RET(1, 1);
 }
 
 /* --- heap ---
- * One heap. Each block carries its size in front (HeapSize and _msize answer
- * from it, and a Local/Global block is the same kind of block). */
-#define HDR 16u
-static void *blk_alloc(uint32_t n, int zero) {
-    uint8_t *p = (uint8_t *)(zero ? calloc(1, (size_t)n + HDR) : malloc((size_t)n + HDR));
-    if (!p) return NULL;
-    *(uint32_t *)p = n;
-    *(uint32_t *)(p + 4) = 0x48454150u;                  /* 'HEAP' */
-    return p + HDR;
-}
-static int blk_ok(void *u) { return u && *(uint32_t *)((uint8_t *)u - HDR + 4) == 0x48454150u; }
-static uint32_t blk_size(void *u) { return blk_ok(u) ? *(uint32_t *)((uint8_t *)u - HDR) : 0; }
-static void blk_free(void *u) {
-    if (!u) return;
-    if (!blk_ok(u)) { fprintf(stderr, "[win32hle] free of a block this heap did not hand out: %p\n", u); return; }
-    *(uint32_t *)((uint8_t *)u - HDR + 4) = 0;
-    free((uint8_t *)u - HDR);
-}
-static void *blk_realloc(void *u, uint32_t n, int zero) {
-    if (!u) return blk_alloc(n, zero);
-    uint32_t old = blk_size(u);
-    uint8_t *p = (uint8_t *)realloc((uint8_t *)u - HDR, (size_t)n + HDR);
-    if (!p) return NULL;
-    *(uint32_t *)p = n;
-    if (zero && n > old) memset(p + HDR + old, 0, n - old);
-    return p + HDR;
-}
-void *hle_alloc(uint32_t n) { return blk_alloc(n, 1); }
-void  hle_free(void *p) { blk_free(p); }
+ * One heap (guest_mem.c). Each block carries its size in front (HeapSize and
+ * _msize answer from it, and a Local/Global block is the same kind of block). */
+#define blk_alloc   hle_heap_alloc
+#define blk_free    hle_heap_free
+#define blk_realloc hle_heap_realloc
+#define blk_ok      hle_heap_ok
+#define blk_size    hle_heap_size
 
 static void k_HeapCreate(void)  { RET(0x00000001u, 3); }
 static void k_HeapDestroy(void) { RET(1, 1); }
@@ -160,7 +163,7 @@ static void k_HeapReAlloc(void) {                        /* (hHeap, flags, ptr, 
     void *u = APTR(2);
     if (fl & HEAP_REALLOC_IN_PLACE_ONLY) {
         if (!blk_ok(u) || n > blk_size(u)) { g_last_error = ERROR_NOT_ENOUGH_MEMORY; RET(0, 4); }
-        *(uint32_t *)((uint8_t *)u - HDR) = n;
+        hle_heap_resize(u, n);
         RETP(u, 4);
     }
     RETP(blk_realloc(u, n, (fl & HEAP_ZERO_MEMORY) != 0), 4);
@@ -205,28 +208,23 @@ static void k_VirtualAlloc(void) {                       /* (addr, size, type, p
         RET(addr & ~0xFFFu, 4);
     }
     if (!size) { g_last_error = ERROR_INVALID_PARAMETER; RET(0, 4); }
-    void *p = mmap(addr ? (void *)(uintptr_t)(addr & ~0xFFFFu) : NULL, size, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | (addr ? 0x100000 /* MAP_FIXED_NOREPLACE */ : 0), -1, 0);
-    if (p == MAP_FAILED || (addr && (uint32_t)(uintptr_t)p != (addr & ~0xFFFFu))) {
-        if (p != MAP_FAILED) munmap(p, size);
-        g_last_error = ERROR_NOT_ENOUGH_MEMORY;
-        RET(0, 4);
-    }
+    uint32_t p = hle_vm_reserve(addr, size);
+    if (!p) { g_last_error = ERROR_NOT_ENOUGH_MEMORY; RET(0, 4); }
     for (int i = 0; i < MAX_REGIONS; i++)
-        if (!g_region[i].size) { g_region[i].base = (uint32_t)(uintptr_t)p, g_region[i].size = size; break; }
+        if (!g_region[i].size) { g_region[i].base = p, g_region[i].size = size; break; }
     (void)type;
-    RETP(p, 4);
+    RET(p, 4);
 }
 static void k_VirtualFree(void) {                        /* (addr, size, type) */
     uint32_t addr = A32(0), size = A32(1), type = A32(2);
     int i = region_of(addr);
     if (i < 0) { g_last_error = ERROR_INVALID_PARAMETER; RET(0, 3); }
     if (type & MEM_RELEASE) {
-        munmap((void *)(uintptr_t)g_region[i].base, g_region[i].size);
+        hle_vm_release(g_region[i].base, g_region[i].size);
         g_region[i].size = 0;
     } else if (type & MEM_DECOMMIT) {
         uint32_t a = addr & ~0xFFFu, end = size ? (addr + size + 0xFFFu) & ~0xFFFu : g_region[i].base + g_region[i].size;
-        madvise((void *)(uintptr_t)a, end - a, MADV_DONTNEED);
+        hle_vm_zero(a, end - a);
     }
     RET(1, 3);
 }
@@ -287,14 +285,14 @@ static void k_lstrcmpA(void) { RET((uint32_t)strcmp(ASTR(0) ? ASTR(0) : "", ASTR
 static void k_lstrcmpiA(void) { RET((uint32_t)strcasecmp(ASTR(0) ? ASTR(0) : "", ASTR(1) ? ASTR(1) : ""), 2); }
 
 /* STARTUPINFOA is 68 bytes; the CRT reads it early. */
-static void k_GetStartupInfoA(void) { uint32_t si = A32(0); if (si) { memset((void *)(uintptr_t)si, 0, 68); MEM32(si) = 68; } RETV(1); }
+static void k_GetStartupInfoA(void) { uint32_t si = A32(0); if (si) { memset(hle_ptr(si), 0, 68); MEM32(si) = 68; } RETV(1); }
 
 /* --- critical sections ---
  * CRITICAL_SECTION: DebugInfo, LockCount, RecursionCount, OwningThread,
  * LockSemaphore, SpinCount. The guest's own struct holds the state. */
 #define CS_REC(cs)   MEM32((cs) + 8)
 #define CS_OWNER(cs) MEM32((cs) + 12)
-static void k_InitializeCriticalSection(void) { uint32_t cs = A32(0); if (cs) memset((void *)(uintptr_t)cs, 0, 24), MEM32(cs + 4) = 0xFFFFFFFFu; RETV(1); }
+static void k_InitializeCriticalSection(void) { uint32_t cs = A32(0); if (cs) memset(hle_ptr(cs), 0, 24), MEM32(cs + 4) = 0xFFFFFFFFu; RETV(1); }
 static void k_DeleteCriticalSection(void) { RETV(1); }
 void hle_enter_cs(uint32_t cs) {
     uint32_t me = hle_thread_id();

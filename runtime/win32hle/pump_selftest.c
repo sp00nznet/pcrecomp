@@ -7,7 +7,7 @@
  *
  * This is the integration the SDL present layer relies on (hle_present_enable
  * sets exactly this hook); here the hook is plain C so the check needs no
- * display. Build -m32.
+ * display.
  */
 #define RECOMP_GENERATED_CODE
 #define _GNU_SOURCE
@@ -25,7 +25,7 @@ static void ok(const char *w, int c) { if (!c) { printf("FAIL %s\n", w); fails++
 #define GUEST_PROLOGUE(va) \
     uint32_t _cf = 0; uint32_t _flag_k = FK_NONE; uint32_t _flag_a = 0, _flag_b = 0; RECOMP_ENTER(va)
 
-static uint8_t  g_msg[28];
+static uint32_t g_msg;          /* a MSG in guest memory */
 static uint32_t VA_GetMessageA;
 static int      g_keydowns;
 
@@ -41,10 +41,10 @@ static void stub_pump(void) {
 static void guest_msgloop(void) {
     GUEST_PROLOGUE(ENTRY_VA);
     for (;;) {
-        PUSH32(esp, 0); PUSH32(esp, 0); PUSH32(esp, 0); PUSH32(esp, (uint32_t)(uintptr_t)g_msg);
+        PUSH32(esp, 0); PUSH32(esp, 0); PUSH32(esp, 0); PUSH32(esp, g_msg);
         RECOMP_ICALL(VA_GetMessageA);
         if (eax == 0) break;
-        if (MEM32((uint32_t)(uintptr_t)g_msg + 4) == WM_KEYDOWN) g_keydowns++;
+        if (MEM32(g_msg + 4) == WM_KEYDOWN) g_keydowns++;
     }
     eax = 0;
 }
@@ -58,6 +58,7 @@ int main(void) {
     ok("GetMessageA resolves", VA_GetMessageA != 0);
 
     hle_set_pump_hook(stub_pump);
+    g_msg = hle_va(hle_alloc(28));
 
     mach_enter();
     guest_msgloop();

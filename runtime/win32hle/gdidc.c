@@ -92,6 +92,11 @@ static const char *font_file(const char *face, int bold, int italic) {
         snprintf(path, sizeof path, "%s%s", dirs[i], bold ? "DejaVuSans-Bold.ttf" : "DejaVuSans.ttf");
         if (access(path, R_OK) == 0) return path;
     }
+    /* macOS has the faces Liberation stands in for */
+    const char *mac = strstr(family, "Serif") ? "Times New Roman" : strstr(family, "Mono") ? "Courier New" : "Arial";
+    snprintf(path, sizeof path, "/System/Library/Fonts/Supplemental/%s%s.ttf", mac,
+             bold && italic ? " Bold Italic" : bold ? " Bold" : italic ? " Italic" : "");
+    if (access(path, R_OK) == 0) return path;
     return NULL;
 }
 static font_t *FONT(uint32_t h) {
@@ -132,7 +137,7 @@ static void g_CreateFontIndirectA(void) {                /* LOGFONTA: height, wi
             font_t *f = &g_font[i];
             memset(f, 0, sizeof *f);
             f->used = 1, f->height = (int)MEM32(lf), f->weight = (int)MEM32(lf + 16), f->italic = MEM8(lf + 20) != 0, f->quality = MEM8(lf + 26);
-            snprintf(f->face, sizeof f->face, "%s", (const char *)(uintptr_t)(lf + 28));
+            snprintf(f->face, sizeof f->face, "%s", (const char *)hle_ptr(lf + 28));
             RET(FONT_BASE + (uint32_t)i, 1);
         }
     RET(SYSTEM_FONT, 1);
@@ -358,7 +363,7 @@ static void g_GetTextMetricsA(void) {                    /* TEXTMETRICA */
     TTF_Font *t = ttf_of(FONT(d ? d->font : SYSTEM_FONT));
     uint32_t m = A32(1);
     if (!m) RET(0, 2);
-    memset((void *)(uintptr_t)m, 0, 56);
+    memset(hle_ptr(m), 0, 56);
     int asc = t ? TTF_FontAscent(t) : 10, desc = t ? -TTF_FontDescent(t) : 3, ave = 6, max = 12;
     if (t) { int w; TTF_SizeText(t, "x", &ave, &w); TTF_SizeText(t, "W", &max, &w); }
     MEM32(m) = (uint32_t)(asc + desc), MEM32(m + 4) = (uint32_t)asc, MEM32(m + 8) = (uint32_t)desc;

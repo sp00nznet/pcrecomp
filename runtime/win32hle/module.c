@@ -162,12 +162,12 @@ static void k_GetProcAddress(void) {                     /* (hModule, name or or
             snprintf(nm, sizeof nm, "%s#%u", g_mod[i].base_name, n);
             va = hle_resolve(nm);
         } else {
-            va = hle_resolve((const char *)(uintptr_t)n);
+            va = hle_resolve((const char *)hle_ptr(n));
         }
     }
     if (!va) {
         fprintf(stderr, "[module] GetProcAddress(%s, %s%s): not answered\n", i >= 0 ? g_mod[i].base_name : "?",
-                n < 0x10000u ? "#" : "", n < 0x10000u ? "" : (const char *)(uintptr_t)n);
+                n < 0x10000u ? "#" : "", n < 0x10000u ? "" : (const char *)hle_ptr(n));
         hle_set_last_error(ERROR_PROC_NOT_FOUND);
     }
     RET(va, 2);
@@ -181,7 +181,7 @@ static void k_GetProcAddress(void) {                     /* (hModule, name or or
  * entry's address. */
 static int name_matches(uint32_t root, uint32_t entry_name, uint32_t want) {
     if (want < 0x10000u) return !(entry_name & 0x80000000u) && entry_name == want;
-    const char *w = (const char *)(uintptr_t)want;
+    const char *w = (const char *)hle_ptr(want);
     if (w[0] == '#') return !(entry_name & 0x80000000u) && entry_name == (uint32_t)atoi(w + 1);
     if (!(entry_name & 0x80000000u)) return 0;
     uint32_t s = root + (entry_name & 0x7FFFFFFFu);

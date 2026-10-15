@@ -7,8 +7,10 @@
  * It runs as user32's pump hook, on the thread that runs the game (SDL wants
  * its video calls on one thread, and the game's thread is the one that pumps
  * messages). A frame is shown when the primary has changed, at most 60 times
- * a second; a game that draws without pumping (a loading screen) shows the
- * frame it last pumped on.
+ * a second: from the pump, and as the game draws into the primary (ddraw.c's
+ * hle_dd_primary_hook), since on Windows the primary is the screen. A game
+ * that draws without pumping (a loading screen, a menu's transition) is seen
+ * as it draws, as on Windows.
  *
  * Headless (hle_screen_open(..., headless)), there is no window: the pump
  * only paces, and input comes from a host's script.
@@ -18,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <SDL2/SDL.h>
 #include "win32hle.h"
 
@@ -38,6 +41,7 @@ static unsigned g_shown_seq = ~0u;
 static uint32_t g_last_present;
 static int g_headless, g_fullscreen;
 static SDL_Rect g_dst;                                   /* where the picture is in the window */
+static pthread_t g_video_thread;                         /* SDL's video calls stay on the thread that opened it */
 static SDL_Texture *g_pre, *g_small;                     /* sharp's integer prescale; the bars' blur */
 static int g_pre_w, g_pre_h;
 
@@ -357,6 +361,19 @@ static void warp(int x, int y) {
     SDL_WarpMouseInWindow(g_win, g_dst.x + x * g_dst.w / w, g_dst.y + y * g_dst.h / h);
 }
 
+/* The game drew into the primary. On the window's thread, show it (present
+ * keeps to 60 a second), and keep the window's own events moving: a load
+ * that does not pump for seconds would otherwise look hung to the desktop
+ * (macOS's spinning cursor). The events wait in SDL's queue for the pump. */
+static void primary_changed(void) {
+    static uint32_t last_events;
+    if (!g_ren || !pthread_equal(pthread_self(), g_video_thread)) return;
+    uint32_t now = hle_ticks_ms();
+    if (now - g_last_present < 15) return;
+    if (now - last_events >= 100) SDL_PumpEvents(), last_events = now;
+    present();
+}
+
 int hle_screen_open(const char *title, int fullscreen, int headless) {
     g_headless = headless, g_fullscreen = fullscreen;
     hle_set_pump_hook(hle_screen_pump);
@@ -374,6 +391,8 @@ int hle_screen_open(const char *title, int fullscreen, int headless) {
     hle_cursor_hook = warp;
     SDL_RendererInfo ri;
     SDL_GetRendererInfo(g_ren, &ri);
+    g_video_thread = pthread_self();
+    hle_dd_primary_hook = primary_changed;
     fprintf(stderr, "[screen] %s, renderer %s, scaling %s (F12), fullscreen F11\n", SDL_GetCurrentVideoDriver(), ri.name, k_modes[g_mode]);
     return 0;
 }

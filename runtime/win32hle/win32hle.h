@@ -32,24 +32,75 @@
 #include "recomp_types.h"   /* g_eax, g_esp, MEM*, recomp_func_t, the dispatch contract */
 
 /* ---- the Win32 ABI, portably ----
- * Win32 is 32-bit stdcall. On a 32-bit host a guest pointer is a host pointer,
- * so HANDLE/HWND/HDC are just uint32_t the host casts as needed. */
+ * Win32 is 32-bit stdcall. HANDLE/HWND/HDC are uint32_t; a guest pointer is a
+ * guest address (VA), which hle_ptr turns into a host pointer. */
 typedef uint32_t win_handle;   /* HANDLE/HWND/HDC/HMODULE/HBITMAP... */
+
+/* ---- guest addresses and host pointers ----
+ * With RECOMP_FLAT_MEMORY (a 32-bit host) a VA is a host address. Without it
+ * (a 64-bit host: macOS on arm64, Linux x86-64) the guest's 4 GB is one block
+ * at g_mem_base (guest_mem.c), and a VA is an offset into it. hle_ptr and
+ * hle_va convert either way; guest NULL is host NULL. Anything the guest is
+ * handed an address of must live in that block: allocate it with hle_alloc,
+ * hle_vm_reserve or hle_scratch, never malloc or the host's stack. */
+#if defined(RECOMP_FLAT_MEMORY) || UINTPTR_MAX == 0xFFFFFFFFu
+#define HLE_FLAT 1                                /* any 32-bit host: g_mem_base is 0 */
+static inline void    *hle_ptr(uint32_t va)   { return (void *)(uintptr_t)va; }
+static inline uint32_t hle_va(const void *p)  { return (uint32_t)(uintptr_t)p; }
+#else
+uint32_t hle_va_bad(const void *p);            /* fatal: a host pointer handed to the guest */
+static inline void *hle_ptr(uint32_t va) { return va ? (void *)ADDR(va) : NULL; }
+static inline uint32_t hle_va(const void *p) {
+    if (!p) return 0;
+    uintptr_t off = (uintptr_t)p - (uintptr_t)g_mem_base;
+    return (uint64_t)off >> 32 ? hle_va_bad(p) : (uint32_t)off;
+}
+#endif
 
 /* Stdcall argument access from inside a shim. g_esp -> [ret][arg0][arg1]...,
  * so argument i (0-based) is at g_esp + 4 + 4*i. */
 static inline uint32_t hle_a32(int i) {
-    return *(uint32_t *)(uintptr_t)(g_esp + 4u + 4u * (uint32_t)i);
+    return MEM32(g_esp + 4u + 4u * (uint32_t)i);
 }
 #define A32(i)   hle_a32(i)                       /* arg i as uint32_t */
-#define APTR(i)  ((void *)(uintptr_t)hle_a32(i))  /* arg i as a pointer */
-#define ASTR(i)  ((char *)(uintptr_t)hle_a32(i))  /* arg i as a char*  */
+#define APTR(i)  hle_ptr(hle_a32(i))              /* arg i as a pointer */
+#define ASTR(i)  ((char *)hle_ptr(hle_a32(i)))    /* arg i as a char*  */
 
 /* Return from a stdcall shim: set eax and pop ret + argc args. Every shim ends
  * in exactly one of these; the argc is the callee's own purge. */
 #define RET(eax, argc)   do { g_eax = (uint32_t)(eax); g_esp += 4u + 4u * (uint32_t)(argc); return; } while (0)
 #define RETV(argc)       RET(0, argc)                       /* void-returning (eax undefined) */
-#define RETP(ptr, argc)  RET((uint32_t)(uintptr_t)(ptr), argc)
+#define RETP(ptr, argc)  RET(hle_va(ptr), argc)
+
+/* ---- guest memory (guest_mem.c) ----
+ * Pages: a reservation at va (0: anywhere), zero-filled, 0 on failure. */
+void     hle_mem_init(void);                            /* map the guest block; idempotent */
+uint32_t hle_vm_reserve(uint32_t va, uint32_t size);
+void     hle_vm_release(uint32_t va, uint32_t size);
+void     hle_vm_zero(uint32_t va, uint32_t size);       /* decommit: reads as zero again */
+/* The heap every Heap/Local/Global block comes from: a 16-byte header before
+ * each block holds its size. */
+void    *hle_heap_alloc(uint32_t n, int zero);
+void    *hle_heap_realloc(void *p, uint32_t n, int zero);
+void     hle_heap_free(void *p);
+int      hle_heap_ok(const void *p);                    /* one of this heap's blocks */
+uint32_t hle_heap_size(const void *p);
+void     hle_heap_resize(void *p, uint32_t n);          /* shrink in place (the header's size) */
+uint32_t hle_guest_strdup(const char *s);               /* a heap copy, for a host string the guest keeps */
+/* This thread's scratch in guest memory, for a structure handed to the guest
+ * for the length of one call (a CREATESTRUCT, a QueryInterface's out pointer).
+ * Last in, first out: take a mark, allocate, release to the mark. */
+uint32_t hle_scratch_mark(void);
+uint32_t hle_scratch(uint32_t n);                       /* zeroed, 16-byte aligned */
+uint32_t hle_scratch_copy(const void *src, uint32_t n);
+void     hle_scratch_release(uint32_t mark);
+/* printf with a guest format's arguments read from guest memory at args
+ * (wsprintfA, a game's debug printf): %s is a VA. Returns the length. */
+int      hle_guest_format(char *out, size_t n, const char *fmt, uint32_t args);
+/* A guest address for a host string that may already be one (an argument), or
+ * an atom (below 64 KB, passed as is); otherwise a copy in this thread's
+ * scratch, good until the caller releases its mark. */
+uint32_t hle_guest_str_or_atom(const char *s);
 
 /* ---- shim registry ----
  * A shim is named by the Win32 symbol it answers. The host assigns each a
@@ -173,8 +224,10 @@ void  hle_set_command_line(const char *cmdline);   /* what GetCommandLineA answe
 extern void (*hle_on_exit)(int code);              /* run by ExitProcess before the process goes */
 void  hle_exit(int code);                          /* flush and leave, once */
 uint32_t hle_thread_id(void);                      /* GetCurrentThreadId's answer for this thread */
+uint32_t hle_thread_id_new(void);                  /* an id for a thread about to start (CreateThread's) */
+void     hle_thread_id_adopt(uint32_t tid);        /* that thread, first thing: this is its id */
 uint32_t hle_ticks_ms(void);                       /* GetTickCount */
-void *hle_alloc(uint32_t n);                       /* a zeroed heap block (HeapFree-able) */
+void *hle_alloc(uint32_t n);                       /* a zeroed heap block (HeapFree-able), in guest memory */
 void  hle_free(void *p);
 void  hle_enter_cs(uint32_t cs);                   /* a guest CRITICAL_SECTION */
 void  hle_leave_cs(uint32_t cs);
@@ -183,6 +236,7 @@ extern int (*hle_wait_hook)(uint32_t h);           /* a host's own waitable: 1 r
 void  hle_set_event(uint32_t h);                    /* SetEvent, under the machine */
 int   hle_filetrace(void);                         /* HLE_FILETRACE=1: log file opens */
 void  hle_set_module_path(const char *real_path);  /* real image path -> GetModuleFileNameA */
+int   hle_exe_path(char *out, size_t n);           /* this program's own path (the host's, not the guest's); 0 if unknown */
 
 /* ---- modules and resources (module.c) ----
  * The host adds its main image (main_image 1); LoadLibraryA adds DLLs. A
@@ -217,6 +271,7 @@ extern const win32hle_shim win32hle_ddraw[];          /* DirectDraw in software 
  * when its pixels or palette may have. */
 int  hle_dd_frame(const uint8_t **px, int *w, int *h, int *pitch, int *bpp, const uint32_t **palette, unsigned *seq);
 void hle_dd_mode(int *w, int *h, int *bpp);
+extern void (*hle_dd_primary_hook)(void);            /* the primary's pixels or palette changed (a blit, an Unlock, a Flip) */
 int  hle_dd_surface_pixels(uint32_t obj, uint8_t **px, int *w, int *h, int *pitch, int *bpp);   /* 0: not a surface */
 void hle_dsound_set_master(float gain);              /* 0 mutes */
 /* A host's own sound (a movie's), mixed with the game's buffers: interleaved
@@ -253,6 +308,7 @@ void hle_reg_load(const char *file);
  * hle_com_QueryInterface/AddRef/Release are an IUnknown for such objects. */
 uint32_t hle_com_vtable(const win32hle_shim *methods);
 uint32_t hle_com_new(uint32_t vtable, uint32_t size);
+void     hle_com_free(uint32_t obj);                  /* the last Release of an hle_com_new object */
 void     hle_com_register_class(const uint8_t *clsid, uint32_t (*create)(const uint8_t *iid, uint32_t *out));
 void     hle_com_QueryInterface(void);
 void     hle_com_AddRef(void);

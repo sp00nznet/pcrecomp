@@ -204,7 +204,7 @@ static void b_Release(void) {
             if (--*b->data_refs == 0) { hle_free(b->data); free(b->data_refs); }
             free(b);
         }
-        free((void *)(uintptr_t)self);
+        hle_com_free(self);
     }
     RET(n, 1);
 }
@@ -260,9 +260,9 @@ static void b_Lock(void) {                               /* (this, offset, bytes
     }
     if (off >= b->bytes || n > b->bytes) RET(DSERR_INVALIDPARAM, 8);
     uint32_t n1 = off + n <= b->bytes ? n : b->bytes - off;
-    if (A32(3)) MEM32(A32(3)) = (uint32_t)(uintptr_t)(b->data + off);
+    if (A32(3)) MEM32(A32(3)) = hle_va(b->data + off);
     if (A32(4)) MEM32(A32(4)) = n1;
-    if (A32(5)) MEM32(A32(5)) = n1 < n ? (uint32_t)(uintptr_t)b->data : 0;
+    if (A32(5)) MEM32(A32(5)) = n1 < n ? hle_va(b->data) : 0;
     if (A32(6)) MEM32(A32(6)) = n - n1;
     RET(DS_OK, 8);
 }
@@ -328,7 +328,7 @@ static void b_Restore(void) { RET(DS_OK, 1); }
 /* ---- IDirectSound ---- */
 static void d_Release(void) {
     uint32_t self = A32(0), n = --MEM32(self + 4);
-    if (!n) free((void *)(uintptr_t)self);
+    if (!n) hle_com_free(self);
     RET(n, 1);
 }
 static void d_CreateSoundBuffer(void) {                  /* (this, &DSBUFFERDESC, &out, outer) */
@@ -362,7 +362,7 @@ static void d_GetCaps(void) {                            /* (this, &DSCAPS) */
     uint32_t c = A32(1);
     if (c) {
         uint32_t size = MEM32(c);
-        memset((void *)(uintptr_t)(c + 4), 0, size > 4 ? size - 4 : 0);
+        memset(hle_ptr(c + 4), 0, size > 4 ? size - 4 : 0);
         MEM32(c + 4) = 0x0F5Fu;                          /* the primary/secondary 8/16-bit mono/stereo, continuous rate */
         MEM32(c + 8) = 100, MEM32(c + 12) = 100000;      /* min/max secondary rate */
         MEM32(c + 16) = 1;                               /* primary buffers */
@@ -423,8 +423,9 @@ static void s_DirectSoundCreate(void) {                  /* (guid, &out, outer) 
     RET(DS_OK, 3);
 }
 static void s_DirectSoundEnumerateA(void) {              /* (callback, context): the one device */
-    static char desc[] = "Primary Sound Driver", mod[] = "";
-    uint32_t a[4] = { 0, (uint32_t)(uintptr_t)desc, (uint32_t)(uintptr_t)mod, A32(1) };
+    static uint32_t desc, mod;                           /* the guest may keep them */
+    if (!desc) desc = hle_guest_strdup("Primary Sound Driver"), mod = hle_guest_strdup("");
+    uint32_t a[4] = { 0, desc, mod, A32(1) };
     if (A32(0)) hle_call_guest(A32(0), 4, a);
     RET(DS_OK, 2);
 }

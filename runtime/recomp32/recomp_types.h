@@ -21,6 +21,15 @@
 #include <intrin.h>
 #elif defined(__i386__) || defined(__x86_64__)
 #include <x86intrin.h>   /* __rdtsc, as <intrin.h> gives MSVC */
+#else
+/* Not an x86 host (arm64): rdtsc reads a monotonic nanosecond count, a
+ * counter that rises steadily, which is all a game times with it. */
+#include <time.h>
+static inline uint64_t __rdtsc(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
 #endif
 
 /* ============================================================
@@ -169,6 +178,12 @@ extern ptrdiff_t g_mem_base;
 /* Guest VAs ARE host addresses (a 32-bit host mapping each module at its own
  * base): nothing to add, and no global to reload on every access. */
 #define ADDR(va)     ((uintptr_t)(uint32_t)(va))
+#elif defined(RECOMP_MEM_BASE)
+/* The guest's memory at a host address fixed when built (a 64-bit host; the
+ * host maps it there and sets g_mem_base to match): a constant to add, where
+ * g_mem_base would be reloaded after every store the compiler cannot prove
+ * misses it. */
+#define ADDR(va)     ((uintptr_t)(uint32_t)(va) + (uintptr_t)(RECOMP_MEM_BASE))
 #else
 #define ADDR(va)     ((uintptr_t)(uint32_t)(va) + g_mem_base)
 #endif

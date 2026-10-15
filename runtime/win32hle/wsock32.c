@@ -29,7 +29,14 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <strings.h>
 #include "win32hle.h"
+
+#ifndef MSG_NOSIGNAL             /* macOS: the socket says so instead (SO_NOSIGPIPE, at creation) */
+#define MSG_NOSIGNAL 0
+#endif
 
 #define SOCK_BASE 0x1000u
 #define INVALID_SOCKET 0xFFFFFFFFu
@@ -117,6 +124,9 @@ static void w_socket(void) {                             /* (af, type, protocol)
         RET(INVALID_SOCKET, 3);
     }
     int fd = ipx ? socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP) : socket(AF_INET, type == 2 ? SOCK_DGRAM : SOCK_STREAM, proto);
+#ifdef SO_NOSIGPIPE
+    if (fd >= 0) { int one = 1; setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one); }
+#endif
     if (fd < 0 || fd >= 0x10000) { if (fd >= 0) close(fd); g_wsa_error = wsa_errno(errno); RET(INVALID_SOCKET, 3); }
     if (ipx) g_ipx[fd >> 3] |= (uint8_t)(1 << (fd & 7));
     else g_ipx[fd >> 3] &= (uint8_t)~(1 << (fd & 7));
@@ -203,7 +213,7 @@ static void w_getsockopt(void) {                         /* (s, level, opt, val,
     if (A32(1) == NSPROTO_IPX) {
         uint32_t o = A32(3);
         if (A32(2) == 0x4007u && o) {                    /* IPX_ADDRESS: IPXEmu's one adapter */
-            memset((void *)(uintptr_t)o, 0, 24);
+            memset(hle_ptr(o), 0, 24);
             MEM8(o + 13) = 1;                            /* node 00:00:00:00:00:01 */
             MEM8(o + 15) = 1;                            /* status: up */
             MEM32(o + 16) = 1470, MEM32(o + 20) = 1000000;   /* max packet, link speed */
@@ -252,9 +262,10 @@ static void w_ntohl(void) { RET(ntohl(A32(0)), 1); }
 static void w_ntohs(void) { RET(ntohs((uint16_t)A32(0)), 1); }
 static void w_inet_addr(void) { RET(ASTR(0) ? inet_addr(ASTR(0)) : 0xFFFFFFFFu, 1); }
 static void w_inet_ntoa(void) {                          /* (in_addr by value) */
-    static __thread char buf[16];
+    static __thread char *buf;                           /* guest memory: the guest reads it */
+    if (!buf) buf = (char *)hle_alloc(16);
     uint32_t a = A32(0);
-    snprintf(buf, sizeof buf, "%u.%u.%u.%u", a & 255, (a >> 8) & 255, (a >> 16) & 255, a >> 24);
+    snprintf(buf, 16, "%u.%u.%u.%u", a & 255, (a >> 8) & 255, (a >> 16) & 255, a >> 24);
     RETP(buf, 1);
 }
 static void w_gethostname(void) {
@@ -264,20 +275,42 @@ static void w_gethostname(void) {
 /* hostent, in guest-readable memory: name, aliases, addrtype(2), length(2),
  * addr_list. One per thread, as Winsock's is. */
 static void w_gethostbyname(void) {
-    static __thread struct { uint32_t name, aliases; uint16_t type, len; uint32_t list; uint32_t lp[9]; uint32_t addr[8]; uint32_t none; char nm[256]; } he;
-    struct hostent *h = ASTR(0) ? gethostbyname(ASTR(0)) : NULL;
-    if (!h || h->h_addrtype != AF_INET) { g_wsa_error = WSAHOST_NOT_FOUND; RET(0, 1); }
-    memset(&he, 0, sizeof he);
-    snprintf(he.nm, sizeof he.nm, "%s", h->h_name);
-    he.name = (uint32_t)(uintptr_t)he.nm;
-    he.aliases = (uint32_t)(uintptr_t)&he.none;
-    he.type = 2, he.len = 4;
-    he.list = (uint32_t)(uintptr_t)he.lp;
-    for (int i = 0; i < 8 && h->h_addr_list[i]; i++) {
-        memcpy(&he.addr[i], h->h_addr_list[i], 4);
-        he.lp[i] = (uint32_t)(uintptr_t)&he.addr[i];
+    typedef struct { uint32_t name, aliases; uint16_t type, len; uint32_t list; uint32_t lp[9]; uint32_t addr[8]; uint32_t none; char nm[256]; } guest_hostent;
+    static __thread guest_hostent *he;
+    if (!he) he = (guest_hostent *)hle_alloc(sizeof *he);
+    const char *name = ASTR(0);
+    struct hostent *h = name ? gethostbyname(name) : NULL;
+    memset(he, 0, sizeof *he);
+    he->name = hle_va(he->nm);
+    he->aliases = hle_va(&he->none);
+    he->type = 2, he->len = 4;
+    he->list = hle_va(he->lp);
+    if (h && h->h_addrtype == AF_INET) {
+        snprintf(he->nm, sizeof he->nm, "%s", h->h_name);
+        for (int i = 0; i < 8 && h->h_addr_list[i]; i++) {
+            memcpy(&he->addr[i], h->h_addr_list[i], 4);
+            he->lp[i] = hle_va(&he->addr[i]);
+        }
+        RETP(he, 1);
     }
-    RETP(&he, 1);
+    /* Windows always resolves its own name; a Mac's (a .local name) may not
+     * be in the resolver gethostbyname uses, and a game that looks itself up
+     * goes on as if it had an address (Yuri's Revenge's WOnline screen does).
+     * Its own name is its interfaces' IPv4 addresses, or loopback. */
+    char self[256];
+    if (!name || gethostname(self, sizeof self) != 0 || strcasecmp(name, self)) { g_wsa_error = WSAHOST_NOT_FOUND; RET(0, 1); }
+    snprintf(he->nm, sizeof he->nm, "%s", self);
+    int n = 0;
+    struct ifaddrs *ifs = NULL;
+    if (getifaddrs(&ifs) == 0) {
+        for (struct ifaddrs *i = ifs; i && n < 8; i = i->ifa_next)
+            if (i->ifa_addr && i->ifa_addr->sa_family == AF_INET && !(i->ifa_flags & IFF_LOOPBACK) && (i->ifa_flags & IFF_UP))
+                memcpy(&he->addr[n++], &((struct sockaddr_in *)i->ifa_addr)->sin_addr, 4);
+        freeifaddrs(ifs);
+    }
+    if (!n) he->addr[n++] = htonl(INADDR_LOOPBACK);
+    for (int i = 0; i < n; i++) he->lp[i] = hle_va(&he->addr[i]);
+    RETP(he, 1);
 }
 
 /* ---- WSAAsyncSelect ---- */
@@ -311,13 +344,14 @@ void hle_ws_poll(void) {
 /* EnumProtocolsA(protocols, buffer, &length): what IPXEmu answers, the IPX
  * entry (when IPX is asked for, or everything is), as a PROTOCOL_INFOA. */
 static void w_EnumProtocolsA(void) {
-    static char ipx_name[] = "IPX";
+    static uint32_t ipx_name;                            /* the guest keeps it */
+    if (!ipx_name) ipx_name = hle_guest_strdup("IPX");
     uint32_t list = A32(0), buf = A32(1), lenp = A32(2), want = !list;
     for (uint32_t p = list; p && MEM32(p); p += 4) if (MEM32(p) == NSPROTO_IPX) want = 1;
     if (!want) RET(0, 3);
     if (!lenp || MEM32(lenp) < 32) { if (lenp) MEM32(lenp) = 32; g_wsa_error = 10055u /* WSAENOBUFS */; RET(SOCKET_ERROR, 3); }
     MEM32(buf) = 0x609, MEM32(buf + 4) = AF_IPX_WIN, MEM32(buf + 8) = 16, MEM32(buf + 12) = 14;
-    MEM32(buf + 16) = 2, MEM32(buf + 20) = NSPROTO_IPX, MEM32(buf + 24) = 576, MEM32(buf + 28) = (uint32_t)(uintptr_t)ipx_name;
+    MEM32(buf + 16) = 2, MEM32(buf + 20) = NSPROTO_IPX, MEM32(buf + 24) = 576, MEM32(buf + 28) = ipx_name;
     RET(1, 3);
 }
 

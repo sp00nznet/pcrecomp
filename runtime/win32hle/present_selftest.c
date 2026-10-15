@@ -4,7 +4,7 @@
  * opens a window, presents a framebuffer, pushes SDL input events, pumps them,
  * and checks each turned into the right WM_* message in the user32 queue.
  *
- * Build -m32 against 32-bit SDL2. Forces SDL_VIDEODRIVER=dummy itself so the
+ * Forces SDL_VIDEODRIVER=dummy itself so the
  * check is deterministic without a display.
  */
 #define _GNU_SOURCE

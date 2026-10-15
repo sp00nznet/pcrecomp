@@ -34,7 +34,7 @@ uint64_t  g_mm[8];
 xmm_t     g_xmm[8];
 uint32_t  g_mxcsr = 0x1F80;
 uint32_t  g_fs_base, g_gs_base;
-ptrdiff_t g_mem_base = 0;
+ptrdiff_t g_mem_base = 0;   /* flat: 0; based: set by hle_mem_init (guest_mem.c) */
 uint32_t  g_cur_func;
 const char *g_cur_import;
 uint32_t  g_icall_trace[ICALL_TRACE_SIZE], g_icall_from[ICALL_TRACE_SIZE];
@@ -103,12 +103,13 @@ static void regs_load(const regs_t *r) {
 #define GUEST_STACK (4u << 20)
 
 static uint32_t make_tib(uint32_t lo, uint32_t hi) {
-    uint32_t *t = (uint32_t *)calloc(1, 0x1000);
+    uint32_t *t = (uint32_t *)hle_alloc(0x1000);
+    if (!t) hle_fatal("no guest memory for a thread block");
     t[0]        = 0xFFFFFFFFu;                 /* ExceptionList: end of chain */
     t[1]        = hi;                          /* StackBase                   */
     t[2]        = lo;                          /* StackLimit                  */
-    t[0x18/4]   = (uint32_t)(uintptr_t)t;      /* Self (fs:[0x18])            */
-    return (uint32_t)(uintptr_t)t;
+    t[0x18/4]   = hle_va(t);                   /* Self (fs:[0x18])            */
+    return hle_va(t);
 }
 
 typedef struct { regs_t r; int depth, inited; } mstate;
@@ -117,7 +118,8 @@ static __thread mstate g_ms;
 void mach_enter(void) {
     if (g_ms.depth++ == 0) {
         if (!g_ms.inited) {
-            uint32_t lo = (uint32_t)(uintptr_t)calloc(1, GUEST_STACK);
+            uint32_t lo = hle_vm_reserve(0, GUEST_STACK);
+            if (!lo) hle_fatal("no guest memory for a thread's stack");
             g_ms.r.esp    = lo + GUEST_STACK - 64;
             g_ms.r.fs     = make_tib(lo, lo + GUEST_STACK);
             g_ms.r.fpu_cw = 0x027F;

@@ -2,7 +2,8 @@
  * win32hle_selftest.c - exercises the host spine and the shim ABI with a
  * hand-written synthetic "guest" in the global-register lifted style, so the
  * whole guest<->native<->guest path is proven with no game binary and no
- * display. This is the win32hle CI green signal (build -m32, run).
+ * display. This is the win32hle CI green signal (build -m32, or 64-bit with
+ * guest memory based: build_selftests.sh).
  *
  * The guest functions below are what the lifter emits by hand: they drive g_esp
  * and g_eax directly, push stdcall arguments, and call imports through
@@ -40,8 +41,10 @@ static uint32_t VA_CreateDIBSection, VA_StretchDIBits;
 static uint32_t g_fb[FB_W * FB_H];
 void hle_gdi_set_target(uint32_t *pixels, int w, int h);
 
-static uint8_t  g_bmi[40];       /* BITMAPINFOHEADER: 4x4, top-down, 32bpp */
-static uint32_t g_dibbits_slot;  /* CreateDIBSection writes the pixel ptr here */
+/* What the guest reads and writes is guest memory (hle_alloc), as a lifted
+ * program's own data would be. */
+static uint8_t  *g_bmi;          /* BITMAPINFOHEADER: 4x4, top-down, 32bpp */
+static uint32_t *g_dibbits_slot; /* CreateDIBSection writes the pixel ptr here */
 static uint32_t src_pixel(int x, int y) { return 0xFF000000u | (uint32_t)((x << 4) | y); }
 
 /* guest: p = HeapAlloc(heap, 0, 64); for (i<16) p[i]=i*i; return p;
@@ -74,12 +77,12 @@ static void guest_draw(void) {
     /* CreateDIBSection(hdc=0, &bmi, usage=0, &bits_slot, hSection=0, offset=0) */
     PUSH32(esp, 0);                                   /* offset   */
     PUSH32(esp, 0);                                   /* hSection */
-    PUSH32(esp, (uint32_t)(uintptr_t)&g_dibbits_slot);/* ppvBits  */
+    PUSH32(esp, hle_va(g_dibbits_slot));              /* ppvBits  */
     PUSH32(esp, 0);                                   /* usage    */
-    PUSH32(esp, (uint32_t)(uintptr_t)g_bmi);          /* pbmi     */
+    PUSH32(esp, hle_va(g_bmi));                       /* pbmi     */
     PUSH32(esp, 0);                                   /* hdc      */
     RECOMP_ICALL(VA_CreateDIBSection);
-    uint32_t bits = g_dibbits_slot;
+    uint32_t bits = *g_dibbits_slot;
     for (uint32_t y = 0; y < 4; y++)
         for (uint32_t x = 0; x < 4; x++)
             MEM32(bits + 4 * (y * 4 + x)) = src_pixel((int)x, (int)y);
@@ -87,7 +90,7 @@ static void guest_draw(void) {
     /* StretchDIBits(hdc,0,0,8,8, 0,0,4,4, bits, &bmi, 0, SRCCOPY=0xCC0020) */
     PUSH32(esp, 0x00CC0020u);                         /* rop     */
     PUSH32(esp, 0);                                   /* usage   */
-    PUSH32(esp, (uint32_t)(uintptr_t)g_bmi);          /* bmi     */
+    PUSH32(esp, hle_va(g_bmi));                       /* bmi     */
     PUSH32(esp, bits);                                /* bits    */
     PUSH32(esp, 4); PUSH32(esp, 4);                   /* hS, wS  (pushed hS then wS) */
     PUSH32(esp, 0); PUSH32(esp, 0);                   /* yS, xS  */
@@ -129,6 +132,8 @@ int main(void) {
     ok("hle_name round-trips",  hle_name(VA_HeapAlloc) && !strcmp(hle_name(VA_HeapAlloc), "HeapAlloc"));
 
     /* BITMAPINFOHEADER: 4x4, top-down (negative height), 32bpp BI_RGB. */
+    g_bmi = (uint8_t *)hle_alloc(40);
+    g_dibbits_slot = (uint32_t *)hle_alloc(4);
     g_bmi[0]=40;                                 /* biSize */
     g_bmi[4]=4;                                  /* biWidth = 4 */
     { int32_t h=-4; memcpy(g_bmi+8,&h,4); }      /* biHeight = -4 (top-down) */
@@ -148,7 +153,7 @@ int main(void) {
 
     /* 2. guest -> shim with a pointer arg: lstrlenA. */
     static const char msg[] = "win32hle";
-    esi = (uint32_t)(uintptr_t)msg;
+    esi = hle_guest_strdup(msg);
     guest_strlen();
     ok("lstrlenA counted the string", eax == strlen(msg));
 

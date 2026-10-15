@@ -24,11 +24,33 @@ non-executable `.text` and no exec-fault trampoline. That is the single thing
 that makes this portable where native32 is not: no inline asm, no OS exception
 handler.
 
+## Guest memory: flat or based
+
+The guest is 32-bit; the host need not be. On a 32-bit host (Linux `-m32`,
+`RECOMP_FLAT_MEMORY`) a guest address *is* a host address. On a 64-bit host
+(macOS on Apple silicon or Intel, Linux x86-64 or arm64) the guest's 4 GB is
+one mapping at `g_mem_base`, the lift's `ADDR(va)` adds it, and nothing outside
+that mapping has a guest address. Built with `RECOMP_MEM_BASE` (a host address,
+`0x100000000000ull` on a Mac) the mapping goes exactly there and `ADDR` adds
+that constant, not a global the compiler reloads after every store. The layer
+is written for all of these:
+
+- `hle_ptr(va)` and `hle_va(p)` convert (guest NULL is host NULL); `APTR`,
+  `ASTR` and `RETP` use them. Based, `hle_va` of a pointer outside guest memory
+  stops the run, naming it, rather than truncating it.
+- anything the guest is handed an address of lives in guest memory: heap
+  blocks and host objects behind a COM object (`hle_alloc`), pages
+  (`hle_vm_reserve`), and structures passed for one call, a CREATESTRUCT or an
+  out pointer (`hle_scratch`, per thread, released to a mark);
+- a guest's varargs are formatted from guest memory (`hle_guest_format`): a
+  `va_list` cannot be made from them off i386.
+
 ## Layout
 
 | File | What |
 |---|---|
 | `win32hle.h` | the shim ABI (`A32`/`RET`/…), the registry, `hle_call_guest`, and every module's host-facing API |
+| `guest_mem.c` | the memory the guest sees: page reservations, the heap (size classes, based), per-thread scratch, `hle_guest_format` |
 | `host_lite.c` | the spine: register file, the machine lock (taken and given back with the registers saved: `hle_block_begin`/`_end`, `hle_yield`; every import and every loop back-edge is a hand-over point when another thread waits), per-thread simulated TIB (`g_fs_base`), dispatch lookups, shim registry, kernel object handles |
 | `host.c` | the full host: `recomp_host_init`/`_boot`/`_run`/`_main` — register the shim modules, map+bind a PE, call its lifted entry |
 | `pe_format.h`, `pe_loader.c` | the 32-bit PE structures; map an image at its base (or a DLL anywhere, relocated), bind its IAT by name or ordinal (`dll#N`) |
@@ -80,7 +102,10 @@ GDI but text.
 runtime/win32hle/build_selftests.sh
 ```
 
-builds every `*_selftest.c` with the whole layer under gcc `-m32` and runs
-it (SDL's dummy drivers: no display or sound card needed). Prereqs on
-Debian/Ubuntu: `dpkg --add-architecture i386; apt install gcc-multilib
-libsdl2-dev:i386 libsdl2-ttf-dev:i386`.
+builds every `*_selftest.c` with the whole layer and runs it (SDL's dummy
+drivers: no display or sound card needed): on Linux under gcc `-m32` (flat),
+on a Mac 64-bit (based), and `HLE_BASED=1` builds a 64-bit Linux host the
+same way; `HLE_MEM_BASE=0x100000000000ull` with either puts the guest's memory
+at that fixed address. Prereqs on Debian/Ubuntu: `dpkg --add-architecture i386; apt
+install gcc-multilib libsdl2-dev:i386 libsdl2-ttf-dev:i386` (`libsdl2-dev
+libsdl2-ttf-dev` for `HLE_BASED=1`); on a Mac, `brew install sdl2 sdl2_ttf`.

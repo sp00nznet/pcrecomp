@@ -1,5 +1,5 @@
 /*
- * pe_loader.c - see pe_loader.h. Maps a 32-bit PE with mmap and binds its IAT
+ * pe_loader.c - see pe_loader.h. Maps a 32-bit PE into guest memory and binds its IAT
  * to resolver-provided addresses. No windows.h: that is the point.
  */
 #define _GNU_SOURCE
@@ -9,10 +9,10 @@
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include "pe_format.h"
 #include "pe_loader.h"
+#include "win32hle.h"
 
 #define PAGE 0x1000u
 static uint32_t round_up(uint32_t v, uint32_t a) { return (v + a - 1) & ~(a - 1); }
@@ -35,14 +35,14 @@ void recomp_pe_relocate(uint32_t base, uint32_t reloc_rva, uint32_t reloc_size, 
     if (!reloc_rva || !reloc_size || !delta) return;
     uint32_t off = 0;
     while (off < reloc_size) {
-        pe_base_reloc *blk = (pe_base_reloc *)(uintptr_t)(base + reloc_rva + off);
+        pe_base_reloc *blk = (pe_base_reloc *)hle_ptr(base + reloc_rva + off);
         if (blk->SizeOfBlock < sizeof *blk) break;
         uint32_t nent = (blk->SizeOfBlock - (uint32_t)sizeof *blk) / 2;
         uint16_t *ent = (uint16_t *)(blk + 1);
         for (uint32_t i = 0; i < nent; i++) {
             uint32_t type = ent[i] >> 12, where = ent[i] & 0x0FFF;
             if (type == PE_REL_HIGHLOW)
-                *(uint32_t *)(uintptr_t)(base + blk->VirtualAddress + where) += (uint32_t)delta;
+                MEM32(base + blk->VirtualAddress + where) += (uint32_t)delta;
             /* type 0 (ABSOLUTE) is padding; others are unused on x86 PE32 */
         }
         off += blk->SizeOfBlock;
@@ -69,29 +69,24 @@ static int pe_map_at(const char *path, pe_image *img, int anywhere) {
     uint32_t image_base = opt->ImageBase;
     uint32_t span = round_up(opt->SizeOfImage, PAGE);
 
-    /* Reserve the image's VA range, fixed. On a 32-bit host the VA is a real
-     * host address, so a 1:1 map means every MEM32(va) in lifted code lands.
-     * NOREPLACE: a range the host already uses (its heap, a library) fails the
-     * map instead of being silently replaced under it. A DLL (anywhere) goes
-     * wherever there is room and is relocated. */
-#ifndef MAP_FIXED_NOREPLACE
-#define MAP_FIXED_NOREPLACE 0x100000
-#endif
-    void *p = mmap(anywhere ? NULL : (void *)(uintptr_t)image_base, span, PROT_READ | PROT_WRITE,
-                   (anywhere ? 0 : MAP_FIXED_NOREPLACE) | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (p == MAP_FAILED || (!anywhere && (uint32_t)(uintptr_t)p != image_base)) {
-        free(file); fprintf(stderr, "[pe] mmap @ 0x%08X failed (the range is in use)\n", image_base); return 1;
+    /* Reserve the image's VA range, fixed, so every MEM32(va) in lifted code
+     * lands. A range already in use (on a flat host, its heap or a library)
+     * fails the map instead of being silently replaced under it. A DLL
+     * (anywhere) goes wherever there is room and is relocated. */
+    uint32_t base = hle_vm_reserve(anywhere ? 0 : image_base, span);
+    if (!base || (!anywhere && base != image_base)) {
+        if (base) hle_vm_release(base, span);
+        free(file); fprintf(stderr, "[pe] map @ 0x%08X failed (the range is in use)\n", image_base); return 1;
     }
-    uint32_t base = (uint32_t)(uintptr_t)p;
 
     /* headers, then each section's raw data (the rest of VirtualSize is the
      * zero MAP_ANONYMOUS already gave us, i.e. .bss). */
-    memcpy((void *)(uintptr_t)base, file, opt->SizeOfHeaders);
+    memcpy(hle_ptr(base), file, opt->SizeOfHeaders);
     pe_section_header *sec = (pe_section_header *)((uint8_t *)&nt->OptionalHeader + nt->FileHeader.SizeOfOptionalHeader);
     for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
         uint32_t copy = sec[i].SizeOfRawData < sec[i].VirtualSize ? sec[i].SizeOfRawData : sec[i].VirtualSize;
         if (copy && (size_t)sec[i].PointerToRawData + copy <= flen)
-            memcpy((void *)(uintptr_t)(base + sec[i].VirtualAddress), file + sec[i].PointerToRawData, copy);
+            memcpy(hle_ptr(base + sec[i].VirtualAddress), file + sec[i].PointerToRawData, copy);
     }
 
     if (base != image_base) {
@@ -116,11 +111,11 @@ int recomp_pe_bind(const pe_image *img, uint32_t (*resolve)(const char *name)) {
     if (!img->import_rva) return 0;
     uint32_t base = img->base;
     int unresolved = 0, bound = 0;
-    pe_import_descriptor *d = (pe_import_descriptor *)(uintptr_t)(base + img->import_rva);
+    pe_import_descriptor *d = (pe_import_descriptor *)hle_ptr(base + img->import_rva);
     for (; d->Name; d++) {
-        const char *dll = (const char *)(uintptr_t)(base + d->Name);
-        uint32_t *ilt = (uint32_t *)(uintptr_t)(base + (d->OriginalFirstThunk ? d->OriginalFirstThunk : d->FirstThunk));
-        uint32_t *iat = (uint32_t *)(uintptr_t)(base + d->FirstThunk);
+        const char *dll = (const char *)hle_ptr(base + d->Name);
+        uint32_t *ilt = (uint32_t *)hle_ptr(base + (d->OriginalFirstThunk ? d->OriginalFirstThunk : d->FirstThunk));
+        uint32_t *iat = (uint32_t *)hle_ptr(base + d->FirstThunk);
         for (; *ilt; ilt++, iat++) {
             uint32_t va = 0;
             if (*ilt & PE_ORDINAL_FLAG) {
@@ -137,7 +132,7 @@ int recomp_pe_bind(const pe_image *img, uint32_t (*resolve)(const char *name)) {
                 va = resolve(name);
                 if (!va) fprintf(stderr, "[pe] unresolved import %s\n", name);
             } else {
-                const char *name = (const char *)(uintptr_t)(base + *ilt + 2); /* skip hint word */
+                const char *name = (const char *)hle_ptr(base + *ilt + 2); /* skip hint word */
                 va = resolve(name);
                 if (!va) fprintf(stderr, "[pe] unresolved import %s!%s\n", dll, name);
             }

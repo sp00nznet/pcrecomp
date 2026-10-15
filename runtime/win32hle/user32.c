@@ -287,7 +287,12 @@ static void invalidate(win_t *x, int all_children) {
         for (int i = 0; i < MAX_WIN; i++) if (g_win[i].used && g_win[i].parent == x->hwnd) invalidate(&g_win[i], 1);
 }
 
-/* ---- creation ---- */
+/* ---- creation ----
+ * A class name is a string or an atom (below 64 KB). Host code passes an atom
+ * as a small pointer, which no host string can be; a guest argument is
+ * tested as a VA first (STR_OR_ATOM), since its host pointer never is small. */
+static const char *str_or_atom(uint32_t va) { return va < 0x10000u ? (const char *)(uintptr_t)va : (const char *)hle_ptr(va); }
+#define STR_OR_ATOM(i) str_or_atom(A32(i))
 static int find_class(const char *name) {
     if (!name) return -1;
     if ((uintptr_t)name < 0x10000u) {                    /* an atom: one of ours, or a built-in's */
@@ -340,8 +345,17 @@ static uint32_t cbt_hook(uint32_t code, uint32_t wParam, uint32_t lParam) {
     return hle_call_guest(fn, 3, a);
 }
 
+static uint32_t create_window(uint32_t exstyle, const char *cls, const char *title, uint32_t style, int px, int py, int pw, int ph,
+                              uint32_t parent, uint32_t menu, uint32_t hinst, uint32_t param);
 uint32_t hle_create_window(uint32_t exstyle, const char *cls, const char *title, uint32_t style, int px, int py, int pw, int ph,
                            uint32_t parent, uint32_t menu, uint32_t hinst, uint32_t param) {
+    uint32_t mark = hle_scratch_mark();                  /* the CREATESTRUCT and its strings, for the length of creation */
+    uint32_t h = create_window(exstyle, cls, title, style, px, py, pw, ph, parent, menu, hinst, param);
+    hle_scratch_release(mark);
+    return h;
+}
+static uint32_t create_window(uint32_t exstyle, const char *cls, const char *title, uint32_t style, int px, int py, int pw, int ph,
+                              uint32_t parent, uint32_t menu, uint32_t hinst, uint32_t param) {
     int c = find_class(cls);
     if (c < 0) {
         fprintf(stderr, "[user32] CreateWindowEx: no class %s\n", (uintptr_t)cls < 0x10000u ? "(atom)" : cls);
@@ -362,14 +376,15 @@ uint32_t hle_create_window(uint32_t exstyle, const char *cls, const char *title,
     x->x = px, x->y = py, x->w = pw, x->h = ph;
     x->cursel = -1, x->item_h = 13, x->rmax = 100, x->limit = 0x7FFFFFFE;
     if (title && (uintptr_t)title >= 0x10000u) snprintf(x->text, sizeof x->text, "%s", title);
-    uint32_t cs[12] = { param, hinst, menu, parent, (uint32_t)ph, (uint32_t)pw, (uint32_t)py, (uint32_t)px, style,
-                        (uint32_t)(uintptr_t)title, (uint32_t)(uintptr_t)cls, exstyle };
+    uint32_t cs_[12] = { param, hinst, menu, parent, (uint32_t)ph, (uint32_t)pw, (uint32_t)py, (uint32_t)px, style,
+                         title ? hle_guest_str_or_atom(title) : 0, hle_guest_str_or_atom(cls), exstyle };
+    uint32_t cs = hle_scratch_copy(cs_, sizeof cs_);
     uint32_t h = x->hwnd;
-    uint32_t cbtcw[2] = { (uint32_t)(uintptr_t)cs, 0 };  /* CBT_CREATEWND { lpcs, hwndInsertAfter } */
-    if (cbt_hook(3 /*HCBT_CREATEWND*/, h, (uint32_t)(uintptr_t)cbtcw)) { x->used = 0; return 0; }
+    uint32_t cbtcw_[2] = { cs, 0 };                      /* CBT_CREATEWND { lpcs, hwndInsertAfter } */
+    if (cbt_hook(3 /*HCBT_CREATEWND*/, h, hle_scratch_copy(cbtcw_, sizeof cbtcw_))) { x->used = 0; return 0; }
     if (!(x = W(h))) return 0;                            /* the hook may subclass via SetWindowLong(GWL_WNDPROC) */
-    hle_send(h, WM_NCCREATE, 0, (uint32_t)(uintptr_t)cs);
-    if ((int32_t)hle_send(h, WM_CREATE, 0, (uint32_t)(uintptr_t)cs) == -1) {
+    hle_send(h, WM_NCCREATE, 0, cs);
+    if ((int32_t)hle_send(h, WM_CREATE, 0, cs) == -1) {
         x = W(h);
         if (x) item_free(x), x->used = 0;
         return 0;
@@ -398,28 +413,43 @@ static void measure(win_t *x) {
     win_t *p = W(x->parent);
     x->sel_h = 17, x->item_h = 13, x->drop_h = x->h;
     if (owner && p) {
-        uint32_t mi[6] = { combo ? 3u : 2u, x->id, combo ? 0xFFFFFFFFu : 0u, (uint32_t)x->w, combo ? 11u : 13u, 0 };
-        hle_send(p->hwnd, WM_MEASUREITEM, x->id, (uint32_t)(uintptr_t)mi);
-        if (!(x = W(h))) return;
+        uint32_t mark = hle_scratch_mark();
+        uint32_t mi_[6] = { combo ? 3u : 2u, x->id, combo ? 0xFFFFFFFFu : 0u, (uint32_t)x->w, combo ? 11u : 13u, 0 };
+        uint32_t mi = hle_scratch_copy(mi_, sizeof mi_);  /* MEASUREITEMSTRUCT */
+        hle_send(p->hwnd, WM_MEASUREITEM, x->id, mi);
+        if (!(x = W(h))) { hle_scratch_release(mark); return; }
         if (combo) {
-            x->sel_h = 6 + (int)mi[4];
+            x->sel_h = 6 + (int)MEM32(mi + 16);
             if (x->style & 0x10u) {                      /* CBS_OWNERDRAWFIXED: the list's items too */
-                uint32_t li[6] = { 3u, x->id, 0, (uint32_t)x->w, 17u, 0 };
-                hle_send(x->parent, WM_MEASUREITEM, x->id, (uint32_t)(uintptr_t)li);
-                if (!(x = W(h))) return;
-                x->item_h = (int)li[4];
+                uint32_t li_[6] = { 3u, x->id, 0, (uint32_t)x->w, 17u, 0 };
+                uint32_t li = hle_scratch_copy(li_, sizeof li_);
+                hle_send(x->parent, WM_MEASUREITEM, x->id, li);
+                if (!(x = W(h))) { hle_scratch_release(mark); return; }
+                x->item_h = (int)MEM32(li + 16);
             }
         } else {
-            x->item_h = (int)mi[4];
+            x->item_h = (int)MEM32(mi + 16);
         }
+        hle_scratch_release(mark);
     }
     if (combo && (x->style & 3u) != 1u) x->h = x->sel_h + 4;   /* not CBS_SIMPLE */
+}
+
+/* A visible child going (hidden or destroyed) uncovers its parent, which
+ * Windows then repaints there. Without it a game that paints its dialogs
+ * itself leaves the child's last picture on screen (Red Alert 2's combo
+ * lists, closed, stayed drawn). */
+static void invalidate_rect(win_t *x, int l, int t, int r, int b);
+static void uncover(win_t *x) {
+    win_t *p = x && x->parent && (x->style & WS_VISIBLE) ? W(x->parent) : NULL;
+    if (p) invalidate_rect(p, x->x, x->y, x->x + x->w, x->y + x->h);   /* and the siblings it covered */
 }
 
 static void destroy(uint32_t h) {
     win_t *x = W(h);
     if (!x || x->destroying) return;
     x->destroying = 1;
+    uncover(x);
     for (int i = 0; i < MAX_WIN; i++)                    /* owned windows and children first */
         if (g_win[i].used && (g_win[i].parent == h || g_win[i].owner == h)) destroy(g_win[i].hwnd);
     hle_send(h, WM_DESTROY, 0, 0);
@@ -680,14 +710,14 @@ static uint32_t def_proc(uint32_t h, uint32_t m, uint32_t w, uint32_t l) {
     case WM_CLOSE: destroy(h); return 0;
     case WM_NCHITTEST: return 1;                         /* HTCLIENT */
     case WM_SETTEXT:
-        snprintf(x->text, sizeof x->text, "%s", l ? (const char *)(uintptr_t)l : "");
+        snprintf(x->text, sizeof x->text, "%s", l ? (const char *)hle_ptr(l) : "");
         return 1;
     case WM_GETTEXT: {
         uint32_t n = (uint32_t)strlen(x->text);
         if (!w) return 0;
         if (n > w - 1) n = w - 1;
-        memcpy((void *)(uintptr_t)l, x->text, n);
-        ((char *)(uintptr_t)l)[n] = 0;
+        memcpy(hle_ptr(l), x->text, n);
+        ((char *)hle_ptr(l))[n] = 0;
         return n;
     }
     case WM_GETTEXTLENGTH: return (uint32_t)strlen(x->text);
@@ -709,7 +739,7 @@ static void p_MDIClient(void) {
     uint32_t h = A32(0), m = A32(1), w = A32(2), l = A32(3);
     if (m == 0x0220u && l) {                             /* WM_MDICREATE: MDICREATESTRUCT* */
         uint32_t cs = l;
-        const char *cls = (const char *)(uintptr_t)MEM32(cs), *title = (const char *)(uintptr_t)MEM32(cs + 4);
+        const char *cls = str_or_atom(MEM32(cs)), *title = (const char *)hle_ptr(MEM32(cs + 4));
         uint32_t child = hle_create_window(0x40u /*WS_EX_MDICHILD*/, cls, title,
             0x50000000u | MEM32(cs + 28) /*WS_CHILD|WS_VISIBLE|style*/,
             (int)MEM32(cs + 12), (int)MEM32(cs + 16), (int)MEM32(cs + 20), (int)MEM32(cs + 24),
@@ -735,7 +765,9 @@ static void owner_draw(win_t *x, uint32_t type, int item, uint32_t state, int l,
     if (!p) return;
     uint32_t dis[12] = { type, x->id, (uint32_t)item, 1u /* ODA_DRAWENTIRE */, state, x->hwnd, 0x0DC00001u,
                          (uint32_t)l, (uint32_t)t, (uint32_t)r, (uint32_t)b, item >= 0 && item < x->nitems ? x->items[item].data : 0 };
-    hle_send(p->hwnd, WM_DRAWITEM, x->id, (uint32_t)(uintptr_t)dis);
+    uint32_t mark = hle_scratch_mark();                  /* DRAWITEMSTRUCT */
+    hle_send(p->hwnd, WM_DRAWITEM, x->id, hle_scratch_copy(dis, sizeof dis));
+    hle_scratch_release(mark);
 }
 
 static void radio_group_clear(win_t *x) {
@@ -863,7 +895,7 @@ static uint32_t edit_proc(win_t *x, uint32_t m, uint32_t w, uint32_t l) {
         return 0;
     }
     case 0x00C2u: {                                      /* EM_REPLACESEL */
-        const char *s = (const char *)(uintptr_t)l;
+        const char *s = (const char *)hle_ptr(l);
         char tmp[512];
         snprintf(tmp, sizeof tmp, "%.*s%s%s", x->sel0, x->text, s ? s : "", x->text + x->sel1);
         x->sel0 += s ? (int)strlen(s) : 0, x->sel1 = x->sel0;
@@ -920,8 +952,8 @@ static uint32_t list_msg(win_t *x, uint32_t m, uint32_t w, uint32_t l, int *hand
     int strings = !(x->style & (x->kind == K_LISTBOX ? 0x30u : 0x30u)) || (x->style & (x->kind == K_LISTBOX ? 0x40u : 0x200u));
     *handled = 1;
     switch (m) {
-    case 0x0180u: case 0x0143u: return (uint32_t)item_add(x, -1, strings ? (const char *)(uintptr_t)l : NULL, strings ? 0 : l, sorted);
-    case 0x0181u: case 0x014Au: return (uint32_t)item_add(x, (int)w, strings ? (const char *)(uintptr_t)l : NULL, strings ? 0 : l, 0);
+    case 0x0180u: case 0x0143u: return (uint32_t)item_add(x, -1, strings ? (const char *)hle_ptr(l) : NULL, strings ? 0 : l, sorted);
+    case 0x0181u: case 0x014Au: return (uint32_t)item_add(x, (int)w, strings ? (const char *)hle_ptr(l) : NULL, strings ? 0 : l, 0);
     case 0x0182u: case 0x0144u: return (uint32_t)item_del(x, (int)w);
     case 0x0184u: case 0x014Bu: item_free(x); x->cursel = -1, x->top = 0; invalidate(x, 0); return 0;
     case 0x0186u: case 0x014Eu:                          /* SETCURSEL */
@@ -934,18 +966,18 @@ static uint32_t list_msg(win_t *x, uint32_t m, uint32_t w, uint32_t l, int *hand
     case 0x0189u: case 0x0148u:                          /* GETTEXT / GETLBTEXT */
         if ((int)w < 0 || (int)w >= x->nitems) return 0xFFFFFFFFu;
         if (!strings) { MEM32(l) = x->items[w].data; return 4; }
-        strcpy((char *)(uintptr_t)l, x->items[w].text);
+        strcpy((char *)hle_ptr(l), x->items[w].text);
         return (uint32_t)strlen(x->items[w].text);
     case 0x018Au: case 0x0149u:                          /* GETTEXTLEN */
         return (int)w < 0 || (int)w >= x->nitems ? 0xFFFFFFFFu : (uint32_t)strlen(x->items[w].text);
     case 0x018Bu: case 0x0146u: return (uint32_t)x->nitems;   /* GETCOUNT */
     case 0x018Cu: case 0x014Du: {                        /* SELECTSTRING */
-        int i = item_find(x, (int)w, (const char *)(uintptr_t)l, 0);
+        int i = item_find(x, (int)w, (const char *)hle_ptr(l), 0);
         if (i >= 0) x->cursel = i, invalidate(x, 0);
         return (uint32_t)i;
     }
-    case 0x018Fu: case 0x014Cu: return (uint32_t)item_find(x, (int)w, (const char *)(uintptr_t)l, 0);   /* FINDSTRING */
-    case 0x01A2u: case 0x0158u: return (uint32_t)item_find(x, (int)w, (const char *)(uintptr_t)l, 1);   /* FINDSTRINGEXACT */
+    case 0x018Fu: case 0x014Cu: return (uint32_t)item_find(x, (int)w, (const char *)hle_ptr(l), 0);   /* FINDSTRING */
+    case 0x01A2u: case 0x0158u: return (uint32_t)item_find(x, (int)w, (const char *)hle_ptr(l), 1);   /* FINDSTRINGEXACT */
     case 0x018Eu: return (uint32_t)x->top;               /* LB_GETTOPINDEX */
     case 0x0197u: x->top = (int)w; invalidate(x, 0); return 0;   /* LB_SETTOPINDEX */
     case 0x0190u: return x->cursel >= 0;                 /* LB_GETSELCOUNT */
@@ -1411,30 +1443,30 @@ static void u_GetNextDlgTabItem(void) { RET(next_tab(A32(0), A32(1), A32(2) != 0
 static void u_RegisterClassA(void) {                     /* WNDCLASSA: style, proc, clsExtra, wndExtra, hinst, icon, cursor, brush, menu, name */
     builtin_classes();
     uint32_t wc = A32(0);
-    const char *name = (const char *)(uintptr_t)MEM32(wc + 36);
+    const char *name = str_or_atom(MEM32(wc + 36));
     int i = add_class((uintptr_t)name < 0x10000u ? "?" : name, MEM32(wc + 4), MEM32(wc), MEM32(wc + 12), MEM32(wc + 16), K_GUEST);
     RET(i < 0 ? 0u : 0xC000u + (uint32_t)i, 1);
 }
 static void u_RegisterClassExA(void) {                   /* WNDCLASSEXA: size, style, proc, ..., name at +40 */
     builtin_classes();
     uint32_t wc = A32(0);
-    const char *name = (const char *)(uintptr_t)MEM32(wc + 40);
+    const char *name = str_or_atom(MEM32(wc + 40));
     int i = add_class((uintptr_t)name < 0x10000u ? "?" : name, MEM32(wc + 8), MEM32(wc + 4), MEM32(wc + 16), MEM32(wc + 20), K_GUEST);
     RET(i < 0 ? 0u : 0xC000u + (uint32_t)i, 1);
 }
 static void u_GetClassInfoA(void) {                      /* (hinst, name, &WNDCLASSA) */
     builtin_classes();
-    int i = find_class(ASTR(1));
+    int i = find_class(STR_OR_ATOM(1));
     if (i < 0) RET(0, 3);
     uint32_t wc = A32(2);
-    memset((void *)(uintptr_t)wc, 0, 40);
+    memset(hle_ptr(wc), 0, 40);
     MEM32(wc) = g_cls[i].style, MEM32(wc + 4) = g_cls[i].proc, MEM32(wc + 12) = g_cls[i].extra;
     MEM32(wc + 16) = g_cls[i].hinst, MEM32(wc + 36) = A32(1);
     RET(1, 3);
 }
 static void u_CreateWindowExA(void) {
     builtin_classes();
-    RET(hle_create_window(A32(0), ASTR(1), ASTR(2), A32(3), (int)A32(4), (int)A32(5), (int)A32(6), (int)A32(7),
+    RET(hle_create_window(A32(0), STR_OR_ATOM(1), ASTR(2), A32(3), (int)A32(4), (int)A32(5), (int)A32(6), (int)A32(7),
                           A32(8), A32(9), A32(10), A32(11)), 12);
 }
 static void u_DestroyWindow(void) { int ok = W(A32(0)) != NULL; destroy(A32(0)); RET((uint32_t)ok, 1); }
@@ -1455,6 +1487,7 @@ static void u_ShowWindow(void) {
     win_t *x = W(A32(0));
     if (!x) RET(0, 2);
     int was = (x->style & WS_VISIBLE) != 0, show = A32(1) != 0;   /* SW_HIDE is 0 */
+    if (was && !show) uncover(x);
     if (show) x->style |= WS_VISIBLE; else x->style &= ~WS_VISIBLE;
     if (show != was) {
         hle_send(x->hwnd, WM_SHOWWINDOW, (uint32_t)show, 0);
@@ -1523,7 +1556,7 @@ static void u_EnumChildWindows(void) {                   /* (parent, proc, lPara
     RET(1, 3);
 }
 static void u_FindWindowA(void) {                        /* (class, title) */
-    int c = find_class(ASTR(0));
+    int c = find_class(STR_OR_ATOM(0));
     for (int i = 0; i < MAX_WIN; i++) {
         win_t *x = &g_win[i];
         if (!x->used || x->parent) continue;
@@ -1618,7 +1651,15 @@ static void u_MapWindowPoints(void) {                    /* (from, to, pts, n) *
 }
 static void move(win_t *x, int px, int py, int pw, int ph, int do_move, int do_size) {
     uint32_t h = x->hwnd;
-    if (do_size && x->kind == K_COMBOBOX && (x->style & 3u) != 1u) x->drop_h = ph, ph = x->h;   /* sets the dropped height */
+    /* A drop-down combo's height, given, is its height dropped; its own stays
+     * its field's. As Windows does, only a height past the field's sets it:
+     * one no taller than the field is a move of the control alone (Red Alert
+     * 2's skirmish rows are laid out at their field height, and a dropped
+     * height of 21 left their lists no room for one item). */
+    if (do_size && x->kind == K_COMBOBOX && (x->style & 3u) != 1u) {
+        if (ph > x->h) x->drop_h = ph;
+        ph = x->h;
+    }
     if (do_move) x->x = px, x->y = py;
     if (do_size) x->w = pw, x->h = ph;
     invalidate(x, 1);
@@ -1726,7 +1767,7 @@ static void u_BeginPaint(void) {                         /* (h, &PAINTSTRUCT) */
     win_t *x = W(A32(0));
     uint32_t ps = A32(1);
     if (ps) {
-        memset((void *)(uintptr_t)ps, 0, 64);
+        memset(hle_ptr(ps), 0, 64);
         MEM32(ps) = 0x0DC00001u;
         if (x) put_rect(ps + 8, x->ix0, x->iy0, x->ix1, x->iy1);
     }
@@ -1903,11 +1944,11 @@ static int g_ncursors;
 static uint32_t load_mono_cursor(uint32_t hinst, uint32_t id) {
     uint32_t group = hle_find_resource(hinst, id, RT_GROUP_CURSOR_ID), size = 0;
     if (!group) return 0;
-    const uint8_t *dir = (const uint8_t *)(uintptr_t)hle_resource_data(hinst, group, &size);
+    const uint8_t *dir = (const uint8_t *)hle_ptr(hle_resource_data(hinst, group, &size));
     if (!dir || size < 6 + 14) return 0;
     uint16_t first_entry_id = (uint16_t)(dir[6 + 12] | dir[6 + 13] << 8);   /* NEWHEADER, then CURSORDIRENTRY's nID */
     uint32_t res = hle_find_resource(hinst, first_entry_id, RT_CURSOR_ID);
-    const uint8_t *cur = res ? (const uint8_t *)(uintptr_t)hle_resource_data(hinst, res, &size) : NULL;
+    const uint8_t *cur = res ? (const uint8_t *)hle_ptr(hle_resource_data(hinst, res, &size)) : NULL;
     if (!cur || size < 4 + 40 + 8 + 2 * 128) return 0;
     const uint8_t *bih = cur + 4;                         /* after the hot spot: a BITMAPINFOHEADER */
     int32_t w = (int32_t)(bih[4] | bih[5] << 8 | bih[6] << 16 | (uint32_t)bih[7] << 24);
@@ -2020,7 +2061,7 @@ static void u_LoadMenuA(void) {                          /* (hModule, lpMenuName
     if (!hr) RET(0, 2);
     uint32_t data = hle_resource_data(A32(0), hr, NULL);
     if (!data) RET(0, 2);
-    const uint8_t *p = (const uint8_t *)(uintptr_t)data;
+    const uint8_t *p = (const uint8_t *)hle_ptr(data);
     uint16_t ver = (uint16_t)(p[0] | p[1] << 8);
     if (ver != 0) RET(0, 2);                             /* MENUEX (version 1) not handled */
     p += 4;                                              /* MENUHEADER: version, headerSize (both 0) */
@@ -2074,21 +2115,12 @@ static void u_DrawTextA(void) {                          /* (hdc, text, n, rect,
 
 /* wsprintfA is cdecl: the caller pops, so only the return address goes. */
 static void u_wsprintfA(void) {
-    char *out = ASTR(0);
-    const char *fmt = ASTR(1);
-    va_list ap;
-    char *first = (char *)(uintptr_t)(g_esp + 12);
-    memcpy(&ap, &first, sizeof ap);
-    int n = vsnprintf(out, 1024, fmt, ap);
-    RET((uint32_t)(n < 0 ? 0 : n > 1023 ? 1023 : n), 0);
+    int n = hle_guest_format(ASTR(0), 1024, ASTR(1), g_esp + 12);   /* the arguments follow the format on the stack */
+    RET((uint32_t)n, 0);
 }
 static void u_wvsprintfA(void) {
-    char *out = ASTR(0);
-    va_list ap;
-    char *first = (char *)(uintptr_t)A32(2);
-    memcpy(&ap, &first, sizeof ap);
-    int n = vsnprintf(out, 1024, ASTR(1), ap);
-    RET((uint32_t)(n < 0 ? 0 : n > 1023 ? 1023 : n), 3);
+    int n = hle_guest_format(ASTR(0), 1024, ASTR(1), A32(2));
+    RET((uint32_t)n, 3);
 }
 
 /* Message boxes print, and answer the first button. */
@@ -2099,8 +2131,8 @@ static void u_MessageBoxA(void) {
 }
 static void u_MessageBoxIndirectA(void) {
     uint32_t p = A32(0);
-    fprintf(stderr, "[MessageBox] %s: %s\n", MEM32(p + 12) ? (const char *)(uintptr_t)MEM32(p + 12) : "",
-            MEM32(p + 8) ? (const char *)(uintptr_t)MEM32(p + 8) : "");
+    fprintf(stderr, "[MessageBox] %s: %s\n", MEM32(p + 12) ? (const char *)hle_ptr(MEM32(p + 12)) : "",
+            MEM32(p + 8) ? (const char *)hle_ptr(MEM32(p + 8)) : "");
     RET(1, 1);
 }
 
