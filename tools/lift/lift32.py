@@ -1385,15 +1385,15 @@ class Lifter:
                     # path for an overlapping blit, and it smashed the object
                     # sitting after its destination.
                     #
-                    # memmove, not memcpy: overlap is the whole reason the
-                    # backward form exists.
+                    # Overlap is the whole reason the backward form exists,
+                    # and a forward copy into itself is an idiom of its own:
+                    # recomp_rep_movs copies element by element when the copy
+                    # reads what it wrote, as the CPU does.
                     lines.append(
-                        f"{{ uint32_t _n = ecx, _b = _n * {esz}u; {comment}"
-                        f" if (_df > 0) {{ memmove((void*)ADDR(edi),"
-                        f" (void*)ADDR(esi), _b); esi += _b; edi += _b; }}"
-                        f" else {{ memmove((void*)ADDR(edi - _b + {esz}u),"
-                        f" (void*)ADDR(esi - _b + {esz}u), _b);"
-                        f" esi -= _b; edi -= _b; }} ecx = 0; }}")
+                        f"{{ uint32_t _b = ecx * {esz}u; {comment}"
+                        f" recomp_rep_movs(edi, esi, ecx, {esz}u, _df);"
+                        f" if (_df > 0) {{ esi += _b; edi += _b; }}"
+                        f" else {{ esi -= _b; edi -= _b; }} ecx = 0; }}")
                 elif esz == 1:
                     lines.append(f"MEM8(edi) = MEM8(esi); esi += _df; edi += _df; {comment}")
                 elif esz == 2:

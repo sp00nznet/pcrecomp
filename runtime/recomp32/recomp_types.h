@@ -221,6 +221,24 @@ static inline void MEMSET16(void* dst, uint16_t val, uint32_t count) {
     for (uint32_t i = 0; i < count; i++) p[i] = val;
 }
 
+/* `rep movs`: n elements of esz bytes, from esi to edi, walking up (df > 0)
+ * or down from there. A CPU copies one element at a time, so when the
+ * destination starts inside what is still to be read, the copy reads its
+ * own output: `rep movsd` from p to p+12 repeats p's 12 bytes along the
+ * buffer, and Red Alert 2's Tesla bolt starts its three strands that way.
+ * memmove would copy as if through a temporary, so it serves every other
+ * case and only that one walks element by element. */
+static inline void recomp_rep_movs(uint32_t edi, uint32_t esi, uint32_t n, uint32_t esz, int df) {
+    uint32_t b = n * esz;
+    if (df > 0 ? edi - esi >= b : esi - edi >= b) {
+        if (df > 0) memmove((void*)ADDR(edi), (void*)ADDR(esi), b);
+        else memmove((void*)ADDR(edi - b + esz), (void*)ADDR(esi - b + esz), b);
+        return;
+    }
+    for (uint32_t i = 0; i < n; i++, edi += df * esz, esi += df * esz)
+        memcpy((void*)ADDR(edi), (void*)ADDR(esi), esz);
+}
+
 /* ============================================================
  * Stack Operations
  * ============================================================ */

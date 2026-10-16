@@ -326,6 +326,19 @@ CASES = [
     Case('movsb.rep-forward', bytes.fromhex('fcf3a4'),       # cld; rep movsb
          {'ecx': 4, 'esi': SCRATCH, 'edi': SCRATCH + 0x100},
          mem={SCRATCH: b'ABCD'}),
+    # A forward copy into itself repeats the source along the buffer, element
+    # by element: Red Alert 2 fills a bolt's three strand starts with one
+    # point that way (rep movsd from p to p+12), and memmove gave the second
+    # and third strands stale stack -- lines shot off the top of the screen.
+    Case('movsd.rep-forward-overlap', bytes.fromhex('fcf3a5'),  # cld; rep movsd
+         {'ecx': 6, 'esi': SCRATCH, 'edi': SCRATCH + 12},
+         mem={SCRATCH: b'ABCDEFGHIJKLmnopqrstuvwxyz0123456789'}),
+    Case('movsb.rep-forward-overlap', bytes.fromhex('fcf3a4'),  # cld; rep movsb
+         {'ecx': 7, 'esi': SCRATCH, 'edi': SCRATCH + 1},
+         mem={SCRATCH: b'Xabcdefgh'}),
+    Case('movsd.rep-backward-overlap', bytes.fromhex('fdf3a5'),  # std; rep movsd
+         {'ecx': 3, 'esi': SCRATCH + 12, 'edi': SCRATCH + 8},
+         mem={SCRATCH: b'ABCDEFGHIJKLMNOP'}),
     Case('stosb.rep-backward', bytes.fromhex('fdf3aa'),      # std; rep stosb
          {'eax': 0x5A, 'ecx': 4, 'edi': SCRATCH + 0x103}),
     Case('stosd.rep-backward', bytes.fromhex('fdf3ab'),      # std; rep stosd
