@@ -116,6 +116,7 @@ extern void (*hle_cursor_hook)(int x, int y);                          /* the gu
 typedef struct { uint32_t handle; int hot_x, hot_y; uint8_t and_mask[128], xor_mask[128]; } hle_cursor_image_t;
 const hle_cursor_image_t *hle_cursor_image(uint32_t handle);   /* NULL: not one of those (show the system arrow) */
 uint32_t hle_current_cursor(void);                              /* the last SetCursor; 0 if none */
+int      hle_cursor_shown(void);                                /* ShowCursor's count is not negative */
 extern void (*hle_proc_hook)(uint32_t hwnd, uint32_t msg, uint32_t wParam, uint32_t lParam);   /* every message delivered */
 extern volatile int hle_lbutton_reads;   /* GetKeyState/GetAsyncKeyState(VK_LBUTTON) calls so far */
 int         hle_is_window(uint32_t h);
@@ -145,7 +146,7 @@ void  hle_present_close(void);
  * Typed: hle_handle_obj(h, type) is NULL for a handle of another type (type 0
  * takes any). CloseHandle calls the type's closer. */
 enum { HLE_H_FILE = 1, HLE_H_FIND, HLE_H_EVENT, HLE_H_MUTEX, HLE_H_THREAD, HLE_H_SEMAPHORE,
-       HLE_H_REGKEY, HLE_H_SOCKET, HLE_H_OTHER };
+       HLE_H_REGKEY, HLE_H_SOCKET, HLE_H_OTHER, HLE_H_MAPPING, HLE_H_MMIO };
 uint32_t hle_handle_alloc(int type, void *obj);       /* 0 when the table is full */
 void    *hle_handle_obj(uint32_t h, int type);
 int      hle_handle_type(uint32_t h);
@@ -173,6 +174,9 @@ void  hle_set_command_line(const char *cmdline);   /* what GetCommandLineA answe
 extern void (*hle_on_exit)(int code);              /* run by ExitProcess before the process goes */
 void  hle_exit(int code);                          /* flush and leave, once */
 uint32_t hle_thread_id(void);                      /* GetCurrentThreadId's answer for this thread */
+int   hle_thread_done(uint32_t h);                 /* a CreateThread handle's thread has ended */
+uint32_t hle_thread_id_alloc(void);                /* a new thread's id, handed out before it runs */
+void  hle_thread_id_set(uint32_t tid);             /* this thread's, from the start */
 uint32_t hle_ticks_ms(void);                       /* GetTickCount */
 void *hle_alloc(uint32_t n);                       /* a zeroed heap block (HeapFree-able) */
 void  hle_free(void *p);
@@ -204,6 +208,16 @@ extern const win32hle_shim win32hle_module[];         /* modules, resources, cur
 extern const win32hle_shim win32hle_gdi32[];
 extern const win32hle_shim win32hle_gdidc[];          /* DCs, fonts, text (SDL2_ttf) */
 uint32_t hle_gdi_surface_dc(uint8_t *px, int w, int h, int pitch, int bpp);   /* a DC drawing into those pixels */
+/* A GDI game's screen: the pixels its window DCs (GetDC, BeginPaint) draw
+ * into, at the display mode's size; screen.c shows them when there is no
+ * DirectDraw primary. seq changes when they may have. */
+void     hle_gdi_window_surface(uint8_t *px, int w, int h, int pitch, int bpp);
+uint32_t hle_gdi_window_dc(void);
+int      hle_gdi_window_frame(const uint8_t **px, int *w, int *h, int *pitch, int *bpp, unsigned *seq);
+void     hle_gdi_window_touched(void);                /* drawn into directly (a movie): show it */
+extern void (*hle_gdi_window_hook)(void);              /* called after a blit to it: screen.c presents */
+/* A DIB section's bitmap (gdi32.c's CreateDIBSection): bottom-up unless topdown. */
+uint32_t hle_gdi_make_dib(int w, int h, int bpp, uint8_t *bits, int topdown, const uint32_t *ctab, int ncolors, int is555);
 void     hle_gdi_release_dc(uint32_t hdc);
 extern const win32hle_shim win32hle_user32[];
 extern const win32hle_shim win32hle_winmm[];
@@ -219,6 +233,7 @@ int  hle_dd_frame(const uint8_t **px, int *w, int *h, int *pitch, int *bpp, cons
 void hle_dd_mode(int *w, int *h, int *bpp);
 int  hle_dd_surface_pixels(uint32_t obj, uint8_t **px, int *w, int *h, int *pitch, int *bpp);   /* 0: not a surface */
 void hle_dsound_set_master(float gain);              /* 0 mutes */
+void hle_dsound_register_com(void);                  /* CoCreateInstance(CLSID_DirectSound) (recomp_host_init) */
 /* A host's own sound (a movie's), mixed with the game's buffers: interleaved
  * s16 pushed at its own rate. */
 int  hle_audio_stream_open(int rate, int channels);   /* an id, or -1 with no audio */
@@ -227,6 +242,7 @@ int  hle_audio_stream_queued(int id);                 /* frames pushed and not y
 void hle_audio_stream_gain(int id, float gain);
 void hle_audio_stream_close(int id);
 int  hle_file_fd(uint32_t handle);                    /* a file HANDLE's descriptor, or -1 */
+extern const win32hle_shim win32hle_mss[];            /* Miles: file helpers, an MP3 ASI codec on ffmpeg (mss.c) */
 extern const win32hle_shim win32hle_bink[];           /* binkw32 on ffmpeg (bink.c; stubs without HLE_WITH_FFMPEG) */
 /* The SDL2 display and input for a DirectDraw game (screen.c): installs
  * itself as the pump hook. headless: no window (a script drives input). */

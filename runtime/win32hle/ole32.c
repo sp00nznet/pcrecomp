@@ -195,7 +195,19 @@ static void a_VariantClear(void)  { if (A32(0)) memset(APTR(0), 0, 16); RET(S_OK
 static void a_VariantChangeType(void) { RET(E_NOTIMPL, 4); }
 static void a_GetErrorInfo(void)  { if (A32(1)) MEM32(A32(1)) = 0; RET(1u /* S_FALSE */, 2); }
 
+/* CoCreateGuid(&guid): a random (version 4) GUID, from the kernel's randomness. */
+static void o_CoCreateGuid(void) {
+    uint8_t *g = (uint8_t *)APTR(0);
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (!g) RET(0x80070057u, 1);                         /* E_INVALIDARG */
+    if (!f || fread(g, 1, 16, f) != 16) for (int i = 0; i < 16; i++) g[i] = (uint8_t)rand();
+    if (f) fclose(f);
+    g[7] = (uint8_t)((g[7] & 0x0F) | 0x40), g[8] = (uint8_t)((g[8] & 0x3F) | 0x80);
+    RET(S_OK, 1);
+}
+
 const win32hle_shim win32hle_ole32[] = {
+    { "CoCreateGuid",          o_CoCreateGuid },
     { "CoCreateInstance",      o_CoCreateInstance },
     { "OleInitialize",         o_OleInitialize },
     { "OleUninitialize",       o_OleUninitialize },

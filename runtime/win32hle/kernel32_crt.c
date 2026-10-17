@@ -29,22 +29,54 @@
  * A guest thread runs lifted code, so it enters through hle_call_guest, which
  * takes the machine and gives the thread its own guest stack + TIB. The lifted
  * start routine is stdcall with one argument (lpParameter). */
-struct thread_arg { uint32_t start, param; };
+/* A thread's handle object: how many ResumeThreads it still waits for
+ * (CREATE_SUSPENDED), and once it has ended, its exit code, so a wait on the
+ * handle returns. Never freed: CloseHandle can come while it still runs. */
+struct thread_arg { uint32_t start, param, tid; volatile int suspend, done; uint32_t code; };
+static __thread struct thread_arg *t_self;
 static void *thread_trampoline(void *p) {
-    struct thread_arg a = *(struct thread_arg *)p; free(p);
-    uint32_t args[1] = { a.param };
-    hle_call_guest(a.start, 1, args);
+    struct thread_arg *a = (struct thread_arg *)p;
+    hle_thread_id_set(a->tid);                     /* the id CreateThread gave out (PostThreadMessageA) */
+    while (a->suspend > 0) usleep(1000);
+    t_self = a;
+    uint32_t args[1] = { a->param };
+    a->code = hle_call_guest(a->start, 1, args);
+    a->done = 1;
     return NULL;
 }
 static void k_CreateThread(void) {             /* (sa, stack, start, param, flags, &tid) */
-    struct thread_arg *a = (struct thread_arg *)malloc(sizeof *a);
-    a->start = A32(2); a->param = A32(3);
+    struct thread_arg *a = (struct thread_arg *)calloc(1, sizeof *a);
+    a->start = A32(2); a->param = A32(3); a->suspend = (A32(4) & 4) != 0;   /* CREATE_SUSPENDED */
+    a->tid = hle_thread_id_alloc();
+    uint32_t h = hle_handle_alloc(HLE_H_THREAD, a);
     pthread_t t;
-    if (pthread_create(&t, NULL, thread_trampoline, a) != 0) { free(a); RET(0, 6); }
+    if (!h || pthread_create(&t, NULL, thread_trampoline, a) != 0) { if (h) hle_handle_close(h); free(a); RET(0, 6); }
     pthread_detach(t);
-    uint32_t tid = (uint32_t)(uintptr_t)t;
-    uint32_t ptid = A32(5); if (ptid) MEM32(ptid) = tid;
-    RET(hle_handle_alloc(HLE_H_THREAD, NULL), 6);
+    uint32_t ptid = A32(5); if (ptid) MEM32(ptid) = a->tid;
+    RET(h, 6);
+}
+static void k_ResumeThread(void) {
+    struct thread_arg *a = (struct thread_arg *)hle_handle_obj(A32(0), HLE_H_THREAD);
+    if (!a) RET(0xFFFFFFFFu, 1);
+    int prev = a->suspend;
+    if (prev > 0) a->suspend = prev - 1;
+    RET((uint32_t)prev, 1);
+}
+/* ExitThread from lifted code: the machine is given up first (the thread
+ * will never hand it back), then the thread ends where it stands. */
+static void k_ExitThread(void) {
+    if (t_self) t_self->code = A32(0), t_self->done = 1;
+    hle_block_begin();
+    pthread_exit(NULL);
+}
+static void k_GetExitCodeThread(void) {        /* (h, &code) */
+    struct thread_arg *a = (struct thread_arg *)hle_handle_obj(A32(0), HLE_H_THREAD);
+    if (A32(1)) MEM32(A32(1)) = a && a->done ? a->code : 259u;   /* STILL_ACTIVE */
+    RET(a != NULL, 2);
+}
+int hle_thread_done(uint32_t h) {
+    struct thread_arg *a = (struct thread_arg *)hle_handle_obj(h, HLE_H_THREAD);
+    return a && a->done;
 }
 static void k_SetThreadPriority(void) { RET(1, 2); }
 static void k_GetThreadPriority(void) { RET(0, 1); }
@@ -494,6 +526,9 @@ const win32hle_shim win32hle_kernel32_crt[] = {
     { "RaiseException",               k_RaiseException },
     { "LoadModule",                   k_LoadModule },
     { "CreateThread",                 k_CreateThread },
+    { "ResumeThread",                 k_ResumeThread },
+    { "ExitThread",                   k_ExitThread },
+    { "GetExitCodeThread",            k_GetExitCodeThread },
     { "SetThreadPriority",            k_SetThreadPriority },
     { "GetThreadPriority",            k_GetThreadPriority },
     { "GetCurrentThread",             k_GetCurrentThread },

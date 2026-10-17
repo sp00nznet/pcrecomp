@@ -38,26 +38,29 @@ handler.
 | `kernel32_ext.c` | files on descriptors, `FindFirstFileA`, attributes, file times, disks, `.ini` profiles |
 | `kernel32_crt.c` | what an MSVC CRT asks on its way to `WinMain`: std handles, codepage 1252, locale (the wide calls answer `ERROR_CALL_NOT_IMPLEMENTED`, as on Windows 95), environment, threads |
 | `user32.c` | a window manager without a display: windows, classes, the message queue with `WM_PAINT`/`WM_TIMER` generated, focus/capture/activation, dialogs from templates (modal and not), and the standard controls (button, static, edit, list and combo boxes with owner-draw, trackbar, progress, hotkey) |
-| `gdi32.c`, `gdidc.c` | DIBs and `StretchDIBits` into a framebuffer; device contexts, fonts (TrueType through SDL2_ttf, Liberation for Arial/MS Sans Serif) and `TextOutA` into a surface |
+| `gdi32.c`, `gdidc.c` | DIBs and `StretchDIBits` into a framebuffer; device contexts, fonts (TrueType through SDL2_ttf, Liberation for Arial/MS Sans Serif, a game's own through `AddFontResourceA`, smoothed as the font's `gasp` table says, synthetic bold and italic) and `TextOutA` into a surface; DIB sections selected into DCs and blitted between depths, clip rectangles, and the *window surface* a GDI game's window DCs draw into (`hle_gdi_window_surface`) |
 | `ddraw.c` | DirectDraw in software: `IDirectDraw`/`2`, surfaces 1–3 (lock, blit with colour fill, colour key and stretch, flip), palettes, clippers, a virtual display mode |
 | `dsound.c` | DirectSound on SDL2 audio: buffers mixed in software at their rate, volume and pan, with play cursors in real time |
-| `bink.c` | `binkw32.dll` on ffmpeg (`HLE_WITH_FFMPEG`): `BinkOpen` on a name or on the game's open file, frames decoded and converted into the game's surface, the soundtrack into a `dsound.c` stream |
-| `screen.c` | the SDL2 window for a DirectDraw game: the primary surface scaled (sharp, smooth, CRT, nearest, integer; F12, F11), SDL input turned into the messages a mouse and keyboard give |
+| `bink.c` | `binkw32.dll` on ffmpeg (`HLE_WITH_FFMPEG`): `BinkOpen` on a name or on the game's open file, frames decoded and converted into the game's surface, the soundtrack into a `dsound.c` stream; `BinkBuffer*` for a GDI game, onto the window surface |
+| `mss.c` | the part of Miles (`mss32.dll`) a game's own audio DLL calls: file and memory helpers, and the RIB lookup that hands out an ASI codec, MP3 on ffmpeg |
+| `screen.c` | the SDL2 window for a DirectDraw game, or a GDI game's window surface: the picture scaled (sharp, smooth, CRT, nearest, integer; F12, F11), SDL input turned into the messages a mouse and keyboard give |
 | `winmm.c` | timers (`timeSetEvent` on threads, `timeKillEvent` waiting for a callback under way), joystick, waveOut, MCI |
 | `wsock32.c` | Winsock 1.1 on BSD sockets, by name and ordinal; `WSAAsyncSelect` through the pump; IPX as IPXEmu carries it on UDP |
 | `ole32.c` | COM: class factories a host serves and ones the guest registers itself, GUID strings, BSTRs |
 | `storage.c` | structured storage on compound files in Windows' format (`StgCreateDocfile`, `IStorage`, `IStream`, `OleSaveToStream`) |
 | `advapi32.c` | an in-memory registry (seeded by the host, optionally saved to a file); COMCTL32, VERSION, SHELL32 |
 | `present.c` | the plain SDL2 layer for a GDI game: the gdi32 framebuffer in a window |
-| `*_selftest.c` | synthetic lifted guests driving the spine, the loader, the host, the pump and present, headless; `build_selftests.sh` builds and runs them |
+| `*_selftest.c` | synthetic lifted guests driving the spine, the loader, the host, the pump and present, headless, and the GDI and mmio shims called as a guest calls them; `build_selftests.sh` builds and runs them |
 
 ## State (what's real, what's next)
 
-Three titles run on it: Fury³ (its CRT and `WinMain`, the first census);
+Four titles run on it: Fury³ (its CRT and `WinMain`, the first census);
 Tiberian Sun, which boots, plays its movies and music, runs its menus (the
 game's own and the Win32 dialogs behind them) and plays a skirmish on Linux,
 with no Windows and no Wine (tiberiansun-recomp, `src/linux`); and Red Alert
-2 and Yuri's Revenge, with their Bink movies (redalert2-recomp, `src/linux`).
+2 and Yuri's Revenge, with their Bink movies (redalert2-recomp, `src/linux`);
+and Civilization III: Conquests, a GDI game whose renderer and audio DLLs are
+lifted with it, with its movies and MP3 music (civ3, `src/linux`).
 
 What a title still brings:
 

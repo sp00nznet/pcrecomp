@@ -164,12 +164,21 @@ static int audio_open(void) {
     if (g_audio_ok >= 0) return g_audio_ok;
     g_audio_ok = 0;
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");      /* SIGINT and SIGTERM end the process, not WM_CLOSE */
-    if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) { fprintf(stderr, "[dsound] no audio: %s\n", SDL_GetError()); return 0; }
     SDL_AudioSpec want, have;
     SDL_zero(want);
     want.freq = OUT_RATE, want.format = AUDIO_S16SYS, want.channels = 2, want.samples = 1024, want.callback = mix;
-    g_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
-    if (!g_dev) { fprintf(stderr, "[dsound] no audio device: %s\n", SDL_GetError()); return 0; }
+    if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) g_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+    if (!g_dev) {
+        /* No sound card (a server, a container): a silent device whose
+         * cursors still move, rather than DirectSound failing. A game whose
+         * sound DLL takes the failure for granted (Civilization III's
+         * sound.dll) would fault on it. */
+        fprintf(stderr, "[dsound] no audio device (%s): silent\n", SDL_GetError());
+        SDL_QuitSubSystem(SDL_INIT_AUDIO);
+        SDL_setenv("SDL_AUDIODRIVER", "dummy", 1);
+        if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) g_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+        if (!g_dev) { fprintf(stderr, "[dsound] no audio: %s\n", SDL_GetError()); return 0; }
+    }
     SDL_PauseAudioDevice(g_dev, 0);
     fprintf(stderr, "[dsound] %s, %d Hz\n", SDL_GetCurrentAudioDriver(), have.freq);
     return g_audio_ok = 1;
@@ -427,6 +436,21 @@ static void s_DirectSoundEnumerateA(void) {              /* (callback, context):
     uint32_t a[4] = { 0, (uint32_t)(uintptr_t)desc, (uint32_t)(uintptr_t)mod, A32(1) };
     if (A32(0)) hle_call_guest(A32(0), 4, a);
     RET(DS_OK, 2);
+}
+
+/* CoCreateInstance(CLSID_DirectSound): the object DirectSoundCreate makes;
+ * the caller's IDirectSound::Initialize follows. */
+static uint32_t ds_create(const uint8_t *iid, uint32_t *out) {
+    (void)iid;
+    vtables();
+    if (!audio_open()) { *out = 0; return DSERR_NODRIVER; }
+    *out = hle_com_new(g_vt_ds, 12);
+    return DS_OK;
+}
+void hle_dsound_register_com(void) {
+    static const uint8_t CLSID_DirectSound[16] = { 0x46, 0xD9, 0xD4, 0x47, 0xE8, 0x62, 0xCF, 0x11,
+                                                   0x93, 0xBC, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 };
+    hle_com_register_class(CLSID_DirectSound, ds_create);
 }
 
 const win32hle_shim win32hle_dsound[] = {

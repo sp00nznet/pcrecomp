@@ -261,7 +261,67 @@ static void k_CopyToBuffer(void) {
     RET(0, 7);
 }
 
+/* ---- BinkBuffer: where a GDI game has Bink put the picture ----
+ * The game locks the buffer, has BinkCopyToBuffer fill it at its
+ * SurfaceType, and blits it to its window at the offset it set: here a
+ * 32-bit buffer, blitted onto the window surface (gdidc.c). The leading
+ * fields are Bink's BINKBUFFER, which games read. */
+typedef struct {
+    uint32_t Width, Height, WindowWidth, WindowHeight, SurfaceType, Buffer;
+    int32_t BufferPitch;
+    uint32_t ClientOffsetX, ClientOffsetY, ScreenWidth, ScreenHeight, ScreenDepth;
+    uint32_t pad[48];
+    int destx, desty;                                    /* ours */
+} binkbuf_t;
+static void k_BufferOpen(void) {                         /* (hwnd, width, height, flags) */
+    binkbuf_t *b = (binkbuf_t *)calloc(1, sizeof *b);
+    int sw, sh;
+    const uint8_t *px; int pitch, bpp;
+    b->Width = b->WindowWidth = A32(1), b->Height = b->WindowHeight = A32(2);
+    b->SurfaceType = 3;                                  /* BINKSURFACE32 */
+    b->BufferPitch = (int32_t)(b->Width * 4);
+    b->Buffer = (uint32_t)(uintptr_t)calloc((size_t)b->Width * b->Height + 1, 4);
+    if (hle_gdi_window_frame(&px, &sw, &sh, &pitch, &bpp, NULL)) b->ScreenWidth = (uint32_t)sw, b->ScreenHeight = (uint32_t)sh, b->ScreenDepth = (uint32_t)bpp;
+    RETP(b, 4);
+}
+static void k_BufferClose(void) {
+    binkbuf_t *b = (binkbuf_t *)APTR(0);
+    if (b) free((void *)(uintptr_t)b->Buffer), free(b);
+    RETV(1);
+}
+static void k_BufferLock(void) { RET(A32(0) != 0, 1); }
+static void k_BufferUnlock(void) { RET(1, 1); }
+static void k_BufferSetOffset(void) {                    /* (buf, x, y) */
+    binkbuf_t *b = (binkbuf_t *)APTR(0);
+    if (b) b->destx = (int)A32(1), b->desty = (int)A32(2);
+    RET(1, 3);
+}
+static void k_BufferBlit(void) {                         /* (buf, rects, n): the whole picture, whatever changed */
+    binkbuf_t *b = (binkbuf_t *)APTR(0);
+    const uint8_t *px;
+    int sw, sh, pitch, bpp;
+    if (b && hle_gdi_window_frame(&px, &sw, &sh, &pitch, &bpp, NULL) && bpp == 32) {
+        for (int y = 0; y < (int)b->Height; y++) {
+            int ty = b->desty + y;
+            if (ty < 0 || ty >= sh) continue;
+            for (int x = 0; x < (int)b->Width; x++) {
+                int tx = b->destx + x;
+                if (tx >= 0 && tx < sw)
+                    ((uint32_t *)(uintptr_t)(px + (size_t)ty * pitch))[tx] = ((const uint32_t *)(uintptr_t)b->Buffer)[(size_t)y * b->Width + x] & 0xFFFFFFu;
+            }
+        }
+        hle_gdi_window_touched();
+    }
+    RETV(3);
+}
+static void k_GetRects(void) { RET(1, 2); }              /* (bink, flags): one rectangle, the whole frame */
+static void k_SetIOSize(void) { RETV(1); }
+
 const win32hle_shim win32hle_bink[] = {
+    { "_BinkBufferOpen@16", k_BufferOpen }, { "_BinkBufferClose@4", k_BufferClose },
+    { "_BinkBufferLock@4", k_BufferLock }, { "_BinkBufferUnlock@4", k_BufferUnlock },
+    { "_BinkBufferSetOffset@12", k_BufferSetOffset }, { "_BinkBufferBlit@12", k_BufferBlit },
+    { "_BinkGetRects@8", k_GetRects }, { "_BinkSetIOSize@4", k_SetIOSize },
     { "_BinkOpen@8", k_Open }, { "_BinkClose@4", k_Close }, { "_BinkDoFrame@4", k_DoFrame },
     { "_BinkNextFrame@4", k_NextFrame }, { "_BinkWait@4", k_Wait }, { "_BinkCopyToBuffer@28", k_CopyToBuffer },
     { "_BinkGoto@12", k_Goto }, { "_BinkPause@8", k_Pause }, { "_BinkSetVolume@8", k_SetVolume },

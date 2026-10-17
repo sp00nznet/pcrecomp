@@ -227,16 +227,23 @@ uint32_t hle_send(uint32_t h, uint32_t m, uint32_t w, uint32_t l) {
 }
 
 /* ---- the queue ---- */
-typedef struct { uint32_t hwnd, message, wParam, lParam, time; int x, y; } msg_t;
+typedef struct { uint32_t hwnd, message, wParam, lParam, time; int x, y; uint32_t thread; } msg_t;   /* thread: whose queue (0: anyone's) */
 #define QN 1024
 static msg_t g_q[QN];
 static int g_qn;
 static int g_quit; static uint32_t g_quit_code;
 
-static void q_push(uint32_t h, uint32_t m, uint32_t w, uint32_t l) {
+/* A message is in the queue of its window's thread, as on Windows: a second
+ * thread pumping its own messages (sound.dll's, with PeekMessage(NULL)) must
+ * not take the game window's. */
+static void q_push_to(uint32_t h, uint32_t m, uint32_t w, uint32_t l, uint32_t thread) {
     if (g_qn == QN) { memmove(g_q, g_q + 1, sizeof g_q[0] * (QN - 1)); g_qn--; }
-    msg_t x = { h, m, w, l, hle_ticks_ms(), g_cursor_x, g_cursor_y };
+    msg_t x = { h, m, w, l, hle_ticks_ms(), g_cursor_x, g_cursor_y, thread };
     g_q[g_qn++] = x;
+}
+static void q_push(uint32_t h, uint32_t m, uint32_t w, uint32_t l) {
+    win_t *x = W(h == 0xFFFFu ? hle_first_hwnd() : h);   /* HWND_BROADCAST: the top-level windows, the game's */
+    q_push_to(h, m, w, l, x ? x->thread : 0);
 }
 void hle_post_message(uint32_t hwnd, uint32_t message, uint32_t wParam, uint32_t lParam) {
     if (message == WM_QUIT) { g_quit = 1, g_quit_code = wParam; return; }
@@ -453,6 +460,7 @@ static void notify(win_t *x, uint32_t code) {
  * WM_PAINT for a visible window with an update region, then due timers. */
 static int matches(const msg_t *m, uint32_t hwnd, uint32_t lo, uint32_t hi) {
     if (m->message == 0xFFFFFFFFu) return 0;
+    if (m->thread && m->thread != hle_thread_id()) return 0;
     if (hwnd == 0xFFFFFFFFu) { if (m->hwnd) return 0; }
     else if (hwnd && !(m->hwnd == hwnd || is_descendant(m->hwnd, hwnd))) return 0;
     if (lo || hi) return m->message >= lo && m->message <= hi;
@@ -478,7 +486,7 @@ static int next_message(msg_t *out, uint32_t hwnd, uint32_t lo, uint32_t hi, int
     if (!(lo || hi) || (WM_PAINT >= lo && WM_PAINT <= hi))
         for (int i = 0; i < MAX_WIN; i++) {
             win_t *x = &g_win[i];
-            if (x->used && x->inval && visible(x) && (!hwnd || hwnd == 0xFFFFFFFFu ? hwnd != 0xFFFFFFFFu : (x->hwnd == hwnd || is_descendant(x->hwnd, hwnd)))) {
+            if (x->used && x->inval && visible(x) && (!x->thread || x->thread == hle_thread_id()) && (!hwnd || hwnd == 0xFFFFFFFFu ? hwnd != 0xFFFFFFFFu : (x->hwnd == hwnd || is_descendant(x->hwnd, hwnd)))) {
                 memset(out, 0, sizeof *out);
                 out->hwnd = x->hwnd, out->message = WM_PAINT, out->time = hle_ticks_ms();
                 return 1;                                /* stays until the window validates */
@@ -547,8 +555,27 @@ static void u_WaitMessage(void) {
 }
 static void u_PostMessageA(void) {
     if (A32(1) == WM_QUIT) { g_quit = 1, g_quit_code = A32(2); RET(1, 4); }
+    if (!A32(0)) { q_push_to(0, A32(1), A32(2), A32(3), hle_thread_id()); RET(1, 4); }   /* NULL: this thread's own queue */
     q_push(A32(0), A32(1), A32(2), A32(3));
     RET(1, 4);
+}
+static void u_PostThreadMessageA(void) {                 /* (thread, msg, w, l) */
+    q_push_to(0, A32(1), A32(2), A32(3), A32(0));
+    RET(1, 4);
+}
+/* MsgWaitForMultipleObjects(n, handles, all, timeout, wake): the handles, or
+ * WAIT_OBJECT_0 + n once this thread has a message waiting. */
+static void u_MsgWaitForMultipleObjects(void) {
+    uint32_t n = A32(0), all = A32(2), timeout = A32(3), hs[64], start = hle_ticks_ms();
+    if (n > 64) n = 64;
+    for (uint32_t i = 0; i < n; i++) hs[i] = MEM32(A32(1) + 4 * i);
+    for (;;) {
+        if (n) { uint32_t r = hle_wait((int)n, hs, (int)all, 0); if (r != 0x102u) RET(r, 5); }   /* not WAIT_TIMEOUT */
+        msg_t m;
+        if (next_message(&m, 0, 0, 0, 0)) RET(n, 5);
+        if (timeout != 0xFFFFFFFFu && hle_ticks_ms() - start >= timeout) RET(0x102u, 5);
+        hle_block_begin(); usleep(1000); hle_block_end();
+    }
 }
 static void u_PostQuitMessage(void) { g_quit = 1, g_quit_code = A32(0); RETV(1); }
 static void u_SendMessageA(void) { RET(hle_send(A32(0), A32(1), A32(2), A32(3)), 4); }
@@ -1725,15 +1752,16 @@ static void u_RedrawWindow(void) {                       /* (h, rect, rgn, flags
 static void u_BeginPaint(void) {                         /* (h, &PAINTSTRUCT) */
     win_t *x = W(A32(0));
     uint32_t ps = A32(1);
+    uint32_t dc = hle_gdi_window_dc();                   /* the window surface's, if the host set one */
     if (ps) {
         memset((void *)(uintptr_t)ps, 0, 64);
-        MEM32(ps) = 0x0DC00001u;
+        MEM32(ps) = dc;
         if (x) put_rect(ps + 8, x->ix0, x->iy0, x->ix1, x->iy1);
     }
     if (x) x->inval = 0;
-    RET(0x0DC00001u, 2);
+    RET(dc, 2);
 }
-static void u_EndPaint(void) { RET(1, 2); }
+static void u_EndPaint(void) { if (A32(1)) hle_gdi_release_dc(MEM32(A32(1))); RET(1, 2); }
 
 /* focus, capture, activation */
 static void u_SetFocus(void) { uint32_t old = g_focus; if (!A32(0) || W(A32(0))) set_focus(A32(0)); RET(old, 1); }
@@ -1793,7 +1821,17 @@ static void u_SetCursorPos(void) {
     if (hle_cursor_hook) hle_cursor_hook(g_cursor_x, g_cursor_y);
     RET(1, 2);
 }
+static void u_GetCursor(void) { RET(hle_current_cursor(), 0); }
+/* The clipboard: this process's own, text the game put there and nothing
+ * from outside. */
+static uint32_t g_clip;
+static void u_OpenClipboard(void) { RET(1, 1); }
+static void u_CloseClipboard(void) { RET(1, 0); }
+static void u_EmptyClipboard(void) { g_clip = 0; RET(1, 0); }
+static void u_SetClipboardData(void) { if (A32(0) == 1) g_clip = A32(1); RET(A32(1), 2); }   /* CF_TEXT */
+static void u_GetClipboardData(void) { RET(A32(0) == 1 ? g_clip : 0, 1); }
 static void u_ShowCursor(void) { RET((uint32_t)(A32(0) ? ++g_cursor_shown : --g_cursor_shown), 1); }
+int hle_cursor_shown(void) { return g_cursor_shown >= 0; }   /* ShowCursor's count, as Windows reads it */
 /* The cursor the guest last set. Shown only where a host says the game does
  * not draw its own (screen.c, hle_screen_cursor_hook). */
 static uint32_t g_current_cursor;
@@ -2167,6 +2205,8 @@ const win32hle_shim win32hle_user32[] = {
     { "EnableMenuItem", u_EnableMenuItem }, { "GetMenuState", u_GetMenuState }, { "CheckMenuRadioItem", u_CheckMenuRadioItem },
     { "SetMenu", u_SetMenu }, { "DrawMenuBar", u_DrawMenuBar }, { "HiliteMenuItem", u_HiliteMenuItem },
     { "TrackPopupMenu", u_TrackPopupMenu },
+    { "GetCursor", u_GetCursor }, { "OpenClipboard", u_OpenClipboard }, { "CloseClipboard", u_CloseClipboard },
+    { "EmptyClipboard", u_EmptyClipboard }, { "SetClipboardData", u_SetClipboardData }, { "GetClipboardData", u_GetClipboardData },
     { "SetCursor", u_SetCursor }, { "ShowCursor", u_ShowCursor }, { "ClipCursor", u_ClipCursor },
     { "GetCursorPos", u_GetCursorPos }, { "SetCursorPos", u_SetCursorPos },
     { "GetDesktopWindow", u_GetDesktopWindow }, { "GetParent", u_GetParent }, { "GetWindow", u_GetWindow },
@@ -2199,6 +2239,7 @@ const win32hle_shim win32hle_user32[] = {
     { "SetWindowTextA", u_SetWindowTextA }, { "GetWindowTextA", u_GetWindowTextA },
     { "GetWindowTextLengthA", u_GetWindowTextLengthA },
     { "PostMessageA", u_PostMessageA }, { "PostQuitMessage", u_PostQuitMessage },
+    { "PostThreadMessageA", u_PostThreadMessageA }, { "MsgWaitForMultipleObjects", u_MsgWaitForMultipleObjects },
     { "GetMessageA", u_GetMessageA }, { "PeekMessageA", u_PeekMessageA }, { "WaitMessage", u_WaitMessage },
     { "TranslateMessage", u_TranslateMessage }, { "DispatchMessageA", u_DispatchMessageA },
     { "SendMessageA", u_SendMessageA },

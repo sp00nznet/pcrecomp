@@ -10,6 +10,9 @@
 #include <time.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include "win32hle.h"
 
 #define MMSYSERR_NOERROR  0u
@@ -119,7 +122,145 @@ static void m_waveOutGetDevCapsA(void) { RET(MMSYSERR_NOERROR, 3); }
 static void m_mciSendStringA(void)     { RET(MMSYSERR_ERROR, 4); }
 static void m_mciGetErrorStringA(void) { RET(0, 3); }          /* FALSE: no string */
 
+/* --- mmio: RIFF files (WAVs) for reading ---
+ * A file is read whole into memory at mmioOpenA, or a caller's buffer is
+ * used as it stands (FOURCC_MEM). The direct-buffer calls (mmioGetInfo,
+ * mmioAdvance, mmioSetInfo) then hand out that one buffer, which is the
+ * whole file, so an advance never has to refill it. Writing is not done:
+ * opening for write fails, as with a read-only disk. */
+#define MMIOERR_CANNOTOPEN    257u
+#define MMIOERR_CHUNKNOTFOUND 265u
+#define FOURCC_MEM  0x204D454Du
+#define FOURCC_RIFF 0x46464952u
+#define FOURCC_LIST 0x5453494Cu
+typedef struct { uint8_t *data; uint32_t len, pos; int owns; } hmmio;
+static hmmio *MMIO(uint32_t h) { return (hmmio *)hle_handle_obj(h, HLE_H_MMIO); }
+static void mmio_info(const hmmio *m, uint32_t info, uint32_t h) {   /* MMIOINFO over the whole file */
+    MEM32(info + 20) = m->len, MEM32(info + 24) = (uint32_t)(uintptr_t)m->data;
+    MEM32(info + 28) = (uint32_t)(uintptr_t)(m->data + m->pos), MEM32(info + 32) = (uint32_t)(uintptr_t)(m->data + m->len);
+    MEM32(info + 36) = MEM32(info + 32), MEM32(info + 40) = 0, MEM32(info + 44) = m->len, MEM32(info + 68) = h;
+}
+static void m_mmioOpenA(void) {                          /* (name, MMIOINFO*, flags) */
+    const char *name = ASTR(0);
+    uint32_t info = A32(1), flags = A32(2);
+    hmmio *m = (hmmio *)calloc(1, sizeof *m);
+    if (info && MEM32(info + 4) == FOURCC_MEM && MEM32(info + 24)) {
+        m->data = (uint8_t *)(uintptr_t)MEM32(info + 24), m->len = MEM32(info + 20);
+    } else {
+        char host[1024];
+        FILE *f = !(flags & 0x1003u) && name && hle_host_path(name, host, sizeof host) ? fopen(host, "rb") : NULL;   /* not WRITE, READWRITE, CREATE */
+        long n = -1;
+        if (f && fseek(f, 0, SEEK_END) == 0 && (n = ftell(f)) >= 0) rewind(f);
+        m->data = f && n >= 0 ? (uint8_t *)malloc((size_t)n + 1) : NULL, m->len = (uint32_t)n, m->owns = 1;
+        if (!m->data || fread(m->data, 1, (size_t)n, f) != (size_t)n) {
+            if (f) fclose(f);
+            free(m->data), free(m);
+            if (info) MEM32(info + 12) = MMIOERR_CANNOTOPEN;
+            RET(0, 3);
+        }
+        fclose(f);
+    }
+    uint32_t h = hle_handle_alloc(HLE_H_MMIO, m);
+    if (info) MEM32(info + 12) = 0;
+    RET(h, 3);
+}
+static void m_mmioClose(void) {
+    hmmio *m = MMIO(A32(0));
+    if (!m) RET(MMSYSERR_ERROR, 2);
+    if (m->owns) free(m->data);
+    free(m);
+    hle_handle_close(A32(0));
+    RET(0, 2);
+}
+static void m_mmioRead(void) {                           /* (h, buf, n) */
+    hmmio *m = MMIO(A32(0));
+    if (!m) RET(0xFFFFFFFFu, 3);
+    uint32_t n = A32(2) < m->len - m->pos ? A32(2) : m->len - m->pos;
+    memcpy((void *)(uintptr_t)A32(1), m->data + m->pos, n);
+    m->pos += n;
+    RET(n, 3);
+}
+static void m_mmioWrite(void) { RET(0xFFFFFFFFu, 3); }
+static void m_mmioSeek(void) {                           /* (h, offset, origin) */
+    hmmio *m = MMIO(A32(0));
+    int64_t to = (int32_t)A32(1) + (int64_t)(A32(2) == 1 ? m ? m->pos : 0 : A32(2) == 2 ? m ? m->len : 0 : 0);
+    if (!m || to < 0 || to > m->len) RET(0xFFFFFFFFu, 3);
+    m->pos = (uint32_t)to;
+    RET(m->pos, 3);
+}
+static void m_mmioDescend(void) {                        /* (h, MMCKINFO*, parent, flags) */
+    hmmio *m = MMIO(A32(0));
+    uint32_t ck = A32(1), parent = A32(2), flags = A32(3);
+    uint32_t end = parent ? MEM32(parent + 12) + MEM32(parent + 4) : m ? m->len : 0;
+    if (!m) RET(MMSYSERR_ERROR, 4);
+    if (end > m->len) end = m->len;
+    for (;;) {
+        if (m->pos + 8 > end) RET(MMIOERR_CHUNKNOTFOUND, 4);
+        uint32_t id, size, type = 0;
+        memcpy(&id, m->data + m->pos, 4), memcpy(&size, m->data + m->pos + 4, 4);
+        uint32_t data = m->pos + 8;
+        int list = id == FOURCC_RIFF || id == FOURCC_LIST;
+        if (list && data + 4 <= end) memcpy(&type, m->data + data, 4);
+        int found = flags & 0x10 ? id == MEM32(ck)                                     /* FINDCHUNK */
+                  : flags & 0x20 ? id == FOURCC_RIFF && type == MEM32(ck + 8)          /* FINDRIFF */
+                  : flags & 0x40 ? id == FOURCC_LIST && type == MEM32(ck + 8) : 1;     /* FINDLIST */
+        if (found) {
+            MEM32(ck) = id, MEM32(ck + 4) = size, MEM32(ck + 8) = type, MEM32(ck + 12) = data, MEM32(ck + 16) = 0;
+            m->pos = data + (list ? 4 : 0);
+            RET(0, 4);
+        }
+        m->pos = data + size + (size & 1);
+    }
+}
+static void m_mmioAscend(void) {                         /* (h, MMCKINFO*, flags) */
+    hmmio *m = MMIO(A32(0));
+    uint32_t ck = A32(1), to = MEM32(ck + 12) + MEM32(ck + 4);
+    if (!m) RET(MMSYSERR_ERROR, 3);
+    to += to & 1;
+    m->pos = to < m->len ? to : m->len;
+    RET(0, 3);
+}
+static void m_mmioGetInfo(void) {                        /* (h, MMIOINFO*, flags) */
+    hmmio *m = MMIO(A32(0));
+    if (!m) RET(MMSYSERR_ERROR, 3);
+    memset((void *)(uintptr_t)A32(1), 0, 72);
+    mmio_info(m, A32(1), A32(0));
+    RET(0, 3);
+}
+static void m_mmioSetInfo(void) {                        /* (h, MMIOINFO*, flags): where pchNext got to */
+    hmmio *m = MMIO(A32(0));
+    if (!m) RET(MMSYSERR_ERROR, 3);
+    uint32_t next = MEM32(A32(1) + 28) - (uint32_t)(uintptr_t)m->data;
+    m->pos = next < m->len ? next : m->len;
+    RET(0, 3);
+}
+static void m_mmioAdvance(void) {                        /* (h, MMIOINFO*, flags) */
+    hmmio *m = MMIO(A32(0));
+    if (!m) RET(MMSYSERR_ERROR, 3);
+    if (A32(1)) { uint32_t next = MEM32(A32(1) + 28) - (uint32_t)(uintptr_t)m->data; m->pos = next < m->len ? next : m->len; mmio_info(m, A32(1), A32(0)); }
+    RET(0, 3);
+}
+static void m_mmioSetBuffer(void) { RET(0, 4); }        /* the buffer is the whole file already */
+
+/* mmioStringToFOURCCA(str, flags): the first four characters, padded with
+ * spaces; MMIO_TOUPPER (0x10) upper-cases them. */
+static void m_mmioStringToFOURCCA(void) {
+    const char *s = ASTR(0);
+    uint32_t fcc = 0;
+    for (int i = 0, end = 0; i < 4; i++) {
+        char c = !end && s && s[i] ? s[i] : (end = 1, ' ');
+        if ((A32(1) & 0x10) && c >= 'a' && c <= 'z') c = (char)(c - 32);
+        fcc |= (uint32_t)(uint8_t)c << (8 * i);
+    }
+    RET(fcc, 2);
+}
+
 const win32hle_shim win32hle_winmm[] = {
+    { "mmioStringToFOURCCA",    m_mmioStringToFOURCCA },
+    { "mmioOpenA", m_mmioOpenA }, { "mmioClose", m_mmioClose }, { "mmioRead", m_mmioRead }, { "mmioWrite", m_mmioWrite },
+    { "mmioSeek", m_mmioSeek }, { "mmioDescend", m_mmioDescend }, { "mmioAscend", m_mmioAscend },
+    { "mmioGetInfo", m_mmioGetInfo }, { "mmioSetInfo", m_mmioSetInfo }, { "mmioAdvance", m_mmioAdvance },
+    { "mmioSetBuffer", m_mmioSetBuffer },
     { "timeGetTime",            m_timeGetTime },
     { "timeBeginPeriod",        m_timeBeginPeriod },
     { "timeEndPeriod",          m_timeEndPeriod },

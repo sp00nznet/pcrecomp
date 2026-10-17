@@ -220,6 +220,8 @@ static volatile uint32_t g_pending_shim;
 static void shim_entry(void) {
     uint32_t i = g_pending_shim;
     if (g_waiters) hle_yield();
+    g_last_import_va = g_shim[i].va;                     /* again: the thread that ran meanwhile set its own */
+    g_cur_import = g_shim[i].name;
     g_shim[i].fn();
 }
 recomp_func_t recomp_lookup_import(uint32_t va) {

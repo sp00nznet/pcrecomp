@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/mman.h>
 #include "win32hle.h"
 
 #define INVALID_HANDLE  0xFFFFFFFFu
@@ -73,10 +74,18 @@ static uint32_t new_file(int fd) {
 }
 
 /* Device names a Windows program may open that a host has no file for. */
+/* A port is COM1-COM9 or LPT1-LPT9, the whole name before any extension.
+ * Matching the prefix alone took any file named Com... for a serial port:
+ * Civilization III's credits (complete_credits.txt) and WWII in the
+ * Pacific's Commonwealth advisor (commonwealth_all.pcx), which it then
+ * used without checking. */
+static int is_port(const char *b) {
+    return (!strncasecmp(b, "COM", 3) || !strncasecmp(b, "LPT", 3)) && b[3] >= '1' && b[3] <= '9' && (!b[4] || b[4] == '.');
+}
 static int is_device(const char *p, char *host, size_t n) {
     const char *b = p + strlen(p);
     while (b > p && b[-1] != '\\' && b[-1] != '/' && b[-1] != ':') b--;
-    if (!strncmp(p, "\\\\.\\", 4) || !strncasecmp(b, "COM", 3) || !strncasecmp(b, "LPT", 3)) { host[0] = 0; return 1; }
+    if (!strncmp(p, "\\\\.\\", 4) || is_port(b)) { host[0] = 0; return 1; }
     if (!strcasecmp(b, "NUL")) { snprintf(host, n, "/dev/null"); return 1; }
     if (!strcasecmp(b, "CON")) { snprintf(host, n, "/dev/tty"); return 1; }
     return 0;
@@ -385,21 +394,30 @@ static void k_CopyFileA(void) {                          /* (src, dst, failIfExi
 }
 
 /* ---- FindFirstFileA / FindNextFileA ---- */
-/* A directory search. Under a mod's overlay it lists the overlay's directory
- * first (d), then the game's (base) without the names the overlay had. */
+/* A directory search: the matching names, read at FindFirstFileA and handed
+ * out in NTFS's order, by name without case (a game's load dialog
+ * preselects the first; Linux's own order is the directory's). Under a mod's
+ * overlay the overlay's names come with the game's, the overlay's copy of a
+ * name winning. */
+typedef struct { char name[260]; int base; } found_t;
 typedef struct {
     DIR *d, *base;
     char dir[1024], base_dir[1024], mask[260];
     int dots;
-    char (*shown)[260];
-    int nshown;
+    found_t *names;
+    int n, at;
 } hfind;
 static void find_closer(void *o) {
     hfind *f = (hfind *)o;
     if (f->d) closedir(f->d);
     if (f->base) closedir(f->base);
-    free(f->shown);
+    free(f->names);
     free(f);
+}
+static int by_name(const void *a, const void *b) {
+    const char *x = ((const found_t *)a)->name, *y = ((const found_t *)b)->name;
+    int dx = !strcmp(x, ".") ? 0 : !strcmp(x, "..") ? 1 : 2, dy = !strcmp(y, ".") ? 0 : !strcmp(y, "..") ? 1 : 2;
+    return dx != dy ? dx - dy : strcasecmp(x, y);
 }
 
 /* Windows wildcard match, without case: * any run, ? one character; "*.*"
@@ -436,31 +454,26 @@ static void fill_find(uint32_t o, const char *dir, const char *name) {
     strncpy((char *)(uintptr_t)(o + 44), name, 259);
 }
 
-static int shown_already(hfind *f, const char *name) {
-    for (int i = 0; i < f->nshown; i++)
-        if (!strcasecmp(f->shown[i], name)) return 1;
+static int listed(const hfind *f, const char *name) {
+    for (int i = 0; i < f->n; i++)
+        if (!strcasecmp(f->names[i].name, name)) return 1;
     return 0;
 }
-
-static int find_next(hfind *f, uint32_t out) {
+static void list_dir(hfind *f, DIR *d, int base) {
     struct dirent *e;
-    while (f->d && (e = readdir(f->d))) {
+    while (d && (e = readdir(d))) {
         int dot = !strcmp(e->d_name, ".") || !strcmp(e->d_name, "..");
-        if (dot && !f->dots) continue;
-        if (!wild(f->mask, e->d_name)) continue;
-        if (f->base) {                                   /* remember it: the game's copy is hidden */
-            if (f->nshown % 64 == 0) f->shown = realloc(f->shown, sizeof *f->shown * (size_t)(f->nshown + 64));
-            snprintf(f->shown[f->nshown++], 260, "%s", e->d_name);
-        }
-        fill_find(out, f->dir, e->d_name);
-        return 1;
+        if ((dot && (!f->dots || base)) || !wild(f->mask, e->d_name) || (base && listed(f, e->d_name))) continue;
+        if (f->n % 64 == 0) f->names = (found_t *)realloc(f->names, sizeof *f->names * (size_t)(f->n + 64));
+        snprintf(f->names[f->n].name, sizeof f->names[0].name, "%s", e->d_name);
+        f->names[f->n++].base = base;
     }
-    while (f->base && (e = readdir(f->base))) {
-        if (!wild(f->mask, e->d_name) || shown_already(f, e->d_name)) continue;
-        fill_find(out, f->base_dir, e->d_name);
-        return 1;
-    }
-    return 0;
+}
+static int find_next(hfind *f, uint32_t out) {
+    if (f->at >= f->n) return 0;
+    found_t *e = &f->names[f->at++];
+    fill_find(out, e->base ? f->base_dir : f->dir, e->name);
+    return 1;
 }
 
 static void k_FindFirstFileA(void) {                     /* (pattern, &data) */
@@ -494,12 +507,17 @@ static void k_FindFirstFileA(void) {                     /* (pattern, &data) */
             RET(h ? h : INVALID_HANDLE, 2);
         }
         free(f);
+        if (hle_filetrace()) fprintf(stderr, "[file] FindFirstFileA \"%s\": not found\n", pat);
         hle_set_last_error(ERROR_FILE_NOT_FOUND);
         RET(INVALID_HANDLE, 2);
     }
     f->d = opendir(f->dir);
+    list_dir(f, f->d, 0);
+    list_dir(f, f->base, 1);
+    if (f->n) qsort(f->names, (size_t)f->n, sizeof *f->names, by_name);
     if (!f->d || !find_next(f, A32(1))) {
         find_closer(f);
+        if (hle_filetrace()) fprintf(stderr, "[file] FindFirstFileA \"%s\": not found\n", pat);
         hle_set_last_error(ERROR_FILE_NOT_FOUND);
         RET(INVALID_HANDLE, 2);
     }
@@ -656,7 +674,76 @@ static void k_GetFullPathNameA(void) {
     RET(buf ? (uint32_t)strlen(buf) : (uint32_t)strlen(abs), 4);
 }
 
+/* ---- file mappings ----
+ * CreateFileMappingA keeps the file (a dup of its descriptor) or, for
+ * INVALID_HANDLE_VALUE, only a size: anonymous shared memory. MapViewOfFile
+ * mmaps it; a 32-bit host's address is the guest's. The views are
+ * remembered so UnmapViewOfFile knows their length. */
+typedef struct { int fd; uint64_t size; int writable; } hmapping;
+static void mapping_closer(void *p) { hmapping *m = (hmapping *)p; if (m->fd >= 0) close(m->fd); free(m); }
+static void k_CreateFileMappingA(void) {                 /* (hFile, sa, protect, sizeHigh, sizeLow, name) */
+    static int closer_set;
+    if (!closer_set) hle_handle_set_closer(HLE_H_MAPPING, mapping_closer), closer_set = 1;
+    uint32_t file = A32(0), protect = A32(2);
+    uint64_t size = (uint64_t)A32(3) << 32 | A32(4);
+    int fd = -1;
+    if (file != INVALID_HANDLE) {
+        int f = fd_of(file);
+        struct stat st;
+        if (f < 0 || fstat(f, &st) != 0) { hle_set_last_error(6); RET(0, 6); }   /* ERROR_INVALID_HANDLE */
+        if (!size) size = (uint64_t)st.st_size;
+        fd = dup(f);
+    }
+    if (!size) { hle_set_last_error(1006); RET(0, 6); }    /* ERROR_FILE_INVALID: an empty file */
+    hmapping *m = (hmapping *)malloc(sizeof *m);
+    m->fd = fd, m->size = size, m->writable = (protect & 0x0C) != 0;   /* PAGE_READWRITE | PAGE_WRITECOPY */
+    uint32_t h = hle_handle_alloc(HLE_H_MAPPING, m);
+    if (!h) { mapping_closer(m); RET(0, 6); }
+    hle_set_last_error(0);
+    RET(h, 6);
+}
+#define MAX_VIEWS 64
+static struct { uint32_t addr, len; } g_views[MAX_VIEWS];
+static void k_MapViewOfFile(void) {                      /* (hMap, access, offHigh, offLow, bytes) */
+    hmapping *m = (hmapping *)hle_handle_obj(A32(0), HLE_H_MAPPING);
+    uint64_t off = (uint64_t)A32(2) << 32 | A32(3);
+    if (!m || off >= m->size) { hle_set_last_error(6); RET(0, 5); }
+    uint64_t len = A32(4) ? A32(4) : m->size - off;
+    int copy = A32(1) == 1;                                /* FILE_MAP_COPY */
+    int prot = PROT_READ | (m->writable || copy ? PROT_WRITE : 0);
+    void *p = m->fd < 0 ? mmap(NULL, len, prot, MAP_SHARED | MAP_ANONYMOUS, -1, 0)
+                        : mmap(NULL, len, prot, copy ? MAP_PRIVATE : MAP_SHARED, m->fd, (off_t)off);
+    if (p == MAP_FAILED) { hle_set_last_error(8); RET(0, 5); }   /* ERROR_NOT_ENOUGH_MEMORY */
+    for (int i = 0; i < MAX_VIEWS; i++) if (!g_views[i].addr) { g_views[i].addr = (uint32_t)(uintptr_t)p, g_views[i].len = (uint32_t)len; break; }
+    RET((uint32_t)(uintptr_t)p, 5);
+}
+static void k_UnmapViewOfFile(void) {
+    for (int i = 0; i < MAX_VIEWS; i++)
+        if (g_views[i].addr && g_views[i].addr == A32(0)) {
+            munmap((void *)(uintptr_t)g_views[i].addr, g_views[i].len);
+            g_views[i].addr = 0;
+            RET(1, 1);
+        }
+    RET(0, 1);
+}
+
+/* ---- the process: one CPU of it, and no others to list ---- */
+static void k_GetProcessAffinityMask(void) {             /* (hProcess, &process, &system) */
+    if (A32(1)) MEM32(A32(1)) = 1;
+    if (A32(2)) MEM32(A32(2)) = 1;
+    RET(1, 3);
+}
+static void k_SetProcessAffinityMask(void) { RET(1, 2); }
+static void k_CreateToolhelp32Snapshot(void) { hle_set_last_error(5); RET(INVALID_HANDLE, 2); }   /* ERROR_ACCESS_DENIED */
+static void k_Process32First(void) { hle_set_last_error(18); RET(0, 2); }                     /* ERROR_NO_MORE_FILES */
+static void k_OpenProcess(void) { hle_set_last_error(5); RET(0, 3); }
+
 const win32hle_shim win32hle_kernel32_ext[] = {
+    { "GetProcessAffinityMask", k_GetProcessAffinityMask }, { "SetProcessAffinityMask", k_SetProcessAffinityMask },
+    { "CreateToolhelp32Snapshot", k_CreateToolhelp32Snapshot }, { "Process32First", k_Process32First },
+    { "Process32Next", k_Process32First }, { "OpenProcess", k_OpenProcess },
+    { "CreateFileMappingA", k_CreateFileMappingA }, { "MapViewOfFile", k_MapViewOfFile },
+    { "UnmapViewOfFile", k_UnmapViewOfFile },
     { "GetFullPathNameA", k_GetFullPathNameA },
     { "_lopen", k__lopen }, { "_lcreat", k__lcreat }, { "_lread", k__lread },
     { "_lwrite", k__lwrite }, { "_lclose", k__lclose }, { "_llseek", k__llseek },

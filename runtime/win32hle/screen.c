@@ -138,9 +138,10 @@ static uint32_t scan_of(SDL_Scancode s) {
 }
 
 /* window points -> game pixels, clamped to the picture */
+static int g_src_w, g_src_h;                            /* the picture last shown: what the window maps to */
 static void to_game(int x, int y, int *gx, int *gy) {
-    int w, h, bpp, pw, ph, ww, wh;
-    hle_dd_mode(&w, &h, &bpp);
+    int w = g_src_w, h = g_src_h, bpp, pw, ph, ww, wh;
+    if (w <= 0 || h <= 0) hle_dd_mode(&w, &h, &bpp);
     if (g_ren && g_win) {                                /* HiDPI: the renderer counts pixels, events points */
         SDL_GetRendererOutputSize(g_ren, &pw, &ph);
         SDL_GetWindowSize(g_win, &ww, &wh);
@@ -160,8 +161,10 @@ static void present(void) {
     const uint32_t *pal;
     int w, h, pitch, bpp;
     unsigned seq;
-    if (!hle_dd_frame(&px, &w, &h, &pitch, &bpp, &pal, &seq)) return;
+    pal = NULL;
+    if (!hle_dd_frame(&px, &w, &h, &pitch, &bpp, &pal, &seq) && !hle_gdi_window_frame(&px, &w, &h, &pitch, &bpp, &seq)) return;
     uint32_t now = hle_ticks_ms();
+    g_src_w = w, g_src_h = h;
     if (seq == g_shown_seq && now - g_last_present < 250) return;
     if (now - g_last_present < 15) return;
     g_shown_seq = seq, g_last_present = now;
@@ -360,6 +363,7 @@ static void warp(int x, int y) {
 int hle_screen_open(const char *title, int fullscreen, int headless) {
     g_headless = headless, g_fullscreen = fullscreen;
     hle_set_pump_hook(hle_screen_pump);
+    hle_gdi_window_hook = present;                       /* a GDI game's blit shows, pumping or not (a loading bar) */
     if (headless) return 0;
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");      /* SIGINT and SIGTERM end the process: SDL would make them a close the game can refuse */
     if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) { fprintf(stderr, "[screen] SDL: %s\n", SDL_GetError()); return -1; }
