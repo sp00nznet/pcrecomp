@@ -1,4 +1,4 @@
-"""Remove SteamStub 2.x (x86) from a PE32, statically: nothing is run, Steam is not needed.
+"""Remove SteamStub 2.x and 3.x (x86) from a PE32, statically: nothing is run, Steam is not needed.
 
 SteamStub is the wrapper Steam puts on retail executables: the code section is
 AES-encrypted and the entry point moves into a `.bind` section. Every key it
@@ -38,7 +38,19 @@ build (unwrap_v20): no steamdrm.dll at all, the stub copies its header with
 `rep movsd`, the header's first dword is its own XOR seed, and the code section
 is the same running XOR again, keyed by a header field. Any other layout fails
 one of the checks below with a message saying which, rather than writing a
-broken file. emu_unpack.py is the
+broken file.
+
+3.x (Shadows of the Empire's Steam build) is simpler to unwrap, because the
+code key is in the header rather than in steamdrm.dll: the stub opens with
+`call $+5` to find itself, copies a 0xF0-byte header from just below its entry,
+undoes the running XOR (seeded by the header's first dword, signature
+0xC0DEC0DF), and hands it to steamdrm.dll. The header carries the OEP, the code
+section, the AES-256 key, an ECB-encrypted IV and the code's first 16 bytes
+(stolen from the section). The code decrypts as CBC over those 16 bytes plus
+the section. The layout was read from the stub's own code and checked by
+decrypting: the OEP disassembles to the MSVC CRT start.
+
+emu_unpack.py is the
 fallback for a wrapper this cannot parse: it gets as far as SteamAPI_Init.
 """
 import argparse
@@ -184,6 +196,70 @@ def unwrap_v20(raw, pe, entry_bytes):
                             encryption='XOR chain' if f['flags'] & V20_FLAG_CODE_XORED else None)
 
 
+# The 3.x x86 stub: `call $+5; push eax..ebp; mov eax, [esp+0x1C]; sub eax, 5`,
+# so eax is its own entry VA. It then copies the header from just below that
+# (`push size; lea eax, [ebx - size]`). The header's first dword seeds the same
+# running XOR over the rest. Read from Shadows of the Empire's stub (app 560170).
+V3_PROLOGUE = bytes.fromhex('e800000000505351525657558b44241c2d05000000')
+V3_COPY = re.compile(rb'\x68(.{4})\x8D\x83(.{4})\x50', re.S)  # push size; lea eax, [ebx-size]; push eax
+V3_SIGNATURE = 0xC0DEC0DF
+V3_IMAGE_BASE, V3_OEP, V3_APPID, V3_FLAGS = 0x08, 0x20, 0x38, 0x3C
+V3_CODE_VA, V3_CODE_SIZE = 0x48, 0x50           # RVA and size of the encrypted section
+V3_AES_KEY, V3_AES_IV, V3_FIRST_BLOCK = 0x58, 0x78, 0x88   # 32, 16 and 16 bytes
+
+
+def v3_decrypt_code(hdr, enc, size):
+    """The code section, decrypted: AES-256-CBC over the header's stolen first
+    block followed by the section, IV ECB-decrypted from the header, PKCS#7."""
+    key = hdr[V3_AES_KEY:V3_AES_KEY + 32]
+    iv = Cipher(algorithms.AES(key), modes.ECB()).decryptor().update(hdr[V3_AES_IV:V3_AES_IV + 16])
+    plain = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor().update(
+        hdr[V3_FIRST_BLOCK:V3_FIRST_BLOCK + 16] + enc[:size])
+    pad = plain[-1]
+    if not 1 <= pad <= 16 or plain[-pad:] != bytes([pad]) * pad or len(plain) - pad != size:
+        raise StubError('code section did not decrypt (bad padding): wrong key or layout')
+    return plain[:-pad]
+
+
+def unwrap_v3(raw, pe, entry_bytes):
+    """(unwrapped file bytes, info dict) for the 3.x stub, or None if it is not one."""
+    if not entry_bytes.startswith(V3_PROLOGUE):
+        return None
+    m = V3_COPY.search(entry_bytes, 0x80, 0xC0) or V3_COPY.search(entry_bytes)
+    if not m:
+        raise StubError('3.x stub does not copy its header the known way')
+    size, neg = struct.unpack('<I', m.group(1))[0], struct.unpack('<i', m.group(2))[0]
+    if not 0x40 <= size <= 0x400 or neg != -size:
+        raise StubError('3.x header size 0x%X / 0x%X is not plausible' % (size, -neg))
+    base = pe.OPTIONAL_HEADER.ImageBase
+    ep = pe.OPTIONAL_HEADER.AddressOfEntryPoint
+    off = pe.get_offset_from_rva(ep - size)
+    seed = struct.unpack_from('<I', raw, off)[0]
+    hdr = struct.pack('<I', seed) + xor_chain(raw[off + 4:off + size], seed)
+    word = lambda o: struct.unpack_from('<I', hdr, o)[0]   # noqa: E731
+    if word(4) != V3_SIGNATURE:
+        raise StubError('3.x header signature 0x%08X is not 0x%08X' % (word(4), V3_SIGNATURE))
+    if word(V3_IMAGE_BASE) != base:
+        raise StubError('3.x header image base 0x%08X is not the PE\'s' % word(V3_IMAGE_BASE))
+    f = {k: word(o) for k, o in (('flags', V3_FLAGS), ('appid', V3_APPID), ('code_size', V3_CODE_SIZE))}
+    f['oep'], f['code_va'] = base + word(V3_OEP), base + word(V3_CODE_VA)
+    code = next((s for s in pe.sections if s.VirtualAddress == word(V3_CODE_VA)), None)
+    if code is None:
+        raise StubError('code VA 0x%08X is not the start of a section' % f['code_va'])
+    if not f['code_va'] <= f['oep'] < f['code_va'] + code.Misc_VirtualSize:
+        raise StubError('OEP 0x%08X is outside the code section' % f['oep'])
+    if f['code_size'] > code.SizeOfRawData:
+        raise StubError('code size 0x%X is larger than the section on disk' % f['code_size'])
+    # ponytail: the flags are not decoded; every 3.x file seen so far is encrypted,
+    # and the padding check refuses one that is not. Add the flag bit when one turns up.
+    lo = code.PointerToRawData
+    out = bytearray(raw)
+    out[lo:lo + f['code_size']] = v3_decrypt_code(hdr, raw[lo:lo + f['code_size']], f['code_size'])
+    finish(out, pe, f['oep'])
+    return bytes(out), dict(f, variant='3.x', header_va=base + ep - size, encryption='AES-256-CBC',
+                            section=code.Name.rstrip(b'\0').decode())
+
+
 def finish(out, pe, oep):
     """Point the entry at the OEP and drop .bind when nothing follows it in the file:
     left in, it is an executable section full of dead stub for every later tool."""
@@ -211,9 +287,9 @@ def unwrap(raw):
         return raw[off:off + n]
 
     entry = base + pe.OPTIONAL_HEADER.AddressOfEntryPoint
-    older = unwrap_v20(raw, pe, file_at(entry, 0x60))
-    if older:
-        return older
+    other = unwrap_v20(raw, pe, file_at(entry, 0x60)) or unwrap_v3(raw, pe, file_at(entry, 0x100))
+    if other:
+        return other
     hdr_va, ndw, seed = stub_constants(file_at(entry, 0x60))
     hdr = xor_chain(file_at(hdr_va, 4 * ndw), seed)
     word = lambda b, o: struct.unpack_from('<I', b, o)[0]   # noqa: E731
@@ -314,6 +390,19 @@ def selftest():
     m = V20_COPY.match(ut, len(STUB_PROLOGUE))
     assert m and struct.unpack('<2I', m.group(1) + m.group(2)) == (0x10964380, 0xDD)
     assert not V20_COPY.match(stub, len(STUB_PROLOGUE))     # KotOR's stub is not the older one
+
+    # 3.x: the header copy from Shadows of the Empire's stub, and the code
+    # layout as a round trip (stolen first block + section, PKCS#7).
+    m = V3_COPY.search(bytes.fromhex('68f00000008d8310ffffff50'))
+    assert m and struct.unpack('<Ii', m.group(1) + m.group(2)) == (0xF0, -0xF0)
+    key, iv = bytes(range(32)), bytes(range(16, 32))
+    code = bytes(range(256)) * 2 + b'\xc3' * 16
+    enc_iv = Cipher(algorithms.AES(key), modes.ECB()).encryptor().update(iv)
+    ct = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor().update(code + b'\x10' * 16)
+    hdr = bytearray(0xF0)
+    hdr[V3_AES_KEY:V3_AES_KEY + 32], hdr[V3_AES_IV:V3_AES_IV + 16] = key, enc_iv
+    hdr[V3_FIRST_BLOCK:V3_FIRST_BLOCK + 16] = ct[:16]
+    assert v3_decrypt_code(bytes(hdr), ct[16:], len(code)) == code
     print('steamstub selftest: ok')
 
 

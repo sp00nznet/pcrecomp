@@ -6,6 +6,11 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- `tools/drm/steamstub.py`: SteamStub 3.x (x86). The code key sits in the stub's
+  own 0xF0-byte header, not in `steamdrm.dll`, so it unwraps without loading the
+  DLL. Layout read from the stub's code on Star Wars: Shadows of the Empire
+  (app 560170) and checked on Rogue Squadron 3D (app 455910): both decrypt to
+  an MSVC CRT start at the OEP. Selftest covers the header copy and the AES layout.
 - disasm64: x86-64 function recovery for PE32+, so the 64-bit path no longer
   needs an IDA catalog. Seeds from `.pdata` primary entries (chained entries
   are cold chunks, not functions), the Guard CF table, exports, DIR64
