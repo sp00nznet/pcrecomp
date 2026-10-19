@@ -6,6 +6,13 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- MMSYSTEM for a Win16 game that loads it at run time (`host/mmsystem.c`).
+  `LoadLibrary("MMSYSTEM.DLL")` returns a known handle, `GetProcAddress` on it
+  gives host thunks, and a check that the DLL exists in the Windows system
+  directory succeeds. MCI (`mciSendCommand`: open, play, seek, set, status,
+  stop, close) goes to Win32 MCI, so MIDI music plays. `waveOutOpen` reports the
+  device busy, which sends SimAnt to its own fallback: `sndPlaySound` with
+  `SND_MEMORY`. The shim now plays that asynchronously from a host copy.
 - Win16 `SetTimer` with a `TIMERPROC`: the guest proc is called for each
   tick, as Win16's `DispatchMessage` did, instead of a `WM_TIMER` the window
   ignored. SimAnt runs its whole simulation from one; before this the colony

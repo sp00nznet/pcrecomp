@@ -206,8 +206,19 @@ void KERNEL_GLOBALHANDLE(CPU *cpu) {        /* -> DX:AX = selector:handle (same)
 
 static int map_guest_path(const char *g, char *host, int hostsz);
 
+/* mmsystem.c: the MMSYSTEM a game loads at run time, behind host thunks. */
+#define RECOMP_MMSYSTEM_HINST 0x0050
+int recomp_is_mmsystem(const char *path);
+int recomp_mmsystem_proc(const char *name, uint16_t *seg, uint16_t *off);
+
 void KERNEL_LOADLIBRARY(CPU *cpu) {         /* LoadLibrary(lpLibFileName) */
     char name[128]; read_asciiz(cpu, a16(cpu, 2), a16(cpu, 0), name, sizeof name);
+    if (recomp_is_mmsystem(name)) {
+        IMPL_LOG("[win16] LoadLibrary(%s) -> MMSYSTEM\n", name);
+        cpu->ax = RECOMP_MMSYSTEM_HINST;
+        ret(cpu, 4);
+        return;
+    }
     /* A name with a directory is a file the game ships somewhere in its tree
        (Oddballz: EGGZ\DYNAROO\DYNAROO.ODD); resolve it like any guest path. */
     char host[320];
@@ -234,6 +245,8 @@ void KERNEL_GETPROCADDRESS(CPU *cpu) {      /* GetProcAddress(hModule, lpProcNam
         snprintf(name, sizeof name, "@%u", noff);
         ok = ne_proc_address(hmod, NULL, noff, &seg, &off);
     }
+    if (!ok && hmod == RECOMP_MMSYSTEM_HINST)
+        ok = recomp_mmsystem_proc(nseg ? name : NULL, &seg, &off);
     if (!ok && recomp_game.proc_address)    /* not lifted: the game may answer it */
         ok = recomp_game.proc_address(hmod, nseg ? name : NULL, nseg ? 0 : noff, &seg, &off);
     fprintf(stderr, "[win16] GetProcAddress(%04X, %s) -> %04X:%04X%s\n", hmod, name,
@@ -780,7 +793,7 @@ void WING_WINGCREATEBITMAP(CPU *cpu) {      /* WinGCreateBitmap(HDC,BITMAPINFO*,
         g_wing[i].w = w; g_wing[i].h = h; g_wing[i].bpp = bpp;
         g_wing[i].topdown = ((int)mem_read32(cpu, hseg, hoff + 8) < 0);
         /* The colour table follows the 40-byte header in the caller's
-         * BITMAPINFO — WinG has no SetDIBColorTable import, so this is the only
+         * BITMAPINFO â€” WinG has no SetDIBColorTable import, so this is the only
          * place the palette is handed to us. Without it the blit is grey mush. */
         if (bpp <= 8) {
             /* Prefer the realized palette: the engine leaves this BITMAPINFO's
@@ -839,7 +852,7 @@ void WING_WINGCREATEBITMAP(CPU *cpu) {      /* WinGCreateBitmap(HDC,BITMAPINFO*,
  * The source is the WinG DC with a WinG bitmap selected into it; that bitmap's
  * pixels live in guest memory at sel:0000, so the "blit" is StretchDIBits from
  * guest memory straight onto the real destination DC. This is the engine's
- * only path to the screen — it was a no-op returning TRUE, which is why the
+ * only path to the screen â€” it was a no-op returning TRUE, which is why the
  * window stayed blank even when the engine was drawing. */
 /* What the window has been shown.
  *
@@ -1617,7 +1630,7 @@ void KERNEL_OUTPUTDEBUGSTRING(CPU *cpu) {
     uint16_t off = a16(cpu, 0), seg = a16(cpu, 2);
     char s[256]; read_asciiz(cpu, seg, off, s, sizeof(s));
     /* The engine's own log is the best window into what it thinks it is doing,
-     * and right now the lifted Borland formatter mangles it — so dump the bytes
+     * and right now the lifted Borland formatter mangles it â€” so dump the bytes
      * around the buffer too, which is what showed the output is a TAIL of the
      * intended string ("alled" for " called"). */
     IMPL_LOG("[OutputDebugString] %04X:%04X [", seg, off);
@@ -1870,9 +1883,29 @@ void MMSYSTEM_SNDPLAYSOUND(CPU *cpu) {
     uint16_t flags = a16(cpu, 0);
     uint16_t off = a16(cpu, 2), seg = a16(cpu, 4);
     int ok = 0;
+    static char *mem_snd;                   /* the SND_MEMORY copy now playing */
     if (!seg && !off) {
         PlaySoundA(NULL, NULL, 0);          /* NULL name: stop what is playing */
         ok = 1;
+    } else if (flags & 0x0004) {            /* SND_MEMORY: a RIFF image in guest memory */
+        /* SimAnt builds one around each sample and asks for a synchronous
+           play, then frees it. Play a host copy asynchronously instead, so the
+           colony doesn't stop for every sound; a new sound cuts the last one
+           off. ponytail: one voice, which is what sndPlaySound ever had. */
+        uint32_t n = 8 + ((uint32_t)mem_read16(cpu, seg, (uint16_t)(off + 4))
+                       | (uint32_t)mem_read16(cpu, seg, (uint16_t)(off + 6)) << 16);
+        if (n > 8 && n < 0x100000) {
+            PlaySoundA(NULL, NULL, 0);
+            free(mem_snd);
+            mem_snd = malloc(n);
+            for (uint32_t i = 0; mem_snd && i < n; i++)
+                mem_snd[i] = (char)mem_read8(cpu, seg, (uint16_t)(off + i));
+            ok = mem_snd && PlaySoundA(mem_snd, NULL, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
+            static int told;
+            if (told++ < 3 || !ok)
+                fprintf(stderr, "[sound] in-memory WAV, %u bytes, %u Hz -> %s\n", n,
+                        mem_snd ? *(uint32_t *)(mem_snd + 24) : 0, ok ? "playing" : "FAILED");
+        }
     } else {
         char guest[192] = "", host[256] = "";
         read_asciiz(cpu, seg, off, guest, sizeof guest);
@@ -2055,6 +2088,7 @@ void dos_int21(CPU *cpu) {
         char host[256];
         FILE *f = dos_map_path(cpu, host, sizeof host) ? fopen(host, "rb") : NULL;
         if (f) { fclose(f); cpu->cx = 0; cpu->flags &= ~FLAG_CF; }
+        else if (recomp_is_mmsystem(g_last_dos_path)) { cpu->cx = 0; cpu->flags &= ~FLAG_CF; }
         else   { cpu->ax = 0x02; cpu->flags |= FLAG_CF; }
         break;
     }
@@ -2126,7 +2160,7 @@ void dos_int21(CPU *cpu) {
  * XStruct "file not found". Serve them from the real INIs in RECOMP_DATA_DIR. */
 
 /* Guest INI paths are absolute DOS ("C:\CATZ\KITTENZ.INI") or bare names. Only
- * the leaf matters — everything the game reads lives in the install root.
+ * the leaf matters â€” everything the game reads lives in the install root.
  *
  * A NULL/empty filename means WIN.INI under Win16, and the installer put the
  * game's [Catz] settings there. We have no Windows 3.1 WIN.INI, so fall back to
@@ -2380,7 +2414,7 @@ void USER_WVSPRINTF(CPU *cpu) {
 
 /* ===== KERNEL: Win16 file API =====
  * The engine loads its data files (pet .lnz, sound tables, sprite data) through
- * OpenFile/_lopen/_lread rather than INT 21h, and these were stubs returning 0 —
+ * OpenFile/_lopen/_lread rather than INT 21h, and these were stubs returning 0 â€”
  * so every load silently produced nothing. Same host mapping as the DOS path. */
 /* One handle space with INT 21h, as on the real thing: a handle from
  * AccessResource or _lopen is read with DOS read() as often as with _lread.
@@ -2660,6 +2694,7 @@ void KERNEL_GETPROFILEINT(CPU *cpu) {      /* (lpAppName@6/8, lpKeyName@2/4, nDe
     uint16_t def = a16(cpu, 0);
     cpu->ax = ini_resolve("", app, key, host, sizeof host)
             ? (uint16_t)GetPrivateProfileIntA(app, key, (int16_t)def, host) : def;
+    fprintf(stderr, "[ini] GetProfileInt([%s] %s, %d) -> %d\n", app, key, (int16_t)def, (int16_t)cpu->ax);
     ret(cpu, 10);
 }
 
@@ -2720,3 +2755,5 @@ static void font_resource(CPU *cpu, int add) {
 }
 void GDI_ADDFONTRESOURCE(CPU *cpu)    { font_resource(cpu, 1); }
 void GDI_REMOVEFONTRESOURCE(CPU *cpu) { font_resource(cpu, 0); }
+
+int recomp_map_guest_path(const char *g, char *host, int hostsz) { return map_guest_path(g, host, hostsz); }
