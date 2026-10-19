@@ -94,7 +94,14 @@ class NELifter(Lifter):
                     if r.target_seg > 0 and r.target_seg != 0xFF:
                         target = self.seg_by_index.get(r.target_seg)
                         if target is not None and target.is_code:
-                            return f'seg{r.target_seg:03d}_{r.target_off:04X}'
+                            t_off = r.target_off
+                            # A SELECTOR fixup patches only the segment word; the
+                            # offset is the one in the instruction. MS C links the
+                            # startup's `call far WinMain` that way (SimAnt), and
+                            # target_off (0) sent it to seg1:0000 instead.
+                            if r.src_type == 2 and self.seg.data[local_off] in (0x9A, 0xEA):
+                                t_off = self.seg.data[local_off + 1] | self.seg.data[local_off + 2] << 8
+                            return f'seg{r.target_seg:03d}_{t_off:04X}'
                         else:
                             return f'/* data ref seg{r.target_seg}:{r.target_off:04X} */'
                 elif target_type in (1, 2):  # Import by ordinal / by name

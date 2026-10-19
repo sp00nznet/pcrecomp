@@ -102,6 +102,10 @@ def main():
             os.remove(os.path.join(src, f))
 
     seeds = json.load(open(args.seeds, encoding='utf-8')) if args.seeds else {}
+    stray = set(seeds) - set(names)
+    if stray:   # keyed by file stem, say: every seed would be dropped without a word
+        sys.exit(f'--seeds names {sorted(stray)}, not a module being lifted '
+                 f'(module names: {names})')
     for ne, name in zip(nes, names):
         stem = os.path.splitext(os.path.basename(ne.filename))[0]
         ida = os.path.join(args.ida_dir, stem + '.json') if args.ida_dir else None

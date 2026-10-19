@@ -723,6 +723,57 @@ void USER_GETSYSCOLOR(CPU *cpu) {              /* (nIndex@0) */
     b_ret(cpu, 2);
 }
 
+/* TextOut(hdc@10, x@8, y@6, lpString@2/4, nCount@0): exactly nCount bytes,
+ * no terminator needed. */
+void GDI_TEXTOUT(CPU *cpu) {
+    uint16_t g = b_a16(cpu, 10);
+    int x = (int16_t)b_a16(cpu, 8), y = (int16_t)b_a16(cpu, 6);
+    uint16_t so = b_a16(cpu, 2), ss = b_a16(cpu, 4);
+    int n = (int16_t)b_a16(cpu, 0);
+    char buf[512];
+    if (n < 0 || !ss) n = 0;
+    if (n > (int)sizeof buf) n = sizeof buf;
+    for (int i = 0; i < n; i++) buf[i] = (char)mem_read8(cpu, ss, (uint16_t)(so + i));
+    /* ponytail: a generous box for a WinG target, not the measured extent */
+    RECT r = { x, y - 64, x + 2048, y + 64 }, used = r; int wing = 0;
+    HDC dc = n ? draw_dc(cpu, g, r, &used, &wing) : NULL;
+    if (getenv("RECOMP_LOG_TEXT")) { static int k; if (k++ < 40)
+        fprintf(stderr, "[text] TextOut hdc=%u (%d,%d) \"%.*s\"\n", g, x, y, n, buf); }
+    cpu->ax = (uint16_t)(dc ? TextOutA(dc, x, y, buf, n) : n == 0);
+    if (dc && wing) wing_draw_end(cpu, g, &used);
+    b_ret(cpu, 12);
+}
+
+/* UnrealizeObject(hgdiobj): resets a brush origin or a palette's mapping;
+ * Win32 does both for itself. */
+void GDI_UNREALIZEOBJECT(CPU *cpu) { cpu->ax = 1; b_ret(cpu, 2); }
+
+/* Window properties. A name whose segment is 0 is an atom (MAKEINTATOM);
+ * the 16-bit data handle rides in the Win32 HANDLE. */
+static LPCSTR prop_name(CPU *cpu, uint16_t seg, uint16_t off, char *buf, int max) {
+    if (!seg) return (LPCSTR)(uintptr_t)off;
+    b_asciiz(cpu, seg, off, buf, max);
+    return buf;
+}
+void USER_SETPROP(CPU *cpu) {                  /* (hwnd@6, lpString@2/4, hData@0) */
+    char nm[256]; HWND h = get_hwnd(b_a16(cpu, 6));
+    LPCSTR p = prop_name(cpu, b_a16(cpu, 4), b_a16(cpu, 2), nm, sizeof nm);
+    cpu->ax = (uint16_t)(h && SetPropA(h, p, (HANDLE)(uintptr_t)b_a16(cpu, 0)));
+    b_ret(cpu, 8);
+}
+void USER_GETPROP(CPU *cpu) {                  /* (hwnd@4, lpString@0/2) */
+    char nm[256]; HWND h = get_hwnd(b_a16(cpu, 4));
+    LPCSTR p = prop_name(cpu, b_a16(cpu, 2), b_a16(cpu, 0), nm, sizeof nm);
+    cpu->ax = (uint16_t)(uintptr_t)(h ? GetPropA(h, p) : NULL);
+    b_ret(cpu, 6);
+}
+void USER_REMOVEPROP(CPU *cpu) {               /* (hwnd@4, lpString@0/2) */
+    char nm[256]; HWND h = get_hwnd(b_a16(cpu, 4));
+    LPCSTR p = prop_name(cpu, b_a16(cpu, 2), b_a16(cpu, 0), nm, sizeof nm);
+    cpu->ax = (uint16_t)(uintptr_t)(h ? RemovePropA(h, p) : NULL);
+    b_ret(cpu, 6);
+}
+
 /* DrawText(hdc@12, lpString@8/10, nCount@6, lpRect@2/4, uFormat@0) */
 void USER_DRAWTEXT(CPU *cpu) {
     uint16_t g = b_a16(cpu, 12);

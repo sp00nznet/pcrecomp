@@ -5,6 +5,38 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- Win16 `InitTask` returned CX=0xFFFE. It must be the NE header's stack size:
+  MS C's crt0 adds 256 bytes of slop and exits 255 on a carry, so no MS C
+  Win16 program could start. Borland's C0 ignores CX, which is why Catz and
+  Dogz never showed it. Found on SimAnt.
+- `ne_lift`: a `call/jmp far` whose segment comes from a SELECTOR fixup took
+  its offset from the fixup record (0), not the instruction. MS C links far
+  calls that way, so SimAnt's startup called seg1:0000 instead of WinMain at
+  seg1:3FDA. `ne_decode` now also counts those targets as entries; one
+  record chains many sites, so it walks the expanded map.
+- `ne_decode`: a code-map function entry that lands inside a decoded
+  instruction now wins over that instruction. IDA's own entries always sit on
+  its heads, so such an entry is a seed (from a SYM file or a linker map), and
+  the instruction under it is the desync. IDA read the byte before SimAnt's
+  `__cinit` as `jcxz` and decoded straight over its far prologue.
+- `ne_decode`: a gap the code map calls data, straight after an instruction
+  that falls through, is decoded as code if it resyncs exactly onto the next
+  decoded instruction within 16 bytes. IDA made SimAnt's `pop di; leave` a
+  `dw`, so `_ch_CreateTable` returned with BP unrestored. A gap after a `db`
+  (the decoder failing on a real instruction) is left alone. Dogz relifts
+  identically apart from 2 lines inside data decoded as code.
+- `ne_link --seeds` exits when it names a module that isn't being lifted.
+  Before, seeds keyed by file stem (`SIMANTW`) rather than module name
+  (`SIMANT`) were dropped without a word.
+
+### Added
+- Win16 shims SimAnt reaches: `GetFreeSpace` and `GlobalCompact` (16 MB),
+  `LockSegment`, `TextOut`, `UnrealizeObject`, `SetProp`/`GetProp`/
+  `RemoveProp`, and `wvsprintf`, which shares `wsprintf`'s formatter.
+- `win16.py`: purges for 36 imports SimAnt makes (GDI, KERNEL, KEYBOARD,
+  USER, and the Windows 1-3 `SOUND.DRV` voice API), from their signatures.
+
 ### Added
 - `tools/ne/mapsym.py`: read a MAPSYM `.SYM` file, the symbol table some
   Win16 programs shipped beside the EXE for the debugger. Each NE segment's

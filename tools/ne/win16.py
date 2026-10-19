@@ -418,6 +418,49 @@ PURGE.update({
     ('USER', 'CALLNEXTHOOKEX'): 10,       # HHOOK, int, WPARAM(2), LPARAM(4)
 })
 
+# ---------------------------------------------------------------------------
+# What SimAnt (Maxis, 1991) reaches that nothing before it did, from the same
+# Win16 signatures. SOUND.DRV is the Windows 1-3 voice-queue API (the PC
+# speaker, or a driver standing in for it), long gone from Win32.
+PURGE.update({
+    ('GDI', 'ADDFONTRESOURCE'): 4,        # LPCSTR
+    ('GDI', 'REMOVEFONTRESOURCE'): 4,     # LPCSTR
+    ('GDI', 'RECTINREGION'): 6,           # HRGN, const RECT FAR*
+    ('GDI', 'SELECTCLIPRGN'): 4,          # HDC, HRGN
+    ('GDI', 'SETMAPPERFLAGS'): 6,         # HDC, DWORD
+    ('GDI', 'SETSYSTEMPALETTEUSE'): 4,    # HDC, UINT
+    ('GDI', 'SETTEXTALIGN'): 4,           # HDC, UINT
+    ('GDI', 'TEXTOUT'): 12,               # HDC, int, int, LPCSTR, int
+    ('KERNEL', 'GLOBALCOMPACT'): 4,       # DWORD
+    ('KERNEL', 'GLOBALLRUNEWEST'): 2,     # HGLOBAL
+    ('KERNEL', 'GLOBALPAGELOCK'): 2,      # HGLOBAL
+    ('KERNEL', 'GLOBALPAGEUNLOCK'): 2,    # HGLOBAL
+    ('KERNEL', 'GLOBALWIRE'): 2,          # HGLOBAL
+    ('KERNEL', 'GLOBALUNWIRE'): 2,        # HGLOBAL
+    ('KERNEL', 'LOCALCOMPACT'): 2,        # UINT
+    ('KERNEL', 'NETBIOSCALL'): 0,         # INT 5Ch passthrough: all in registers
+    ('KEYBOARD', 'MAPVIRTUALKEY'): 4,     # UINT, UINT
+    ('SOUND', 'OPENSOUND'): 0,
+    ('SOUND', 'CLOSESOUND'): 0,
+    ('SOUND', 'STARTSOUND'): 0,
+    ('SOUND', 'SETVOICEQUEUESIZE'): 4,    # int voice, int bytes
+    ('SOUND', 'SETVOICENOTE'): 8,         # int voice, int value, int length, int cdots
+    ('USER', 'ENUMCHILDWINDOWS'): 10,     # HWND, WNDENUMPROC, LPARAM
+    ('USER', 'EQUALRECT'): 8,             # const RECT FAR*, const RECT FAR*
+    ('USER', 'GETPROP'): 6,               # HWND, LPCSTR
+    ('USER', 'SETPROP'): 8,               # HWND, LPCSTR, HANDLE
+    ('USER', 'REMOVEPROP'): 6,            # HWND, LPCSTR
+    ('USER', 'GETSCROLLRANGE'): 12,       # HWND, int, int FAR*, int FAR*
+    ('USER', 'GETTOPWINDOW'): 2,          # HWND
+    ('USER', 'INVERTRECT'): 6,            # HDC, const RECT FAR*
+    ('USER', 'LOADACCELERATORS'): 6,      # HINSTANCE, LPCSTR
+    ('USER', 'TRANSLATEACCELERATOR'): 8,  # HWND, HACCEL, MSG FAR*
+    ('USER', 'SCROLLWINDOW'): 14,         # HWND, int, int, const RECT FAR*, const RECT FAR*
+    ('USER', 'SETSYSCOLORS'): 10,         # int, const int FAR*, const COLORREF FAR*
+    ('USER', 'VALIDATERGN'): 4,           # HWND, HRGN
+    ('USER', 'WVSPRINTF'): 12,            # LPSTR, LPCSTR, const void FAR* (PASCAL, unlike wsprintf)
+})
+
 
 # The dialog/drawing leftovers. Every purge here was read off a real call site
 # (BangBang, 1990) by counting the pushes ahead of the far call, then checked

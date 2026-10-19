@@ -167,6 +167,24 @@ void KERNEL_GLOBALLOCK(CPU *cpu) {          /* -> far ptr DX:AX = handle:0000 */
 
 void KERNEL_GLOBALUNLOCK(CPU *cpu) { cpu->ax = 0; ret(cpu, 2); }
 
+/* GetFreeSpace(flags) -> DX:AX bytes free in the global heap. A game checks it
+ * at startup (SimAnt: "not enough memory to run" on 0): report 16 MB, a
+ * well-equipped 1993 machine, not the host's gigabytes, which a 32-bit
+ * DWORD would wrap or a game might multiply. */
+void KERNEL_GETFREESPACE(CPU *cpu) { cpu->dx = 0x0100; cpu->ax = 0; ret(cpu, 2); }
+
+/* GlobalCompact(dwMinFree) -> the largest free block, the same 16 MB. SimAnt
+ * calls it after loading its art and stops with "Fatal Error" on 0. */
+void KERNEL_GLOBALCOMPACT(CPU *cpu) { cpu->dx = 0x0100; cpu->ax = 0; ret(cpu, 4); }
+
+/* LockSegment(seg) -> the segment, locked; -1 means the caller's DS. Nothing
+ * moves here, so there is nothing to lock. */
+void KERNEL_LOCKSEGMENT(CPU *cpu) {
+    uint16_t s = a16(cpu, 0);
+    cpu->ax = s == 0xFFFF ? cpu->ds : s;
+    ret(cpu, 2);
+}
+
 void KERNEL_GLOBALSIZE(CPU *cpu) {          /* -> DWORD size in DX:AX */
     uint16_t hMem = a16(cpu, 0);
     uint32_t sz = (hMem ? g_sel_size[hMem] : 0);
@@ -1485,16 +1503,18 @@ void KERNEL_LOCALINIT(CPU *cpu) {
 }
 
 /* ===== KERNEL: task startup =====
- * InitTask is called once at the very start of a Win16 EXE (Borland C0). It
- * returns the startup register block the runtime needs; a stub returning AX=0
- * makes the startup abort. */
+ * InitTask is called once at the very start of a Win16 EXE (Borland C0, MS C
+ * crt0). It returns the startup register block the runtime needs; a stub
+ * returning AX=0 makes the startup abort. CX is the stack size from the NE
+ * header, as Windows returns it: MS C's crt0 adds its 256-byte slop and
+ * gives up on a carry, so anything near 0xFFFF makes it exit 255. */
 void KERNEL_INITTASK(CPU *cpu) {
     uint16_t hinst = RECOMP_AUTO_DATA_SEG;   /* fake hInstance == WAD DGROUP sel */
     /* Empty command line in the (fake) PSP at DGROUP:0080: length byte 0, CR. */
     mem_write8(cpu, hinst, 0x80, 0);
     mem_write8(cpu, hinst, 0x81, 0x0D);
     cpu->ax = 1;                 /* success (nonzero) */
-    cpu->cx = 0xFFFE;            /* stack top */
+    cpu->cx = RECOMP_MODULES[RECOMP_NUM_MODULES - 1].stack;   /* the host's, last in load order */
     cpu->dx = 1;                 /* nCmdShow = SW_SHOWNORMAL */
     cpu->si = 0;                 /* hPrevInstance = none */
     cpu->di = hinst;             /* hInstance */
@@ -2260,10 +2280,13 @@ void KERNEL_GETPRIVATEPROFILEINT(CPU *cpu) {
  * the purge is 0 and we just walk the arg words ourselves. Supports the subset
  * Win16 wsprintf actually documents: %s (far ptr), %c, %d/%i/%u/%x/%X with an
  * optional l (DWORD) size, %%, plus '-'/'0' flags and a width. */
-void USER__WSPRINTF(CPU *cpu) {
-    uint16_t ooff = a16(cpu, 0), oseg = a16(cpu, 2);
-    uint16_t foff = a16(cpu, 4), fseg = a16(cpu, 6);
-    int argi = 8;                          /* next vararg word, bytes from sp+4 */
+/* The formatter both share: the arguments are words at aseg:aoff on, on the
+ * stack for wsprintf, behind a far pointer for wvsprintf. */
+static uint16_t format16(CPU *cpu, uint16_t oseg, uint16_t ooff,
+                         uint16_t fseg, uint16_t foff, uint16_t aseg, uint16_t aoff) {
+#define a16(cpu, i) mem_read16(cpu, aseg, (uint16_t)(aoff + (i)))
+#define a32(cpu, i) ((uint32_t)a16(cpu, i) | (uint32_t)a16(cpu, (i) + 2) << 16)
+    int argi = 0;                          /* next argument, bytes from aoff */
 
     char fmt[512]; read_asciiz(cpu, fseg, foff, fmt, sizeof fmt);
     char out[1024]; int n = 0;
@@ -2321,8 +2344,23 @@ void USER__WSPRINTF(CPU *cpu) {
 
     for (int i = 0; i <= n; i++) mem_write8(cpu, oseg, (uint16_t)(ooff + i), (uint8_t)out[i]);
     IMPL_LOG("[wsprintf] fmt=%s| -> %s|\n", fmt, out);
-    cpu->ax = (uint16_t)n;
-    ret(cpu, 0);                            /* cdecl: caller cleans the args */
+    return (uint16_t)n;
+#undef a16
+#undef a32
+}
+
+void USER__WSPRINTF(CPU *cpu) {            /* cdecl (lpOut, lpFmt, ...): caller cleans */
+    cpu->ax = format16(cpu, a16(cpu, 2), a16(cpu, 0), a16(cpu, 6), a16(cpu, 4),
+                       cpu->ss, (uint16_t)(cpu->sp + 4 + 8));
+    ret(cpu, 0);
+}
+
+/* wvsprintf(lpOut@8/10, lpFmt@4/6, lpArgs@0/2): PASCAL, the arguments behind
+ * a far pointer. SimAnt formats its fatal-error text through it. */
+void USER_WVSPRINTF(CPU *cpu) {
+    cpu->ax = format16(cpu, a16(cpu, 10), a16(cpu, 8), a16(cpu, 6), a16(cpu, 4),
+                       a16(cpu, 2), a16(cpu, 0));
+    ret(cpu, 12);
 }
 
 /* ===== KERNEL: Win16 file API =====

@@ -166,6 +166,23 @@ def collect_internal_code_targets(ne: NEHeader) -> dict:
             t = ne.seg(tseg) if tseg != 0xFF else None
             if t is not None and t.is_code:
                 m.setdefault(tseg, set()).add(r.target_off)
+    # A SELECTOR fixup on a `call/jmp far` patches only the segment word (at
+    # +3); the offset is the instruction's own. MS C links far calls this way
+    # (SimAnt: the startup's call to WinMain). One record chains many sites,
+    # so walk the expanded map, not the records.
+    # ponytail: "the byte 3 back is 9A/EA" stands in for "this is a far call";
+    # a `mov reg, SEG x` two bytes after a stray 9A would add a bogus entry.
+    # Check against decoded instruction starts if one ever does.
+    for s in ne.segments:
+        if not s.is_code or not s.data:
+            continue
+        for off, ann in build_reloc_map(s, ne).items():
+            r = ann.reloc
+            if (r.flags & 3) or r.src_type != 2 or off < 3 or s.data[off - 3] not in (0x9A, 0xEA):
+                continue
+            t = ne.seg(r.target_seg) if r.target_seg != 0xFF else None
+            if t is not None and t.is_code:
+                m.setdefault(r.target_seg, set()).add(s.data[off - 2] | s.data[off - 1] << 8)
     ne._internal_code_targets = m
     return m
 
@@ -487,11 +504,54 @@ def disassemble_segment(seg: Segment, ne: NEHeader, show_relocs: bool = True) ->
     # pointing into the middle of an instruction must not decode from there, or
     # both readings are emitted (on Catz a stray `inc word [bx+si]` from inside
     # a far call walked over the ball rotation's sin table).
+    # The code map's own function list is the exception, and it wins: IDA's
+    # entries always sit on its heads, so one landing INSIDE a decoded
+    # instruction is a seed (ne_link --seeds), from a linker map or a SYM file,
+    # and the instruction under it is the desync. SimAnt seg 4: IDA read the
+    # byte before __cinit as `jcxz` and walked over 00E4, MS C's `mov ax,ds;
+    # nop; inc bp` far prologue, so the C startup called a function never lifted.
+    trusted = sorted({a for a in (seg_ida or {}).get('functions', []) if 0 <= a < len(seg.data)})
+
+    def covers_trusted(inst):                 # a trusted entry strictly inside inst
+        o = inst.offset - seg.file_offset
+        k = bisect.bisect_right(trusted, o)
+        return k < len(trusted) and trusted[k] < o + inst.length
+    if trusted:
+        instructions = [i for i in instructions if not covers_trusted(i)]
     have = set()
     for _i in instructions:
         _o = _i.offset - seg.file_offset
         have.update(range(_o, _o + max(_i.length, 1)))
     recover(forced_entries, have)
+
+    # A gap the code map calls data, right after an instruction that falls
+    # through, is code: execution runs into it. IDA made SimAnt's
+    # `pop di; leave` (7:904C) a `dw 0C95Fh` between `pop si` and `retf`, and
+    # the lift returned with BP unrestored. Fill such a gap only when decoding
+    # it lands exactly on the next decoded instruction within a few bytes --
+    # real data (a jump table after a call to exit) rarely resyncs that cleanly.
+    # Never after a `db`: that is the decoder failing on a real instruction
+    # (Dogz's `verr ax` = 0F 00 E0), and its tail read alone is a different
+    # instruction (`add al, ah`) that would clobber the flags the next jcc reads.
+    starts = {i.offset - seg.file_offset for i in instructions}
+    for inst in sorted(instructions, key=lambda i: i.offset):
+        pos = inst.offset - seg.file_offset + max(inst.length, 1)
+        if inst.mnemonic in ('ret', 'retf', 'iret', 'jmp', 'hlt', 'db') or pos in have or pos >= len(seg.data):
+            continue
+        decoder.pos, run = pos, []
+        while decoder.pos not in starts and decoder.pos - pos < 16:
+            at = decoder.pos
+            nxt = decoder.decode_one()
+            if nxt is None or any(b in have for b in range(at, at + max(nxt.length, 1))):
+                run = None
+                break
+            run.append(nxt)
+        if run and decoder.pos in starts:
+            for nxt in run:
+                o = nxt.offset - seg.file_offset
+                instructions.append(nxt)
+                have.update(range(o, o + max(nxt.length, 1)))
+                starts.add(o)
     _fpu_fixup(instructions)   # recover() may have added more ESC opcodes
     instructions.sort(key=lambda i: i.offset)
 
