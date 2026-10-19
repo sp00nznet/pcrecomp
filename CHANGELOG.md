@@ -6,6 +6,11 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- `tools/ne/mapsym.py`: read a MAPSYM `.SYM` file, the symbol table some
+  Win16 programs shipped beside the EXE for the debugger. Each NE segment's
+  symbols come back as `(seg, offset, name)`, which a project can use as
+  `ne_link --seeds` and as names. SimAnt's `SIMANTW.SYM` has 2,191 of them,
+  covering every function in its 7 code segments. Run `--selftest` to check it.
 - `tools/ne/ne_link.py`: lift a Win16 program made of several NE modules
   into one segment numbering, image and glue, with cross-module imports as
   direct calls (Catz 2 modules, Dogz 4, Oddballz 8). With it:

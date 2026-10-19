@@ -44,6 +44,19 @@ python tools/ne/ne_xref.py GAME.EXE --dot | dot -Tsvg -o callgraph.svg
 python tools/ne/ne_xref.py GAME.EXE --imports
 ```
 
+## Symbols a game shipped: MAPSYM `.SYM`
+
+Some Win16 programs shipped `GAME.SYM` beside `GAME.EXE`: MAPSYM's
+condensed linker map, kept there for the debugger. It gives every public
+function's segment, offset and real name. Check for one before anything else.
+
+```bash
+python tools/ne/mapsym.py GAME.SYM          # seg:off name
+```
+
+`mapsym.read()` returns `(seg, offset, name)` with NE segment numbers, ready
+to feed `ne_link --seeds`. SimAnt's relift is a worked example.
+
 ## Improving accuracy with an external code map
 
 Linear sweep desyncs on data-in-code. If you have IDA (or any tool that can
