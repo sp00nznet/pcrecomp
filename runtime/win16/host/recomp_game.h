@@ -56,6 +56,14 @@ typedef struct {
     const char *serial_key;
     const char *serial_help;
 
+    /* The game has real child windows and asks about them. Non-zero:
+     * GetClientRect/GetWindowRect report each window's own geometry, and
+     * ClientToScreen/WindowFromPoint work on a virtual screen whose origin is
+     * the main window's client area (where GetCursorPos already measures from).
+     * 0, the PF Magic model: one window is the whole 640x480 screen, every
+     * client rect is that screen and ClientToScreen is the identity. SimAnt: 1. */
+    int real_windows;
+
     /* GetProcAddress into a module that was NOT lifted (a DLL the game loads at
      * run time by path, say). Fill a guest far pointer -- usually one from
      * recomp_host_thunk() -- and return 1, or return 0 to report no such

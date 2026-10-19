@@ -1684,7 +1684,6 @@ static void write_rect(CPU *cpu, uint16_t seg, uint16_t off, int l, int t, int r
 
 /* USER_REGISTERCLASS, USER_CREATEWINDOW: real Win32 in win32_backend.c */
 void USER_GETSYSTEMMENU(CPU *cpu)  { cpu->ax = FAKE_HANDLE; ret(cpu, 4); }
-void USER_APPENDMENU(CPU *cpu)     { cpu->ax = 1; ret(cpu, 10); }
 void USER_LOADICON(CPU *cpu)       { cpu->ax = FAKE_HANDLE; ret(cpu, 6); }
 void USER_GETSYSTEMMETRICS(CPU *cpu) {     /* index@0 */
     uint16_t i = a16(cpu, 0);
@@ -1718,8 +1717,14 @@ void KERNEL_GETWINDOWSDIRECTORY(CPU *cpu) {   /* LPSTR off@2/seg@4, UINT@0 */
     cpu->ax = i; ret(cpu, 6);
 }
 
+int w32_client_rect(uint16_t g, RECT *r);    /* win32_backend.c: RecompGame.real_windows */
+int w32_window_rect(uint16_t g, RECT *r);
+int w32_client_to_screen(uint16_t g, POINT *p);
+
 void USER_GETWINDOWRECT(CPU *cpu) {        /* HWND@4, LPRECT off@0/seg@2 */
-    write_rect(cpu, a16(cpu, 2), a16(cpu, 0), 0, 0, 640, 480);
+    RECT r = { 0, 0, 640, 480 };
+    if (recomp_game.real_windows) w32_window_rect(a16(cpu, 4), &r);
+    write_rect(cpu, a16(cpu, 2), a16(cpu, 0), r.left, r.top, r.right, r.bottom);
     cpu->ax = 1; ret(cpu, 6);
 }
 /* Rect utilities. OffsetRect and InflateRect were stubs that returned without
@@ -1758,13 +1763,23 @@ void USER_INFLATERECT(CPU *cpu) {          /* (lpRect@4/6, dx@2, dy@0) */
     ret(cpu, 8);
 }
 
-void USER_CLIENTTOSCREEN(CPU *cpu) {       /* (hwnd@4, lpPoint@0/2) -- identity */
+void USER_CLIENTTOSCREEN(CPU *cpu) {       /* (hwnd@4, lpPoint@0/2): identity, or real_windows */
+    if (recomp_game.real_windows) {
+        uint16_t po = a16(cpu, 0), ps = a16(cpu, 2);
+        POINT p = { (int16_t)mem_read16(cpu, ps, po), (int16_t)mem_read16(cpu, ps, (uint16_t)(po + 2)) };
+        if (w32_client_to_screen(a16(cpu, 4), &p)) {
+            mem_write16(cpu, ps, po, (uint16_t)p.x);
+            mem_write16(cpu, ps, (uint16_t)(po + 2), (uint16_t)p.y);
+        }
+    }
     cpu->ax = 1;
     ret(cpu, 6);
 }
 
-void USER_GETCLIENTRECT(CPU *cpu) {
-    write_rect(cpu, a16(cpu, 2), a16(cpu, 0), 0, 0, 640, 480);
+void USER_GETCLIENTRECT(CPU *cpu) {        /* (hwnd@4, lpRect@0/2) */
+    RECT r = { 0, 0, 640, 480 };
+    if (recomp_game.real_windows) w32_client_rect(a16(cpu, 4), &r);
+    write_rect(cpu, a16(cpu, 2), a16(cpu, 0), r.left, r.top, r.right, r.bottom);
     cpu->ax = 1; ret(cpu, 6);
 }
 

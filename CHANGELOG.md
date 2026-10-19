@@ -5,6 +5,27 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- Win16 menus are real. `LoadMenu` builds the NE `RT_MENU` template into a
+  Win32 menu, and `SetMenu`, `GetMenu`, `GetSubMenu`, `Append`/`Insert`/
+  `ModifyMenu`, `EnableMenuItem`, `CheckMenuItem` and `DrawMenuBar` work on
+  it. `WM_INITMENU`, `WM_INITMENUPOPUP` and `WM_MENUSELECT` reach the guest
+  with its own handle. A handle the runtime never made keeps the old
+  bookkeeping answers, which Dogz relies on. SimAnt gets its menu bar.
+- `RecompGame.real_windows`: GetClientRect, GetWindowRect, ClientToScreen
+  report each window's real geometry, on a virtual screen whose origin is the
+  main window's client area. Without it, the PF Magic model is unchanged.
+- `WindowFromPoint`, in guest screen coordinates, answering only our windows.
+
+### Fixed
+- `ShowWindow(SW_SHOWMAXIMIZED)` on a frame filled the host desktop. It now
+  gives the frame a 640x480 client area, the screen `GetSystemMetrics` reports,
+  and keeps it when `SetMenu` adds a menu bar.
+- `ScreenToClient` took the guest's point as a host-desktop point, while
+  `GetCursorPos` measures from the main window's client area, so a hit test on
+  any window not at the desktop origin missed. It converts from the guest's
+  screen now.
+
 ### Fixed
 - Win16 `InitTask` returned CX=0xFFFE. It must be the NE header's stack size:
   MS C's crt0 adds 256 bytes of slop and exits 255 on a carry, so no MS C

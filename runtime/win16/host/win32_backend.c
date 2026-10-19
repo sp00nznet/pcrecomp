@@ -52,6 +52,9 @@ static uint16_t put_hwnd(HWND h) {
     return 0;
 }
 static HWND get_hwnd(uint16_t g) { return (g && g < MAXH) ? g_hwnd[g] : NULL; }
+static uint16_t put_hmenu(HMENU h);           /* the menus section */
+static HWND g_vmax_hwnd;                      /* the frame "maximized" to the virtual screen */
+static HMENU get_hmenu(uint16_t g);
 /* Slots must be recycled: the engine takes a DC every frame, and a table that
  * only ever grows ran out within seconds -- put_hdc then returned 0 and the
  * engine reported "Closing already closed screen DC" for the rest of the run. */
@@ -274,6 +277,13 @@ static LRESULT CALLBACK host_wndproc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
                 glp = (uint32_t)sg << 16;
             }
         }
+        /* Menu messages carry an HMENU, which the guest knows by its own handle.
+           WM_MENUSELECT also moves: Win32 wParam = item|flags<<16, lParam = menu;
+           Win16 wParam = item, lParam = flags|menu<<16. */
+        if (msg == WM_INITMENU || msg == WM_INITMENUPOPUP)
+            wParam = put_hmenu((HMENU)wParam);
+        else if (msg == WM_MENUSELECT)
+            glp = (uint32_t)HIWORD(wParam) | (uint32_t)put_hmenu((HMENU)lParam) << 16;
         LRESULT gr = call_guest_wndproc(pseg, poff, gh, (uint16_t)msg,
                                         (uint16_t)wParam, glp);
         /* The engine runs a shutdown chain on WM_CLOSE but never calls
@@ -452,12 +462,26 @@ void USER_POSTQUITMESSAGE(CPU *cpu) {
 void USER_SHOWWINDOW(CPU *cpu) {          /* (hwnd@2, nCmdShow@0) */
     HWND h = get_hwnd(b_a16(cpu, 2));
     int cmd = (int)(int16_t)b_a16(cpu, 0);
+    if (getenv("RECOMP_LOG_WINPOS")) fprintf(stderr, "[winpos] ShowWindow(guest %u, %d)\n", b_a16(cpu, 2), cmd);
     /* One deliberate exception: the engine hides the 640x480 popup because it
        wants to paint the bare desktop instead. We have repurposed exactly that
        window as the pet's screen (GetDC(NULL) returns its DC), so keeping the
        pet indoors means keeping it shown. Everything else is honoured. */
     if (h && h == g_screen_hwnd && cmd == SW_HIDE && !getenv("RECOMP_DESKTOP"))
         cmd = SW_SHOWNA;                  /* show it, but do not steal focus */
+    /* Maximized means the screen the game was told about (GetSystemMetrics:
+       640x480), not the host's desktop. SimAnt maximizes its frame and lays
+       its children over exactly 640x480; on a 1080p desktop it was an island
+       in a sea of white. Give the frame that client area instead. */
+    if (h && !(GetWindowLongA(h, GWL_STYLE) & WS_CHILD) && (cmd == SW_SHOWMAXIMIZED || cmd == SW_MAXIMIZE)) {
+        RECT r = { 0, 0, 640, 480 };
+        AdjustWindowRectEx(&r, (DWORD)GetWindowLongA(h, GWL_STYLE), GetMenu(h) != NULL,
+                           (DWORD)GetWindowLongA(h, GWL_EXSTYLE));
+        SetWindowPos(h, NULL, 0, 0, r.right - r.left, r.bottom - r.top,
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        cmd = SW_SHOWNORMAL;
+        g_vmax_hwnd = h;
+    }
     cpu->ax = (uint16_t)(h ? ShowWindow(h, cmd) : 0);
     b_ret(cpu, 4);
 }
@@ -620,10 +644,12 @@ void USER_SETWINDOWTEXT(CPU *cpu) {            /* (hWnd@4, lpString@0/2) */
     b_ret(cpu, 6);
 }
 
-/* CheckMenuItem(hMenu@4, idCheckItem@2, uCheck@0). The engine draws its own
-   menus, so the only real menu here is the window's system menu. */
+/* CheckMenuItem(hMenu@4, idCheckItem@2, uCheck@0). A menu the guest built is
+   real; any other handle (the PF Magic engines draw their own menus) means
+   the window's system menu, as before. */
 void USER_CHECKMENUITEM(CPU *cpu) {
-    HMENU m = GetSystemMenu(g_main_hwnd, FALSE);
+    HMENU m = get_hmenu(b_a16(cpu, 4));
+    if (!m) m = GetSystemMenu(g_main_hwnd, FALSE);
     DWORD prev = m ? CheckMenuItem(m, b_a16(cpu, 2), b_a16(cpu, 0)) : (DWORD)-1;
     cpu->ax = (uint16_t)prev;
     b_ret(cpu, 6);
@@ -1937,13 +1963,53 @@ void USER_BRINGWINDOWTOTOP(CPU *cpu)  {
 /* The desktop is the real one: games size their full-screen play area from it. */
 void USER_GETDESKTOPWINDOW(CPU *cpu) { cpu->ax = put_hwnd(GetDesktopWindow()); b_ret(cpu, 0); }
 
+/* The guest's screen is the main (or PF Magic screen) window's client area:
+   GetCursorPos measures from there, so every conversion has to as well. */
+static POINT vscreen_origin(void) {
+    POINT o = { 0, 0 };
+    HWND h = g_screen_hwnd ? g_screen_hwnd : g_main_hwnd;
+    if (h) ClientToScreen(h, &o);
+    return o;
+}
+/* For win16_impl.c, under RecompGame.real_windows. 0 when g is no window. */
+int w32_client_rect(uint16_t g, RECT *r) { HWND h = get_hwnd(g); return h && GetClientRect(h, r); }
+int w32_window_rect(uint16_t g, RECT *r) {
+    HWND h = get_hwnd(g);
+    if (!h || !GetWindowRect(h, r)) return 0;
+    POINT o = vscreen_origin();
+    OffsetRect(r, -o.x, -o.y);
+    return 1;
+}
+int w32_client_to_screen(uint16_t g, POINT *p) {
+    HWND h = get_hwnd(g);
+    if (!h) return 0;
+    POINT o = vscreen_origin();
+    ClientToScreen(h, p);
+    p->x -= o.x; p->y -= o.y;
+    return 1;
+}
+
 void USER_SCREENTOCLIENT(CPU *cpu) {        /* (hwnd@4, lpPoint@0/2) */
     HWND h = get_hwnd(b_a16(cpu, 4));
     uint16_t po = b_a16(cpu, 0), ps = b_a16(cpu, 2);
     POINT p = { (int16_t)mem_read16(cpu, ps, po), (int16_t)mem_read16(cpu, ps, (uint16_t)(po + 2)) };
+    POINT o = vscreen_origin();             /* guest screen -> host screen first */
+    p.x += o.x; p.y += o.y;
     if (h) ScreenToClient(h, &p);
     mem_write16(cpu, ps, po, (uint16_t)p.x); mem_write16(cpu, ps, (uint16_t)(po + 2), (uint16_t)p.y);
     b_ret(cpu, 6);
+}
+
+/* WindowFromPoint(POINT by value: x@0, y@2), in guest screen coordinates.
+   Only our own windows are answers; anything else on the desktop is 0. */
+void USER_WINDOWFROMPOINT(CPU *cpu) {
+    POINT o = vscreen_origin();
+    POINT p = { (int16_t)b_a16(cpu, 0) + o.x, (int16_t)b_a16(cpu, 2) + o.y };
+    HWND h = WindowFromPoint(p);
+    DWORD pid = 0;
+    if (h) GetWindowThreadProcessId(h, &pid);
+    cpu->ax = (h && pid == GetCurrentProcessId()) ? put_hwnd(h) : 0;
+    b_ret(cpu, 4);
 }
 
 void USER_SETRECT(CPU *cpu) {               /* (lpRect@8/10, l@6, t@4, r@2, b@0) */
@@ -2024,18 +2090,129 @@ void USER_CREATEWINDOWEX(CPU *cpu) {
     cpu->sp = (uint16_t)(cpu->sp + 4);
 }
 
-/* ---- menus: guest handles only. The recomp's windows have no host menu bar
-   (the engines draw their own), so a menu is bookkeeping the guest can build
-   and query, not something shown. */
-static uint16_t g_nmenu = 0x100;
-void USER_LOADMENU(CPU *cpu)        { cpu->ax = g_nmenu++; b_ret(cpu, 6); }
-void USER_CREATEPOPUPMENU(CPU *cpu) { cpu->ax = g_nmenu++; b_ret(cpu, 0); }
-void USER_CREATEMENU(CPU *cpu)      { cpu->ax = g_nmenu++; b_ret(cpu, 0); }
-void USER_DESTROYMENU(CPU *cpu)     { cpu->ax = 1; b_ret(cpu, 2); }
-void USER_GETMENU(CPU *cpu)         { cpu->ax = 0; b_ret(cpu, 2); }
-void USER_GETSUBMENU(CPU *cpu)      { cpu->ax = g_nmenu++; b_ret(cpu, 4); }
-void USER_INSERTMENU(CPU *cpu)      { cpu->ax = 1; b_ret(cpu, 12); }
-void USER_ENABLEMENUITEM(CPU *cpu)  { cpu->ax = 0; b_ret(cpu, 6); }   /* previous: enabled */
+/* ---- menus: real Win32 menus behind guest handles. The PF Magic engines draw
+   their own and never SetMenu, so they still get no menu bar; SimAnt loads
+   ANTMENU and puts it on its frame. A menu's WM_COMMAND needs no translation
+   (id in wParam, lParam 0 in both); the messages that carry an HMENU do
+   (host_wndproc). */
+#define MAXMENU 128
+static HMENU g_menu[MAXMENU];
+static int g_nmenu = 1;
+static uint16_t put_hmenu(HMENU h) {
+    if (!h) return 0;
+    for (int i = 1; i < g_nmenu; i++) if (g_menu[i] == h) return (uint16_t)(0x100 + i);
+    if (g_nmenu < MAXMENU) { g_menu[g_nmenu] = h; return (uint16_t)(0x100 + g_nmenu++); }
+    handle_table_full("menu");
+    return 0;
+}
+static HMENU get_hmenu(uint16_t g) {
+    return (g > 0x100 && g < 0x100 + MAXMENU) ? g_menu[g - 0x100] : NULL;
+}
+
+/* A Win16 RT_MENU template: a 4-byte header, then per item a flags word, the
+   id word unless MF_POPUP (whose items follow, nested), and an ANSI string;
+   MF_END marks the last item of each level. Returns the bytes consumed. */
+static int menu_build(HMENU m, const uint8_t *p, int n) {
+    int i = 0;
+    while (i + 2 <= n) {
+        uint16_t fl = (uint16_t)(p[i] | p[i + 1] << 8), id = 0; i += 2;
+        if (!(fl & MF_POPUP)) { if (i + 2 > n) break; id = (uint16_t)(p[i] | p[i + 1] << 8); i += 2; }
+        const char *text = (const char *)p + i;
+        while (i < n && p[i]) i++;
+        i++;                                              /* the NUL */
+        UINT f = fl & ~(MF_END | MF_POPUP);
+        if (fl & MF_POPUP) {
+            HMENU sub = CreatePopupMenu();
+            i += menu_build(sub, p + i, n - i);
+            AppendMenuA(m, f | MF_POPUP, (UINT_PTR)sub, text);
+        } else if (!text[0] && !id && !(fl & ~MF_END)) {
+            AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+        } else {
+            AppendMenuA(m, f, id, text);
+        }
+        if (fl & MF_END) break;
+    }
+    return i;
+}
+
+void USER_LOADMENU(CPU *cpu) {                  /* (hinst@4, lpName@0/2: an id when its segment is 0) */
+    uint16_t hinst = b_a16(cpu, 4), noff = b_a16(cpu, 0), nseg = b_a16(cpu, 2);
+    char name[64] = "";
+    if (nseg) b_asciiz(cpu, nseg, noff, name, sizeof name);
+    uint16_t hr = ne_find_resource(hinst, 4 /* RT_MENU */, NULL, nseg ? -1 : (int)noff, nseg ? name : NULL);
+    uint32_t len = 0;
+    const uint8_t *b = hr ? ne_resource_bytes(hr, &len) : NULL;
+    HMENU m = CreateMenu();
+    if (b && len > 4) menu_build(m, b + 4, (int)len - 4);
+    else fprintf(stderr, "[win32] LoadMenu(%s) not found; an empty menu\n", nseg ? name : "#id");
+    cpu->ax = put_hmenu(m);
+    b_ret(cpu, 6);
+}
+void USER_CREATEPOPUPMENU(CPU *cpu) { cpu->ax = put_hmenu(CreatePopupMenu()); b_ret(cpu, 0); }
+void USER_CREATEMENU(CPU *cpu)      { cpu->ax = put_hmenu(CreateMenu()); b_ret(cpu, 0); }
+/* A handle the runtime never made (no real menu behind it) keeps the answers
+   the old bookkeeping-only shims gave, which Dogz was built against: calls
+   succeed and GetSubMenu is never 0. */
+void USER_DESTROYMENU(CPU *cpu)     { HMENU m = get_hmenu(b_a16(cpu, 0)); cpu->ax = (uint16_t)(m ? DestroyMenu(m) : 1); b_ret(cpu, 2); }
+void USER_GETMENU(CPU *cpu)         { HWND h = get_hwnd(b_a16(cpu, 0)); cpu->ax = h ? put_hmenu(GetMenu(h)) : 0; b_ret(cpu, 2); }
+void USER_SETMENU(CPU *cpu) {                   /* (hwnd@2, hmenu@0) */
+    HWND h = get_hwnd(b_a16(cpu, 2));
+    RECT c = { 0 };
+    if (h) GetClientRect(h, &c);
+    cpu->ax = (uint16_t)(h && SetMenu(h, get_hmenu(b_a16(cpu, 0))));
+    /* A frame the runtime sized to the virtual screen keeps that client area:
+       SimAnt maximizes, lays its children over 640x480, then adds ANTMENU. */
+    if (h && h == g_vmax_hwnd) {
+        RECT r = c;
+        AdjustWindowRectEx(&r, (DWORD)GetWindowLongA(h, GWL_STYLE), GetMenu(h) != NULL,
+                           (DWORD)GetWindowLongA(h, GWL_EXSTYLE));
+        SetWindowPos(h, NULL, 0, 0, r.right - r.left, r.bottom - r.top,
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    b_ret(cpu, 4);
+}
+void USER_DRAWMENUBAR(CPU *cpu)     { HWND h = get_hwnd(b_a16(cpu, 0)); if (h) DrawMenuBar(h); b_ret(cpu, 2); }
+void USER_GETSUBMENU(CPU *cpu) {                /* (hmenu@2, pos@0) */
+    HMENU m = get_hmenu(b_a16(cpu, 2));
+    cpu->ax = m ? put_hmenu(GetSubMenu(m, (int16_t)b_a16(cpu, 0))) : put_hmenu(CreatePopupMenu());
+    b_ret(cpu, 4);
+}
+void USER_ENABLEMENUITEM(CPU *cpu) {            /* (hmenu@4, id@2, flags@0) -> previous state */
+    HMENU m = get_hmenu(b_a16(cpu, 4));
+    cpu->ax = m ? (uint16_t)EnableMenuItem(m, b_a16(cpu, 2), b_a16(cpu, 0)) : 0;
+    b_ret(cpu, 6);
+}
+/* The item argument of Append/Insert/ModifyMenu: an id, or a submenu handle
+   under MF_POPUP; the new-item argument: a string, unless MF_BITMAP or
+   MF_OWNERDRAW say it is a handle or data. */
+static UINT_PTR menu_item(uint16_t fl, uint16_t id) { return (fl & MF_POPUP) ? (UINT_PTR)get_hmenu(id) : id; }
+static LPCSTR menu_text(CPU *cpu, uint16_t fl, uint16_t off, uint16_t seg, char *buf, int max) {
+    if (fl & (MF_BITMAP | MF_OWNERDRAW)) return (LPCSTR)(uintptr_t)((uint32_t)seg << 16 | off);
+    if (!seg) return NULL;
+    b_asciiz(cpu, seg, off, buf, max);
+    return buf;
+}
+void USER_APPENDMENU(CPU *cpu) {                /* (hmenu@8, flags@6, id@4, lpNew@0/2) */
+    char t[256]; uint16_t fl = b_a16(cpu, 6);
+    HMENU m = get_hmenu(b_a16(cpu, 8));
+    cpu->ax = (uint16_t)(!m || AppendMenuA(m, fl, menu_item(fl, b_a16(cpu, 4)),
+                                          menu_text(cpu, fl, b_a16(cpu, 0), b_a16(cpu, 2), t, sizeof t)));
+    b_ret(cpu, 10);
+}
+void USER_INSERTMENU(CPU *cpu) {                /* (hmenu@10, pos@8, flags@6, id@4, lpNew@0/2) */
+    char t[256]; uint16_t fl = b_a16(cpu, 6);
+    HMENU m = get_hmenu(b_a16(cpu, 10));
+    cpu->ax = (uint16_t)(!m || InsertMenuA(m, b_a16(cpu, 8), fl, menu_item(fl, b_a16(cpu, 4)),
+                                          menu_text(cpu, fl, b_a16(cpu, 0), b_a16(cpu, 2), t, sizeof t)));
+    b_ret(cpu, 12);
+}
+void USER_MODIFYMENU(CPU *cpu) {                /* (hmenu@10, pos@8, flags@6, id@4, lpNew@0/2) */
+    char t[256]; uint16_t fl = b_a16(cpu, 6);
+    HMENU m = get_hmenu(b_a16(cpu, 10));
+    cpu->ax = (uint16_t)(!m || ModifyMenuA(m, b_a16(cpu, 8), fl, menu_item(fl, b_a16(cpu, 4)),
+                                          menu_text(cpu, fl, b_a16(cpu, 0), b_a16(cpu, 2), t, sizeof t)));
+    b_ret(cpu, 12);
+}
 
 /* ---- scroll bars: none exist, so each is permanently at 0 of 0..0 ---- */
 void USER_GETSCROLLPOS(CPU *cpu)    { cpu->ax = 0; b_ret(cpu, 4); }
