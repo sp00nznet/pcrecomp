@@ -150,6 +150,20 @@ int main(void) {
         ok("overlay off: the game's file again", hle_host_path("C:\\rules.ini", p, sizeof p) && strstr(p, "/game/rules.ini"));
     }
 
+    /* The guest's printf: arguments read from guest memory, and a spec of 19
+     * flags, a 10-digit * width and ll stays inside its buffer (under ASan
+     * this overflowed it). */
+    {
+        char out[64];
+        uint32_t a = hle_va(hle_alloc(16));
+        MEM32(a) = 42, MEM32(a + 4) = hle_guest_strdup("ok");
+        hle_guest_format(out, sizeof out, "%04d %s", a);
+        ok("guest format: %04d %s", !strcmp(out, "0042 ok"));
+        MEM32(a) = (uint32_t)-100000000, MEM32(a + 4) = 7, MEM32(a + 8) = 0;
+        hle_guest_format(out, sizeof out, "%-------------------*lld", a);
+        ok("guest format: a long spec stays in its buffer", out[0] == '7');
+    }
+
     if (fails == 0) printf("kernel32_ext_selftest: all checks passed\n");
     return fails != 0;
 }

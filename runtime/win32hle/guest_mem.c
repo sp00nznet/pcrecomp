@@ -359,7 +359,10 @@ int hle_guest_format(char *out, size_t n, const char *fmt, uint32_t args) {
         while (*fmt && strchr("-+ #0", *fmt) && s < 20) spec[s++] = *fmt++;
         for (int part = 0; part < 2; part++) {              /* width, then .precision */
             if (part) { if (*fmt != '.') break; spec[s++] = *fmt++; }
-            if (*fmt == '*') { s += (size_t)snprintf(spec + s, sizeof spec - s, "%d", (int32_t)MEM32(args)); args += 4; fmt++; }
+            if (*fmt == '*') {                               /* the number, cut at 28 like the digits: ll, the letter and the end must fit */
+                s += (size_t)snprintf(spec + s, sizeof spec - s, "%d", (int32_t)MEM32(args)), args += 4, fmt++;
+                if (s > 28) s = 28;
+            }
             else while (*fmt >= '0' && *fmt <= '9' && s < 28) spec[s++] = *fmt++;
             if (s >= 28) break;
         }
