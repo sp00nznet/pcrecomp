@@ -308,6 +308,11 @@ static LRESULT CALLBACK host_wndproc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
         /* Menu messages carry an HMENU, which the guest knows by its own handle.
            WM_MENUSELECT also moves: Win32 wParam = item|flags<<16, lParam = menu;
            Win16 wParam = item, lParam = flags|menu<<16. */
+        /* WM_COMMAND moves too: Win32 wParam = id|code<<16, lParam = control;
+           Win16 wParam = id, lParam = control|code<<16. An accelerator's code
+           is 1, a menu's 0, a control's its notification. */
+        if (msg == WM_COMMAND)
+            glp = (lParam ? put_hwnd((HWND)lParam) : 0) | (uint32_t)HIWORD(wParam) << 16;
         if (msg == WM_INITMENU || msg == WM_INITMENUPOPUP)
             wParam = put_hmenu((HMENU)wParam);
         else if (msg == WM_MENUSELECT)
@@ -1648,6 +1653,8 @@ void USER_RELEASEDC(CPU *cpu) {
 
 /* Win16 MSG: hwnd@0(2) message@2(2) wParam@4(2) lParam@6(4) time@10(4) pt@14(4) */
 static void write_msg(CPU *cpu, uint16_t mseg, uint16_t moff, const MSG *m) {
+    if (getenv("RECOMP_LOG_ACCEL") && m->message >= WM_KEYFIRST && m->message <= WM_KEYLAST)
+        fprintf(stderr, "[key] msg %04X vk %02X\n", m->message, (unsigned)m->wParam);
     mem_write16(cpu, mseg, (uint16_t)(moff +  0), put_hwnd(m->hwnd));
     mem_write16(cpu, mseg, (uint16_t)(moff +  2), (uint16_t)m->message);
     mem_write16(cpu, mseg, (uint16_t)(moff +  4), (uint16_t)m->wParam);
@@ -1691,7 +1698,19 @@ void USER_PEEKMESSAGE(CPU *cpu) {
     b_ret(cpu, 12);
 }
 
-void USER_TRANSLATEMESSAGE(CPU *cpu) { cpu->ax = 0; b_ret(cpu, 4); }
+/* TranslateMessage(lpMsg@0/2): key-downs become WM_CHAR, for typing a
+ * colony name or a file name. */
+void USER_TRANSLATEMESSAGE(CPU *cpu) {
+    uint16_t mo = b_a16(cpu, 0), ms = b_a16(cpu, 2);
+    MSG m = { 0 };
+    m.hwnd    = get_hwnd(mem_read16(cpu, ms, mo));
+    m.message = mem_read16(cpu, ms, (uint16_t)(mo + 2));
+    m.wParam  = mem_read16(cpu, ms, (uint16_t)(mo + 4));
+    m.lParam  = (LPARAM)((uint32_t)mem_read16(cpu, ms, (uint16_t)(mo + 6))
+              | (uint32_t)mem_read16(cpu, ms, (uint16_t)(mo + 8)) << 16);
+    cpu->ax = (uint16_t)(m.hwnd && TranslateMessage(&m));
+    b_ret(cpu, 4);
+}
 
 void USER_DISPATCHMESSAGE(CPU *cpu) {
     /* lpMsg far ptr @0/2: re-read and dispatch via real Win32 -> host_wndproc. */
@@ -2634,4 +2653,50 @@ void USER_GLOBALADDATOM(CPU *cpu) {            /* (lpString@0/2) */
 void USER_GLOBALDELETEATOM(CPU *cpu) {         /* (nAtom@0) */
     cpu->ax = GlobalDeleteAtom(b_a16(cpu, 0));
     b_ret(cpu, 2);
+}
+
+/* Accelerators: SimAnt's keyboard shortcuts (Shift+0 pauses, and the menu
+ * keys). A Win16 RT_ACCELERATOR entry is 5 bytes -- fFlags, key, command id --
+ * with 0x80 in fFlags marking the last; the flag bits match Win32's ACCEL.
+ * TranslateAccelerator hands the guest's message to Win32, which sends the
+ * WM_COMMAND through host_wndproc to the guest.
+ * ponytail: the HACCEL lives in the GDI handle table; nothing ever deletes it. */
+void USER_LOADACCELERATORS(CPU *cpu) {         /* (hinst@4, lpName@0/2: an id when its segment is 0) */
+    uint16_t hinst = b_a16(cpu, 4), noff = b_a16(cpu, 0), nseg = b_a16(cpu, 2);
+    char name[64] = "";
+    if (nseg) b_asciiz(cpu, nseg, noff, name, sizeof name);
+    uint16_t hr = ne_find_resource(hinst, 9 /* RT_ACCELERATOR */, NULL, nseg ? -1 : (int)noff, nseg ? name : NULL);
+    uint32_t len = 0;
+    const uint8_t *b = hr ? ne_resource_bytes(hr, &len) : NULL;
+    ACCEL a[128]; int n = 0;
+    for (uint32_t i = 0; b && i + 5 <= len && n < 128; i += 5) {
+        a[n].fVirt = (BYTE)(b[i] & 0x7F);
+        a[n].key   = (WORD)(b[i + 1] | b[i + 2] << 8);
+        a[n].cmd   = (WORD)(b[i + 3] | b[i + 4] << 8);
+        n++;
+        if (b[i] & 0x80) break;
+    }
+    HACCEL h = n ? CreateAcceleratorTableA(a, n) : NULL;
+    fprintf(stderr, "[win32] LoadAccelerators(%s) -> %d keys\n", nseg ? name : "#id", n);
+    for (int i = 0; getenv("RECOMP_LOG_ACCEL") && i < n; i++)
+        fprintf(stderr, "  flags %02X key %04X -> command %u\n", a[i].fVirt, a[i].key, a[i].cmd);
+    cpu->ax = put_hgdi(h);
+    b_ret(cpu, 6);
+}
+
+void USER_TRANSLATEACCELERATOR(CPU *cpu) {     /* (hwnd@6, hAccTable@4, lpMsg@0/2) */
+    HWND h = get_hwnd(b_a16(cpu, 6));
+    HACCEL a = (HACCEL)get_hgdi(b_a16(cpu, 4));
+    uint16_t mo = b_a16(cpu, 0), ms = b_a16(cpu, 2);
+    MSG m = { 0 };
+    m.hwnd    = get_hwnd(mem_read16(cpu, ms, mo));
+    m.message = mem_read16(cpu, ms, (uint16_t)(mo + 2));
+    m.wParam  = mem_read16(cpu, ms, (uint16_t)(mo + 4));
+    m.lParam  = (LPARAM)((uint32_t)mem_read16(cpu, ms, (uint16_t)(mo + 6))
+              | (uint32_t)mem_read16(cpu, ms, (uint16_t)(mo + 8)) << 16);
+    cpu->ax = (uint16_t)(h && a && TranslateAcceleratorA(h, a, &m));
+    if (getenv("RECOMP_LOG_ACCEL") && (m.message == WM_KEYDOWN || m.message == WM_SYSKEYDOWN))
+        fprintf(stderr, "[accel] key %02X (shift %d ctrl %d) -> %u\n", (unsigned)m.wParam,
+                GetKeyState(VK_SHIFT) < 0, GetKeyState(VK_CONTROL) < 0, cpu->ax);
+    b_ret(cpu, 8);
 }

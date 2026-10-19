@@ -6,6 +6,10 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Win16 accelerators: `LoadAccelerators` builds the `RT_ACCELERATOR` resource
+  into a Win32 table and `TranslateAccelerator` runs it, so keyboard shortcuts
+  work (SimAnt: 47, Shift+0 pauses). `TranslateMessage` is real, so typing
+  produces `WM_CHAR`.
 - MMSYSTEM for a Win16 game that loads it at run time (`host/mmsystem.c`).
   `LoadLibrary("MMSYSTEM.DLL")` returns a known handle, `GetProcAddress` on it
   gives host thunks, and a check that the DLL exists in the Windows system
@@ -29,6 +33,11 @@ versions follow [SemVer](https://semver.org/).
   `GetKeyState`, `RegisterWindowMessage`, `GlobalAddAtom`, `GlobalDeleteAtom`.
   SimAnt reads its ribbon's user buttons from WIN.INI; with `GetProfileInt`
   at 0 all eight showed the same tool.
+
+### Fixed
+- `WM_COMMAND` reached the guest in Win32 packing. Win16 has the control in
+  the low word of lParam and the notification code in the high word; a
+  control's handle used to arrive as a truncated host pointer.
 
 ### Added
 - Win16 menus are real. `LoadMenu` builds the NE `RT_MENU` template into a
