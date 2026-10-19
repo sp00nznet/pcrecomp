@@ -10,7 +10,7 @@ versions follow [SemVer](https://semver.org/).
   tick, as Win16's `DispatchMessage` did, instead of a `WM_TIMER` the window
   ignored. SimAnt runs its whole simulation from one; before this the colony
   barely moved.
-- Shims for 36 calls the stubs answered with 0: `GetProfileInt` and
+- Shims for 35 calls the stubs answered with 0: `GetProfileInt` and
   `WriteProfileString` (WIN.INI served from the data dir, never the host's),
   `lstrcpy`, `lstrcat`, `GetSystemDirectory`, `GlobalFlags`,
   `GlobalLRUNewest`, `Add`/`RemoveFontResource` (private to the process),
