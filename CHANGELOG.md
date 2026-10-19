@@ -6,6 +6,24 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Win16 `SetTimer` with a `TIMERPROC`: the guest proc is called for each
+  tick, as Win16's `DispatchMessage` did, instead of a `WM_TIMER` the window
+  ignored. SimAnt runs its whole simulation from one; before this the colony
+  barely moved.
+- Shims for 36 calls the stubs answered with 0: `GetProfileInt` and
+  `WriteProfileString` (WIN.INI served from the data dir, never the host's),
+  `lstrcpy`, `lstrcat`, `GetSystemDirectory`, `GlobalFlags`,
+  `GlobalLRUNewest`, `Add`/`RemoveFontResource` (private to the process),
+  `PtInRect`, `EqualRect`, `IntersectRect`, `InvertRect`, `SaveDC`,
+  `RestoreDC`, `IntersectClipRect`, `CreateRectRgn`, `SelectClipRgn`,
+  `RectInRegion`, `GetUpdateRgn`, `InvalidateRgn`, `ValidateRgn`,
+  `SetMapperFlags`, `SetMapMode`, `SetTextAlign`, `GetMenuItemCount`,
+  `RemoveMenu`, `GetTopWindow`, `GetWindow`, `GetNextWindow`, `GetCapture`,
+  `GetKeyState`, `RegisterWindowMessage`, `GlobalAddAtom`, `GlobalDeleteAtom`.
+  SimAnt reads its ribbon's user buttons from WIN.INI; with `GetProfileInt`
+  at 0 all eight showed the same tool.
+
+### Added
 - Win16 menus are real. `LoadMenu` builds the NE `RT_MENU` template into a
   Win32 menu, and `SetMenu`, `GetMenu`, `GetSubMenu`, `Append`/`Insert`/
   `ModifyMenu`, `EnableMenuItem`, `CheckMenuItem` and `DrawMenuBar` work on

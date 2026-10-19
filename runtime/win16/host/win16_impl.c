@@ -2646,3 +2646,77 @@ void SHELL_REGCREATEKEY(CPU *cpu) {         /* (hKey@8/10, lpSubKey@4/6, phkResu
     ret(cpu, 12);
 }
 void SHELL_REGSETVALUE(CPU *cpu) { cpu->ax = 0; cpu->dx = 0; ret(cpu, 20); }
+
+/* ===== KERNEL: WIN.INI, strings, memory flags =====
+ * SimAnt keeps its ribbon's user-button choices in WIN.INI [SimAnt]:
+ * GetProfileInt(app, "Button%d", current) for each one. As a stub returning 0
+ * every button became type 0, and the row showed one icon eight times. WIN.INI
+ * is served the way a NULL lpFileName is for the private-profile calls, and
+ * writes go to RECOMP_DATA_DIR, never the host's own WIN.INI. */
+void KERNEL_GETPROFILEINT(CPU *cpu) {      /* (lpAppName@6/8, lpKeyName@2/4, nDefault@0) */
+    char app[128] = "", key[128] = "", host[320];
+    read_asciiz(cpu, a16(cpu, 8), a16(cpu, 6), app, sizeof app);
+    read_asciiz(cpu, a16(cpu, 4), a16(cpu, 2), key, sizeof key);
+    uint16_t def = a16(cpu, 0);
+    cpu->ax = ini_resolve("", app, key, host, sizeof host)
+            ? (uint16_t)GetPrivateProfileIntA(app, key, (int16_t)def, host) : def;
+    ret(cpu, 10);
+}
+
+void KERNEL_WRITEPROFILESTRING(CPU *cpu) { /* (lpAppName@8/10, lpKeyName@4/6, lpString@0/2) */
+    char app[128] = "", key[128] = "", val[512] = "", host[320];
+    uint16_t kseg = a16(cpu, 6), vseg = a16(cpu, 2);
+    read_asciiz(cpu, a16(cpu, 10), a16(cpu, 8), app, sizeof app);
+    if (kseg) read_asciiz(cpu, kseg, a16(cpu, 4), key, sizeof key);
+    if (vseg) read_asciiz(cpu, vseg, a16(cpu, 0), val, sizeof val);
+    snprintf(host, sizeof host, "%s/%s", RECOMP_DATA_DIR, RECOMP_WIN_INI);
+    cpu->ax = (uint16_t)!!WritePrivateProfileStringA(app, kseg ? key : NULL,
+                                                     vseg ? val : NULL, host);
+    ret(cpu, 12);
+}
+
+/* lstrcpy/lstrcat(lpDst@4/6, lpSrc@0/2) -> lpDst in DX:AX. */
+static void lstr_copy(CPU *cpu, int append) {
+    uint16_t doff = a16(cpu, 4), dseg = a16(cpu, 6);
+    uint16_t soff = a16(cpu, 0), sseg = a16(cpu, 2);
+    uint16_t d = doff;
+    if (append) while (mem_read8(cpu, dseg, d)) d++;
+    uint8_t c;
+    do { c = mem_read8(cpu, sseg, soff++); mem_write8(cpu, dseg, d++, c); } while (c);
+    cpu->ax = doff; cpu->dx = dseg;
+    ret(cpu, 8);
+}
+void KERNEL_LSTRCPY(CPU *cpu) { lstr_copy(cpu, 0); }
+void KERNEL_LSTRCAT(CPU *cpu) { lstr_copy(cpu, 1); }
+
+void KERNEL_GETSYSTEMDIRECTORY(CPU *cpu) { /* (lpBuffer@2/4, uSize@0) -> length */
+    static const char dir[] = "C:\\WINDOWS\\SYSTEM";
+    uint16_t off = a16(cpu, 2), seg = a16(cpu, 4), n = a16(cpu, 0);
+    if (n > sizeof dir)
+        for (unsigned i = 0; i < sizeof dir; i++) mem_write8(cpu, seg, (uint16_t)(off + i), (uint8_t)dir[i]);
+    cpu->ax = n > sizeof dir ? (uint16_t)(sizeof dir - 1) : (uint16_t)sizeof dir;
+    ret(cpu, 6);
+}
+
+/* Nothing is ever discarded or moved here, so no handle is discardable. */
+void KERNEL_GLOBALFLAGS(CPU *cpu)     { cpu->ax = 0; ret(cpu, 2); }
+void KERNEL_GLOBALLRUNEWEST(CPU *cpu) { cpu->ax = a16(cpu, 0); ret(cpu, 2); }
+
+/* AddFontResource(lpFilename@0/2): SimAnt ships its own FONTRES.FON. Added
+ * privately, so the font lives only as long as the game. A null selector is a
+ * module handle (a loaded font DLL), which nothing here produces. */
+static void font_resource(CPU *cpu, int add) {
+    char g[260], host[320];
+    uint16_t seg = a16(cpu, 2);
+    cpu->ax = 0;
+    if (seg) {
+        read_asciiz(cpu, seg, a16(cpu, 0), g, sizeof g);
+        if (map_guest_path(g, host, sizeof host))
+            cpu->ax = (uint16_t)(add ? AddFontResourceExA(host, FR_PRIVATE, 0)
+                                     : RemoveFontResourceExA(host, FR_PRIVATE, 0));
+        IMPL_LOG("[gdi] %sFontResource(%s -> %s) -> %u\n", add ? "Add" : "Remove", g, host, cpu->ax);
+    }
+    ret(cpu, 4);
+}
+void GDI_ADDFONTRESOURCE(CPU *cpu)    { font_resource(cpu, 1); }
+void GDI_REMOVEFONTRESOURCE(CPU *cpu) { font_resource(cpu, 0); }

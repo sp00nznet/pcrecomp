@@ -205,7 +205,35 @@ static int forward_to_guest(UINT msg) {
     }
 }
 
+/* SetTimer with a TIMERPROC: Win16's DispatchMessage calls the proc for the
+ * WM_TIMER instead of the window's WNDPROC. Remember which guest proc each
+ * (window, id) asked for; host_wndproc calls it. SimAnt runs its whole
+ * simulation from one (MYTIMERFUNC). */
+#define MAXTIMERS 16
+static struct { HWND h; uint16_t id, seg, off; } g_tproc[MAXTIMERS];
+
+static int tproc_find(HWND h, uint16_t id) {
+    for (int i = 0; i < MAXTIMERS; i++)
+        if (g_tproc[i].seg && g_tproc[i].h == h && g_tproc[i].id == id) return i;
+    return -1;
+}
+
+static void tproc_set(HWND h, uint16_t id, uint16_t seg, uint16_t off) {
+    int i = tproc_find(h, id);
+    for (int j = 0; i < 0 && j < MAXTIMERS; j++) if (!g_tproc[j].seg) i = j;
+    if (i < 0) { fprintf(stderr, "[win32] *** timer-proc table full\n"); return; }
+    g_tproc[i].h = h; g_tproc[i].id = id; g_tproc[i].seg = seg; g_tproc[i].off = off;
+}
+
 static LRESULT CALLBACK host_wndproc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_TIMER) {
+        int i = tproc_find(hWnd, (uint16_t)wParam);
+        if (i >= 0) {   /* TIMERPROC(hwnd, WM_TIMER, id, dwTime): same PASCAL frame as a WNDPROC */
+            call_guest_wndproc(g_tproc[i].seg, g_tproc[i].off, put_hwnd(hWnd),
+                               WM_TIMER, (uint16_t)wParam, GetTickCount());
+            return 0;
+        }
+    }
     /* Only the application's own frame ends the app. Quitting on any window's
        WM_DESTROY meant closing a modal dialog tore down the whole program --
        which is exactly what happened the first time a valid serial let the
@@ -1512,9 +1540,6 @@ void USER_SETTIMER(CPU *cpu) {
     uint16_t id   = b_a16(cpu, 6);             /* nIDEvent@6 */
     uint16_t ms   = b_a16(cpu, 4);             /* uElapse@4 */
     uint16_t pseg = b_a16(cpu, 2);             /* lpTimerFunc@0/2 */
-    if (pseg)
-        fprintf(stderr, "[win16] *** SetTimer with a TIMERPROC (%04X) - "
-                        "callback thunk not implemented, using WM_TIMER\n", pseg);
     /* Win16 timers run off the PC's 18.2 Hz tick, so SetTimer rounds the period
      * UP to a multiple of 54.925 ms and can go no faster. The engine asks for
      * 10 ms and got exactly that here, running the pet at ~100 Hz instead of
@@ -1522,6 +1547,11 @@ void USER_SETTIMER(CPU *cpu) {
      * way KERNEL did. */
     UINT period = ms ? (UINT)(((ms + 54) / 55) * 55) : 55;
     UINT_PTR t = h ? SetTimer(h, id, period, NULL) : 0;
+    if (t) {
+        int i = tproc_find(h, id);
+        if (pseg) tproc_set(h, id, pseg, b_a16(cpu, 0));   /* lpTimerFunc@0/2 */
+        else if (i >= 0) g_tproc[i].seg = 0;                /* re-armed without a proc */
+    }
     fprintf(stderr, "[win32] SetTimer(id=%u, %ums -> %ums tick) -> %u\n",
             id, ms, period, (unsigned)t);
     cpu->ax = (uint16_t)t;
@@ -1532,6 +1562,8 @@ void USER_KILLTIMER(CPU *cpu) {
     HWND h      = get_hwnd(b_a16(cpu, 2));     /* hWnd@2 */
     uint16_t id = b_a16(cpu, 0);               /* nIDEvent@0 */
     if (h) KillTimer(h, id);
+    int i = tproc_find(h, id);
+    if (i >= 0) g_tproc[i].seg = 0;
     cpu->ax = 1;
     b_ret(cpu, 4);
 }
@@ -2445,4 +2477,161 @@ void GDI_STRETCHDIBITS(CPU *cpu) {
     free(bi);
     cpu->ax = (uint16_t)n;
     b_ret(cpu, 32);
+}
+
+/* ===== small USER/GDI calls SimAnt makes =====
+ * Rect arithmetic, clip regions, window order, key state. Each is a straight
+ * forward to Win32 over the guest handle tables; the stubs answered 0, which
+ * for PtInRect and IntersectRect means every hit test missed. */
+static RECT rd_rect(CPU *cpu, uint16_t seg, uint16_t off) {
+    RECT r = { (int16_t)mem_read16(cpu, seg, off),
+               (int16_t)mem_read16(cpu, seg, (uint16_t)(off + 2)),
+               (int16_t)mem_read16(cpu, seg, (uint16_t)(off + 4)),
+               (int16_t)mem_read16(cpu, seg, (uint16_t)(off + 6)) };
+    return r;
+}
+
+void USER_PTINRECT(CPU *cpu) {                 /* (lpRect@4/6, POINT x@0 y@2) */
+    RECT r = rd_rect(cpu, b_a16(cpu, 6), b_a16(cpu, 4));
+    POINT p = { (int16_t)b_a16(cpu, 0), (int16_t)b_a16(cpu, 2) };
+    cpu->ax = (uint16_t)PtInRect(&r, p);
+    b_ret(cpu, 8);
+}
+void USER_EQUALRECT(CPU *cpu) {                /* (lpRect1@4/6, lpRect2@0/2) */
+    RECT a = rd_rect(cpu, b_a16(cpu, 6), b_a16(cpu, 4));
+    RECT b = rd_rect(cpu, b_a16(cpu, 2), b_a16(cpu, 0));
+    cpu->ax = (uint16_t)EqualRect(&a, &b);
+    b_ret(cpu, 8);
+}
+void USER_INTERSECTRECT(CPU *cpu) {            /* (lpDst@8/10, lpSrc1@4/6, lpSrc2@0/2) */
+    RECT a = rd_rect(cpu, b_a16(cpu, 6), b_a16(cpu, 4));
+    RECT b = rd_rect(cpu, b_a16(cpu, 2), b_a16(cpu, 0)), d;
+    cpu->ax = (uint16_t)IntersectRect(&d, &a, &b);
+    uint16_t s = b_a16(cpu, 10), o = b_a16(cpu, 8);
+    const LONG v[4] = { d.left, d.top, d.right, d.bottom };
+    for (int i = 0; i < 4; i++) mem_write16(cpu, s, (uint16_t)(o + 2 * i), (uint16_t)v[i]);
+    b_ret(cpu, 12);
+}
+void USER_INVERTRECT(CPU *cpu) {               /* (hdc@4, lpRect@0/2) */
+    RECT r = rd_rect(cpu, b_a16(cpu, 2), b_a16(cpu, 0));
+    HDC dc = get_hdc(b_a16(cpu, 4));
+    if (dc) InvertRect(dc, &r);
+    b_ret(cpu, 6);
+}
+
+void GDI_SAVEDC(CPU *cpu) {                    /* (hdc@0) */
+    HDC dc = get_hdc(b_a16(cpu, 0));
+    cpu->ax = (uint16_t)(dc ? SaveDC(dc) : 0);
+    b_ret(cpu, 2);
+}
+void GDI_RESTOREDC(CPU *cpu) {                 /* (hdc@2, nSavedDC@0) */
+    HDC dc = get_hdc(b_a16(cpu, 2));
+    cpu->ax = (uint16_t)(dc && RestoreDC(dc, (int16_t)b_a16(cpu, 0)));
+    b_ret(cpu, 4);
+}
+void GDI_INTERSECTCLIPRECT(CPU *cpu) {         /* (hdc@8, l@6, t@4, r@2, b@0) */
+    HDC dc = get_hdc(b_a16(cpu, 8));
+    cpu->ax = (uint16_t)(dc ? IntersectClipRect(dc, (int16_t)b_a16(cpu, 6), (int16_t)b_a16(cpu, 4),
+                                                (int16_t)b_a16(cpu, 2), (int16_t)b_a16(cpu, 0)) : 0);
+    b_ret(cpu, 10);
+}
+void GDI_CREATERECTRGN(CPU *cpu) {             /* (l@6, t@4, r@2, b@0) */
+    cpu->ax = put_hgdi(CreateRectRgn((int16_t)b_a16(cpu, 6), (int16_t)b_a16(cpu, 4),
+                                     (int16_t)b_a16(cpu, 2), (int16_t)b_a16(cpu, 0)));
+    b_ret(cpu, 8);
+}
+void GDI_SELECTCLIPRGN(CPU *cpu) {             /* (hdc@2, hrgn@0) */
+    HDC dc = get_hdc(b_a16(cpu, 2));
+    cpu->ax = (uint16_t)(dc ? SelectClipRgn(dc, (HRGN)get_hgdi(b_a16(cpu, 0))) : 0);
+    b_ret(cpu, 4);
+}
+void GDI_RECTINREGION(CPU *cpu) {              /* (hrgn@4, lpRect@0/2) */
+    RECT r = rd_rect(cpu, b_a16(cpu, 2), b_a16(cpu, 0));
+    HRGN g = (HRGN)get_hgdi(b_a16(cpu, 4));
+    cpu->ax = (uint16_t)(g && RectInRegion(g, &r));
+    b_ret(cpu, 6);
+}
+void USER_GETUPDATERGN(CPU *cpu) {             /* (hwnd@4, hrgn@2, bErase@0) */
+    HWND h = get_hwnd(b_a16(cpu, 4));
+    HRGN g = (HRGN)get_hgdi(b_a16(cpu, 2));
+    cpu->ax = (uint16_t)(h && g ? GetUpdateRgn(h, g, (BOOL)b_a16(cpu, 0)) : 0);
+    b_ret(cpu, 6);
+}
+void USER_INVALIDATERGN(CPU *cpu) {            /* (hwnd@4, hrgn@2, bErase@0) */
+    HWND h = get_hwnd(b_a16(cpu, 4));
+    if (h) InvalidateRgn(h, (HRGN)get_hgdi(b_a16(cpu, 2)), (BOOL)b_a16(cpu, 0));
+    b_ret(cpu, 6);
+}
+void USER_VALIDATERGN(CPU *cpu) {              /* (hwnd@2, hrgn@0) */
+    HWND h = get_hwnd(b_a16(cpu, 2));
+    if (h) ValidateRgn(h, (HRGN)get_hgdi(b_a16(cpu, 0)));
+    b_ret(cpu, 4);
+}
+/* Font mapping, map mode and text alignment pass straight through. */
+void GDI_SETMAPPERFLAGS(CPU *cpu) {            /* (hdc@4, dwFlag@0/2) -> previous */
+    HDC dc = get_hdc(b_a16(cpu, 4));
+    DWORD r = dc ? SetMapperFlags(dc, b_a16(cpu, 0) | (DWORD)b_a16(cpu, 2) << 16) : 0;
+    cpu->ax = (uint16_t)r; cpu->dx = (uint16_t)(r >> 16);
+    b_ret(cpu, 6);
+}
+void GDI_SETMAPMODE(CPU *cpu) {                /* (hdc@2, mode@0) */
+    HDC dc = get_hdc(b_a16(cpu, 2));
+    cpu->ax = (uint16_t)(dc ? SetMapMode(dc, b_a16(cpu, 0)) : 0);
+    b_ret(cpu, 4);
+}
+void GDI_SETTEXTALIGN(CPU *cpu) {              /* (hdc@2, fMode@0) */
+    HDC dc = get_hdc(b_a16(cpu, 2));
+    cpu->ax = (uint16_t)(dc ? SetTextAlign(dc, b_a16(cpu, 0)) : 0);
+    b_ret(cpu, 4);
+}
+
+void USER_GETMENUITEMCOUNT(CPU *cpu) {         /* (hMenu@0) */
+    HMENU m = get_hmenu(b_a16(cpu, 0));
+    cpu->ax = (uint16_t)(m ? GetMenuItemCount(m) : -1);
+    b_ret(cpu, 2);
+}
+void USER_REMOVEMENU(CPU *cpu) {               /* (hMenu@4, nPosition@2, wFlags@0) */
+    HMENU m = get_hmenu(b_a16(cpu, 4));
+    cpu->ax = (uint16_t)(m && RemoveMenu(m, b_a16(cpu, 2), b_a16(cpu, 0)));
+    b_ret(cpu, 6);
+}
+
+void USER_GETTOPWINDOW(CPU *cpu) {             /* (hwnd@0) */
+    HWND h = get_hwnd(b_a16(cpu, 0)), t = GetTopWindow(h);
+    cpu->ax = t ? put_hwnd(t) : 0;
+    b_ret(cpu, 2);
+}
+void USER_GETWINDOW(CPU *cpu) {                /* (hwnd@2, uCmd@0) */
+    HWND h = get_hwnd(b_a16(cpu, 2)), t = h ? GetWindow(h, b_a16(cpu, 0)) : NULL;
+    cpu->ax = t ? put_hwnd(t) : 0;
+    b_ret(cpu, 4);
+}
+void USER_GETNEXTWINDOW(CPU *cpu) {            /* (hwnd@2, wFlag@0): GW_HWNDNEXT/PREV */
+    HWND h = get_hwnd(b_a16(cpu, 2)), t = h ? GetWindow(h, b_a16(cpu, 0)) : NULL;
+    cpu->ax = t ? put_hwnd(t) : 0;
+    b_ret(cpu, 4);
+}
+void USER_GETCAPTURE(CPU *cpu) {
+    HWND t = GetCapture();
+    cpu->ax = t ? put_hwnd(t) : 0;
+    b_ret(cpu, 0);
+}
+void USER_GETKEYSTATE(CPU *cpu) {              /* (nVirtKey@0) */
+    cpu->ax = (uint16_t)GetKeyState(b_a16(cpu, 0));
+    b_ret(cpu, 2);
+}
+
+void USER_REGISTERWINDOWMESSAGE(CPU *cpu) {    /* (lpString@0/2) */
+    char s[256]; b_asciiz(cpu, b_a16(cpu, 2), b_a16(cpu, 0), s, sizeof s);
+    cpu->ax = (uint16_t)RegisterWindowMessageA(s);
+    b_ret(cpu, 4);
+}
+void USER_GLOBALADDATOM(CPU *cpu) {            /* (lpString@0/2) */
+    char s[256]; b_asciiz(cpu, b_a16(cpu, 2), b_a16(cpu, 0), s, sizeof s);
+    cpu->ax = GlobalAddAtomA(s);
+    b_ret(cpu, 4);
+}
+void USER_GLOBALDELETEATOM(CPU *cpu) {         /* (nAtom@0) */
+    cpu->ax = GlobalDeleteAtom(b_a16(cpu, 0));
+    b_ret(cpu, 2);
 }
