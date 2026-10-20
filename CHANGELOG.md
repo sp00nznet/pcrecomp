@@ -35,6 +35,14 @@ versions follow [SemVer](https://semver.org/).
   at 0 all eight showed the same tool.
 
 ### Fixed
+- native32: `TerminateThread` on a guest thread no longer breaks the machine
+  lock. A thread killed while it waited for the lock left its wait block
+  linked into the lock, and the next thread to wait faulted inside ntdll
+  (Star Wars Rebellion kills its movie worker; the sound thread started next
+  died). Each guest thread now says whether it is waiting, a doomed thread
+  exits by itself at the lock, and only one in native code is killed for
+  real. The killer gives up every nested claim while it waits.
+  `NATIVE32_LOG_THREADS=1` logs guest threads coming and going.
 - `WM_COMMAND` reached the guest in Win32 packing. Win16 has the control in
   the low word of lParam and the notification code in the high word; a
   control's handle used to arrive as a truncated host pointer.

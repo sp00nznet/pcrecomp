@@ -90,10 +90,51 @@ static uint32_t make_tib(uint32_t lo, uint32_t hi) {
 
 typedef struct { regs_t r; int depth; } mstate;
 
-/* Nests: a callback that arrives while this thread is inside a native call
- * claims again, and only the outermost claim loads the saved state. */
+/* TerminateThread and the machine lock. A thread killed while it waits for
+ * the lock leaves its wait block linked into the lock, on a stack that no
+ * longer exists, and the next thread to wait on the lock faults inside ntdll
+ * (Star Wars Rebellion: its movie player kills its worker thread, and the
+ * sound thread started next died on its first mach_enter). So every guest
+ * thread says, in a table any thread can read, whether it is waiting for the
+ * lock; a doomed one exits by itself at the lock (shim_TerminateThread). The
+ * order is what makes it safe: a thread marks itself waiting BEFORE it looks
+ * at its doom, and the killer dooms it BEFORE it looks at that mark, so a
+ * thread the killer sees as not waiting can never start waiting. */
+#define MAX_GTHREADS 64
+enum { T_FREE, T_NATIVE, T_WAITING };
+static volatile LONG g_tid[MAX_GTHREADS], g_tstate[MAX_GTHREADS], g_tdoom[MAX_GTHREADS];
+static volatile LONG g_tcode[MAX_GTHREADS];
+
+static int tslot(DWORD tid, int add) {
+    for (int i = 0; i < MAX_GTHREADS; i++)
+        if ((DWORD)g_tid[i] == tid) return i;
+    for (int i = 0; add && i < MAX_GTHREADS; i++)
+        if (InterlockedCompareExchange(&g_tid[i], (LONG)tid, 0) == 0) return i;
+    return -1;
+}
+
+static void tslot_exit(int k, int holding) {
+    DWORD code = (DWORD)g_tcode[k];
+    g_tdoom[k] = 0;
+    InterlockedExchange(&g_tstate[k], T_FREE);
+    InterlockedExchange(&g_tid[k], 0);
+    if (holding) LeaveCriticalSection(&g_mach);
+    if (getenv("NATIVE32_LOG_THREADS"))
+        fprintf(stderr, "[thread] %lu exits at the lock (holding %d)\n", GetCurrentThreadId(), holding);
+    ExitThread(code);
+}
+
 void mach_enter(void) {
+    int k = tslot(GetCurrentThreadId(), 1);
+    if (k >= 0) {
+        InterlockedExchange(&g_tstate[k], T_WAITING);
+        if (InterlockedCompareExchange(&g_tdoom[k], 0, 0)) tslot_exit(k, 0);
+    }
     EnterCriticalSection(&g_mach);
+    if (k >= 0) {
+        InterlockedExchange(&g_tstate[k], T_NATIVE);   /* not waiting; the lock says it runs */
+        if (g_tdoom[k]) tslot_exit(k, 1);
+    }
     mstate* m = (mstate*)TlsGetValue(g_mach_tls);
     if (!m) {
         /* Stack left for a fault handler after an overflow: without it the
@@ -523,7 +564,56 @@ static void shim_CreateThread(void) {
                             (LPTHREAD_START_ROUTINE)(uintptr_t)a[2], (LPVOID)(uintptr_t)a[3],
                             a[4] | STACK_SIZE_PARAM_IS_A_RESERVATION, (LPDWORD)(uintptr_t)a[5]);
     g_eax = (uint32_t)(uintptr_t)h;
+    if (getenv("NATIVE32_LOG_THREADS"))
+        fprintf(stderr, "[thread] %lu creates %lu at 0x%08X\n", GetCurrentThreadId(), GetThreadId(h), a[2]);
     g_esp += 4 + 6 * 4;
+}
+
+/* TerminateThread on a guest thread (see g_doomed). The caller holds the
+ * machine lock, so the target is not running lifted code: it is waiting for
+ * the lock, or inside a native call. Mark it, give up the lock for a moment,
+ * and it exits by itself as soon as it reaches the lock. Only a thread still
+ * inside a native call after that is terminated for real -- it is not waiting
+ * on the lock, and anything that reaches mach_enter from now on exits there. */
+static void shim_TerminateThread(void) {
+    uint32_t* a = (uint32_t*)(uintptr_t)(g_esp + 4);
+    HANDLE h = (HANDLE)(uintptr_t)a[0];
+    DWORD code = a[1], tid = GetThreadId(h);
+    g_esp += 4 + 2 * 4;
+    if (tid == GetCurrentThreadId()) { mach_leave(); ExitThread(code); }
+    int k = tid ? tslot(tid, 0) : -1;
+    if (k >= 0) {
+        g_tcode[k] = (LONG)code;
+        InterlockedExchange(&g_tdoom[k], 1);
+        if (InterlockedCompareExchange(&g_tstate[k], 0, 0) == T_WAITING) {
+            /* It gets the lock when we give it up, and exits there. Give up
+             * every claim: a TerminateThread inside a window procedure (the
+             * movie player's, on WM_DESTROY) holds the lock twice, and
+             * releasing it once left the waiter waiting forever. */
+            mstate* m = (mstate*)TlsGetValue(g_mach_tls);
+            int d = m->depth;
+            m->depth = 1;
+            mach_leave();
+            for (int i = 1; i < d; i++) LeaveCriticalSection(&g_mach);
+            WaitForSingleObject(h, INFINITE);
+            mach_enter();
+            for (int i = 1; i < d; i++) EnterCriticalSection(&g_mach);
+            m->depth = d;
+            if (getenv("NATIVE32_LOG_THREADS"))
+                fprintf(stderr, "[thread] %lu exited at the lock\n", tid);
+            g_eax = 1;
+            return;
+        }
+    }
+    /* In native code, not waiting, and it can no longer start to. */
+    if (getenv("NATIVE32_LOG_THREADS"))
+        fprintf(stderr, "[thread] %lu terminated in native code\n", tid);
+    g_eax = (uint32_t)TerminateThread(h, code);
+    if (k >= 0) {
+        g_tdoom[k] = 0;
+        InterlockedExchange(&g_tstate[k], T_FREE);
+        InterlockedExchange(&g_tid[k], 0);
+    }
 }
 
 /* RaiseException(0x406D1388): MSVC's SetThreadName, which only an attached
@@ -555,6 +645,7 @@ X87CRT(controlfp) X87CRT(control87)
 static native32_shim_t g_builtin[] = {
     { "CreateThread", shim_CreateThread },
     { "RaiseException", shim_RaiseException },
+    { "TerminateThread", shim_TerminateThread },
     { "_CxxThrowException", native32_shim_CxxThrowException },
     { "_ftol", native32_shim_ftol },
     { "_CIsqrt", native32_shim_CIsqrt }, { "_CIsin", native32_shim_CIsin },
