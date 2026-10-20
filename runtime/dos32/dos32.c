@@ -515,9 +515,13 @@ static CRITICAL_SECTION video_lock;
 
 int dos32_video_mode(void) { return vmode; }
 
-static const struct { uint16_t mode; uint16_t w, h; } vesa_modes[] = {
+static struct { uint16_t mode; uint16_t w, h; } vesa_modes[] = {
     { 0x100, 640, 400 }, { 0x101, 640, 480 }, { 0x103, 800, 600 }, { 0x105, 1024, 768 },
+    { 0x17F, 0, 0 },   /* the host's own size (dos32_vesa_custom); listed once set */
 };
+#define NVESA (vesa_modes[4].w ? 5 : 4)
+
+void dos32_vesa_custom(int w, int h) { vesa_modes[4].w = (uint16_t)w; vesa_modes[4].h = (uint16_t)h; }
 
 static void set_mode(int mode, int clear) {
     EnterCriticalSection(&video_lock);
@@ -525,7 +529,7 @@ static void set_mode(int mode, int clear) {
     if (mode == 0x13) { vw = 320; vh = 200; vpitch = 320; }
     else if (mode < 0x100) { vw = 80; vh = 25; vpitch = 80; }
     else {
-        for (int i = 0; i < 4; i++)
+        for (int i = 0; i < NVESA; i++)
             if (vesa_modes[i].mode == (mode & 0x1FF)) { vw = vesa_modes[i].w; vh = vesa_modes[i].h; }
         vpitch = vw;
         vesa_lfb = (mode & 0x4000) != 0;
@@ -969,12 +973,12 @@ static void int10(regs_t* r) {
             R32(p + 10) = 1;
             R32(p + 14) = (seg << 16) | (list - base);
             R16(p + 18) = VRAM_SIZE >> 16;
-            for (int i = 0; i < 4; i++) R16(list + i * 2) = vesa_modes[i].mode;
-            R16(list + 8) = 0xFFFF;
+            for (int i = 0; i < NVESA; i++) R16(list + i * 2) = vesa_modes[i].mode;
+            R16(list + NVESA * 2) = 0xFFFF;
             SET16(r->eax, 0x004F); break; }
         case 0x01: {
             int m = -1;
-            for (int i = 0; i < 4; i++) if (vesa_modes[i].mode == (CX(r) & 0x1FF)) m = i;
+            for (int i = 0; i < NVESA; i++) if (vesa_modes[i].mode == (CX(r) & 0x1FF)) m = i;
             if (m < 0) { SET16(r->eax, 0x014F); break; }
             memset(LIN(p), 0, 256);
             R16(p + 0) = 0x009B;          /* supported, color, graphics, LFB available */

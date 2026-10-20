@@ -38,6 +38,11 @@ typedef struct {
  * calling thread. Returns the program's exit code. */
 int dos32_run(const dos32_config* cfg);
 
+/* One VESA mode of the host's own size, as mode 0x17F (8-bit, banked or
+ * linear, like the standard ones): for a host that has a program draw at a
+ * size of its choosing. Up to 4 MB of pixels; 0x0 takes it away again. */
+void dos32_vesa_custom(int w, int h);
+
 /* Guest memory, for the platform layer (game-specific readers, mods). */
 uint8_t* dos32_mem(uint32_t va);
 
