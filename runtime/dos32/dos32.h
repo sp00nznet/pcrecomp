@@ -32,10 +32,16 @@ typedef struct {
     const uint8_t* image;  /* the relocated LE image (tools/le/le_parse.py) */
     uint32_t image_base, image_size, entry, stack;
     int log;               /* 1: log every int and unknown port to stderr */
+    /* optional: the program's dispatch table (sorted by address), for a host
+     * that links more than one lifted program; NULL = recomp_dispatch_table */
+    const void* dispatch;  /* const recomp_dispatch_entry_t* */
+    uint32_t dispatch_count;
 } dos32_config;
 
 /* Map guest memory, load the image, and run the program to its exit on the
- * calling thread. Returns the program's exit code. */
+ * calling thread. Returns the program's exit code. A host may call it again
+ * afterwards, with the same program or another (DOS ran one, then the next):
+ * each run starts on a fresh machine, with the guest clock running on. */
 int dos32_run(const dos32_config* cfg);
 
 /* Guest memory, for the platform layer (game-specific readers, mods). */

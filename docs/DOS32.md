@@ -153,6 +153,22 @@ it refuses with -2 and changes nothing. For Theme Park that means a state saved
 in a park loads in a park, in this run or a later one, but not from the main
 menu, and not into a different build.
 
+## One program after another
+
+DOS ran a game's programs one after the other from a batch file (Theme Park's
+opening film, INTRO.EXE, then the game). A host can do the same in one
+process: link both lifts (one of them with its symbols renamed, as Theme
+Park's `run_lift.py --intro` does), pass the second program's dispatch table
+in `cfg.dispatch` / `cfg.dispatch_count`, and call `dos32_run` again when the
+first returns. The second run starts on a fresh machine: the save state's
+variables back at their power-on values, guest memory released and reserved
+again, files closed. Guest time runs on, so a host's frame clock never steps
+back, and the window can stay up throughout.
+
+The DOS device handles 3 and 4 (AUX, PRN) read nothing, swallow writes and
+seek to 0: the host has no such files, and the MSVC CRT aborts the process on
+an fd it never opened. A Watcom program's exit flushes every stream.
+
 ## Debugging
 
 - `cfg.log`: every `int` (except the noisy mouse and keyboard ones), file opens,

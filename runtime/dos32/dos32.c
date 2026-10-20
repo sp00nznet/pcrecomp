@@ -243,12 +243,15 @@ void recomp_set_seg(int sreg, uint32_t s) {
 }
 
 /* ---- dispatch ----------------------------------------------------------- */
+static const recomp_dispatch_entry_t* dispatch;
+static uint32_t dispatch_n;
+
 recomp_func_t recomp_lookup(uint32_t va) {
-    uint32_t lo = 0, hi = recomp_dispatch_count;
+    uint32_t lo = 0, hi = dispatch_n;
     while (lo < hi) {
         uint32_t mid = (lo + hi) / 2;
-        uint32_t a = recomp_dispatch_table[mid].address;
-        if (a == va) return recomp_dispatch_table[mid].func;
+        uint32_t a = dispatch[mid].address;
+        if (a == va) return dispatch[mid].func;
         if (a < va) lo = mid + 1; else hi = mid;
     }
     return NULL;
@@ -850,7 +853,7 @@ static void int21(regs_t* r) {
         OK(r); break; }
     case 0x3F: { int h = BX(r);
         uint32_t n = r->rm ? CX(r) : r->ecx, p = dsdx(r);
-        if (h == 0) { SET16(r->eax, 0); OK(r); break; }
+        if (h <= 4) { SET16(r->eax, 0); OK(r); break; }   /* con, aux, prn: nothing to read */
         if (h >= NFILES || fh[h] < 0) { FAIL(r, 6); break; }
         int got = _read(fh[h], LIN(p), n);
         if (got < 0) { FAIL(r, 5); break; }
@@ -858,6 +861,7 @@ static void int21(regs_t* r) {
     case 0x40: { int h = BX(r);
         uint32_t n = r->rm ? CX(r) : r->ecx, p = dsdx(r);
         if (h == 1 || h == 2) { fwrite(LIN(p), 1, n, h == 1 ? stdout : stderr); r->eax = n; OK(r); break; }
+        if (h == 3 || h == 4) { r->eax = n; OK(r); break; }   /* aux, prn: nowhere */
         if (h >= NFILES || fh[h] < 0) { FAIL(r, 6); break; }
         int put = n ? _write(fh[h], LIN(p), n) : (_chsize(fh[h], _lseek(fh[h], 0, SEEK_CUR)), 0);
         if (put < 0) { FAIL(r, 5); break; }
@@ -866,6 +870,10 @@ static void int21(regs_t* r) {
         if (_unlink(path)) FAIL(r, 2); else OK(r); break;
     case 0x42: { int h = BX(r);
         if (h >= NFILES || fh[h] < 0) { FAIL(r, 6); break; }
+        /* The DOS devices (con, aux, prn) seek nowhere. Host fds 3 and 4 are
+         * not open, and the CRT aborts on them: a C library's exit flush
+         * seeks every stream. */
+        if (h <= 4) { SET16(r->eax, 0); SET16(r->edx, 0); OK(r); break; }
         long off = (long)((uint32_t)CX(r) << 16 | DX(r));
         long pos = _lseek(fh[h], off, AL(r));
         if (pos < 0) { FAIL(r, 25); break; }
@@ -1498,12 +1506,49 @@ int dos32_state_load(const char* path, uint32_t where) {
     return ok ? 0 : -1;
 }
 
+/* A second run starts where the first did: the machine as it was before the
+ * first program touched it (STATE_VARS at their initial values, fresh memory,
+ * no open files). Guest time runs on, so the host's frame clock never steps
+ * back. The locks are held, as the platform layer may be reading the screen. */
+static uint8_t* power_on;
+
+static void reset_machine(void) {
+    EnterCriticalSection(&input_lock);
+    EnterCriticalSection(&video_lock);
+    const uint8_t* p = power_on;
+#define STATE_RESET(v) memcpy(&(v), p, sizeof(v)); p += sizeof(v);
+    STATE_VARS(STATE_RESET)
+    for (int i = 5; i < NFILES; i++) if (fh[i] >= 0) _close(fh[i]);
+#ifdef _WIN32
+    VirtualFree(M, 0, MEM_RELEASE);
+#else
+    munmap(M, 0x100000000ull);
+#endif
+    M = NULL;
+    free(vram);
+    vram = NULL;
+    g_if = 1; in_irq = 0;
+    scq_r = scq_w = 0; kb_r = kb_w = 0; port60 = 0;
+    spin = 0; exit_code = 0;
+    memset(port_reads, 0, sizeof port_reads);
+    LeaveCriticalSection(&video_lock);
+    LeaveCriticalSection(&input_lock);
+}
+
 int dos32_run(const dos32_config* cfg) {
     char frame;
     run_frame = &frame;
     C = cfg;
-    InitializeCriticalSection(&input_lock);
-    InitializeCriticalSection(&video_lock);
+    dispatch = cfg->dispatch ? cfg->dispatch : recomp_dispatch_table;
+    dispatch_n = cfg->dispatch ? cfg->dispatch_count : recomp_dispatch_count;
+    int again = power_on != NULL;
+    if (!again) {
+        InitializeCriticalSection(&input_lock);
+        InitializeCriticalSection(&video_lock);
+        uint8_t* p = power_on = malloc(state_size);
+#define STATE_KEEP(v) memcpy(p, &(v), sizeof(v)); p += sizeof(v);
+        STATE_VARS(STATE_KEEP)
+    } else reset_machine();
 
     /* 4 GB of address space, so every 32-bit guest address is ours; only what
      * is used is committed. */
@@ -1562,8 +1607,8 @@ int dos32_run(const dos32_config* cfg) {
     for (int i = 0; i < NFILES; i++) fh[i] = i <= 4 ? i : -1;
     snprintf(cwd, sizeof cwd, "%s", cfg->cwd);
     mouse_ranges();
-    pit_next = bios_next = 65536 / 1193182.0;
-    last_real = now_s();
+    if (!again) last_real = now_s();
+    pit_next = bios_next = gtime() + 65536 / 1193182.0;
     recomp_yield_hook = yield_hook;
 
     g_esp = cfg->stack;
@@ -1574,7 +1619,7 @@ int dos32_run(const dos32_config* cfg) {
     g_flag_k = FK_EFLAGS; g_flag_a = 0x202;
     push32(RECOMP_RETADDR);
 
-    watch_faults();
+    if (!again) watch_faults();
     recomp_func_t entry = recomp_lookup(cfg->entry);
     if (!entry) { fprintf(stderr, "dos32: entry 0x%08X not lifted\n", cfg->entry); return 255; }
     if (!setjmp(exit_jmp)) {
