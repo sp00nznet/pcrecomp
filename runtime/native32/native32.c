@@ -104,6 +104,7 @@ typedef struct { regs_t r; int depth; } mstate;
 enum { T_FREE, T_NATIVE, T_WAITING };
 static volatile LONG g_tid[MAX_GTHREADS], g_tstate[MAX_GTHREADS], g_tdoom[MAX_GTHREADS];
 static volatile LONG g_tcode[MAX_GTHREADS];
+static DWORD g_tslot_fls = FLS_OUT_OF_INDEXES;  /* frees a slot when its thread ends */
 
 static int tslot(DWORD tid, int add) {
     for (int i = 0; i < MAX_GTHREADS; i++)
@@ -118,14 +119,31 @@ static void tslot_exit(int k, int holding) {
     g_tdoom[k] = 0;
     InterlockedExchange(&g_tstate[k], T_FREE);
     InterlockedExchange(&g_tid[k], 0);
+    if (g_tslot_fls != FLS_OUT_OF_INDEXES) FlsSetValue(g_tslot_fls, NULL);   /* freed already */
     if (holding) LeaveCriticalSection(&g_mach);
     if (getenv("NATIVE32_LOG_THREADS"))
         fprintf(stderr, "[thread] %lu exits at the lock (holding %d)\n", GetCurrentThreadId(), holding);
     ExitThread(code);
 }
 
+static __declspec(thread) int t_slot;          /* this thread's slot + 1; 0: not looked up */
+
+/* A thread that ends any other way (returns, ExitThread) frees its slot here:
+ * an FLS destructor runs as the thread exits. */
+static void WINAPI tslot_free(void* v) {
+    int k = (int)(intptr_t)v - 1;
+    if (k < 0) return;
+    g_tdoom[k] = 0;
+    InterlockedExchange(&g_tstate[k], T_FREE);
+    InterlockedExchange(&g_tid[k], 0);
+}
+
 void mach_enter(void) {
-    int k = tslot(GetCurrentThreadId(), 1);
+    if (!t_slot) {
+        t_slot = tslot(GetCurrentThreadId(), 1) + 1;
+        if (t_slot && g_tslot_fls != FLS_OUT_OF_INDEXES) FlsSetValue(g_tslot_fls, (void*)(intptr_t)t_slot);
+    }
+    int k = t_slot - 1;
     if (k >= 0) {
         InterlockedExchange(&g_tstate[k], T_WAITING);
         if (InterlockedCompareExchange(&g_tdoom[k], 0, 0)) tslot_exit(k, 0);
@@ -871,6 +889,7 @@ void native32_init(void) {
     InitializeCriticalSection(&g_mach);
     recomp_yield_hook = native32_yield;
     g_mach_tls = TlsAlloc();
+    g_tslot_fls = FlsAlloc(tslot_free);
     g_shim_page = (uint32_t)(uintptr_t)VirtualAlloc(NULL, 0x10000, MEM_RESERVE, PAGE_NOACCESS);
     AddVectoredExceptionHandler(1, native32_veh);
 }
