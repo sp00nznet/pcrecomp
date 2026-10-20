@@ -41,6 +41,7 @@
 #include <sys/stat.h>
 #include <ctype.h>
 #include <errno.h>
+#include <math.h>
 #include <setjmp.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -781,9 +782,15 @@ static uint32_t dsdx(regs_t* r) { return ds_ptr(r, r->rm ? DX(r) : r->edx); }
  * that times itself by the DOS clock then keeps pace with everything else
  * (the speed control, the virtual clock of a headless run). */
 static time_t start_time;
+/* DOS keeps the time of day in BIOS timer ticks, so the time it reports moves
+ * in steps of 1/18.2 s (5 or 6 hundredths), not every hundredth. Programs
+ * that wait "2 hundredths" with int 21h 2Ch really waited a whole tick:
+ * Theme Park's ride films are timed this way, and ran nearly three times too
+ * fast with an exact clock. */
 static int guest_clock(struct tm* t) {   /* returns hundredths of a second */
     if (!start_time) start_time = time(NULL);
-    double g = gtime();
+    const double tick = 65536.0 / 1193182.0;
+    double g = floor(gtime() / tick) * tick;
     time_t s = start_time + (time_t)g;
     struct tm* l = localtime(&s);
     if (l) *t = *l; else memset(t, 0, sizeof *t);
