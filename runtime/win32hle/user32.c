@@ -136,7 +136,8 @@ typedef struct {
     uint32_t extra[32];
     char text[512];
     int inval, ix0, iy0, ix1, iy1;       /* the update region, as a rectangle (client coordinates) */
-    int seq;                             /* creation order: the z-order among siblings, first on top */
+    int seq;                             /* creation order: the tab order, and who wins a click among equals */
+    int z;                               /* the z-order among siblings, lowest on top: creation order until moved */
     /* the built-in controls' state */
     int state, check, pos, rmin, rmax, cursel, top, item_h, sel0, sel1, limit, dropped, tracking;
     int sel_h, drop_h;                   /* a combo box: its selection field, and its height dropped */
@@ -375,7 +376,7 @@ static uint32_t create_window(uint32_t exstyle, const char *cls, const char *tit
     win_t *x = &g_win[i];
     memset(x, 0, sizeof *x);
     x->used = 1, x->hwnd = HWND_OF(i), x->cls = c, x->kind = g_cls[c].kind, x->proc = g_cls[c].proc;
-    x->style = style, x->exstyle = exstyle, x->hinst = hinst, x->seq = ++g_seq, x->thread = hle_thread_id();
+    x->style = style, x->exstyle = exstyle, x->hinst = hinst, x->seq = x->z = ++g_seq, x->thread = hle_thread_id();
     if (style & WS_CHILD) x->parent = parent, x->id = menu;
     else x->owner = parent, x->menu = menu;
     if ((int)px == (int)0x80000000) px = 0, py = 0;      /* CW_USEDEFAULT */
@@ -1547,16 +1548,16 @@ static void u_GetWindow(void) {                          /* (h, cmd) */
     int bseq = 0;
     if (!x) RET(0, 2);
     switch (cmd) {
-    case 5:                                              /* GW_CHILD: the first created (top) */
+    case 5:                                              /* GW_CHILD: the top child */
         for (int i = 0; i < MAX_WIN; i++)
-            if (g_win[i].used && g_win[i].parent == x->hwnd && (!best || g_win[i].seq < bseq)) best = g_win[i].hwnd, bseq = g_win[i].seq;
+            if (g_win[i].used && g_win[i].parent == x->hwnd && (!best || g_win[i].z < bseq)) best = g_win[i].hwnd, bseq = g_win[i].z;
         RET(best, 2);
-    case 2: case 3:                                      /* GW_HWNDNEXT / PREV among siblings */
+    case 2: case 3:                                      /* GW_HWNDNEXT / PREV among siblings: below / above */
         for (int i = 0; i < MAX_WIN; i++) {
             win_t *s = &g_win[i];
             if (!s->used || s->parent != x->parent || s == x || (!x->parent && s->parent)) continue;
-            if (cmd == 2 ? s->seq > x->seq && (!best || s->seq < bseq) : s->seq < x->seq && (!best || s->seq > bseq))
-                best = s->hwnd, bseq = s->seq;
+            if (cmd == 2 ? s->z > x->z && (!best || s->z < bseq) : s->z < x->z && (!best || s->z > bseq))
+                best = s->hwnd, bseq = s->z;
         }
         RET(best, 2);
     case 4: RET(x->owner, 2);                            /* GW_OWNER */
@@ -1567,7 +1568,7 @@ static void u_GetTopWindow(void) {
     uint32_t parent = A32(0), best = 0;
     int bseq = 0;
     for (int i = 0; i < MAX_WIN; i++)
-        if (g_win[i].used && g_win[i].parent == parent && (!best || g_win[i].seq < bseq)) best = g_win[i].hwnd, bseq = g_win[i].seq;
+        if (g_win[i].used && g_win[i].parent == parent && (!best || g_win[i].z < bseq)) best = g_win[i].hwnd, bseq = g_win[i].z;
     RET(best, 1);
 }
 static void u_EnumChildWindows(void) {                   /* (parent, proc, lParam): all descendants */
@@ -1704,10 +1705,31 @@ static void u_DeferWindowPos(void) {                     /* (hdwp, hwnd, after, 
 }
 static void u_EndDeferWindowPos(void) { RET(1, 1); }
 
+/* Move a window in its siblings' z-order: HWND_TOP (0) and HWND_TOPMOST (-1)
+ * on top, HWND_BOTTOM (1) at the bottom, else just below `after`. Red Alert
+ * 2 raises each dialog it opens so; its mode-change box repaints the dialogs
+ * above it (GW_HWNDPREV), and while the Options screen still counted as
+ * above, it painted that over itself and the game looked frozen (issue
+ * redalert2-recomp#24). */
+static void zorder(win_t *x, uint32_t after) {
+    win_t *a = W(after);
+    int lo = x->z, hi = x->z;
+    for (int i = 0; i < MAX_WIN; i++) {
+        win_t *s = &g_win[i];
+        if (!s->used || s == x || s->parent != x->parent) continue;
+        if (a && a != x && a->parent == x->parent && after != 1 && s->z > a->z) s->z++;   /* room below `after` */
+        if (s->z < lo) lo = s->z;
+        if (s->z > hi) hi = s->z;
+    }
+    if (after == 1) x->z = hi + 1;
+    else if (a && a != x && a->parent == x->parent) x->z = a->z + 1;
+    else x->z = lo - 1;
+}
 static void u_SetWindowPos(void) {                       /* (h, after, x, y, cx, cy, flags) */
     win_t *x = W(A32(0));
     uint32_t fl = A32(6);
     if (!x) RET(0, 7);
+    if (!(fl & 4u)) zorder(x, A32(1));                   /* not SWP_NOZORDER */
     if (!(fl & 3u)) move(x, (int)A32(2), (int)A32(3), (int)A32(4), (int)A32(5), !(fl & 2u), !(fl & 1u));
     else if (!(fl & 2u)) move(x, (int)A32(2), (int)A32(3), 0, 0, 1, 0);
     else if (!(fl & 1u)) move(x, 0, 0, (int)A32(4), (int)A32(5), 0, 1);
@@ -1717,7 +1739,7 @@ static void u_SetWindowPos(void) {                       /* (h, after, x, y, cx,
     }
     RET(1, 7);
 }
-static void u_BringWindowToTop(void) { RET(W(A32(0)) != NULL, 1); }
+static void u_BringWindowToTop(void) { win_t *x = W(A32(0)); if (x) zorder(x, 0); RET(x != NULL, 1); }
 static void u_WindowFromPoint(void) { RET(hle_window_at((int)A32(0), (int)A32(1), NULL, NULL), 2); }
 static uint32_t child_at(uint32_t parent, int px, int py) {
     win_t *p = W(parent);
@@ -1726,8 +1748,8 @@ static uint32_t child_at(uint32_t parent, int px, int py) {
     int bseq = 0x7FFFFFFF;
     for (int i = 0; i < MAX_WIN; i++) {
         win_t *c = &g_win[i];
-        if (c->used && c->parent == p->hwnd && px >= c->x && py >= c->y && px < c->x + c->w && py < c->y + c->h && c->seq < bseq)
-            best = c->hwnd, bseq = c->seq;
+        if (c->used && c->parent == p->hwnd && px >= c->x && py >= c->y && px < c->x + c->w && py < c->y + c->h && c->z < bseq)
+            best = c->hwnd, bseq = c->z;
     }
     return best;
 }

@@ -45,6 +45,13 @@ versions follow [SemVer](https://semver.org/).
   at 0 all eight showed the same tool.
 
 ### Fixed
+- win32hle: `SetWindowPos` and `BringWindowToTop` move a window in its
+  siblings' z-order, and `GetWindow`, `GetTopWindow` and `ChildWindowFromPoint`
+  follow it; before, the order was only creation order. Red Alert 2's
+  mode-change box, raised over the Options screen, asks for the windows above
+  it and repaints them; the Options screen came back as above it and was
+  painted over the box, so the game seemed to freeze
+  (redalert2-recomp#24). `zorder_selftest.c` checks the order.
 - native32: `TerminateThread` on a guest thread no longer breaks the machine
   lock. A thread killed while it waited for the lock left its wait block
   linked into the lock, and the next thread to wait faulted inside ntdll
