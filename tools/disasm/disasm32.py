@@ -385,10 +385,18 @@ class Disassembler:
             return False
 
         end = va
+        zeros = 0
         for insn in decode(self._probe_md, data, va):
             if insn.mnemonic in RETS or insn.mnemonic in UNCOND_JUMPS:
                 return True
             if insn.mnemonic in NOT_COMPILED:
+                return False
+            # Zero fill decodes as `add [eax], al` for as long as it lasts, so
+            # a zeroed table passes the window test. No compiler emits four of
+            # those in a row: House of the Dead's Watcom build keeps 250 KB of
+            # zeroed tables in its code section.
+            zeros = zeros + 1 if insn.bytes == b'\x00\x00' else 0
+            if zeros >= 4:
                 return False
             end = insn.address + insn.size
 
@@ -809,6 +817,10 @@ class Disassembler:
                 if real not in queued:
                     queued.add(real)
                     queue.append(real)
+                return None
+            # Zero fill is data, whichever scan named it: the E8/E9 byte scan
+            # is not probed, and a stray E8 in a zeroed table names more zeros.
+            if self.read_bytes(addr, 4) == b'\x00\x00\x00\x00':
                 return None
             func = self.disassemble_function(addr, iat_map)
             if not (func and func.blocks):
@@ -1603,6 +1615,9 @@ def demo():
     # window, are a pass -- garbage does not stay decodable that long.
     assert d.probes_as_function_body(BASE + 0x1100, window=16), \
         "a full clean window counts as corroboration"
+    # ...but zero fill is a table, however long it decodes (House of the Dead).
+    zd = Disassembler(b"\x00" * 0x600, BASE, [_Sec(".text", 0x1000, 0x400, 0x200, True)])
+    assert not zd.probes_as_function_body(BASE + 0x1000, window=64), "zero fill is not code"
 
     # A window that cuts its own last instruction in half stopped for a reason
     # that has nothing to do with the bytes, and must not read as a reject.

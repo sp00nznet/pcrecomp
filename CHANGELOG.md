@@ -53,6 +53,12 @@ versions follow [SemVer](https://semver.org/).
   at 0 all eight showed the same tool.
 
 ### Fixed
+- disasm32: zero fill is not a function. It decodes as `add [eax], al` for as
+  long as it lasts, so a zeroed table in the code section passed the probe's
+  clean-window test, and a stray `E8` byte (whose targets are never probed)
+  named more of it. House of the Dead's Watcom build keeps about 250 KB of
+  zeroed tables in `BEGTEXT`: 500 invented functions, each lifting to up to
+  100,000 lines (one 844 MB C file, 14.9M lines in all; 1.7M after).
 - native32: a guest's code stays non-executable, so Windows' calls into it
   always run the lift. Watcom sections (`VirtualSize` 0) are sized by
   `SizeOfRawData`, and a built-in `VirtualProtect` drops the execute bit when
