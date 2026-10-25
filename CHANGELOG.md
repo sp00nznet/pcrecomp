@@ -6,6 +6,14 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- native32: guest setjmp/longjmp on the C++ landing pads. A function that
+  calls the guest's `setjmp` gets a landing pad after the call (pass the
+  address to `lift_function_linear(eh_resume=...)`), and the host's shim for
+  the guest's `longjmp` sets the registers from the jmp_buf, then calls
+  `recomp_eh_owner(esp)` for the frame that called `setjmp` and
+  `recomp_eh_resume(frame, resume)` to continue there. `recomp_ehframe_t`
+  records its function (`func`). House of the Dead runs its task scheduler
+  this way: every task ends with `longjmp` back to it.
 - win32hle: a host's popup menu over the picture (`hle_screen_menu`), the kind
   a Windows presenter opens on F10: at the mouse, submenus beside their item,
   check marks and key hints, the mouse or the arrow keys, Enter and Esc. The

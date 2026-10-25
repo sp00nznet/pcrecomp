@@ -60,6 +60,26 @@ void recomp_eh_pop(recomp_ehframe_t* f) {
         if (p == f) { t_frames = f->prev; return; }
 }
 
+/* Guest setjmp/longjmp. The guest's setjmp saves its caller's registers and
+ * esp, and longjmp puts them back and returns from setjmp a second time: in
+ * a lifted program that is a jump into the middle of a body further up the
+ * host stack. The caller of setjmp gets a landing pad like a catching frame
+ * (a label after the call), and the host's longjmp shim finds it here: the
+ * newest frame entered above the saved esp is the one that called setjmp.
+ * House of the Dead's task scheduler (sub_0043E354) is run this way. */
+recomp_ehframe_t* recomp_eh_owner(uint32_t esp) {
+    for (recomp_ehframe_t* f = t_frames; f; f = f->prev)
+        if (f->entry_esp > esp) return f;
+    return NULL;
+}
+
+void recomp_eh_resume(recomp_ehframe_t* f, uint32_t resume) {
+    t_frames = f;
+    f->resume = resume;
+    g_cur_func = f->func;
+    longjmp(f->jb, 1);
+}
+
 /* The FuncInfo a C++ frame's handler stub names, or 0 if it is not one. */
 static uint32_t funcinfo(uint32_t handler) {
     const uint8_t* h = (const uint8_t*)(uintptr_t)handler;

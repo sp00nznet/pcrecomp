@@ -1229,12 +1229,19 @@ typedef struct recomp_ehframe {
     jmp_buf  jb;
     uint32_t entry_esp;
     uint32_t resume;
+    uint32_t func;      /* the lifted function that owns the frame */
 } recomp_ehframe_t;
 void recomp_eh_push(recomp_ehframe_t* f);
 void recomp_eh_pop(recomp_ehframe_t* f);
+/* A guest longjmp (setjmp's other half): the frame whose body owns guest
+ * stack address esp, and the jump back into it at resume, with the guest
+ * registers already set. Never returns. */
+recomp_ehframe_t* recomp_eh_owner(uint32_t esp);
+void recomp_eh_resume(recomp_ehframe_t* f, uint32_t resume);
 #define RECOMP_EH_ENTER()                                                     \
     recomp_ehframe_t _ehf;                                                    \
     _ehf.entry_esp = g_esp;                                                   \
+    _ehf.func = g_cur_func;                                                   \
     recomp_eh_push(&_ehf);                                                    \
     if (setjmp(_ehf.jb)) { RECOMP_REGS_IN(); _flag_k = FK_NONE;               \
                            _itail_tgt = _ehf.resume; goto _ljump; }

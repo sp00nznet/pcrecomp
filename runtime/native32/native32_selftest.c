@@ -198,6 +198,28 @@ int main(void) {
         CHECK(recomp_lookup_import(*slot) == (recomp_func_t)add3);
     }
 
+    /* A guest longjmp: the frame that owns a saved esp is the newest one
+     * entered above it, and resuming it lands in its setjmp with its function
+     * current again. */
+    {
+        static recomp_ehframe_t outer, inner;
+        outer.entry_esp = 0x1000, outer.func = 0x00401000u;
+        inner.entry_esp = 0x0F00, inner.func = 0x00402000u;
+        recomp_eh_push(&outer);
+        recomp_eh_push(&inner);
+        CHECK(recomp_eh_owner(0x0F80) == &outer);
+        CHECK(recomp_eh_owner(0x0E00) == &inner);
+        CHECK(recomp_eh_owner(0x2000) == NULL);
+        if (!setjmp(outer.jb)) {
+            recomp_eh_resume(&outer, 0x00401234u);
+            CHECK(!"recomp_eh_resume returned");
+        } else {
+            CHECK(outer.resume == 0x00401234u && g_cur_func == 0x00401000u);
+            CHECK(recomp_eh_owner(0x0E00) == &outer);     /* the inner frame is gone */
+        }
+        recomp_eh_pop(&outer);
+    }
+
     printf("native32 selftest: %s\n", fails ? "FAILED" : "ok");
     return fails != 0;
 }
