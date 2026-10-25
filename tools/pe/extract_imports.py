@@ -59,7 +59,9 @@ def parse_pe_imports(filepath):
 
     def rva_to_offset(rva):
         for name, s_rva, s_vsize, s_rawptr, s_rawsize in sections:
-            if s_rva <= rva < s_rva + s_vsize:
+            # Watcom's linker writes VirtualSize 0 in every section header
+            # (as pe_analyze.py notes): the raw size is the extent then.
+            if s_rva <= rva < s_rva + (s_vsize or s_rawsize):
                 return rva - s_rva + s_rawptr
         return rva  # fallback: direct mapping (works for SoF since RVA == file offset)
 

@@ -63,6 +63,10 @@ versions follow [SemVer](https://semver.org/).
 - `WM_COMMAND` reached the guest in Win32 packing. Win16 has the control in
   the low word of lParam and the notification code in the high word; a
   control's handle used to arrive as a truncated host pointer.
+- `extract_imports.py` reads a Watcom PE: its linker writes VirtualSize 0 in
+  every section header, so no section held the import directory and the
+  script read past the end of the file (`struct.error`). The raw size is the
+  extent then, as in `pe_analyze.py`.
 
 ### Added
 - Win16 menus are real. `LoadMenu` builds the NE `RT_MENU` template into a
