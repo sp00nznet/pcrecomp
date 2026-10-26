@@ -518,7 +518,25 @@ static void k_GlobalGetAtomNameA(void) {              /* (atom, buf, size) */
     RET(n && buf ? (uint32_t)strlen(buf) : 0u, 3);
 }
 
+/* What a statically linked MFC asks on its way up, answered as Windows does
+ * for a single process with nothing to share: the version the process was
+ * built for (4.0, which keeps MFC on its Windows 95 paths), no flags on a
+ * global block, a duplicate that is the same handle, and file locks that
+ * always succeed. */
+static void k_GetProcessVersion(void) { RET(0x00040000u, 1); }
+static void k_GlobalFlags(void)       { RET(0, 1); }
+static void k_DuplicateHandle(void) {        /* (srcProc, src, dstProc, &dst, access, inherit, options) */
+    if (A32(3)) MEM32(A32(3)) = A32(1);
+    RET(1, 7);
+}
+static void k_LockFile(void)          { RET(1, 5); }
+
 const win32hle_shim win32hle_kernel32[] = {
+    { "GetProcessVersion",  k_GetProcessVersion },
+    { "GlobalFlags",        k_GlobalFlags },
+    { "DuplicateHandle",    k_DuplicateHandle },
+    { "LockFile",           k_LockFile },
+    { "UnlockFile",         k_LockFile },
     { "GlobalAddAtomA",     k_GlobalAddAtomA },
     { "GlobalFindAtomA",    k_GlobalFindAtomA },
     { "GlobalDeleteAtom",   k_GlobalDeleteAtom },

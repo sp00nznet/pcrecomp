@@ -350,6 +350,14 @@ static uint32_t pen_color(const dc_t *d, int *null) {
 }
 
 static void g_CreateSolidBrush(void)    { RET(make_brush(A32(0), 0), 1); }
+/* GetSysColorBrush: a brush of GetSysColor's colour, one per index and kept,
+ * as Windows keeps its system brushes (a caller must not delete them). */
+static void g_GetSysColorBrush(void) {
+    static uint32_t made[32];
+    uint32_t i = A32(0) & 31;
+    if (!made[i]) made[i] = make_brush(hle_call_guest(hle_resolve("GetSysColor"), 1, &i), 0);
+    RET(made[i], 1);
+}
 static void g_CreateHatchBrush(void)    { RET(make_brush(A32(1), 0), 2); }     /* hatch drawn as solid */
 static void g_CreatePen(void)           { RET(make_pen((int)A32(0), (int)A32(1), A32(2)), 3); }
 static void g_CreateBrushIndirect(void) { uint32_t lb = A32(0); RET(make_brush(lb ? MEM32(lb + 4) : 0, lb && MEM32(lb) == 1 ? HS_HOLLOW : 0), 1); } /* LOGBRUSH: style, color */
@@ -785,6 +793,7 @@ static void g_CreateCompatibleDC(void) { RET(new_dc(), 1); }   /* a memory DC; a
 static void g_DeleteDC(void) { hle_gdi_release_dc(A32(0)); RET(1, 1); }
 
 const win32hle_shim win32hle_gdidc[] = {
+    { "GetSysColorBrush", g_GetSysColorBrush },
     { "CreateSolidBrush", g_CreateSolidBrush }, { "CreateHatchBrush", g_CreateHatchBrush },
     { "CreateBrushIndirect", g_CreateBrushIndirect }, { "CreatePen", g_CreatePen }, { "CreatePenIndirect", g_CreatePenIndirect },
     { "CreateCompatibleBitmap", g_CreateCompatibleBitmap }, { "CreateBitmap", g_CreateBitmap },
