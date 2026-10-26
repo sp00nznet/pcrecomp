@@ -446,11 +446,24 @@ static void measure(win_t *x) {
 /* A visible child going (hidden or destroyed) uncovers its parent, which
  * Windows then repaints there. Without it a game that paints its dialogs
  * itself leaves the child's last picture on screen (Red Alert 2's combo
- * lists, closed, stayed drawn). */
+ * lists, closed, stayed drawn). The siblings it covered repaint there too,
+ * even under a WS_CLIPCHILDREN parent, whose own invalidation stops short of
+ * them: Red Alert 2's dialogs are children of such a window, and its box to
+ * keep a new resolution, closed, left the Options screen under it blank
+ * (redalert2-recomp#24). */
 static void invalidate_rect(win_t *x, int l, int t, int r, int b);
 static void uncover(win_t *x) {
-    win_t *p = x && x->parent && (x->style & WS_VISIBLE) ? W(x->parent) : NULL;
-    if (p) invalidate_rect(p, x->x, x->y, x->x + x->w, x->y + x->h);   /* and the siblings it covered */
+    if (!x || !(x->style & WS_VISIBLE)) return;
+    win_t *p = x->parent ? W(x->parent) : NULL;
+    if (p) invalidate_rect(p, x->x, x->y, x->x + x->w, x->y + x->h);
+    for (int i = 0; i < MAX_WIN; i++) {                  /* the siblings below it (higher z) */
+        win_t *s = &g_win[i];
+        if (!s->used || s == x || s->parent != x->parent || s->z <= x->z || !(s->style & WS_VISIBLE)) continue;
+        int l = x->x > s->x ? x->x : s->x, t = x->y > s->y ? x->y : s->y;
+        int r = x->x + x->w < s->x + s->w ? x->x + x->w : s->x + s->w;
+        int b = x->y + x->h < s->y + s->h ? x->y + x->h : s->y + s->h;
+        invalidate_rect(s, l - s->x, t - s->y, r - s->x, b - s->y);   /* empty when they don't overlap */
+    }
 }
 
 static void destroy(uint32_t h) {

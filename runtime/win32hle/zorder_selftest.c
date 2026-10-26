@@ -3,7 +3,9 @@
  * SetWindowPos or BringWindowToTop moves a window. Red Alert 2 raises each
  * dialog it opens with SetWindowPos(HWND_TOP) and then asks GetWindow for the
  * windows above; a raise that did nothing left its mode-change box under the
- * Options screen (redalert2-recomp#24).
+ * Options screen (redalert2-recomp#24). And a child closed uncovers the
+ * siblings under it, which repaint there even under a WS_CLIPCHILDREN parent:
+ * the box, closed, left that Options screen blank otherwise.
  */
 #define RECOMP_GENERATED_CODE
 #define _GNU_SOURCE
@@ -18,6 +20,8 @@
 #define GW_CHILD 5u
 #define SWP_NOSIZE_NOMOVE 3u
 #define SWP_NOZORDER 4u
+#define WS_VISIBLE 0x10000000u
+#define WS_CLIPCHILDREN 0x02000000u
 
 static int fails;
 static void ok(const char *w, int c) { if (!c) { printf("FAIL %s\n", w); fails++; } }
@@ -26,6 +30,7 @@ static void ok(const char *w, int c) { if (!c) { printf("FAIL %s\n", w); fails++
     uint32_t _cf = 0; uint32_t _flag_k = FK_NONE; uint32_t _flag_a = 0, _flag_b = 0; RECOMP_ENTER(va)
 
 static uint32_t VA_CreateWindowExA, VA_GetWindow, VA_SetWindowPos, VA_BringWindowToTop;
+static uint32_t VA_DestroyWindow, VA_ValidateRect, VA_GetUpdateRect;
 static uint32_t g_args[12], g_nargs, g_fn, g_ret, g_static;   /* g_static: "Static" in guest memory */
 
 /* One stdcall into a shim with g_args, as the lifted code makes it. */
@@ -60,7 +65,11 @@ int main(void) {
     VA_GetWindow = hle_resolve("GetWindow");
     VA_SetWindowPos = hle_resolve("SetWindowPos");
     VA_BringWindowToTop = hle_resolve("BringWindowToTop");
-    ok("the shims resolve", VA_CreateWindowExA && VA_GetWindow && VA_SetWindowPos && VA_BringWindowToTop);
+    VA_DestroyWindow = hle_resolve("DestroyWindow");
+    VA_ValidateRect = hle_resolve("ValidateRect");
+    VA_GetUpdateRect = hle_resolve("GetUpdateRect");
+    ok("the shims resolve", VA_CreateWindowExA && VA_GetWindow && VA_SetWindowPos && VA_BringWindowToTop &&
+                            VA_DestroyWindow && VA_ValidateRect && VA_GetUpdateRect);
     char *s = hle_alloc(8);
     snprintf(s, 8, "Static");
     g_static = hle_va(s);
@@ -87,6 +96,17 @@ int main(void) {
 
     call(VA_BringWindowToTop, 1, (uint32_t[]){ b });
     ok("BringWindowToTop raises b", get_window(main_w, GW_CHILD) == b && get_window(b, GW_HWNDNEXT) == a);
+
+    /* A box over a dialog, both children of a WS_CLIPCHILDREN window, as Red
+     * Alert 2 has them: the box closed, the dialog must repaint. */
+    uint32_t shell = create(WS_VISIBLE | WS_CLIPCHILDREN, 0, 0);
+    uint32_t dialog = create(WS_CHILD | WS_VISIBLE, shell, 1), box = create(WS_CHILD | WS_VISIBLE, shell, 2);
+    set_window_pos(box, 0, SWP_NOSIZE_NOMOVE);
+    uint32_t r = hle_va(hle_alloc(16));
+    call(VA_ValidateRect, 2, (uint32_t[]){ dialog, 0 });
+    ok("the dialog starts painted", !call(VA_GetUpdateRect, 3, (uint32_t[]){ dialog, r, 0 }));
+    call(VA_DestroyWindow, 1, (uint32_t[]){ box });
+    ok("the box closed, the dialog under it repaints", call(VA_GetUpdateRect, 3, (uint32_t[]){ dialog, r, 0 }));
 
     if (fails == 0) printf("zorder_selftest: all checks passed\n");
     return fails != 0;
