@@ -66,7 +66,8 @@ is written for all of these:
 | `bink.c` | `binkw32.dll` on ffmpeg (`HLE_WITH_FFMPEG`): `BinkOpen` on a name or on the game's open file, frames decoded and converted into the game's surface, the soundtrack into a `dsound.c` stream; `BinkBuffer*` for a GDI game, onto the window surface |
 | `mss.c` | the part of Miles (`mss32.dll`) a game's own audio DLL calls: file and memory helpers, and the RIB lookup that hands out an ASI codec, MP3 on ffmpeg |
 | `screen.c` | the SDL2 window for a DirectDraw game, or a GDI game's window surface: the picture scaled (sharp, smooth, CRT, nearest, integer; F12, F11), SDL input turned into the messages a mouse and keyboard give, and a host's popup menu over the picture (`hle_screen_menu`: submenus, check marks, mouse and arrow keys) |
-| `winmm.c` | timers (`timeSetEvent` on threads, `timeKillEvent` waiting for a callback under way), joystick, waveOut, MCI |
+| `winmm.c` | timers (`timeSetEvent` on threads, `timeKillEvent` waiting for a callback under way), joystick, waveOut, MCI; no mixer and no recording device |
+| `lz32.c` | LZ32: `LZOpenFileA` and the rest, a COMPRESS.EXE (SZDD) file read as its expansion, expanded in memory at open |
 | `wsock32.c` | Winsock 1.1 on BSD sockets, by name and ordinal; `WSAAsyncSelect` through the pump; IPX as IPXEmu carries it on UDP |
 | `ole32.c` | COM: class factories a host serves and ones the guest registers itself, GUID strings, BSTRs |
 | `storage.c` | structured storage on compound files in Windows' format (`StgCreateDocfile`, `IStorage`, `IStream`, `OleSaveToStream`) |

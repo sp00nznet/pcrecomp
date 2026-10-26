@@ -661,6 +661,40 @@ static void k__llseek(void) {                            /* (hf, off, origin) */
     RET(p < 0 ? INVALID_HANDLE : (uint32_t)p, 3);
 }
 
+/* OpenFile(name, &OFSTRUCT, style): the Win16 open, still in KERNEL32. The
+ * mode is the low two bits as for _lopen; OF_CREATE makes the file, OF_EXIST
+ * opens and closes it, OF_DELETE removes it, OF_PARSE only fills the
+ * OFSTRUCT. It answers an HFILE, or HFILE_ERROR with the error in nErrCode. */
+#define OF_PARSE  0x0100u
+#define OF_DELETE 0x0200u
+#define OF_CREATE 0x1000u
+#define OF_EXIST  0x4000u
+static void k_OpenFile(void) {
+    const char *name = ASTR(0);
+    uint8_t *of = (uint8_t *)APTR(1);
+    uint32_t style = A32(2), m = style & 3, h;
+    char path[1024];
+    if (of) {                                            /* cBytes, fFixedDisk, nErrCode, reserved, szPathName[128] */
+        memset(of, 0, 136);
+        of[0] = 136, of[1] = 1;
+        snprintf((char *)of + 8, 128, "%s", name ? name : "");
+    }
+    if (!name) RET(INVALID_HANDLE, 3);
+    if (style & OF_PARSE) RET(0, 3);
+    if (style & OF_DELETE) {
+        hle_host_path(name, path, sizeof path);
+        RET(unlink(path) == 0 ? 1u : INVALID_HANDLE, 3);
+    }
+    h = lopen_common(name, (style & OF_CREATE) ? O_RDWR : m == 1 ? O_WRONLY : m == 2 ? O_RDWR : O_RDONLY,
+                     (style & OF_CREATE) != 0);
+    if (h == INVALID_HANDLE) {
+        if (of) { uint16_t e = (uint16_t)hle_get_last_error(); memcpy(of + 2, &e, 2); }
+        RET(INVALID_HANDLE, 3);
+    }
+    if (style & OF_EXIST) { hle_handle_close(h); RET(1, 3); }
+    RET(h, 3);
+}
+
 /* GetFullPathNameA(name, buflen, buf, &filePart): a lexical absolute path (no
  * disk access). Relative names are taken against the current directory; the
  * result keeps whatever separators it had, which hle_path matches on either. */
@@ -754,6 +788,7 @@ const win32hle_shim win32hle_kernel32_ext[] = {
     { "CreateFileMappingA", k_CreateFileMappingA }, { "MapViewOfFile", k_MapViewOfFile },
     { "UnmapViewOfFile", k_UnmapViewOfFile },
     { "GetFullPathNameA", k_GetFullPathNameA },
+    { "OpenFile", k_OpenFile }, { "_hread", k__lread }, { "_hwrite", k__lwrite },
     { "_lopen", k__lopen }, { "_lcreat", k__lcreat }, { "_lread", k__lread },
     { "_lwrite", k__lwrite }, { "_lclose", k__lclose }, { "_llseek", k__llseek },
     { "CreateFileA",                k_CreateFileA },
