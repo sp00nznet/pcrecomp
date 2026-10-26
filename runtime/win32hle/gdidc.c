@@ -253,7 +253,11 @@ static TTF_Font *ttf_of(font_t *f) {
      * plus descent), which for these faces is about 1.15 em. */
     int em = f->height < 0 ? -f->height : f->height > 0 ? f->height * 87 / 100 : 11;
     f->ttf = open_font(file, em > 0 ? em : 11);
-    f->crisp = f->quality == 3 || (f->quality != 4 && f->quality != 5 && !gasp_gray(file, em));   /* not ANTIALIASED, CLEARTYPE */
+    /* Windows never smooths a raster font, and these three are only ever
+     * raster: a program that reads its label pixels back (eJay 2's sample
+     * blocks, in Small Fonts) expects exactly the text colour or not. */
+    int raster = !strcasecmp(f->face, "Small Fonts") || !strcasecmp(f->face, "Terminal") || !strcasecmp(f->face, "Fixedsys");
+    f->crisp = raster || f->quality == 3 || (f->quality != 4 && f->quality != 5 && !gasp_gray(file, em));   /* not ANTIALIASED, CLEARTYPE */
     if (!f->ttf) return NULL;
     /* Crisp text is hinted fully, as GDI hints it, advances included: what
      * FreeType does only for monochrome. */
