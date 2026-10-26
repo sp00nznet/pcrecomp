@@ -1,5 +1,6 @@
 /*
- * winmm.c - win32hle WINMM: multimedia timers, joystick, waveOut audio, MCI.
+ * winmm.c - win32hle WINMM: multimedia timers, joystick, waveOut audio, MCI;
+ * no mixer and no recording device.
  * On libc for timing; audio is "accept and retire" (a silent device that
  * completes every buffer immediately, so a game's double-buffered mixer thread
  * keeps cycling without a real sound card); no joystick; MCI stubbed. Real SDL
@@ -117,6 +118,26 @@ static void m_waveOutReset(void)       { RET(MMSYSERR_NOERROR, 1); }
 static void m_waveOutClose(void)       { RET(MMSYSERR_NOERROR, 1); }
 static void m_waveOutGetNumDevs(void)  { RET(1, 0); }          /* one (silent) device */
 static void m_waveOutGetDevCapsA(void) { RET(MMSYSERR_NOERROR, 3); }
+
+/* The device's own volume, the id behind a handle: the one device, at full
+ * volume (a caller's level is its own business: dsound.c mixes at the level
+ * a buffer asks for). */
+static void m_waveOutSetVolume(void)  { RET(MMSYSERR_NOERROR, 2); }
+static void m_waveOutGetVolume(void)  { if (A32(1)) MEM32(A32(1)) = 0xFFFFFFFFu; RET(MMSYSERR_NOERROR, 2); }
+static void m_waveOutGetID(void)      { if (A32(1)) MEM32(A32(1)) = 0; RET(MMSYSERR_NOERROR, 2); }
+
+/* --- no mixer, no recording device ---
+ * What Windows answers on a PC without either: no devices, an open of device
+ * 0 refused as a bad id, and anything given a handle told it is not one. A
+ * program that sets its card's levels through the mixer, or enumerates
+ * inputs for a record page, carries on without them. */
+#define MMSYSERR_BADDEVICEID  2u
+#define MMSYSERR_INVALHANDLE  5u
+static void m_none0(void)       { RET(0, 0); }                        /* mixerGetNumDevs, waveInGetNumDevs */
+static void m_mixerOpen(void)   { if (A32(0)) MEM32(A32(0)) = 0; RET(MMSYSERR_BADDEVICEID, 5); }
+static void m_waveInOpen(void)  { if (A32(0)) MEM32(A32(0)) = 0; RET(MMSYSERR_BADDEVICEID, 6); }
+static void m_badhandle1(void)  { RET(MMSYSERR_INVALHANDLE, 1); }     /* (h) */
+static void m_badhandle3(void)  { RET(MMSYSERR_INVALHANDLE, 3); }     /* (h, struct, size or flags) */
 
 /* --- MCI (CD audio / command strings): not available --- */
 static void m_mciSendStringA(void)     { RET(MMSYSERR_ERROR, 4); }
@@ -279,6 +300,26 @@ const win32hle_shim win32hle_winmm[] = {
     { "waveOutClose",           m_waveOutClose },
     { "waveOutGetNumDevs",      m_waveOutGetNumDevs },
     { "waveOutGetDevCapsA",     m_waveOutGetDevCapsA },
+    { "waveOutSetVolume",       m_waveOutSetVolume },
+    { "waveOutGetVolume",       m_waveOutGetVolume },
+    { "waveOutGetID",           m_waveOutGetID },
+    { "mixerGetNumDevs",        m_none0 },
+    { "mixerOpen",              m_mixerOpen },
+    { "mixerClose",             m_badhandle1 },
+    { "mixerGetLineInfoA",      m_badhandle3 },
+    { "mixerGetLineControlsA",  m_badhandle3 },
+    { "mixerGetControlDetailsA", m_badhandle3 },
+    { "mixerSetControlDetails", m_badhandle3 },
+    { "waveInGetNumDevs",       m_none0 },
+    { "waveInOpen",             m_waveInOpen },
+    { "waveInClose",            m_badhandle1 },
+    { "waveInReset",            m_badhandle1 },
+    { "waveInStart",            m_badhandle1 },
+    { "waveInStop",             m_badhandle1 },
+    { "waveInPrepareHeader",    m_badhandle3 },
+    { "waveInUnprepareHeader",  m_badhandle3 },
+    { "waveInAddBuffer",        m_badhandle3 },
+    { "waveInGetPosition",      m_badhandle3 },
     { "mciSendStringA",         m_mciSendStringA },
     { "mciGetErrorStringA",     m_mciGetErrorStringA },
     { 0, 0 }
