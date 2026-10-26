@@ -471,6 +471,49 @@ uint32_t hle_gdi_make_dib(int w, int h, int bpp, uint8_t *bits, int topdown, con
     }
     return handle;
 }
+/* GetObjectA(h, size, buf): what an object is, in the caller's buffer.
+ * A bitmap is a BITMAP (24 bytes), or a DIBSECTION (84) when asked for that
+ * much - bmBits is the pixels' address for a DIB section, NULL for a bitmap
+ * this layer owns. Pens are a LOGPEN, brushes a LOGBRUSH, fonts a LOGFONTA,
+ * palettes their entry count. A NULL buffer asks for the size. */
+static void put32(uint8_t *b, int off, uint32_t v) { memcpy(b + off, &v, 4); }
+static void put16(uint8_t *b, int off, uint32_t v) { uint16_t w = (uint16_t)v; memcpy(b + off, &w, 2); }
+static void g_GetObjectA(void) {
+    uint32_t h = A32(0), n = A32(1), out = A32(2);
+    uint8_t tmp[84];
+    uint32_t len = 0;
+    memset(tmp, 0, sizeof tmp);
+    gobj_t *o = GOBJ(h);
+    if (o && o->type == GO_BITMAP) {
+        int pitch = o->pitch < 0 ? -o->pitch : o->pitch;
+        uint8_t *first = o->pitch < 0 ? o->px + (ptrdiff_t)(o->h - 1) * o->pitch : o->px;
+        put32(tmp, 4, o->w), put32(tmp, 8, o->h), put32(tmp, 12, pitch), put16(tmp, 16, 1), put16(tmp, 18, o->bpp);
+        if (!o->owns) put32(tmp, 20, hle_va(first));
+        len = 24;
+        if (!o->owns && n >= 84) {                       /* DIBSECTION: + BITMAPINFOHEADER, masks, section */
+            put32(tmp, 24, 40), put32(tmp, 28, o->w), put32(tmp, 32, o->pitch < 0 ? o->h : -o->h), put16(tmp, 36, 1), put16(tmp, 38, o->bpp);
+            put32(tmp, 40, o->bpp == 16 && !o->is555 ? 3 : 0), put32(tmp, 44, pitch * o->h);
+            if (o->bpp == 16) put32(tmp, 64, o->is555 ? 0x7C00 : 0xF800), put32(tmp, 68, o->is555 ? 0x03E0 : 0x07E0), put32(tmp, 72, 0x001F);
+            len = 84;
+        }
+    } else if (o && o->type == GO_PEN) {
+        put32(tmp, 0, o->style), put32(tmp, 4, o->width), put32(tmp, 12, o->color), len = 16;
+    } else if (o && o->type == GO_BRUSH) {
+        put32(tmp, 0, o->style == HS_HOLLOW ? 1 : 0), put32(tmp, 4, o->color), len = 12;
+    } else if (o && o->type == GO_PALETTE) {
+        put16(tmp, 0, o->paln), len = 2;
+    } else if (h >= FONT_BASE && h <= SYSTEM_FONT) {
+        font_t *f = FONT(h);                             /* LOGFONTA */
+        put32(tmp, 0, f ? -f->height : -13), put32(tmp, 16, f ? f->weight : 400), tmp[20] = (uint8_t)(f && f->italic);
+        snprintf((char *)tmp + 28, 32, "%s", f ? f->face : "MS Sans Serif");
+        len = 60;
+    }
+    if (!len) RET(0, 3);
+    if (!out) RET(len, 3);
+    if (n < len) len = n;
+    memcpy(hle_ptr(out), tmp, len);
+    RET(len, 3);
+}
 /* Regions are rectangles, which is what a game clipping its blits makes:
  * left, top in style and width, right, bottom in w and h. */
 static uint32_t make_region(int l, int t, int r, int b) {
@@ -794,6 +837,7 @@ static void g_DeleteDC(void) { hle_gdi_release_dc(A32(0)); RET(1, 1); }
 
 const win32hle_shim win32hle_gdidc[] = {
     { "GetSysColorBrush", g_GetSysColorBrush },
+    { "GetObjectA", g_GetObjectA },
     { "CreateSolidBrush", g_CreateSolidBrush }, { "CreateHatchBrush", g_CreateHatchBrush },
     { "CreateBrushIndirect", g_CreateBrushIndirect }, { "CreatePen", g_CreatePen }, { "CreatePenIndirect", g_CreatePenIndirect },
     { "CreateCompatibleBitmap", g_CreateCompatibleBitmap }, { "CreateBitmap", g_CreateBitmap },

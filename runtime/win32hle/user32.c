@@ -2050,8 +2050,67 @@ static void u_LoadCursorA(void) {                        /* (hinst, name): an id
     if (hinst && name < 0x10000u) h = load_mono_cursor(hinst, name);
     RET(h ? h : CURSOR_STANDIN, 2);
 }
-static void u_LoadImageA(void)       { RET(0x1C000003u, 6); }
-static void u_LoadBitmapA(void)      { RET(0x1C000004u, 2); }
+/* LoadImageA and LoadBitmapA: a bitmap is a real DIB section, from a .bmp
+ * file (LR_LOADFROMFILE) or the module's RT_BITMAP resource - so it blits,
+ * and GetObjectA hands back its pixels, which is how a program that keeps its
+ * own copy of a texture reads one. Icons and cursors stay placeholders. */
+#define LR_LOADFROMFILE 0x0010u
+static uint32_t bitmap_from_packed(const uint8_t *bmi, uint32_t n, const uint8_t *bits_at) {
+    if (n < 40) return 0;
+    uint32_t hsize = bmi[0] | bmi[1] << 8, bpp = bmi[14] | bmi[15] << 8, comp = bmi[16] | bmi[17] << 8;
+    int32_t w = (int32_t)(bmi[4] | bmi[5] << 8 | bmi[6] << 16 | (uint32_t)bmi[7] << 24);
+    int32_t h = (int32_t)(bmi[8] | bmi[9] << 8 | bmi[10] << 16 | (uint32_t)bmi[11] << 24);
+    if (hsize < 40 || w <= 0 || !h || comp > 3 || comp == 1 || comp == 2) return 0;   /* no RLE */
+    uint32_t used = bmi[32] | bmi[33] << 8 | bmi[34] << 16, colors = bpp <= 8 ? (used ? used : 1u << bpp) : 0;
+    uint32_t table = hsize + colors * 4 + (comp == 3 ? 12 : 0);
+    uint32_t bytes = (uint32_t)((w * (int)bpp + 31) / 32 * 4) * (uint32_t)(h < 0 ? -h : h);
+    if (!bits_at) bits_at = bmi + table;                    /* a resource: the pixels follow the table */
+    if (bits_at < bmi + table || bits_at + bytes > bmi + n) return 0;
+    uint8_t info[40 + 256 * 4 + 12];
+    memset(info, 0, sizeof info);
+    memcpy(info, bmi, table < sizeof info ? table : sizeof info);
+    info[0] = 40, info[1] = info[2] = info[3] = 0;          /* any newer header, read as the 40-byte one */
+    if (hsize > 40) memmove(info + 40, bmi + hsize, table - hsize < sizeof info - 40 ? table - hsize : sizeof info - 40);
+    uint32_t *bits = NULL, hb = hle_gdi_dib_section(info, &bits);
+    if (hb && bits) memcpy(bits, bits_at, bytes);
+    return hb;
+}
+static uint32_t load_bitmap(uint32_t hinst, uint32_t name, int from_file) {
+    if (from_file) {
+        char path[1024];
+        const char *guest = (const char *)hle_ptr(name);
+        if (!guest || !hle_host_path(guest, path, sizeof path)) return 0;
+        FILE *f = fopen(path, "rb");
+        if (!f) return 0;
+        fseek(f, 0, SEEK_END);
+        long n = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        uint8_t *b = n > 54 ? (uint8_t *)malloc((size_t)n) : NULL;
+        uint32_t hb = 0;
+        if (b && fread(b, 1, (size_t)n, f) == (size_t)n && b[0] == 'B' && b[1] == 'M') {
+            uint32_t off = b[10] | b[11] << 8 | b[12] << 16 | (uint32_t)b[13] << 24;
+            hb = off < (uint32_t)n ? bitmap_from_packed(b + 14, (uint32_t)n - 14, b + off) : 0;
+        }
+        free(b);
+        fclose(f);
+        if (hle_filetrace()) fprintf(stderr, "[file] LoadImageA \"%s\" -> 0x%08X\n", guest, hb);
+        return hb;
+    }
+    uint32_t size = 0, r = hle_find_resource(hinst, name, 2);   /* RT_BITMAP */
+    uint32_t data = r ? hle_resource_data(hinst, r, &size) : 0;
+    return data ? bitmap_from_packed((const uint8_t *)hle_ptr(data), size, NULL) : 0;
+}
+static void u_LoadImageA(void) {                         /* (hinst, name, type, cx, cy, flags) */
+    if (A32(2) != 0) RET(0x1C000003u, 6);                /* an icon or a cursor: a placeholder */
+    /* one that cannot be read keeps the placeholder these always answered:
+     * titles already running here treat NULL as fatal */
+    uint32_t hb = load_bitmap(A32(0), A32(1), (A32(5) & LR_LOADFROMFILE) != 0);
+    RET(hb ? hb : 0x1C000003u, 6);
+}
+static void u_LoadBitmapA(void) {                        /* (hinst, name) */
+    uint32_t hb = load_bitmap(A32(0), A32(1), 0);
+    RET(hb ? hb : 0x1C000004u, 2);
+}
 static void u_LoadAcceleratorsA(void){ RET(0x1C000005u, 2); }  /* nonzero: games treat NULL as fatal */
 /* ---- menus ----
  * A menu is a flat list of items; a popup item carries a submenu handle. Menus
