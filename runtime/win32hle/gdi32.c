@@ -40,11 +40,10 @@ static struct { uint32_t h; uint32_t *bits; int w, h_abs, topdown; } g_dibs[MAX_
 static int g_dib_n;
 static uint32_t g_next_handle = 0xD1B00001u;
 
-/* CreateDIBSection(hdc, pbmi, usage, ppvBits, hSection, offset): allocate the
- * pixel array, hand the guest its pointer through *ppvBits, return an HBITMAP. */
-static void g_CreateDIBSection(void) {
-    const uint8_t *bmi = (const uint8_t *)APTR(1);
-    uint32_t *ppv = (uint32_t *)APTR(3);
+/* A DIB section for a BITMAPINFO (header, then masks or colour table): its
+ * pixels in guest memory, *bits_out pointing at them; the HBITMAP, or 0.
+ * CreateDIBSection, and LoadImageA's bitmaps (user32.c). */
+uint32_t hle_gdi_dib_section(const uint8_t *bmi, uint32_t **bits_out) {
     int w = bi_w(bmi), h = bi_h(bmi), bpp = bi_bpp(bmi);
     int hab = h < 0 ? -h : h;
     /* any depth gets its pixels (rows are DWORD-aligned), and a bitmap object
@@ -64,6 +63,15 @@ static void g_CreateDIBSection(void) {
         g_dibs[g_dib_n].h_abs = hab; g_dibs[g_dib_n].topdown = h < 0;
         g_dib_n++;
     }
+    if (bits_out) *bits_out = bits;
+    return handle;
+}
+
+/* CreateDIBSection(hdc, pbmi, usage, ppvBits, hSection, offset): allocate the
+ * pixel array, hand the guest its pointer through *ppvBits, return an HBITMAP. */
+static void g_CreateDIBSection(void) {
+    uint32_t *bits = NULL, *ppv = (uint32_t *)APTR(3);
+    uint32_t handle = hle_gdi_dib_section((const uint8_t *)APTR(1), &bits);
     if (ppv) *ppv = hle_va(bits);   /* the guest draws straight into this */
     RET(handle, 6);
 }

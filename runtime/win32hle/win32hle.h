@@ -269,6 +269,7 @@ int      hle_gdi_window_frame(const uint8_t **px, int *w, int *h, int *pitch, in
 void     hle_gdi_window_touched(void);                /* drawn into directly (a movie): show it */
 extern void (*hle_gdi_window_hook)(void);              /* called after a blit to it: screen.c presents */
 /* A DIB section's bitmap (gdi32.c's CreateDIBSection): bottom-up unless topdown. */
+uint32_t hle_gdi_dib_section(const uint8_t *bmi, uint32_t **bits);   /* CreateDIBSection from the host side */
 uint32_t hle_gdi_make_dib(int w, int h, int bpp, uint8_t *bits, int topdown, const uint32_t *ctab, int ncolors, int is555);
 void     hle_gdi_release_dc(uint32_t hdc);
 extern const win32hle_shim win32hle_user32[];
