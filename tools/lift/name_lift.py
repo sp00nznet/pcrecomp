@@ -344,7 +344,9 @@ def annotate_constants(text, image, vtable_class):
 
 
 def name_lift(gen_dir, image, rtti, known):
-    files = sorted(f for f in os.listdir(gen_dir) if f.endswith(('.c', '.h')))
+    # skip macOS ._* metadata files (AppleDouble, on some external drives)
+    files = sorted(f for f in os.listdir(gen_dir)
+                   if not f.startswith('._') and f.endswith(('.c', '.h')))
     texts = {f: open(os.path.join(gen_dir, f), encoding='utf-8').read() for f in files}
     if any(MARK in t for t in texts.values()):
         raise SystemExit('%s is already named: lift again first' % gen_dir)
@@ -413,6 +415,8 @@ def demo():
                 '    RECOMP_ICALL(MEM32(0x500100));\n}\n'
                 'void sub_00401100(void) {\n}\n'
                 'void sub_00401300(void) {\n    MEM32(esi) = 0x%08Xu;\n    MEM32(esi) = 0x%08Xu;\n}\n' % (vt + 4, vt))
+    with open(os.path.join(gen, '._recomp_0000.c'), 'wb') as f:   # macOS AppleDouble sidecar
+        f.write(b'\x00\x05\x16\x07\xb0\xff')
     functions = name_lift(gen, image, rtti, {})
     out = open(os.path.join(gen, 'recomp_0000.c')).read()
     assert functions[0x401000].name == 'MapClass__Init_Clear', functions[0x401000].name    # its message beats slot 0
