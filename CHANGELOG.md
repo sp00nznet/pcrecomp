@@ -6,6 +6,16 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- win32hle, for eJay 2's engine and its MFC graphics DLL (sp00nznet/ejay):
+  winmm answers as a PC with no mixer and no recording device, and has
+  `waveOutSetVolume`, `waveOutGetVolume`, `waveOutGetID` (#135); MFC's
+  start-up calls `GetProcessVersion`, `GlobalFlags`, `DuplicateHandle`,
+  `LockFile`, `UnlockFile`, `GetSysColorBrush` (#140); `LoadImageA` and
+  `LoadBitmapA` make real DIB sections from `.bmp` files and `RT_BITMAP`
+  resources (`hle_gdi_dib_section`), and `GetObjectA` (#141); `OpenFile`,
+  `_hread`, `_hwrite`, and LZ32 with SZDD expansion in `lz32.c` (#142); Small
+  Fonts, Terminal and Fixedsys are drawn unsmoothed, as Windows draws raster
+  fonts (#143).
 - native32: guest setjmp/longjmp on the C++ landing pads. A function that
   calls the guest's `setjmp` gets a landing pad after the call (pass the
   address to `lift_function_linear(eh_resume=...)`), and the host's shim for
