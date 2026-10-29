@@ -634,6 +634,23 @@ def find_splits(md, code, code_start, code_end, entries):
     `entries` gets, and keep them dispatchable.
     """
     ordered = sorted(e for e in entries if code_start <= e < code_end)
+    # Splits come in chains: Rise of Legends has 0x0063005F, 0x0063006D and
+    # 0x00630073 inside one loop at 0x0062FE40, each after a call. Each walk
+    # stops at the next false entry, so only 0x00630073 sees the back edge
+    # (to 0x00630060), and that lies below the entry just before it. Missed,
+    # the loop ran as nested calls and overflowed the host stack. So also
+    # count a back edge into code an earlier entry's own walk reaches.
+    # ponytail: looks back CHAIN entries; a longer chain stays unsplit.
+    CHAIN = 8
+    reach_of = {}
+
+    def reaches(p, t):
+        if p not in reach_of:
+            r = set()
+            true_extent(md, code, code_start, p, min(p + EXTENT_REACH, code_end), entries, reached=r)
+            reach_of[p] = r
+        return t in reach_of[p]
+
     splits = set()
     for i, e in enumerate(ordered):
         if i == 0:
@@ -641,7 +658,9 @@ def find_splits(md, code, code_start, code_end, entries):
         back = set()
         true_extent(md, code, code_start, e, min(e + EXTENT_REACH, code_end), entries,
                     behind=back)
-        if any(ordered[i - 1] <= t < e and code[t - code_start - 1] != 0xCC for t in back):
+        back = {t for t in back if t < e and code[t - code_start - 1] != 0xCC}
+        if any(ordered[i - 1] <= t for t in back) or any(
+                reaches(p, t) for t in back for p in ordered[max(0, i - CHAIN):i] if p <= t):
             splits.add(e)
     return splits
 
