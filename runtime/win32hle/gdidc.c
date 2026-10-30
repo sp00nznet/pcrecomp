@@ -40,7 +40,7 @@ typedef struct {
 static dc_t g_dc[MAX_DC], g_saved[MAX_DC];
 #define DC_BASE 0x0DC10000u
 
-typedef struct { int used; int height, weight, italic, quality; char face[32]; TTF_Font *ttf; int crisp, synth_bold, underline; } font_t;
+typedef struct { int used; int height, width, weight, italic, quality; char face[32]; TTF_Font *ttf; int crisp, synth_bold, underline; } font_t;
 #define MAX_FONTS 1024                    /* Civilization III: 37 sizes in each of 8 styles */
 static font_t g_font[MAX_FONTS];
 #define FONT_BASE 0x0DF10000u
@@ -239,7 +239,7 @@ const char *hle_font_file(const char *face, int bold, int italic) {
 }
 static font_t *FONT(uint32_t h) {
     if (h == SYSTEM_FONT || h < FONT_BASE || h - FONT_BASE >= MAX_FONTS || !g_font[h - FONT_BASE].used) {
-        static font_t sys = { 1, -11, 400, 0, 0, "MS Sans Serif", NULL };   /* 8 pt at 96 dpi: 11 px em, 13 px cell */
+        static font_t sys = { .used = 1, .height = -11, .weight = 400, .face = "MS Sans Serif" };   /* 8 pt at 96 dpi: 11 px em, 13 px cell */
         return &sys;
     }
     return &g_font[h - FONT_BASE];
@@ -289,6 +289,7 @@ static void g_CreateFontIndirectA(void) {                /* LOGFONTA: height, wi
             font_t *f = &g_font[i];
             memset(f, 0, sizeof *f);
             f->used = 1, f->height = (int)MEM32(lf), f->weight = (int)MEM32(lf + 16), f->italic = MEM8(lf + 20) != 0, f->quality = MEM8(lf + 26);
+            f->width = (int)MEM32(lf + 4);
             f->underline = MEM8(lf + 21) != 0;
             snprintf(f->face, sizeof f->face, "%s", (const char *)hle_ptr(lf + 28));
             if (win32hle_trace) fprintf(stderr, "[gdi] CreateFontIndirectA(\"%s\", height %d, width %d, weight %d, italic %d, underline %d, quality %d)\n",
@@ -594,6 +595,17 @@ static void g_SetGraphicsMode(void) { RET(1u, 2); }
 static void g_ModifyWorldTransform(void) { RET(1, 3); }
 
 /* ---- text ---- */
+/* LOGFONT's lfWidth: a font asked for at an average character width of its
+ * own is the TrueType face stretched or squeezed across, so that its average
+ * width (tmAveCharWidth, an 'x' here) is that. 1.0 when the width is 0, the
+ * face's own. */
+static float hscale(const font_t *f, TTF_Font *t) {
+    int ave = 0, h;
+    if (!f || f->width <= 0 || !t || TTF_SizeText(t, "x", &ave, &h) != 0 || ave <= 0) return 1.0f;
+    return (float)f->width / (float)ave;
+}
+static int scaled(int w, float sx) { return sx == 1.0f ? w : (int)((float)w * sx + 0.5f); }
+
 static void g_GetTextExtentPoint32A(void) {              /* (hdc, text, n, &SIZE) */
     dc_t *d = DC(A32(0));
     font_t *f = FONT(d ? d->font : SYSTEM_FONT);
@@ -604,6 +616,7 @@ static void g_GetTextExtentPoint32A(void) {              /* (hdc, text, n, &SIZE
         if (n >= (int)sizeof buf) n = sizeof buf - 1;
         memcpy(buf, APTR(1), (size_t)n), buf[n] = 0;
         TTF_SizeText(t, buf, &w, &h);
+        w = scaled(w, hscale(f, t));
         if (f->synth_bold) w += n;                       /* a pixel more per character */
     } else if (t) {
         w = 0, h = TTF_FontHeight(t);
@@ -620,6 +633,7 @@ static void g_GetTextMetricsA(void) {                    /* TEXTMETRICA */
     memset(hle_ptr(m), 0, 56);
     int asc = t ? TTF_FontAscent(t) : 10, desc = t ? -TTF_FontDescent(t) : 3, ave = 6, max = 12;
     if (t) { int w; TTF_SizeText(t, "x", &ave, &w); TTF_SizeText(t, "W", &max, &w); }
+    if (f->width > 0) max = scaled(max, hscale(f, t)), ave = f->width;
     int em = f->height < 0 ? -f->height : f->height > 0 ? f->height * 87 / 100 : 11, bold = f->synth_bold;
     MEM32(m) = (uint32_t)(asc + desc), MEM32(m + 4) = (uint32_t)asc, MEM32(m + 8) = (uint32_t)desc;
     MEM32(m + 12) = (uint32_t)(asc + desc > em ? asc + desc - em : 0);   /* tmInternalLeading: the cell above the em */
@@ -697,6 +711,24 @@ static SDL_Surface *render(const font_t *f, TTF_Font *t, const char *s) {
     SDL_Color white = { 255, 255, 255, 255 };
     return f->crisp ? TTF_RenderText_Solid(t, s, white) : TTF_RenderText_Blended(t, s, white);
 }
+/* The ink stretched or squeezed across to a width of nw, each new column
+ * the average of the old ones it covers. */
+static uint8_t *ink_scale(uint8_t *ink, int iw, int ih, int nw) {
+    if (nw < 1) nw = 1;
+    uint8_t *out = (uint8_t *)calloc((size_t)nw * (size_t)ih + 1, 1);
+    for (int x = 0; x < nw; x++) {
+        int a = x * iw / nw, b = (x + 1) * iw / nw;
+        if (b <= a) b = a + 1;
+        if (b > iw) b = iw;
+        for (int y = 0; y < ih; y++) {
+            int sum = 0;
+            for (int k = a; k < b; k++) sum += ink[y * iw + k];
+            out[y * nw + x] = (uint8_t)(b > a ? sum / (b - a) : 0);
+        }
+    }
+    free(ink);
+    return out;
+}
 static uint8_t *text_ink(const font_t *f, TTF_Font *t, const char *buf, int n, int *iw, int *ih) {
     int w, h;
     if (TTF_SizeText(t, buf, &w, &h) != 0) return NULL;
@@ -731,6 +763,11 @@ static void g_TextOutA(void) {                           /* (hdc, x, y, text, n)
     int iw, ih;
     uint8_t *ink = text_ink(f, t, buf, n, &iw, &ih);
     if (!ink) RET(1, 5);
+    float sx = hscale(f, t);
+    if (sx != 1.0f) {
+        int nw = scaled(iw, sx);
+        ink = ink_scale(ink, iw, ih, nw), iw = nw < 1 ? 1 : nw;
+    }
     int x = (int)A32(1) - d->wox + d->vox, y = (int)A32(2) - d->woy + d->voy;
     if ((d->align & 6) == 6) x -= iw / 2;                /* TA_CENTER */
     else if (d->align & 2) x -= iw;                      /* TA_RIGHT */
