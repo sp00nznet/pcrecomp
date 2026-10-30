@@ -6,6 +6,14 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- `ports/`: the console, Android and browser build kit from SkiFree and Link's
+  Awakening DX portable: the Docker driver with the game taken out
+  (`setup-consoles.sh`), `sdl2lite` for toolchains with no SDL2, and each
+  target's build recipe. docs/PORTS.md has the targets and what a lift needs.
+- dos32: `DOS32_SMALL_HOST` puts guest memory in one block (`DOS32_MEM`,
+  default 64 MB) instead of a 4 GB reservation, with the frame buffer and the
+  default handlers at its top, for 32-bit hosts. Theme Park passes its
+  conformance script (6/6) this way on Linux.
 - win32hle: a browser host (Emscripten/WebAssembly): the guest image in linear
   memory, DirectSound through a shared-memory ring an AudioWorklet drains,
   frames to the page's WebGL presenter, Bink movies played by the page. For

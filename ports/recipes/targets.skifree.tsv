@@ -1,0 +1,17 @@
+# Every target setup-consoles.sh / tools/setup-consoles.ps1 builds, one per line, tab-separated:
+#   target  image  command (run by sh in the image, in /src = this repo)  files to collect from build-<target>/  state
+# "state" is what's known to work. Update it when someone runs a build; the
+# setup prints it beside each result, and the README's table says the same.
+wasm	emscripten/emsdk	bash scripts/build_wasm.sh /src/build-wasm	skifree.html skifree.js skifree.wasm	Runs in a browser (title screen, sounds load)
+psp	pspdev/pspdev	apk add -q bash >/dev/null 2>&1; bash scripts/build_psp.sh /src/build-psp	EBOOT.PBP	Runs in PPSSPP (title screen)
+android	skifree-android	bash scripts/build_android.sh /src/build-android	skifree.apk	Runs in the Android emulator (x86_64; arm64-v8a built too), touch steers
+3ds	devkitpro/devkitarm	bash scripts/build_3ds.sh /src/build-3ds	skifree.3dsx	Runs in Azahar (title screen, 60 fps)
+vita	vitasdk/vitasdk	bash scripts/build_vita.sh /src/build-vita	skifree.vpk	Runs in Vita3K (title screen, 61 fps)
+wii	devkitpro/devkitppc	bash scripts/build_wii.sh /src/build-wii	skifree.dol	Runs in Dolphin (title screen)
+gamecube	devkitpro/devkitppc	bash scripts/build_gamecube.sh /src/build-gamecube	skifree.dol	Runs in Dolphin (title screen)
+dreamcast	kazade/dreamcast-sdk	bash scripts/build_dreamcast.sh /src/build-dreamcast	skifree.elf skifree.cdi	Boots to the title screen in Flycast
+ps3	ps3dev/ps3dev:submodules	bash scripts/build_ps3.sh /src/build-ps3	EBOOT.BIN	Runs in RPCS3 (title screen, ~60 fps)
+xenon	free60/libxenon	bash scripts/build_libxenon.sh /src/build-xenon	skifree.elf32	Xbox 360: builds; untested (no emulator runs libxenon homebrew; needs RGH/JTAG)
+ps2	ps2dev/ps2dev	apk add -q bash >/dev/null 2>&1; bash scripts/build_ps2.sh /src/build-ps2	skifree.elf	Runs in PCSX2 (title screen, 60 fps)
+xbox	ghcr.io/xboxdev/nxdk	apk add -q bash >/dev/null 2>&1; bash scripts/build_xbox.sh /src/build-xbox	skifree.xbe skifree.iso	Original Xbox: runs in xemu (title screen)
+ps4	openorbisofficial/toolchain	bash scripts/build_ps4.sh /src/build-ps4	skifree.pkg	Builds; untested (no PS4 emulator; installs on a jailbroken PS4)
