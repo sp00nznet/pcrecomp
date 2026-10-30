@@ -6,6 +6,12 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- pe: `pdb2_ref.py` reads a Visual C++ 5/6 PDB (MSF 2.00, `_ST` symbol
+  records), which llvm-pdbutil and `pdb_ref.py` cannot, into the same
+  reference JSON, plus a `--seed-functions` list for disasm32. No external
+  tool; `--selftest`. MechCommander 2 ships its release PDB on the disc:
+  9,776 functions, 5,525 with sizes. Scored against it, unseeded disasm32 is
+  89.7% precise and 85.4% complete; seeded, complete to 99.99%.
 - win32hle: a browser host (Emscripten/WebAssembly): the guest image in linear
   memory, DirectSound through a shared-memory ring an AudioWorklet drains,
   frames to the page's WebGL presenter, Bink movies played by the page. For
