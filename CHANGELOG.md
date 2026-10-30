@@ -14,6 +14,10 @@ versions follow [SemVer](https://semver.org/).
   default 64 MB) instead of a 4 GB reservation, with the frame buffer and the
   default handlers at its top, for 32-bit hosts. Theme Park passes its
   conformance script (6/6) this way on Linux.
+- recomp32: `RECOMP_ITAIL` is a `musttail` call under clang, and its
+  unresolved-target report moved out of line. Without that, wasm turned each
+  jump between the pieces of a split loop into a nested call, and Theme Park's
+  intro overflowed the browser's stack in seconds.
 - win32hle: a browser host (Emscripten/WebAssembly): the guest image in linear
   memory, DirectSound through a shared-memory ring an AudioWorklet drains,
   frames to the page's WebGL presenter, Bink movies played by the page. For

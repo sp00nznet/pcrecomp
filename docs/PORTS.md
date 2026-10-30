@@ -43,6 +43,10 @@ pcrecomp title can use it:
   guest needs no signals. A title's host may still use threads (Theme Park's
   game thread, its audio feeder); the browser needs `-pthread` and a page
   served cross-origin isolated, or the game loop moved onto `ASYNCIFY`.
+- **Tail calls.** A loop the lift splits across functions jumps from one to
+  the next with `RECOMP_ITAIL`. Native compilers make those jumps; wasm grows
+  the stack on each and overflows it within seconds. `RECOMP_ITAIL` now uses
+  clang's `musttail`, so build wasm with `-mtail-call`.
 - **Code size.** A lift is tens of MB of C. LA's notes: split it across
   files, and expect slow PowerPC and wasm compiles.
 
@@ -54,5 +58,4 @@ order, Dreamcast RAM).
 
 | Title | Runtime | Status |
 |---|---|---|
-| Theme Park | dos32 | Small-host layout passes conformance on Linux. Next: the browser. |
-| Civilization | recomp16 | Picked second: a 1 MB real-mode machine, so it fits every target, the 16 MB Dreamcast included, and opens the other DOS runtime (DinoPark, Bolo, Coaster). |
+| Theme Park | dos32 | Plays in Chrome: intro, menus, a new park with its clock running (themepark's `wasm` branch). No music yet. |
