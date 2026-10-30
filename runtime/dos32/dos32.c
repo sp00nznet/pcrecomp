@@ -18,7 +18,8 @@
  * DOS32_SMALL_HOST (a host that cannot reserve 4 GB: 32-bit, a browser, a
  * console) puts everything in one block of DOS32_MEM bytes instead, with the
  * frame buffer and the default handlers moved down to its top. The guest is
- * told where they are, so nothing in the lift changes.
+ * told where they are, so nothing in the lift changes, and the heap starts
+ * just past the program instead of at 16 MB.
  * ponytail: no guard pages there; a stray guest access past the block
  * corrupts host memory instead of faulting.
  *
@@ -65,7 +66,9 @@
 #include <sched.h>
 #include <signal.h>
 #include <strings.h>
+#ifndef DOS32_SMALL_HOST
 #include <sys/mman.h>
+#endif
 #if defined(__x86_64__) && defined(__linux__)
 #include <ucontext.h>
 #endif
@@ -187,7 +190,7 @@ void (*dos32_on_retrace)(void);
 #define VRAM_SIZE    0x00400000u   /* 4 MB, 1024x768x8 with room */
 #ifdef DOS32_SMALL_HOST
 #ifndef DOS32_MEM
-#define DOS32_MEM    0x04000000u   /* 64 MB in all: a 43 MB heap */
+#define DOS32_MEM    0x04000000u   /* 64 MB in all */
 #endif
 #define HOSTVEC_VA   (DOS32_MEM - 0x10000u)
 #define LFB_VA       (HOSTVEC_VA - VRAM_SIZE)
@@ -1158,8 +1161,8 @@ static void int31(regs_t* r) {
     case 0x0400: SET16(r->eax, 0x005A); SET16(r->ebx, 0x0005); SET8L(r->ecx, 5); SET16(r->edx, 0x0870); OK(r); break;
     case 0x0500: { uint32_t p = es_ptr(r, edi), fb = arena_free_bytes(&heap);
         for (int i = 0; i < 12; i++) R32(p + i * 4) = 0xFFFFFFFFu;
-        R32(p) = fb; R32(p + 4) = fb >> 12; R32(p + 8) = fb >> 12; R32(p + 0xC) = (HEAP_HI - HEAP_LO) >> 12;
-        R32(p + 0x10) = fb >> 12; R32(p + 0x14) = fb >> 12; R32(p + 0x18) = (HEAP_HI - HEAP_LO) >> 12;
+        R32(p) = fb; R32(p + 4) = fb >> 12; R32(p + 8) = fb >> 12; R32(p + 0xC) = (heap.hi - heap.lo) >> 12;
+        R32(p + 0x10) = fb >> 12; R32(p + 0x14) = fb >> 12; R32(p + 0x18) = (heap.hi - heap.lo) >> 12;
         R32(p + 0x1C) = fb >> 12; R32(p + 0x20) = 0;
         OK(r); break; }
     case 0x0501: {
@@ -1414,6 +1417,9 @@ static void watch_faults(void) {
         WaitForSingleObject(CreateThread(NULL, 0, set_watchpoint, NULL, 0, NULL), INFINITE);
     }
 }
+#elif !defined(__unix__) && !defined(__APPLE__)
+/* No signals to catch faults with (a console): a fault is the host's own. */
+static void watch_faults(void) {}
 #else
 static void on_signal(int sig, siginfo_t* si, void* uc) {
     int access = sig == SIGSEGV || sig == SIGBUS ? -1 : 0;
@@ -1549,12 +1555,15 @@ static void reset_machine(void) {
 #define STATE_RESET(v) memcpy(&(v), p, sizeof(v)); p += sizeof(v);
     STATE_VARS(STATE_RESET)
     for (int i = 5; i < NFILES; i++) if (fh[i] >= 0) _close(fh[i]);
-#ifdef _WIN32
+#if defined(DOS32_SMALL_HOST)
+    /* the block is kept for the next program; run clears it */
+#elif defined(_WIN32)
     VirtualFree(M, 0, MEM_RELEASE);
+    M = NULL;
 #else
     munmap(M, 0x100000000ull);
-#endif
     M = NULL;
+#endif
     free(vram);
     vram = NULL;
     g_if = 1; in_irq = 0;
@@ -1606,6 +1615,13 @@ int dos32_run(const dos32_config* cfg) {
     g_mem_base = (ptrdiff_t)M;
     vram = calloc(1, VRAM_SIZE);
     memcpy(LIN(cfg->image_base), cfg->image, cfg->image_size);
+#ifdef DOS32_SMALL_HOST
+    /* Every byte counts here: the heap starts just past the program. */
+    {
+        uint32_t end = (cfg->image_base + cfg->image_size + 0xFFFFu) & ~0xFFFFu;
+        heap.lo = end > 0x00100000u ? end : 0x00100000u;
+    }
+#endif
 
     /* Selectors: flat code and data, the PSP and the environment. */
     sel_set(SEL_CODE, 0, 0xFFFFFFFFu);

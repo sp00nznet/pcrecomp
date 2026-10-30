@@ -58,4 +58,4 @@ order, Dreamcast RAM).
 
 | Title | Runtime | Status |
 |---|---|---|
-| Theme Park | dos32 | Plays in Chrome: intro, menus, a new park with its clock running (themepark's `wasm` branch). No music yet. |
+| Theme Park | dos32 | Plays in Chrome (themepark's `wasm` branch) and on the 3DS in Azahar (`3ds` branch: stylus is the mouse, the top screen a 1:1 close-up). 16 MB of guest memory is enough. No music yet. |

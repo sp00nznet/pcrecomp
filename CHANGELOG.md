@@ -14,6 +14,10 @@ versions follow [SemVer](https://semver.org/).
   default 64 MB) instead of a 4 GB reservation, with the frame buffer and the
   default handlers at its top, for 32-bit hosts. Theme Park passes its
   conformance script (6/6) this way on Linux.
+- dos32 on a console: in small-host mode the heap starts just past the
+  program (not at 16 MB), a second program reuses the block instead of
+  unmapping 4 GB it never mapped, and a host without signals (the 3DS)
+  builds. Theme Park needs 16 MB in all and runs on a 3DS with 24.
 - recomp32: `RECOMP_ITAIL` is a `musttail` call under clang, and its
   unresolved-target report moved out of line. Without that, wasm turned each
   jump between the pieces of a split loop into a nested call, and Theme Park's
