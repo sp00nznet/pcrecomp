@@ -1193,6 +1193,29 @@ recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
 } while(0)
 
 /* Indirect tail call (jmp through dispatch) */
+/* The report out of line: an fprintf inside the macro gives every lifted
+ * function a stack frame to pop after the call, so the call is no longer a
+ * tail call. Native compilers jump anyway; wasm (-mtail-call) does not, and a
+ * loop split across functions then overflows the browser's stack. */
+/* A lifted RECOMP_ITAIL is always followed by a return (lift32, generate),
+ * so the call may return for it: clang's musttail makes it a jump, which wasm
+ * needs (-mtail-call) and native code gets anyway. The registers are already
+ * out, so skipping the caller's RECOMP_REGS_IN/OUT changes nothing. */
+#if defined(__clang__) && defined(__has_attribute)
+#if __has_attribute(musttail)
+#define RECOMP_TAIL_CALL(fn) __attribute__((musttail)) return (fn)()
+#endif
+#endif
+#ifndef RECOMP_TAIL_CALL
+#define RECOMP_TAIL_CALL(fn) do { (fn)(); RECOMP_REGS_IN(); } while (0)
+#endif
+#ifdef _MSC_VER
+static __declspec(noinline) void recomp_itail_miss(uint32_t va) {
+#else
+static __attribute__((noinline, cold, unused)) void recomp_itail_miss(uint32_t va) {
+#endif
+    fprintf(stderr, "ITAIL: unresolved VA 0x%08X from 0x%08X\n", va, g_cur_func);
+}
 #define RECOMP_ITAIL(target_va) do { \
     uint32_t _va = (uint32_t)(target_va); \
     g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
@@ -1202,10 +1225,10 @@ recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_import(_va); \
-    if (_fn) { RECOMP_FLAGS_OUT(); RECOMP_REGS_OUT(); _fn(); RECOMP_REGS_IN(); } \
+    if (_fn) { RECOMP_FLAGS_OUT(); RECOMP_REGS_OUT(); RECOMP_TAIL_CALL(_fn); } \
     else if (_va == RECOMP_RETADDR) { /* setjmp and friends return by jumping \
         to the saved return address; that is a return, not a missing target. */ } \
-    else { fprintf(stderr, "ITAIL: unresolved VA 0x%08X from 0x%08X\n", _va, g_cur_func); } \
+    else recomp_itail_miss(_va); \
 } while(0)
 
 /* `push target; ret` (Lifter dos=True): a jump to a computed address. Its own

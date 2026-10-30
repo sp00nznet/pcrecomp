@@ -15,6 +15,14 @@
  *   HEAP_LO     DPMI 0501h / int 21h 48h blocks
  *   LFB_VA      the VESA linear frame buffer
  *
+ * DOS32_SMALL_HOST (a host that cannot reserve 4 GB: 32-bit, a browser, a
+ * console) puts everything in one block of DOS32_MEM bytes instead, with the
+ * frame buffer and the default handlers moved down to its top. The guest is
+ * told where they are, so nothing in the lift changes, and the heap starts
+ * just past the program instead of at 16 MB.
+ * ponytail: no guard pages there; a stray guest access past the block
+ * corrupts host memory instead of faulting.
+ *
  * Low memory: Watcom's startup reads the command tail with `repe scasb` and
  * the environment through ds, and the lifter treats both as flat (base 0),
  * while the PSP's own fields are read through es: with a real base. So the
@@ -58,8 +66,12 @@
 #include <sched.h>
 #include <signal.h>
 #include <strings.h>
+#ifndef DOS32_SMALL_HOST
 #include <sys/mman.h>
+#endif
+#if defined(__x86_64__) && defined(__linux__)
 #include <ucontext.h>
+#endif
 #include <unistd.h>
 typedef pthread_mutex_t CRITICAL_SECTION;
 static void InitializeCriticalSection(CRITICAL_SECTION* m) {   /* recursive, as Windows' are */
@@ -172,14 +184,24 @@ volatile int dos32_quit;
 void (*dos32_on_retrace)(void);
 
 /* ---- layout ------------------------------------------------------------- */
-#define COMMIT_SIZE  0x10000000u   /* 256 MB, demand-zero */
 #define HEAP_LO      0x01000000u
-#define HEAP_HI      0x05000000u   /* 64 MB: more than any DOS game expects */
 #define CONV_LO      0x00001000u
 #define CONV_HI      0x0009F000u
-#define LFB_VA       0xE0000000u
 #define VRAM_SIZE    0x00400000u   /* 4 MB, 1024x768x8 with room */
+#ifdef DOS32_SMALL_HOST
+#ifndef DOS32_MEM
+#define DOS32_MEM    0x04000000u   /* 64 MB in all */
+#endif
+#define HOSTVEC_VA   (DOS32_MEM - 0x10000u)
+#define LFB_VA       (HOSTVEC_VA - VRAM_SIZE)
+#define HEAP_HI      LFB_VA
+#define COMMIT_SIZE  DOS32_MEM
+#else
+#define COMMIT_SIZE  0x10000000u   /* 256 MB, demand-zero */
+#define HEAP_HI      0x05000000u   /* 64 MB: more than any DOS game expects */
+#define LFB_VA       0xE0000000u
 #define HOSTVEC_VA   0xFFF00000u   /* default interrupt handlers live here */
+#endif
 
 #define SEL_CODE 0x0170
 #define SEL_DATA 0x0178
@@ -267,7 +289,7 @@ static void int_stub(void) { recomp_int(stub_n); g_esp += 4; }
 
 recomp_func_t recomp_lookup_manual(uint32_t va) {
     if (va - HOSTVEC_VA < 256 * 16) { hostvec_n = (va - HOSTVEC_VA) / 16; return hostvec_default; }
-    if (va - 0x1000u < 0x0F000000u && R8(va) == 0xCD && R8(va + 2) == 0xC3) { stub_n = R8(va + 1); return int_stub; }
+    if (va - 0x1000u < COMMIT_SIZE - 0x1000u && R8(va) == 0xCD && R8(va + 2) == 0xC3) { stub_n = R8(va + 1); return int_stub; }
     return NULL;
 }
 recomp_func_t recomp_lookup_import(uint32_t va) { (void)va; return NULL; }
@@ -1139,8 +1161,8 @@ static void int31(regs_t* r) {
     case 0x0400: SET16(r->eax, 0x005A); SET16(r->ebx, 0x0005); SET8L(r->ecx, 5); SET16(r->edx, 0x0870); OK(r); break;
     case 0x0500: { uint32_t p = es_ptr(r, edi), fb = arena_free_bytes(&heap);
         for (int i = 0; i < 12; i++) R32(p + i * 4) = 0xFFFFFFFFu;
-        R32(p) = fb; R32(p + 4) = fb >> 12; R32(p + 8) = fb >> 12; R32(p + 0xC) = (HEAP_HI - HEAP_LO) >> 12;
-        R32(p + 0x10) = fb >> 12; R32(p + 0x14) = fb >> 12; R32(p + 0x18) = (HEAP_HI - HEAP_LO) >> 12;
+        R32(p) = fb; R32(p + 4) = fb >> 12; R32(p + 8) = fb >> 12; R32(p + 0xC) = (heap.hi - heap.lo) >> 12;
+        R32(p + 0x10) = fb >> 12; R32(p + 0x14) = fb >> 12; R32(p + 0x18) = (heap.hi - heap.lo) >> 12;
         R32(p + 0x1C) = fb >> 12; R32(p + 0x20) = 0;
         OK(r); break; }
     case 0x0501: {
@@ -1342,7 +1364,7 @@ static void fault_report(const char* what, uintptr_t a, int access) {
     fprintf(stderr, "  guest stack:");
     for (int i = 0; i < 16; i++) {
         uint32_t v = g_esp + i * 4;
-        if (v - 0x1000u < 0x0F000000u) fprintf(stderr, "%s%08X", i % 8 ? " " : "\n    ", R32(v));
+        if (v - 0x1000u < COMMIT_SIZE - 0x1000u) fprintf(stderr, "%s%08X", i % 8 ? " " : "\n    ", R32(v));
     }
     fprintf(stderr, "\n");
     fflush(stderr);
@@ -1395,6 +1417,9 @@ static void watch_faults(void) {
         WaitForSingleObject(CreateThread(NULL, 0, set_watchpoint, NULL, 0, NULL), INFINITE);
     }
 }
+#elif !defined(__unix__) && !defined(__APPLE__)
+/* No signals to catch faults with (a console): a fault is the host's own. */
+static void watch_faults(void) {}
 #else
 static void on_signal(int sig, siginfo_t* si, void* uc) {
     int access = sig == SIGSEGV || sig == SIGBUS ? -1 : 0;
@@ -1530,12 +1555,15 @@ static void reset_machine(void) {
 #define STATE_RESET(v) memcpy(&(v), p, sizeof(v)); p += sizeof(v);
     STATE_VARS(STATE_RESET)
     for (int i = 5; i < NFILES; i++) if (fh[i] >= 0) _close(fh[i]);
-#ifdef _WIN32
+#if defined(DOS32_SMALL_HOST)
+    /* the block is kept for the next program; run clears it */
+#elif defined(_WIN32)
     VirtualFree(M, 0, MEM_RELEASE);
+    M = NULL;
 #else
     munmap(M, 0x100000000ull);
-#endif
     M = NULL;
+#endif
     free(vram);
     vram = NULL;
     g_if = 1; in_irq = 0;
@@ -1563,7 +1591,11 @@ int dos32_run(const dos32_config* cfg) {
 
     /* 4 GB of address space, so every 32-bit guest address is ours; only what
      * is used is committed. */
-#ifdef _WIN32
+#if defined(DOS32_SMALL_HOST)
+    if (!M) M = malloc(DOS32_MEM);
+    if (!M) { fprintf(stderr, "dos32: cannot allocate %u bytes of guest memory\n", DOS32_MEM); return 255; }
+    memset(M, 0, DOS32_MEM);
+#elif defined(_WIN32)
     M = VirtualAlloc(NULL, 0x100000000ull, MEM_RESERVE, PAGE_NOACCESS);
     if (!M || !VirtualAlloc(M, COMMIT_SIZE, MEM_COMMIT, PAGE_READWRITE) ||
         !VirtualAlloc(M + LFB_VA, VRAM_SIZE, MEM_COMMIT, PAGE_READWRITE) ||
@@ -1583,6 +1615,13 @@ int dos32_run(const dos32_config* cfg) {
     g_mem_base = (ptrdiff_t)M;
     vram = calloc(1, VRAM_SIZE);
     memcpy(LIN(cfg->image_base), cfg->image, cfg->image_size);
+#ifdef DOS32_SMALL_HOST
+    /* Every byte counts here: the heap starts just past the program. */
+    {
+        uint32_t end = (cfg->image_base + cfg->image_size + 0xFFFFu) & ~0xFFFFu;
+        heap.lo = end > 0x00100000u ? end : 0x00100000u;
+    }
+#endif
 
     /* Selectors: flat code and data, the PSP and the environment. */
     sel_set(SEL_CODE, 0, 0xFFFFFFFFu);

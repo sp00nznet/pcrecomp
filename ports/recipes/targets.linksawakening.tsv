@@ -1,0 +1,17 @@
+# Every target setup.sh / tools/setup.ps1 builds, one per line, tab-separated:
+#   target  image  command (run by bash in the image, in /src = this repo)  files to collect from build-<target>/  state
+# "state" is what's known to work. Update it when someone runs a build; the
+# setup prints it beside each result, and the README's table says the same.
+wii	devkitpro/devkitppc	bash scripts/build_wii.sh /src/build-wii	la360.dol	Runs in Dolphin (title screen and intro)
+gamecube	devkitpro/devkitppc	bash scripts/build_gamecube.sh /src/build-gamecube	la360.dol	Builds; not run yet
+3ds	devkitpro/devkitarm	bash scripts/build_3ds.sh /src/build-3ds	la360.3dsx	Plays in Azahar and on a New 2DS XL
+ps4	openorbisofficial/toolchain	bash scripts/build_ps4.sh /src/build-ps4 && bash scripts/package_ps4.sh /src/build-ps4	linksawakening.pkg	Plays on real hardware
+ps3	ps3dev/ps3dev:submodules	bash scripts/build_ps3.sh	EBOOT.BIN	Plays in RPCS3 (~56 fps)
+ps2	ps2dev/ps2dev	apk add -q bash >/dev/null 2>&1; bash scripts/build_ps2.sh /src/build-ps2	la360.elf	Builds; not run yet
+psp	pspdev/pspdev	bash scripts/build_psp.sh /src/build-psp	EBOOT.PBP	Builds; not run yet
+vita	vitasdk/vitasdk	bash scripts/build_vita.sh /src/build-vita	la360.vpk	Builds; not run yet
+dreamcast	kazade/dreamcast-sdk	OPT=-Os bash scripts/build_dreamcast.sh /src/build-dreamcast	la360.elf	Boots to the title screen in Flycast; not full speed
+android	linksawakening-android	bash scripts/build_android.sh /src/build-android	linksawakening.apk	Runs in the Android emulator (title screen)
+wasm	emscripten/emsdk	bash scripts/build_wasm.sh /src/build-wasm	linksawakening.html linksawakening.js linksawakening.wasm	Runs in a browser
+xenon	free60/libxenon	bash scripts/build_libxenon.sh /src/build-xenon	la360.elf32	Xbox 360: builds; untested (Xenia can't run libxenon homebrew; needs RGH/JTAG hardware)
+xbox	ghcr.io/xboxdev/nxdk	sh scripts/build_xbox.sh	linksawakening.xbe linksawakening.iso	Original Xbox: builds; hangs at the Xbox logo in xemu
