@@ -87,9 +87,17 @@ static inline void fmt_unpack(const rfmt_t *f, uint32_t v, float c[4]) {
 }
 /* The texture as ARGB8888, remade when its pixels or key have changed. */
 static void tex_cache(surf_t *t) {
-    if (t->argb && t->argb_gen == t->gen) return;
+    if (t->argb && t->argb_gen == t->gen && t->argb_w == t->w && t->argb_h == t->h) return;
     size_t n = (size_t)t->w * (size_t)t->h;
-    if (!t->argb) t->argb = (uint32_t *)malloc(n * 4), t->keyed = (uint8_t *)malloc(n);
+    if (t->argb && (t->argb_w != t->w || t->argb_h != t->h)) {   /* resized (SetSurfaceDesc): a new cache */
+        free(t->argb), free(t->keyed);
+        t->argb = NULL, t->keyed = NULL;
+    }
+    if (!t->argb) {
+        t->argb = (uint32_t *)malloc(n * 4), t->keyed = (uint8_t *)malloc(n);
+        if (!t->argb || !t->keyed) hle_fatal("no memory for a %dx%d texture's cache", t->w, t->h);
+        t->argb_w = t->w, t->argb_h = t->h;
+    }
     for (int y = 0; y < t->h; y++)
         for (int x = 0; x < t->w; x++) {
             float c[4];
