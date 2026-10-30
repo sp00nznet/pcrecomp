@@ -1074,13 +1074,17 @@ static inline void fp_st80(uint8_t* p, double v) {
  * unimplemented SIMD sites against a handful of x87 ones). */
 RECOMP_WEAK uint32_t g_cpuid_edx1 = 0xFFFFFFFFu, g_cpuid_ecx1 = 0xFFFFFFFFu;
 RECOMP_WEAK uint32_t g_cpuid_edx_ext = 0xFFFFFFFFu;
+/* Nonzero replaces leaf 1's family/model/stepping (eax). Some libraries pick
+ * SIMD paths by family alone (Crypto++ on family 0xF), past the feature bits. */
+RECOMP_WEAK uint32_t g_cpuid_signature = 0;
 
 static inline void CPUID_impl(uint32_t eax_val, uint32_t ebx_val, uint32_t ecx_val, uint32_t edx_val) {
 #ifdef _MSC_VER
     int info[4];
     __cpuidex(info, eax_val, ecx_val);
     g_eax = info[0]; g_ebx = info[1]; g_ecx = info[2]; g_edx = info[3];
-    if (eax_val == 1) { g_edx &= g_cpuid_edx1; g_ecx &= g_cpuid_ecx1; }
+    if (eax_val == 1) { g_edx &= g_cpuid_edx1; g_ecx &= g_cpuid_ecx1;
+                        if (g_cpuid_signature) g_eax = g_cpuid_signature; }
     if (eax_val == 0x80000001u) g_edx &= g_cpuid_edx_ext;
     (void)ebx_val; (void)edx_val;
 #else
