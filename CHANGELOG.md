@@ -86,6 +86,12 @@ versions follow [SemVer](https://semver.org/).
   at 0 all eight showed the same tool.
 
 ### Fixed
+- generate: `find_splits` catches chains of false entries. Each false entry's
+  walk stops at the next one, so only the last sees the loop's back edge, and it
+  lands below the entry just before it. A back edge into code an earlier
+  entry's own walk reaches now counts too (looks back 8 entries). Rise of
+  Legends: 309 -> 428 splits; a per-unit loop ran as one nested C call per
+  iteration and overflowed the host stack on starting a match.
 - `tools/drm/unlzexe.py`: malformed LZEXE streams are rejected: header and
   loader sizes, both relocation-table formats, and back-references before the
   start of the output (which read from its end through negative indexing).
