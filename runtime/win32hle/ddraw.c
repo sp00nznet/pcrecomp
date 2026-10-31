@@ -84,6 +84,16 @@ static uint32_t g_vt_dd, g_vt_dd2, g_vt_dd4, g_vt_surf, g_vt_pal, g_vt_clip;
 static uint32_t g_dd, g_dd2, g_dd4;                      /* the one DirectDraw object, all three faces */
 static volatile unsigned g_frame_seq;                    /* bumped when the primary may have changed */
 
+/* Hooks for Direct3D's renderer (d3d.c, ddraw_int.h): ACCESS before DirectDraw
+ * reads or writes any surface, TOUCH for each one it does. */
+void (*hle_dd_access_hook)(void);
+void (*hle_dd_sync_hook)(surf_t *s);
+int (*hle_dd_blit_hook)(surf_t *d, int dl, int dt, int dr, int db, surf_t *s, int sl, int st, int sr, int sb,
+                        int keyed, uint32_t klo, uint32_t khi);
+void (*hle_dd_frame_hook)(void);
+#define ACCESS() do { if (hle_dd_access_hook) hle_dd_access_hook(); } while (0)
+#define TOUCH(s) do { if (hle_dd_sync_hook && (s)) hle_dd_sync_hook(s); } while (0)
+
 /* The host state behind an object is in guest memory too (hle_alloc), so
  * the object holds its VA at +8. */
 #define S(self) ((surf_t *)hle_ptr(MEM32((self) + 8)))
@@ -92,6 +102,7 @@ static volatile unsigned g_frame_seq;                    /* bumped when the prim
 /* What the presenter shows: the primary's pixels and their format. 0 if
  * there is no primary yet. */
 int hle_dd_frame(const uint8_t **px, int *w, int *h, int *pitch, int *bpp, const uint32_t **palette, unsigned *seq) {
+    if (hle_dd_frame_hook) hle_dd_frame_hook();
     surf_t *s = g_primary;
     if (!s) return 0;
     *px = s->px, *w = s->w, *h = s->h, *pitch = s->pitch, *bpp = s->bpp;
@@ -104,11 +115,10 @@ int hle_dd_frame(const uint8_t **px, int *w, int *h, int *pitch, int *bpp, const
 int hle_dd_surface_pixels(uint32_t obj, uint8_t **px, int *w, int *h, int *pitch, int *bpp) {
     if (!obj || !g_vt_surf || MEM32(obj) != g_vt_surf) return 0;
     surf_t *s = S(obj);
+    TOUCH(s);
     *px = s->px, *w = s->w, *h = s->h, *pitch = s->pitch, *bpp = s->bpp;
     return 1;
 }
-void (*hle_dd_access_hook)(void);
-#define ACCESS() do { if (hle_dd_access_hook) hle_dd_access_hook(); } while (0)
 surf_t *hle_dd_surf(uint32_t obj) {
     if (!obj || !g_vt_surf || MEM32(obj) != g_vt_surf) return NULL;
     return S(obj);
@@ -164,7 +174,10 @@ static uint32_t new_surface(int w, int h, int bpp, uint32_t caps, int primary) {
     s->self = o;
     return o;
 }
+void (*hle_dd_free_hook)(surf_t *s);
+void (*hle_dd_flip_hook)(surf_t *front, surf_t *back);
 static void free_surface(surf_t *s) {
+    if (hle_dd_free_hook) hle_dd_free_hook(s);
     free(s->argb), free(s->keyed);
     if (g_primary == s) g_primary = NULL, g_frame_seq++;
     if (s->mip) { surf_t *m = s->mip; uint32_t mo = m->self; s->mip = NULL; free_surface(m); hle_com_free(mo); }
@@ -529,6 +542,7 @@ static void sf_Blt(void) {                               /* (this, dstRect, src,
     int dl, dt, dr, db;
     get_rect(A32(1), d, &dl, &dt, &dr, &db);
     if (fl & DDBLT_COLORFILL) {
+        TOUCH(d);
         fill(d, dl, dt, dr, db, fx ? MEM32(fx + 80) : 0);
         RET(DD_OK, 6);
     }
@@ -540,7 +554,10 @@ static void sf_Blt(void) {                               /* (this, dstRect, src,
     if ((fl & DDBLT_KEYSRCOVERRIDE) && fx) keyed = 1, lo = MEM32(fx + 92), hi = MEM32(fx + 96);
     else if ((fl & DDBLT_KEYSRC) && s->ck_src) keyed = 1, lo = s->ck_lo, hi = s->ck_hi;
     if (hi < lo) hi = lo;
-    blit(d, dl, dt, dr, db, s, sl, st, sr, sb, keyed, lo, hi);
+    if (!(hle_dd_blit_hook && hle_dd_blit_hook(d, dl, dt, dr, db, s, sl, st, sr, sb, keyed, lo, hi))) {
+        TOUCH(d); TOUCH(s);
+        blit(d, dl, dt, dr, db, s, sl, st, sr, sb, keyed, lo, hi);
+    }
     RET(DD_OK, 6);
 }
 static void sf_BltBatch(void) { RET(DDERR_UNSUPPORTED, 4); }
@@ -552,7 +569,10 @@ static void sf_BltFast(void) {                           /* (this, x, y, src, sr
     get_rect(A32(4), s, &sl, &st, &sr, &sb);
     int keyed = (A32(5) & DDBLTFAST_SRCCOLORKEY) && s->ck_src;
     uint32_t hi = s->ck_hi < s->ck_lo ? s->ck_lo : s->ck_hi;
-    blit(d, x, y, x + (sr - sl), y + (sb - st), s, sl, st, sr, sb, keyed, s->ck_lo, hi);
+    if (!(hle_dd_blit_hook && hle_dd_blit_hook(d, x, y, x + (sr - sl), y + (sb - st), s, sl, st, sr, sb, keyed, s->ck_lo, hi))) {
+        TOUCH(d); TOUCH(s);
+        blit(d, x, y, x + (sr - sl), y + (sb - st), s, sl, st, sr, sb, keyed, s->ck_lo, hi);
+    }
     RET(DD_OK, 6);
 }
 static void sf_DeleteAttachedSurface(void) {
@@ -581,6 +601,7 @@ static void sf_Flip(void) {                              /* (this, target, flags
         uint8_t *t = s->px;
         s->px = s->back->px, s->back->px = t;
         mark(s);
+        if (hle_dd_flip_hook) hle_dd_flip_hook(s, s->back);
     }
     RET(DD_OK, 3);
 }
@@ -612,6 +633,7 @@ static void sf_GetColorKey(void) {                       /* (this, flags, &key) 
 static void sf_GetDC(void) {
     ACCESS();
     surf_t *s = S(A32(0));
+    TOUCH(s);
     if (A32(1)) MEM32(A32(1)) = hle_gdi_surface_dc(s->px, s->w, s->h, s->pitch, s->bpp);
     RET(DD_OK, 2);
 }
@@ -628,6 +650,7 @@ static void sf_Initialize(void) { RET(DD_OK, 3); }
 static void sf_Lock(void) {                              /* (this, rect, &desc, flags, event) */
     ACCESS();
     surf_t *s = S(A32(0));
+    TOUCH(s);
     s->gen++;                                            /* whatever the game writes, from now */
     uint32_t d = A32(2);
     if (!d) RET(DDERR_INVALIDPARAMS, 5);
