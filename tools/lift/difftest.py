@@ -657,6 +657,10 @@ CASES = [
     # sahf; setp cl -- stored first so TOP (which fnstsw does not model) is 0
     Case('fsin.c2', bytes.fromhex('dd06' 'd9e5' 'd9fe' 'dd1f' 'dfe0' '9e' '0f9ac1'),
          mem={SCRATCH: struct.pack('<d', 0.5) + bytes(24)}, undef=('OF',)),
+    # fsincos leaves ST(0)=cos, ST(1)=sin: fld qword [esi]; fsincos;
+    # fstp qword [edi]; fstp qword [edi+8] (MechCommander 2's camera)
+    Case('fsincos', bytes.fromhex('dd06' 'd9fb' 'dd1f' 'dd5f08'),
+         mem={SCRATCH: struct.pack('<d', 0.6108652) + bytes(24)}),
     # Quake's span stepper: the fraction adds carry into the texel address.
     # add edx,eax; sbb ecx,ecx; add ebx,ebp; adc esi,[edi+ecx*4+4]
     Case('span.carry', bytes.fromhex('01c2' '19c9' '01eb' '13748f04'),
