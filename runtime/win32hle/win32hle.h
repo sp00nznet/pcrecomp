@@ -325,6 +325,7 @@ int  hle_screen_scale(const char *name);   /* sharp, smooth, crt, nearest, integ
 void hle_screen_bars(int blur);            /* the bars beside the picture: a blur of it, or black */
 extern void (*hle_screen_settings_hook)(const char *scale, int bars, int fullscreen);   /* F11/F12 changed them */
 void hle_screen_fullscreen(int on);        /* as F11 does, the settings hook told */
+void hle_screen_confine(int on);           /* hold the mouse in the picture while focused (default on) */
 const char *hle_screen_settings(int *bars, int *fullscreen);   /* the scaling now; bars and fullscreen if asked */
 /* A popup menu over the picture, the kind the Windows presenter opens on F10:
  * at the mouse, a submenu beside its item, the arrow keys, Enter and a click
