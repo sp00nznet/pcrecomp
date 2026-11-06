@@ -24,6 +24,7 @@ repo is a scar from one specific binary, and the entry below names it.
 | `disasm/fpu_decode.py` | El-Fish | x87 in a 16-bit NE image, mixed into the code stream |
 | `disasm/callgraph.py` | Soldier of Fortune | "Who calls this" without booting Ghidra |
 | `disasm/score_recovery.py` | Trespasser | A recovered catalog is worthless until scored against symbols |
+| `pe/pdb2_ref.py` | MechCommander 2 | The disc ships a VC6 PDB 2.00, a format llvm-pdbutil cannot read |
 | `lift/lift32.py` | X-Wing Alliance | The core x86-32 -> C lifter |
 | `lift/lift32_cpu.py` | Encarta 97 | A reentrant CPU struct, because MFC re-enters lifted code |
 | `lift/lift16.py` | Civilization | 16-bit segmented lifting with a DOS runtime under it |

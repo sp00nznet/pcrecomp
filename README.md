@@ -95,6 +95,7 @@ or IDA, whatever the architecture.
 | `rsrc.py` | List and extract `.rsrc` (bitmaps get their file header back, so they open) |
 | `map_names.py` | Names from an MSVC linker MAP; `port` carries library names onto a binary that shipped without one |
 | `pdb_ref.py` | A scoring reference from the vendor's PDB, fetched from the symbol server; handles stripped public PDBs (publics + `/Gy` COMDAT ranges) |
+| `pdb2_ref.py` | The same from a VC5/6 PDB 2.00 shipped with the game (no llvm-pdbutil); also writes disasm32 seeds |
 | `debug_symbols.py` | Which source file each function came from, from surviving `__FILE__` strings |
 | `merge_names.py` | Every name source (MAP > RTTI > `__FILE__` > anything else) merged into one C-safe name per address |
 
