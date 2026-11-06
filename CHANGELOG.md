@@ -5,6 +5,14 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- lift32: `fsincos` left the sine in ST(0) and the cosine in ST(1); it is
+  the other way round. MechCommander 2's camera builds its view direction
+  with it, and the swapped pair laid the 35-degree camera almost flat on the
+  ground. A difftest case covers it. Removed a dead second copy of `fpatan`
+  (with its operands swapped), `f2xm1` and `fscale` that the first copies
+  shadowed.
+
 ### Added
 - pe: `pdb2_ref.py` reads a Visual C++ 5/6 PDB (MSF 2.00, `_ST` symbol
   records), which llvm-pdbutil and `pdb_ref.py` cannot, into the same

@@ -2002,16 +2002,9 @@ class Lifter:
             lines.append(f"_st[0] = cos(_st[0]); _fpu_cmp = 1; {comment}")
 
         elif m == 'fsincos':
-            lines.append(f"{{ double _a = _st[0]; _st[0] = cos(_a); fp_push(sin(_a)); }} _fpu_cmp = 1; {comment}")
-
-        elif m == 'fpatan':
-            lines.append(f"{{ double _v = fp_pop(); _st[0] = atan2(_v, _st[0]); }} {comment}")
-
-        elif m == 'f2xm1':
-            lines.append(f"_st[0] = pow(2.0, _st[0]) - 1.0; {comment}")
-
-        elif m == 'fscale':
-            lines.append(f"_st[0] = _st[0] * pow(2.0, (int)_st[1]); {comment}")
+            # The sine replaces ST(0), then the cosine is pushed: ST(0)=cos,
+            # ST(1)=sin. Swapped, MechCommander 2's camera tilt came out wrong.
+            lines.append(f"{{ double _a = _st[0]; _st[0] = sin(_a); fp_push(cos(_a)); }} _fpu_cmp = 1; {comment}")
 
         elif m == 'frndint':
             # Round by the control word, like fist. `(double)(int)x` always
