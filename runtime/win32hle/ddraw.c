@@ -164,8 +164,18 @@ static uint32_t new_surface(int w, int h, int bpp, uint32_t caps, int primary) {
     s->self = o;
     return o;
 }
+/* Let go of an attached z-buffer: AddAttachedSurface took a reference. */
+static void free_surface(surf_t *s);
+static void release_zbuf(surf_t *s) {
+    surf_t *z = s->zbuf;
+    if (!z) return;
+    uint32_t zo = z->self;
+    s->zbuf = NULL;
+    if (MEM32(zo + 4) && --MEM32(zo + 4) == 0) { free_surface(z); hle_com_free(zo); }
+}
 static void free_surface(surf_t *s) {
     free(s->argb), free(s->keyed);
+    release_zbuf(s);
     if (g_primary == s) g_primary = NULL, g_frame_seq++;
     if (s->mip) { surf_t *m = s->mip; uint32_t mo = m->self; s->mip = NULL; free_surface(m); hle_com_free(mo); }
     if (s->palette) { uint32_t p = s->palette; if (--MEM32(p + 4) == 0) { hle_free(P(p)); hle_com_free(p); } }
@@ -557,7 +567,7 @@ static void sf_BltFast(void) {                           /* (this, x, y, src, sr
 }
 static void sf_DeleteAttachedSurface(void) {
     surf_t *s = S(A32(0)), *b = A32(2) ? S(A32(2)) : NULL;
-    if (b && b == s->zbuf) s->zbuf = NULL; else s->back = NULL;
+    if (b && b == s->zbuf) release_zbuf(s); else s->back = NULL;
     RET(DD_OK, 3);
 }
 static void sf_EnumAttachedSurfaces(void) {              /* (this, ctx, callback) */
@@ -647,6 +657,7 @@ static void sf_SetClipper(void) {
     RET(DD_OK, 2);
 }
 static void sf_SetColorKey(void) {                       /* (this, flags, &key) */
+    ACCESS();                                            /* a texture's key changes what queued drawing samples */
     surf_t *s = S(A32(0));
     if (A32(1) & DDCKEY_SRCBLT) {
         if (A32(2)) s->ck_src = 1, s->ck_lo = MEM32(A32(2)), s->ck_hi = MEM32(A32(2) + 4);
@@ -676,12 +687,14 @@ static void sf_GetDDInterface(void) { MEM32(A32(1)) = g_dd; RET(DD_OK, 2); }
 static void sf_PageLock(void) { RET(DD_OK, 2); }
 static void sf_PageUnlock(void) { RET(DD_OK, 2); }
 static void sf_SetSurfaceDesc(void) {                    /* (this, &desc, flags): the game's own memory */
+    ACCESS();                                            /* queued drawing reads the old pixels first */
     surf_t *s = S(A32(0));
     uint32_t d = A32(1), fl = MEM32(d + 4);
     if ((fl & DDSD_LPSURFACE) && MEM32(d + 36)) s->px = (uint8_t *)hle_ptr(MEM32(d + 36));   /* own_px is kept until the surface goes */
     if (fl & DDSD_PITCH) s->pitch = (int)MEM32(d + 16);
     if (fl & DDSD_WIDTH) s->w = (int)MEM32(d + 12);
     if (fl & DDSD_HEIGHT) s->h = (int)MEM32(d + 8);
+    s->gen++;
     RET(DD_OK, 3);
 }
 
@@ -690,8 +703,10 @@ static void sf_SetSurfaceDesc(void) {                    /* (this, &desc, flags)
 static void sf_SetPrivateData(void) { RET(DD_OK, 5); }
 static void sf_GetPrivateData(void) { RET(DDERR_NOTFOUND, 4); }
 static void sf_FreePrivateData(void) { RET(DD_OK, 2); }
-static void sf_GetUniquenessValue(void) { if (A32(1)) MEM32(A32(1)) = g_frame_seq; RET(DD_OK, 2); }
-static void sf_ChangeUniquenessValue(void) { g_frame_seq++; RET(DD_OK, 1); }
+/* The uniqueness value is the surface's own change counter (gen), which
+ * moves whenever its pixels or colour key do. */
+static void sf_GetUniquenessValue(void) { if (A32(1)) MEM32(A32(1)) = S(A32(0))->gen; RET(DD_OK, 2); }
+static void sf_ChangeUniquenessValue(void) { S(A32(0))->gen++; RET(DD_OK, 1); }
 
 /* ---- IDirectDrawPalette, IDirectDrawClipper ---- */
 static void pl_Release(void) {
