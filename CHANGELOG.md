@@ -6,6 +6,11 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- lift32: `loop`, `loope`, `loopne`, `jecxz` and `jcxz` leave the function the
+  way `jmp` and `jcc` do. A taken branch to an address that is not a block of
+  the function being lifted was a `goto` to a label that does not exist, and the
+  generated file did not compile; it now dispatches with `RECOMP_ITAIL` and
+  returns. `tools/lift/test_loop_exits.py`.
 - lift32: `fsincos` left the sine in ST(0) and the cosine in ST(1); it is
   the other way round. MechCommander 2's camera builds its view direction
   with it, and the swapped pair laid the 35-degree camera almost flat on the
