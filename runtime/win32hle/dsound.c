@@ -47,7 +47,12 @@ typedef struct {
     int mixed;                  /* pos0 is from the last mix (not set since) */
     int volume, pan;            /* hundredths of a dB; -10000..10000 */
     float gl, gr;
+    /* DirectSound 3D (a DSBCAPS_CTRL3D buffer): where it is, as a listener hears it */
+    int is3d, mode3d;           /* DS3DMODE_NORMAL 0, HEADRELATIVE 1, DISABLE 2 */
+    float p3d[3], mind, maxd;
 } dsbuf;
+/* the one listener (IDirectSound3DListener on the primary buffer) */
+static struct { float pos[3], front[3], top[3], rolloff, distf; } g_lis = { { 0, 0, 0 }, { 0, 0, 1 }, { 0, 1, 0 }, 1, 1 };
 
 static pthread_mutex_t g_mix = PTHREAD_MUTEX_INITIALIZER;
 #define MAX_BUFS 256
@@ -62,6 +67,23 @@ void hle_dsound_set_master(float gain) { g_master = gain; }
 static void gains(dsbuf *b) {
     float v = b->volume <= -10000 ? 0.0f : powf(10.0f, (float)b->volume / 2000.0f);
     float l = 1.0f, r = 1.0f;
+    if (b->is3d && b->mode3d != 2) {
+        /* inverse distance past the minimum, held at the maximum; panned
+         * by the side the sound is on (DirectSound is left-handed: right =
+         * top x front) */
+        float rel[3];
+        for (int k = 0; k < 3; k++) rel[k] = b->mode3d == 1 ? b->p3d[k] : b->p3d[k] - g_lis.pos[k];
+        float d = sqrtf(rel[0] * rel[0] + rel[1] * rel[1] + rel[2] * rel[2]);
+        float mind = b->mind > 0 ? b->mind : 1.0f, maxd = b->maxd > mind ? b->maxd : 1e9f;
+        float dd = d < mind ? mind : d > maxd ? maxd : d;
+        float att = mind / (mind + g_lis.rolloff * (dd - mind));
+        const float *f = g_lis.front, *t = g_lis.top;
+        float right[3] = { t[1] * f[2] - t[2] * f[1], t[2] * f[0] - t[0] * f[2], t[0] * f[1] - t[1] * f[0] };
+        float rn = sqrtf(right[0] * right[0] + right[1] * right[1] + right[2] * right[2]);
+        float side = d > 1e-4f && rn > 1e-6f ? (rel[0] * right[0] + rel[1] * right[1] + rel[2] * right[2]) / (d * rn) : 0.0f;
+        v *= att;
+        l = side > 0 ? 1.0f - 0.7f * side : 1.0f, r = side < 0 ? 1.0f + 0.7f * side : 1.0f;
+    }
     if (b->pan < 0) r = b->pan <= -10000 ? 0.0f : powf(10.0f, (float)b->pan / 2000.0f);
     if (b->pan > 0) l = b->pan >= 10000 ? 0.0f : powf(10.0f, (float)-b->pan / 2000.0f);
     b->gl = v * l, b->gr = v * r;
@@ -446,6 +468,154 @@ static void b_Stop(void) {
 }
 static void b_Restore(void) { RET(DS_OK, 1); }
 
+/* ---- DirectSound 8 and 3D ---- */
+static uint32_t g_vt_3db, g_vt_lis, g_lis_obj;
+static float fa(int i) { uint32_t v = A32(i); float f; memcpy(&f, &v, 4); return f; }
+static void all3d_gains(void) { for (int i = 0; i < MAX_BUFS; i++) if (g_buf[i] && g_buf[i]->is3d) gains(g_buf[i]); }
+static void b_QueryInterface(void) {                     /* (this, iid, &out) */
+    uint32_t self = A32(0), d1 = A32(1) ? MEM32(A32(1)) : 0, out = A32(2);
+    dsbuf *b = buf_of(self);
+    if (d1 == 0x279AFA86u && b) {                        /* IID_IDirectSound3DBuffer */
+        uint32_t o = hle_com_new(g_vt_3db, 12);
+        SLOT(o) = SLOT(self);
+        pthread_mutex_lock(&g_mix);
+        if (!b->is3d) b->is3d = 1, b->mind = 1.0f, b->maxd = 1e9f, gains(b);
+        pthread_mutex_unlock(&g_mix);
+        if (out) MEM32(out) = o;
+        RET(DS_OK, 3);
+    }
+    if (d1 == 0x279AFA84u) {                             /* IID_IDirectSound3DListener */
+        if (!g_lis_obj) g_lis_obj = hle_com_new(g_vt_lis, 12);
+        MEM32(g_lis_obj + 4)++;
+        if (out) MEM32(out) = g_lis_obj;
+        RET(DS_OK, 3);
+    }
+    if (out) MEM32(out) = self;
+    MEM32(self + 4)++;
+    RET(DS_OK, 3);
+}
+static void b8_SetFX(void) { RET(0x8878001Eu, 4); }      /* DSERR_CONTROLUNAVAIL */
+static void b8_AcquireResources(void) { RET(DS_OK, 4); }
+static void b8_GetObjectInPath(void) { if (A32(4)) MEM32(A32(4)) = 0; RET(0x88780FFFu, 5); }
+static void d8_VerifyCertification(void) { if (A32(1)) MEM32(A32(1)) = 0; RET(DS_OK, 2); }
+
+static void t_SetPosition(void) {                        /* (this, x, y, z, apply) */
+    dsbuf *b = buf_of(A32(0));
+    if (b) { pthread_mutex_lock(&g_mix); b->p3d[0] = fa(1), b->p3d[1] = fa(2), b->p3d[2] = fa(3); gains(b); pthread_mutex_unlock(&g_mix); }
+    RET(DS_OK, 5);
+}
+static void t_GetPosition(void) {
+    dsbuf *b = buf_of(A32(0));
+    if (b && A32(1)) memcpy(hle_ptr(A32(1)), b->p3d, 12);
+    RET(DS_OK, 2);
+}
+static void t_SetMinDistance(void) { dsbuf *b = buf_of(A32(0)); if (b) { pthread_mutex_lock(&g_mix); b->mind = fa(1); gains(b); pthread_mutex_unlock(&g_mix); } RET(DS_OK, 3); }
+static void t_SetMaxDistance(void) { dsbuf *b = buf_of(A32(0)); if (b) { pthread_mutex_lock(&g_mix); b->maxd = fa(1); gains(b); pthread_mutex_unlock(&g_mix); } RET(DS_OK, 3); }
+static void t_GetMinDistance(void) { dsbuf *b = buf_of(A32(0)); if (b && A32(1)) memcpy(hle_ptr(A32(1)), &b->mind, 4); RET(DS_OK, 2); }
+static void t_GetMaxDistance(void) { dsbuf *b = buf_of(A32(0)); if (b && A32(1)) memcpy(hle_ptr(A32(1)), &b->maxd, 4); RET(DS_OK, 2); }
+static void t_SetMode(void) { dsbuf *b = buf_of(A32(0)); if (b) { pthread_mutex_lock(&g_mix); b->mode3d = (int)A32(1); gains(b); pthread_mutex_unlock(&g_mix); } RET(DS_OK, 3); }
+static void t_GetMode(void) { dsbuf *b = buf_of(A32(0)); if (b && A32(1)) MEM32(A32(1)) = (uint32_t)b->mode3d; RET(DS_OK, 2); }
+static void t_SetAllParameters(void) {                   /* (this, DS3DBUFFER*, apply) */
+    dsbuf *b = buf_of(A32(0));
+    uint32_t p = A32(1);
+    if (b && p) {
+        pthread_mutex_lock(&g_mix);
+        memcpy(b->p3d, hle_ptr(p + 4), 12);
+        memcpy(&b->mind, hle_ptr(p + 52), 4), memcpy(&b->maxd, hle_ptr(p + 56), 4);
+        b->mode3d = (int)MEM32(p + 60);
+        gains(b);
+        pthread_mutex_unlock(&g_mix);
+    }
+    RET(DS_OK, 3);
+}
+static void t_GetAllParameters(void) {
+    dsbuf *b = buf_of(A32(0));
+    uint32_t p = A32(1);
+    if (b && p) {
+        memset(hle_ptr(p + 4), 0, 60);
+        memcpy(hle_ptr(p + 4), b->p3d, 12);
+        MEM32(p + 28) = MEM32(p + 32) = 360;
+        MEM32(p + 44) = 0; memcpy(hle_ptr(p + 52), &b->mind, 4), memcpy(hle_ptr(p + 56), &b->maxd, 4);
+        MEM32(p + 60) = (uint32_t)b->mode3d;
+    }
+    RET(DS_OK, 2);
+}
+static void t_ok2(void) { RET(DS_OK, 3); }
+static void t_ok3(void) { RET(DS_OK, 4); }
+static void t_ok4(void) { RET(DS_OK, 5); }
+static void t_zero1(void) { if (A32(1)) MEM32(A32(1)) = 0; RET(DS_OK, 2); }
+static void t_zero2(void) { if (A32(1)) MEM32(A32(1)) = 0; if (A32(2)) MEM32(A32(2)) = 0; RET(DS_OK, 3); }
+static void l_SetPosition(void) { pthread_mutex_lock(&g_mix); g_lis.pos[0] = fa(1), g_lis.pos[1] = fa(2), g_lis.pos[2] = fa(3); all3d_gains(); pthread_mutex_unlock(&g_mix); RET(DS_OK, 5); }
+static void l_GetPosition(void) { if (A32(1)) memcpy(hle_ptr(A32(1)), g_lis.pos, 12); RET(DS_OK, 2); }
+static void l_SetOrientation(void) {                     /* (this, fx, fy, fz, tx, ty, tz, apply) */
+    pthread_mutex_lock(&g_mix);
+    for (int k = 0; k < 3; k++) g_lis.front[k] = fa(1 + k), g_lis.top[k] = fa(4 + k);
+    all3d_gains();
+    pthread_mutex_unlock(&g_mix);
+    RET(DS_OK, 8);
+}
+static void l_GetOrientation(void) {
+    if (A32(1)) memcpy(hle_ptr(A32(1)), g_lis.front, 12);
+    if (A32(2)) memcpy(hle_ptr(A32(2)), g_lis.top, 12);
+    RET(DS_OK, 3);
+}
+static void l_SetRolloffFactor(void) { pthread_mutex_lock(&g_mix); g_lis.rolloff = fa(1); all3d_gains(); pthread_mutex_unlock(&g_mix); RET(DS_OK, 3); }
+static void l_GetRolloffFactor(void) { if (A32(1)) memcpy(hle_ptr(A32(1)), &g_lis.rolloff, 4); RET(DS_OK, 2); }
+static void l_SetDistanceFactor(void) { g_lis.distf = fa(1); RET(DS_OK, 3); }
+static void l_GetDistanceFactor(void) { if (A32(1)) memcpy(hle_ptr(A32(1)), &g_lis.distf, 4); RET(DS_OK, 2); }
+static void l_SetAllParameters(void) {                   /* (this, DS3DLISTENER*, apply) */
+    uint32_t p = A32(1);
+    if (p) {
+        pthread_mutex_lock(&g_mix);
+        memcpy(g_lis.pos, hle_ptr(p + 4), 12);
+        memcpy(g_lis.front, hle_ptr(p + 28), 12), memcpy(g_lis.top, hle_ptr(p + 40), 12);
+        memcpy(&g_lis.distf, hle_ptr(p + 52), 4), memcpy(&g_lis.rolloff, hle_ptr(p + 56), 4);
+        all3d_gains();
+        pthread_mutex_unlock(&g_mix);
+    }
+    RET(DS_OK, 3);
+}
+static void l_GetAllParameters(void) {
+    uint32_t p = A32(1);
+    if (p) {
+        memset(hle_ptr(p + 4), 0, 60);
+        memcpy(hle_ptr(p + 4), g_lis.pos, 12);
+        memcpy(hle_ptr(p + 28), g_lis.front, 12), memcpy(hle_ptr(p + 40), g_lis.top, 12);
+        memcpy(hle_ptr(p + 52), &g_lis.distf, 4), memcpy(hle_ptr(p + 56), &g_lis.rolloff, 4);
+        float one = 1.0f; memcpy(hle_ptr(p + 60), &one, 4);
+    }
+    RET(DS_OK, 2);
+}
+static void l_Commit(void) { RET(DS_OK, 1); }
+static void vtables3d(void) {
+    if (g_vt_3db) return;
+    static const win32hle_shim t[] = {
+        { "IDirectSound3DBuffer::QueryInterface", hle_com_QueryInterface }, { "IDirectSound3DBuffer::AddRef", hle_com_AddRef },
+        { "IDirectSound3DBuffer::Release", hle_com_Release }, { "IDirectSound3DBuffer::GetAllParameters", t_GetAllParameters },
+        { "IDirectSound3DBuffer::GetConeAngles", t_zero2 }, { "IDirectSound3DBuffer::GetConeOrientation", t_zero1 },
+        { "IDirectSound3DBuffer::GetConeOutsideVolume", t_zero1 }, { "IDirectSound3DBuffer::GetMaxDistance", t_GetMaxDistance },
+        { "IDirectSound3DBuffer::GetMinDistance", t_GetMinDistance }, { "IDirectSound3DBuffer::GetMode", t_GetMode },
+        { "IDirectSound3DBuffer::GetPosition", t_GetPosition }, { "IDirectSound3DBuffer::GetVelocity", t_zero1 },
+        { "IDirectSound3DBuffer::SetAllParameters", t_SetAllParameters }, { "IDirectSound3DBuffer::SetConeAngles", t_ok3 },
+        { "IDirectSound3DBuffer::SetConeOrientation", t_ok4 }, { "IDirectSound3DBuffer::SetConeOutsideVolume", t_ok2 },
+        { "IDirectSound3DBuffer::SetMaxDistance", t_SetMaxDistance }, { "IDirectSound3DBuffer::SetMinDistance", t_SetMinDistance },
+        { "IDirectSound3DBuffer::SetMode", t_SetMode }, { "IDirectSound3DBuffer::SetPosition", t_SetPosition },
+        { "IDirectSound3DBuffer::SetVelocity", t_ok4 }, { 0, 0 } };
+    static const win32hle_shim l[] = {
+        { "IDirectSound3DListener::QueryInterface", hle_com_QueryInterface }, { "IDirectSound3DListener::AddRef", hle_com_AddRef },
+        { "IDirectSound3DListener::Release", hle_com_Release }, { "IDirectSound3DListener::GetAllParameters", l_GetAllParameters },
+        { "IDirectSound3DListener::GetDistanceFactor", l_GetDistanceFactor },
+        { "IDirectSound3DListener::GetDopplerFactor", t_zero1 }, { "IDirectSound3DListener::GetOrientation", l_GetOrientation },
+        { "IDirectSound3DListener::GetPosition", l_GetPosition }, { "IDirectSound3DListener::GetRolloffFactor", l_GetRolloffFactor },
+        { "IDirectSound3DListener::GetVelocity", t_zero1 }, { "IDirectSound3DListener::SetAllParameters", l_SetAllParameters },
+        { "IDirectSound3DListener::SetDistanceFactor", l_SetDistanceFactor },
+        { "IDirectSound3DListener::SetDopplerFactor", t_ok2 }, { "IDirectSound3DListener::SetOrientation", l_SetOrientation },
+        { "IDirectSound3DListener::SetPosition", l_SetPosition }, { "IDirectSound3DListener::SetRolloffFactor", l_SetRolloffFactor },
+        { "IDirectSound3DListener::SetVelocity", t_ok4 }, { "IDirectSound3DListener::CommitDeferredSettings", l_Commit }, { 0, 0 } };
+    g_vt_3db = hle_com_vtable(t);
+    g_vt_lis = hle_com_vtable(l);
+}
+
 /* ---- IDirectSound ---- */
 static void d_Release(void) {
     uint32_t self = A32(0), n = --MEM32(self + 4);
@@ -519,9 +689,10 @@ static void vtables(void) {
         { "IDirectSound::GetCaps", d_GetCaps }, { "IDirectSound::DuplicateSoundBuffer", d_DuplicateSoundBuffer },
         { "IDirectSound::SetCooperativeLevel", d_SetCooperativeLevel }, { "IDirectSound::Compact", d_Compact },
         { "IDirectSound::GetSpeakerConfig", d_GetSpeakerConfig }, { "IDirectSound::SetSpeakerConfig", d_SetSpeakerConfig },
-        { "IDirectSound::Initialize", d_Initialize }, { 0, 0 } };
+        { "IDirectSound::Initialize", d_Initialize },
+        { "IDirectSound8::VerifyCertification", d8_VerifyCertification }, { 0, 0 } };
     static const win32hle_shim buf[] = {
-        { "IDirectSoundBuffer::QueryInterface", hle_com_QueryInterface }, { "IDirectSoundBuffer::AddRef", hle_com_AddRef },
+        { "IDirectSoundBuffer::QueryInterface", b_QueryInterface }, { "IDirectSoundBuffer::AddRef", hle_com_AddRef },
         { "IDirectSoundBuffer::Release", b_Release }, { "IDirectSoundBuffer::GetCaps", b_GetCaps },
         { "IDirectSoundBuffer::GetCurrentPosition", b_GetCurrentPosition }, { "IDirectSoundBuffer::GetFormat", b_GetFormat },
         { "IDirectSoundBuffer::GetVolume", b_GetVolume }, { "IDirectSoundBuffer::GetPan", b_GetPan },
@@ -531,9 +702,12 @@ static void vtables(void) {
         { "IDirectSoundBuffer::SetFormat", b_SetFormat }, { "IDirectSoundBuffer::SetVolume", b_SetVolume },
         { "IDirectSoundBuffer::SetPan", b_SetPan }, { "IDirectSoundBuffer::SetFrequency", b_SetFrequency },
         { "IDirectSoundBuffer::Stop", b_Stop }, { "IDirectSoundBuffer::Unlock", b_Unlock },
-        { "IDirectSoundBuffer::Restore", b_Restore }, { 0, 0 } };
+        { "IDirectSoundBuffer::Restore", b_Restore },
+        { "IDirectSoundBuffer8::SetFX", b8_SetFX }, { "IDirectSoundBuffer8::AcquireResources", b8_AcquireResources },
+        { "IDirectSoundBuffer8::GetObjectInPath", b8_GetObjectInPath }, { 0, 0 } };
     g_vt_ds = hle_com_vtable(ds);
     g_vt_buf = hle_com_vtable(buf);
+    vtables3d();
 }
 
 static void s_DirectSoundCreate(void) {                  /* (guid, &out, outer) */
@@ -564,10 +738,14 @@ void hle_dsound_register_com(void) {
     static const uint8_t CLSID_DirectSound[16] = { 0x46, 0xD9, 0xD4, 0x47, 0xE8, 0x62, 0xCF, 0x11,
                                                    0x93, 0xBC, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 };
     hle_com_register_class(CLSID_DirectSound, ds_create);
+    static const uint8_t CLSID_DirectSound8[16] = { 0x3F, 0xCC, 0x01, 0x39, 0xB5, 0x84, 0xA4, 0x4F,
+                                                    0xBA, 0x35, 0xAA, 0x81, 0x72, 0xB8, 0xA0, 0x9B };
+    hle_com_register_class(CLSID_DirectSound8, ds_create);
 }
 
 const win32hle_shim win32hle_dsound[] = {
     { "dsound.dll#1", s_DirectSoundCreate }, { "DirectSoundCreate", s_DirectSoundCreate },
     { "dsound.dll#2", s_DirectSoundEnumerateA }, { "DirectSoundEnumerateA", s_DirectSoundEnumerateA },
+    { "dsound.dll#11", s_DirectSoundCreate }, { "DirectSoundCreate8", s_DirectSoundCreate },
     { 0, 0 }
 };

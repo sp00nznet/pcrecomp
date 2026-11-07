@@ -151,6 +151,15 @@ versions follow [SemVer](https://semver.org/).
   where it runs at a constant rate (scaled to ns by `hle_tsc_calibrate`, which
   a host calls at start), CLOCK_MONOTONIC otherwise. Operation Flashpoint's
   performance log is built on it (#173, by [@neurocontrarian](https://github.com/neurocontrarian)).
+- win32hle: DirectSound 3D and DirectSound 8. A `DSBCAPS_CTRL3D` buffer
+  answers `IDirectSound3DBuffer` and the primary buffer
+  `IDirectSound3DListener`; the mix applies inverse-distance attenuation
+  (minimum and maximum distance, listener roll-off) and pans by the side of
+  the listener the sound is on, in normal and head-relative modes. Cones,
+  velocity and Doppler are accepted and ignored. `DirectSoundCreate8`,
+  `CLSID_DirectSound8` and the `IDirectSoundBuffer8` methods answer, without
+  effects (`SetFX` returns `DSERR_CONTROLUNAVAIL`). Operation Flashpoint
+  places its sounds with it (#176, by [@neurocontrarian](https://github.com/neurocontrarian)).
 - pe: `pdb2_ref.py` reads a Visual C++ 5/6 PDB (MSF 2.00, `_ST` symbol
   records), which llvm-pdbutil and `pdb_ref.py` cannot, into the same
   reference JSON, plus a `--seed-functions` list for disasm32. No external
