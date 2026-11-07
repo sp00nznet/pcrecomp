@@ -28,6 +28,21 @@
 uint32_t  g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi, g_ebp;
 double    g_st[8];
 int       g_fp_top;
+#ifdef RECOMP_X87_RING
+/* the x87 stack, a pointer into a long buffer (recomp_types.h fp_push_ring) */
+double   g_stbuf[X87_RING], *g_stp = g_stbuf + X87_RING / 2;
+int64_t  g_sti64buf[X87_RING], *g_sti64p = g_sti64buf + X87_RING / 2;
+void recomp_x87_recentre(void) {
+    double v[8];
+    int64_t w[8];
+    memcpy(v, g_stp, sizeof v), memcpy(w, g_sti64p, sizeof w);
+    g_stp = g_stbuf + X87_RING / 2, g_sti64p = g_sti64buf + X87_RING / 2;
+    memcpy(g_stp, v, sizeof v), memcpy(g_sti64p, w, sizeof w);
+}
+#define X87_TOP g_stp                   /* st(0..7), saved and loaded with a thread */
+#else
+#define X87_TOP g_st
+#endif
 uint16_t  g_fpu_cw = 0x027F;
 uint16_t  g_seg_cs, g_seg_ds, g_seg_es, g_seg_fs, g_seg_gs, g_seg_ss;
 uint64_t  g_mm[8];
@@ -101,14 +116,14 @@ static void regs_save(regs_t *r) {
     r->eax=g_eax; r->ecx=g_ecx; r->edx=g_edx; r->esp=g_esp;
     r->ebx=g_ebx; r->esi=g_esi; r->edi=g_edi; r->ebp=g_ebp;
     r->fs=g_fs_base; r->cur=g_cur_func;
-    memcpy(r->st, g_st, sizeof g_st); r->fp_top=g_fp_top; r->fpu_cw=g_fpu_cw;
+    memcpy(r->st, X87_TOP, sizeof r->st); r->fp_top=g_fp_top; r->fpu_cw=g_fpu_cw;
     memcpy(r->mm, g_mm, sizeof g_mm);
 }
 static void regs_load(const regs_t *r) {
     g_eax=r->eax; g_ecx=r->ecx; g_edx=r->edx; g_esp=r->esp;
     g_ebx=r->ebx; g_esi=r->esi; g_edi=r->edi; g_ebp=r->ebp;
     g_fs_base=r->fs; g_cur_func=r->cur;
-    memcpy(g_st, r->st, sizeof g_st); g_fp_top=r->fp_top; g_fpu_cw=r->fpu_cw;
+    memcpy(X87_TOP, r->st, sizeof r->st); g_fp_top=r->fp_top; g_fpu_cw=r->fpu_cw;
     memcpy(g_mm, r->mm, sizeof g_mm);
 }
 
