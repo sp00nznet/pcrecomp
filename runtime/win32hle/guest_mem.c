@@ -34,6 +34,10 @@
 #define MAGIC 0x48454150u    /* 'HEAP' */
 #define GRAN  0x10000u       /* the reservation unit */
 
+/* out of guest memory: a host's log may want to know (flat: the 32-bit space
+ * is small; based: the guest's 4 GB) */
+void (*hle_on_alloc_fail)(const char *what, uint32_t n);
+
 #ifdef HLE_FLAT
 /* ================================================================ flat */
 
@@ -102,7 +106,7 @@ void hle_mem_init(void) {}
 uint32_t hle_vm_reserve(uint32_t va, uint32_t size) {
     void *p = mmap(va ? (void *)(uintptr_t)(va & ~0xFFFFu) : NULL, size, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS | (va ? MAP_FIXED_NOREPLACE : 0), -1, 0);
-    if (p == MAP_FAILED) return 0;
+    if (p == MAP_FAILED) { if (hle_on_alloc_fail && !va) hle_on_alloc_fail("pages", size); return 0; }
     if (va && (uint32_t)(uintptr_t)p != (va & ~0xFFFFu)) { munmap(p, size); return 0; }
     return (uint32_t)(uintptr_t)p;
 }
@@ -112,7 +116,7 @@ void hle_vm_zero(uint32_t va, uint32_t size)    { madvise((void *)(uintptr_t)va,
 
 void *hle_heap_alloc(uint32_t n, int zero) {
     uint8_t *p = (uint8_t *)(zero ? calloc(1, (size_t)n + HDR) : malloc((size_t)n + HDR));
-    if (!p) return NULL;
+    if (!p) { if (hle_on_alloc_fail) hle_on_alloc_fail("heap", n); return NULL; }
     ((uint32_t *)p)[0] = n, ((uint32_t *)p)[1] = MAGIC;
     return p + HDR;
 }
@@ -126,7 +130,7 @@ void *hle_heap_realloc(void *u, uint32_t n, int zero) {
     if (!u) return hle_heap_alloc(n, zero);
     uint32_t old = hle_heap_size(u);
     uint8_t *p = (uint8_t *)realloc((uint8_t *)u - HDR, (size_t)n + HDR);
-    if (!p) return NULL;
+    if (!p) { if (hle_on_alloc_fail) hle_on_alloc_fail("heap grow", n); return NULL; }
     ((uint32_t *)p)[0] = n;
     if (zero && n > old) memset(p + HDR + old, 0, n - old);
     return p + HDR;
@@ -137,7 +141,7 @@ void *hle_heap_realloc(void *u, uint32_t n, int zero) {
 
 #define SPAN      0x100000000ull       /* the guest's whole 32-bit space */
 #define ANY_LO    0x10000000u          /* "anywhere" starts above the images */
-#define ANY_HI    0x7F000000u          /* under GetSystemInfo's highest application address */
+#define ANY_HI    hle_vm_any_hi        /* under GetSystemInfo's highest application address */
 #define SHIM_LO   0x7F000000u          /* host_lite.c's synthetic import VAs: never mapped */
 #define SHIM_HI   0x80000000u
 #define MAX_RANGES 8192
@@ -199,6 +203,10 @@ static void add_range(uint64_t lo, uint64_t hi) {
     g_nrng++;
 }
 
+/* Where "anywhere" reservations stop: under 2 GB, as for a Windows program
+ * that is not large-address-aware. A host may raise it (up to 0xFFF00000:
+ * the 4 GB a large-address-aware program gets on a 64-bit Windows). */
+uint32_t hle_vm_any_hi = 0x7F000000u;
 /* First fit above ANY_LO, past the shim range. */
 static uint32_t find_gap(uint32_t size) {
     uint64_t at = ANY_LO;
@@ -313,7 +321,7 @@ void *hle_heap_alloc(uint32_t n, int zero) {
     pthread_mutex_lock(&g_mem_lock);
     va = c >= 0 ? small_alloc(c) : vm_reserve_locked(0, total);
     pthread_mutex_unlock(&g_mem_lock);
-    if (!va) return NULL;
+    if (!va) { if (hle_on_alloc_fail) hle_on_alloc_fail("heap", n); return NULL; }
     uint32_t *h = (uint32_t *)host(va);
     h[0] = n, h[1] = MAGIC, h[2] = c >= 0 ? (uint32_t)c : LARGE, h[3] = 0;
     if (zero) memset(h + 4, 0, n);
