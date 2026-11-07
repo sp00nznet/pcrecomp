@@ -154,6 +154,9 @@ static void w_connect(void) {
 }
 static void w_listen(void) { if (listen(fd_of(A32(0)), (int)A32(1)) != 0) FAIL(2); RET(0, 2); }
 static int nettrace(void) { static int on = -1; if (on < 0) on = getenv("HLE_NETTRACE") != NULL; return on; }
+/* a datagram the guest broadcast (255.255.255.255), for a host that also
+ * sends it elsewhere (game servers on the Internet that answer a LAN search) */
+void (*hle_ws_broadcast_hook)(int fd, const void *buf, uint32_t len, unsigned port);
 static void w_sendto(void) {                             /* (s, buf, len, flags, to, tolen) */
     struct sockaddr_in a;
     ssize_t n;
@@ -162,6 +165,8 @@ static void w_sendto(void) {                             /* (s, buf, len, flags,
         else to_host((const uint8_t *)APTR(4), &a);
         n = sendto(fd_of(A32(0)), APTR(1), A32(2), MSG_NOSIGNAL, (struct sockaddr *)&a, sizeof a);
         if (nettrace()) fprintf(stderr, "[net] sendto %s:%u %u bytes -> %d%s\n", inet_ntoa(a.sin_addr), ntohs(a.sin_port), A32(2), (int)n, n < 0 ? strerror(errno) : "");
+        if (n >= 0 && hle_ws_broadcast_hook && !is_ipx(fd_of(A32(0))) && a.sin_addr.s_addr == htonl(INADDR_BROADCAST))
+            hle_ws_broadcast_hook(fd_of(A32(0)), APTR(1), A32(2), ntohs(a.sin_port));
     }
     else n = send(fd_of(A32(0)), APTR(1), A32(2), MSG_NOSIGNAL);
     if (n < 0) FAIL(6);

@@ -14,6 +14,12 @@ versions follow [SemVer](https://semver.org/).
   shadowed.
 
 ### Added
+- win32hle: `hle_ws_broadcast_hook(fd, buf, len, port)`, called after a
+  guest's UDP `sendto` to 255.255.255.255 (not IPX), so a host can send the
+  same datagram elsewhere. Operation Flashpoint's LAN search is sent this way
+  to the community's Internet servers too, whose answers fill the game's own
+  server list. Only the list (names, ping, players) has been tried; joining a
+  game this way has not.
 - pe: `pdb2_ref.py` reads a Visual C++ 5/6 PDB (MSF 2.00, `_ST` symbol
   records), which llvm-pdbutil and `pdb_ref.py` cannot, into the same
   reference JSON, plus a `--seed-functions` list for disasm32. No external
