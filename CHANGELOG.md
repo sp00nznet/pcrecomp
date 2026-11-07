@@ -14,6 +14,19 @@ versions follow [SemVer](https://semver.org/).
   shadowed.
 
 ### Added
+- recomp32: `RECOMP_RESOLVE_CACHE` (opt-in, a power of two): a direct-mapped
+  cache of indirect-call targets in front of `recomp_lookup_manual` and the
+  dispatch table's binary search, for hosts where one thread at a time runs
+  lifted code. Both `RECOMP_ICALL` forms now go through `recomp_resolve`;
+  without the define the lookups are the same as before. Operation
+  Flashpoint makes about two million indirect calls a second; with a
+  16384-entry cache its start-up loading stalls went from 3.8 s to 3.0 s.
+  `recomp_is_import` (set by win32hle) sends import VAs straight to
+  `recomp_lookup_import`, before the binary search: in OFP's Direct3D-heavy
+  scenes `recomp_resolve` fell from 4.1 % of the main thread to 0.5 %.
+  `RECOMP_ICALL_SITE_CACHE` (opt-in, GCC/Clang) keeps each call site's last
+  lifted target, and `RECOMP_NO_ICALL_TRACE` leaves out the indirect-call
+  trace ring; together they took 4.2 % off OFP's game code cycles per frame.
 - pe: `pdb2_ref.py` reads a Visual C++ 5/6 PDB (MSF 2.00, `_ST` symbol
   records), which llvm-pdbutil and `pdb_ref.py` cannot, into the same
   reference JSON, plus a `--seed-functions` list for disasm32. No external
