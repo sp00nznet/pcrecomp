@@ -23,6 +23,7 @@
 #include <pthread.h>
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
+#include <SDL2/SDL_vulkan.h>
 #include "win32hle.h"
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -45,6 +46,17 @@ static unsigned g_shown_seq = ~0u;
 static uint32_t g_last_present;
 static int g_headless, g_fullscreen;
 static SDL_Rect g_dst;                                   /* where the picture is in the window */
+/* GL mode (hle_screen_gl set before hle_screen_open): the window is made for
+ * OpenGL (1) or Vulkan (2) and has no SDL renderer; a host's 3D layer (a Direct3D 8 on GL) draws
+ * into it and says where its picture is (hle_screen_gl_picture), so the
+ * mouse maps as it does onto a scaled DirectDraw frame. */
+int hle_screen_gl;
+SDL_Window *hle_screen_sdl_window(void) { return g_win; }
+static int g_src_w, g_src_h;                            /* the picture last shown: what the window maps to */
+void hle_screen_gl_picture(int src_w, int src_h, int x, int y, int w, int h) {
+    g_src_w = src_w, g_src_h = src_h;
+    g_dst.x = x, g_dst.y = y, g_dst.w = w, g_dst.h = h;
+}
 static pthread_t g_video_thread;                         /* SDL's video calls stay on the thread that opened it */
 static SDL_Texture *g_pre, *g_small;                     /* sharp's integer prescale; the bars' blur */
 static int g_pre_w, g_pre_h;
@@ -171,12 +183,17 @@ static uint32_t scan_of(SDL_Scancode s) {
 }
 
 /* window points -> game pixels, clamped to the picture */
-static int g_src_w, g_src_h;                            /* the picture last shown: what the window maps to */
 static void to_game(int x, int y, int *gx, int *gy) {
     int w = g_src_w, h = g_src_h, bpp, pw, ph, ww, wh;
     if (w <= 0 || h <= 0) hle_dd_mode(&w, &h, &bpp);
     if (g_ren && g_win) {                                /* HiDPI: the renderer counts pixels, events points */
         SDL_GetRendererOutputSize(g_ren, &pw, &ph);
+        SDL_GetWindowSize(g_win, &ww, &wh);
+        if (ww > 0 && wh > 0) x = x * pw / ww, y = y * ph / wh;
+    }
+    else if (hle_screen_gl && g_win) {                  /* GL mode: the drawable counts pixels */
+        if (hle_screen_gl == 2) SDL_Vulkan_GetDrawableSize(g_win, &pw, &ph);
+        else SDL_GL_GetDrawableSize(g_win, &pw, &ph);
         SDL_GetWindowSize(g_win, &ww, &wh);
         if (ww > 0 && wh > 0) x = x * pw / ww, y = y * ph / wh;
     }
@@ -769,8 +786,17 @@ int hle_screen_open(const char *title, int fullscreen, int headless) {
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");      /* SIGINT and SIGTERM end the process: SDL would make them a close the game can refuse */
     if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) { fprintf(stderr, "[screen] SDL: %s\n", SDL_GetError()); return -1; }
     g_win = SDL_CreateWindow(title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 960,
-                             SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | (fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0));
+                             SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | (fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0)
+                             | (hle_screen_gl == 2 ? SDL_WINDOW_VULKAN : hle_screen_gl ? SDL_WINDOW_OPENGL : 0));
     if (!g_win) { fprintf(stderr, "[screen] window: %s\n", SDL_GetError()); return -1; }
+    if (hle_screen_gl) {                                 /* the host's GL layer draws; no SDL renderer */
+        SDL_ShowCursor(SDL_DISABLE);
+        hle_cursor_hook = warp;
+        g_video_thread = pthread_self();
+        fprintf(stderr, "[screen] %s, %s window (the host draws), fullscreen F11\n", SDL_GetCurrentVideoDriver(),
+                hle_screen_gl == 2 ? "Vulkan" : "OpenGL");
+        return 0;
+    }
 #ifdef __EMSCRIPTEN__
     /* In a browser the game runs on a worker thread and the canvas belongs
      * to the page's: SDL's GL renderer would need the WebGL context made
