@@ -14,6 +14,12 @@ versions follow [SemVer](https://semver.org/).
   shadowed.
 
 ### Added
+- win32hle: Winsock `select` (wsock32 ordinal 18). Winsock's `fd_set` is a
+  count and an array of up to 64 sockets, not a bitmap; the shim polls them
+  with `poll()`, rewrites each set to hold only the ready sockets and returns
+  the total. A NULL timeout waits for ever, and a wait gives the machine to
+  the other guest threads. Operation Flashpoint's multiplayer screen calls it
+  and crashed on the missing import.
 - pe: `pdb2_ref.py` reads a Visual C++ 5/6 PDB (MSF 2.00, `_ST` symbol
   records), which llvm-pdbutil and `pdb_ref.py` cannot, into the same
   reference JSON, plus a `--seed-functions` list for disasm32. No external
