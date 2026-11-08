@@ -70,6 +70,13 @@ typedef struct {
      * export. NULL: every such lookup fails. */
     int (*proc_address)(uint16_t hinst, const char *name, int ordinal,
                         uint16_t *seg, uint16_t *off);
+
+    /* Send the guest's WNDPROC WM_CREATE from CreateWindow, with a Win16
+     * CREATESTRUCT. A game that sets itself up there needs it: Space Bucks
+     * makes its WinG surface, timer and palette in WM_CREATE, and without it
+     * hmemcpy'd every frame through a NULL pointer. 0: not sent (the PF Magic
+     * engines and SimAnt, which were brought up without it). */
+    int create_message;
 } RecompGame;
 
 struct CPU;

@@ -72,6 +72,16 @@ static uint16_t galloc(CPU *cpu, uint32_t bytes) {
             if (cpu->next_sel == 0) return 0;
             uint16_t s = cpu->next_sel++;
             cpu->sel_base[s] = base; g_sel_base[s] = base; g_sel_size[s] = bsz;
+            /* A reused block over 64 KB needs its tiles too, as a fresh one
+               gets them (cpu_alloc_selector): huge-pointer code reaches the
+               second 64 KB as sel+1. Without them sel+1 was whatever selector
+               came next, and Space Bucks' file reader (_lread in 32 KB steps
+               through a huge pointer) wrote its fourth chunk of credit4.lbm
+               into an unrelated block below the stack. */
+            for (uint32_t off = 0x10000u; off < need; off += 0x10000u) {
+                if (cpu->next_sel == 0) break;
+                cpu->sel_base[cpu->next_sel++] = base + off;
+            }
             /* Blocks off the free list still hold the previous tenant's bytes.
                Real KERNEL grows the heap with fresh (zero) pages, and this
                engine leans on that: XApt's on-screen rect at +0xE8 is read by
@@ -703,6 +713,43 @@ void USER_REALIZEPALETTE(CPU *cpu) {         /* (hdc@0) */
     ret(cpu, 2);
 }
 
+/* Get/SetPaletteEntries and AnimatePalette(hpal, start, n, PALETTEENTRY far *):
+ * args p@0 n@4 start@6 hpal@8. A PALETTEENTRY is R G B flags; the table keeps
+ * RGBQUADs (B G R 0). Setting the active palette's entries changes the active
+ * colours too, which is all AnimatePalette is for: Space Bucks fades its
+ * credits and logo with it, and reads the table back with GetPaletteEntries
+ * to start each fade. */
+static void pal_entries(CPU *cpu, int set) {
+    uint16_t poff = a16(cpu, 0), pseg = a16(cpu, 2), n = a16(cpu, 4), start = a16(cpu, 6);
+    uint16_t h = a16(cpu, 8);
+    GuestPalette *p = NULL;
+    for (int i = 0; i < g_npal; i++) if (g_pals[i].h == h) p = &g_pals[i];
+    uint16_t done = 0;
+    if (p) {
+        int active = g_have_pal && !memcmp(g_active_pal, p->rgbq, sizeof g_active_pal);
+        for (; done < n && start + done < 256; done++) {
+            uint8_t *q = &p->rgbq[(start + done) * 4];
+            uint16_t o = (uint16_t)(poff + done * 4);
+            if (set) {
+                q[2] = mem_read8(cpu, pseg, o);
+                q[1] = mem_read8(cpu, pseg, (uint16_t)(o + 1));
+                q[0] = mem_read8(cpu, pseg, (uint16_t)(o + 2));
+            } else {
+                mem_write8(cpu, pseg, o, q[2]);
+                mem_write8(cpu, pseg, (uint16_t)(o + 1), q[1]);
+                mem_write8(cpu, pseg, (uint16_t)(o + 2), q[0]);
+                mem_write8(cpu, pseg, (uint16_t)(o + 3), 0);
+            }
+        }
+        if (set && active) memcpy(g_active_pal, p->rgbq, sizeof g_active_pal);
+    }
+    cpu->ax = done;
+    ret(cpu, 10);
+}
+void GDI_GETPALETTEENTRIES(CPU *cpu) { pal_entries(cpu, 0); }
+void GDI_SETPALETTEENTRIES(CPU *cpu) { pal_entries(cpu, 1); }
+void GDI_ANIMATEPALETTE(CPU *cpu)    { pal_entries(cpu, 1); cpu->ax = 0; }
+
 /* A scratch guest block for marshalling host structures the engine expects to
  * read through a far pointer (WM_DRAWITEM's DRAWITEMSTRUCT, so far). One
  * segment is enough: each use is consumed inside a single WNDPROC call. */
@@ -1053,6 +1100,71 @@ void GDI_BITBLT(CPU *cpu) {
         mem_write16(cpu, cpu->ss, (uint16_t)(cpu->sp + 4 + k * 2), a[k]);
     WING_WINGSTRETCHBLT(cpu);            /* pops 4 + 20, which is what we owe */
 }
+
+/* WinGBitBlt(hdcDest, xDest, yDest, w, h, hdcSrc, xSrc, ySrc): StretchBlt at
+ * one size. Args: ySrc@0 xSrc@2 hdcSrc@4 h@6 w@8 yDest@10 xDest@12 hdcDest@14,
+ * 16 bytes where WinGStretchBlt takes 20: the far return frame moves down 4
+ * bytes (below sp is free), so its pop of 4 + 20 is exactly our 4 + 16.
+ * Space Bucks puts every frame on screen with it. */
+void WING_WINGBITBLT(CPU *cpu) {
+    uint16_t a[10];
+    a[9] = a16(cpu, 14); a[8] = a16(cpu, 12); a[7] = a16(cpu, 10);   /* hdcDest x y */
+    a[6] = a16(cpu, 8);  a[5] = a16(cpu, 6);                         /* w h dest    */
+    a[4] = a16(cpu, 4);  a[3] = a16(cpu, 2);  a[2] = a16(cpu, 0);    /* hdcSrc x y  */
+    a[1] = a16(cpu, 8);  a[0] = a16(cpu, 6);                         /* w h src     */
+    uint16_t ro = mem_read16(cpu, cpu->ss, cpu->sp), rs = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 2));
+    cpu->sp -= 4;
+    mem_write16(cpu, cpu->ss, cpu->sp, ro);
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->sp + 2), rs);
+    for (int k = 0; k < 10; k++)
+        mem_write16(cpu, cpu->ss, (uint16_t)(cpu->sp + 4 + k * 2), a[k]);
+    WING_WINGSTRETCHBLT(cpu);
+}
+
+/* WinGGetDIBPointer(HBITMAP, BITMAPINFO far *pbi) -> void far *: the surface's
+ * pixels, sel:0000, and its header into *pbi. A game that asks for the pointer
+ * this way (Space Bucks) and gets NULL hmemcpy's a whole frame over low
+ * memory, the stack included. */
+void WING_WINGGETDIBPOINTER(CPU *cpu) {
+    uint16_t poff = a16(cpu, 0), pseg = a16(cpu, 2), hbm = a16(cpu, 4);
+    int i = wing_index_of(hbm);
+    cpu->ax = 0; cpu->dx = 0;
+    if (i >= 0) {
+        cpu->dx = g_wing[i].sel;
+        if (pseg || poff) {
+            mem_write32(cpu, pseg, poff + 0, 40);
+            mem_write32(cpu, pseg, poff + 4, (uint32_t)g_wing[i].w);
+            mem_write32(cpu, pseg, poff + 8, (uint32_t)(g_wing[i].topdown ? -g_wing[i].h : g_wing[i].h));
+            mem_write16(cpu, pseg, poff + 12, 1);
+            mem_write16(cpu, pseg, poff + 14, (uint16_t)g_wing[i].bpp);
+            for (int k = 16; k < 40; k += 4) mem_write32(cpu, pseg, (uint16_t)(poff + k), 0);
+        }
+    }
+    ret(cpu, 6);
+}
+
+/* WinGSetDIBColorTable / WinGGetDIBColorTable(HDC, UINT start, UINT n,
+ * RGBQUAD far *): the colour table of the surface selected into the WinG DC.
+ * Args: p@0 n@4 start@6 hdc@8. Returns the entries copied. */
+static void wing_colors(CPU *cpu, int set) {
+    uint16_t poff = a16(cpu, 0), pseg = a16(cpu, 2), n = a16(cpu, 4), start = a16(cpu, 6);
+    int d = (int)a16(cpu, 8) - WING_DC_HANDLE;
+    int i = (d >= 0 && d < WING_DC_MAX) ? wing_index_of(g_wingdc_sel[d]) : -1;
+    if (i < 0) i = g_wing_cur;
+    uint16_t done = 0;
+    for (; i >= 0 && done < n && start + done < 256; done++) {
+        uint8_t *q = &g_wing[i].pal[(start + done) * 4];
+        uint16_t o = (uint16_t)(poff + done * 4);
+        for (int c = 0; c < 4; c++) {
+            if (set) q[c] = mem_read8(cpu, pseg, (uint16_t)(o + c));
+            else     mem_write8(cpu, pseg, (uint16_t)(o + c), q[c]);
+        }
+    }
+    cpu->ax = done;
+    ret(cpu, 10);
+}
+void WING_WINGSETDIBCOLORTABLE(CPU *cpu) { wing_colors(cpu, 1); }
+void WING_WINGGETDIBCOLORTABLE(CPU *cpu) { wing_colors(cpu, 0); }
 
 void GDI_STRETCHBLT(CPU *cpu) {
     if (getenv("RECOMP_LOG_ROP")) { static int n; if (n++ < 40)

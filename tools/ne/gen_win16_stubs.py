@@ -60,7 +60,7 @@ def imports_used(ne, skip=(), seen=None):
             mod = win16.module_name(ne, r.module_idx)
             if mod.upper() in skip:
                 continue            # another lifted module: a direct call, not a shim
-            imp = win16.get_import(mod, r.ordinal)
+            imp = win16.get_import(mod, r.ordinal, r.name)
             entry = seen.setdefault(imp.name, [imp, False])
             if r.src_type != 5:
                 entry[1] = True

@@ -112,7 +112,7 @@ class NELifter(Lifter):
                     if xm is not None and r.ordinal in xm:
                         s, o = xm[r.ordinal]
                         return f'seg{s:03d}_{o:04X}'
-                    imp = get_import(mod, r.ordinal)
+                    imp = get_import(mod, r.ordinal, r.name)
                     return imp.name
         return None
 
@@ -353,7 +353,7 @@ class NELifter(Lifter):
                     # protected mode uses 3/8 because selectors are 8 apart;
                     # our selectors are consecutive, so the pair is 0/1 and
                     # cpu_alloc_selector tiles a huge block one selector per 64K.
-                    if tt in (1, 2) and module_name(self.ne, r.module_idx).upper() == 'KERNEL'                             and r.ordinal in (113, 114):
+                    if tt == 1 and module_name(self.ne, r.module_idx).upper() == 'KERNEL'                             and r.ordinal in (113, 114):
                         val = 0 if r.ordinal == 113 else 1
                         self._emit(_put(f'0x{val:04X}'),
                                    f'{orig} -- KERNEL.{r.ordinal} '
