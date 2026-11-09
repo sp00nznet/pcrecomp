@@ -14,6 +14,7 @@
 #ifndef RECOMP_GAME_H
 #define RECOMP_GAME_H
 #include <stdint.h>
+struct CPU;
 
 typedef struct {
     const char *title;            /* log prefix and window-class fallback, e.g. "Catz" */
@@ -77,6 +78,11 @@ typedef struct {
      * hmemcpy'd every frame through a NULL pointer. 0: not sent (the PF Magic
      * engines and SimAnt, which were brought up without it). */
     int create_message;
+
+    /* Called once the image is loaded and the selectors are mapped, before the
+     * first module entry runs. A DOS-extended game (Jazz Jackrabbit) maps its
+     * video memory and starts its window and timers here. NULL: nothing. */
+    void (*start)(struct CPU *cpu);
 } RecompGame;
 
 struct CPU;

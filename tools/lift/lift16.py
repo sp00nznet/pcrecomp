@@ -1184,6 +1184,10 @@ class Lifter:
             body += '}'
             self._emit(body, orig)
 
+        elif m in ('verr', 'verw'):                     # ZF = the selector is usable
+            self._emit(f'{{ uint16_t _ar; if (cpu_lar(cpu, (uint16_t)({_read(op1)}), &_ar)) '
+                       f'cpu->flags |= FLAG_ZF; else cpu->flags &= ~FLAG_ZF; }}', orig)
+
         elif m in ('lar', 'lsl'):                       # load access rights / segment limit
             helper = 'cpu_lar' if m == 'lar' else 'cpu_lsl'
             body = (f'{{ uint16_t _ar; if ({helper}(cpu, (uint16_t)({_read(op2)}), &_ar)) '

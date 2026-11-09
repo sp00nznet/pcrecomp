@@ -999,6 +999,15 @@ class Decoder:
                     inst.op3 = Operand(type=OpType.IMM8, disp=self._u8(), size=1)
                 else:                         # 0xA5/0xAD: count in CL
                     inst.op3 = Operand(type=OpType.REG8, reg=1, size=1)  # CL
+            elif op2b == 0x00 and self.pos < len(self.data) and ((self.data[self.pos] >> 3) & 7) in (4, 5):
+                # VERR / VERW r/m16: ZF = the selector can be read / written.
+                # Borland Pascal's Dos.Intr checks the DS and ES it is about to
+                # load with VERR; decoded as data, `0F 00 E0` became
+                # `add al,ah` and loaded ES from the sum.
+                _, rm, sub = self._decode_modrm(True, seg_override)
+                inst.mnemonic = 'verr' if sub == 4 else 'verw'
+                rm.size = 2
+                inst.op1 = rm
             elif op2b in (0x02, 0x03):        # LAR / LSL r16, r/m16 (selector validity)
                 reg, rm, _ = self._decode_modrm(True, seg_override)
                 inst.mnemonic = 'lar' if op2b == 0x02 else 'lsl'

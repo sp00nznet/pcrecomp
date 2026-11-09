@@ -2104,7 +2104,13 @@ static int find_step(CPU *cpu, int slot, WIN32_FIND_DATAA *fd, uint8_t want, int
     }
 }
 
+/* A game whose program is DOS-extended rather than Windows (Jazz Jackrabbit,
+ * under Borland's RTM) needs more of DOS than a Windows program does: it
+ * answers first, and returns 0 for what it leaves to the cases below. */
+__attribute__((weak)) int recomp_game_int21(CPU *cpu) { (void)cpu; return 0; }
+
 void dos_int21(CPU *cpu) {
+    if (recomp_game_int21(cpu)) return;
     switch (cpu->ah) {
     case 0x4C:                              /* terminate process */
         printf("[INT21/4C] program exit, code=%u\n", cpu->al);
