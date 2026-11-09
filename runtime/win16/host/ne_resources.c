@@ -246,6 +246,14 @@ uint16_t ne_loadlib(const char *name, const char *hostpath) {
     if (g_nmods < (int)(sizeof g_mods / sizeof g_mods[0])) {
         uint16_t hinst = (uint16_t)(0xF000 + g_nmods);
         Mod *m = register_mod(base, hinst, hostpath);
+        /* A DLL loaded at run time can carry the tag map too: CivNet's is in
+           CIVENG0.DLL, which it LoadLibrary's. */
+        if (m && recomp_game.resource_tags) {
+            int before = g_ntag;
+            scan_tagmap(m);
+            if (g_ntag != before)
+                fprintf(stderr, "[ne] tag map: %d records from %s\n", g_ntag - before, base);
+        }
         if (m) return m->hinst;
     }
     return 0;

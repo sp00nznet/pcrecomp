@@ -143,10 +143,12 @@ static void hwnd_proc(HWND h, uint16_t *seg, uint16_t *off) {
     *seg = g_wndproc_seg; *off = g_wndproc_off;
 }
 
-/* Call the guest WNDPROC(hWnd, uMsg, wParam, lParam) via the far dispatcher.
- * Win16 PASCAL: push args left-to-right; lParam is a DWORD (hi word first). */
-static uint16_t call_guest_wndproc(uint16_t pseg, uint16_t poff,
-                                   uint16_t hwnd, uint16_t msg, uint16_t wparam, uint32_t lparam) {
+/* Call a guest far PASCAL procedure from the host: argw[] are the argument
+ * words in push order (a DWORD is its high word, then its low word). The
+ * guest may be mid-call (a WNDPROC delivered inside CreateWindow, a timer
+ * callback inside the message loop), so its whole state comes back after.
+ * Returns AX. */
+uint16_t recomp_call_guest(uint16_t pseg, uint16_t poff, const uint16_t *argw, int n) {
     CPU *cpu = g_cpu;
     if (!pseg) return 0;
     /* The WNDPROC runs re-entrantly (CreateWindow delivers WM_NCCREATE/CREATE
@@ -167,11 +169,7 @@ static uint16_t call_guest_wndproc(uint16_t pseg, uint16_t poff,
     uint16_t saved_exc_head    = mem_read16(cpu, cpu->ss, 0x14);
     uint16_t saved_exc_head_16 = mem_read16(cpu, cpu->ss, 0x16);
     cpu->ds = cpu->es = recomp_dgroup_of_seg(pseg);   /* the proc's own module */
-    push16(cpu, hwnd);
-    push16(cpu, msg);
-    push16(cpu, wparam);
-    push16(cpu, (uint16_t)(lparam >> 16));
-    push16(cpu, (uint16_t)(lparam & 0xFFFF));
+    for (int i = 0; i < n; i++) push16(cpu, argw[i]);
     push16(cpu, cpu->cs); push16(cpu, 0);          /* far return frame */
     dispatch_far(cpu, pseg, poff);
     uint16_t ret = cpu->ax;
@@ -186,6 +184,13 @@ static uint16_t call_guest_wndproc(uint16_t pseg, uint16_t poff,
     mem_write16(cpu, cpu->ss, 0x14, saved_exc_head);
     mem_write16(cpu, cpu->ss, 0x16, saved_exc_head_16);
     return ret;
+}
+
+/* WNDPROC(hWnd, uMsg, wParam, lParam). */
+static uint16_t call_guest_wndproc(uint16_t pseg, uint16_t poff,
+                                   uint16_t hwnd, uint16_t msg, uint16_t wparam, uint32_t lparam) {
+    uint16_t a[5] = { hwnd, msg, wparam, (uint16_t)(lparam >> 16), (uint16_t)lparam };
+    return recomp_call_guest(pseg, poff, a, 5);
 }
 
 /* Structural/creation messages carry host-only data (CREATESTRUCT/MINMAXINFO/

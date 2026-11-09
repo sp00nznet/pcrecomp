@@ -268,6 +268,28 @@ WINFLAGS = 0x0403       # WF_ENHANCED | WF_PMODE | WF_80x87, as GetWinFlags repo
 # NAME; their sizes are each export's own `retf N`, read off the shipped DLLs
 # (spacebucks-recomp tools/dll_purges.py).
 PURGE.update({
+    # CivNet: from the Windows 3.1 SDK prototypes,
+    # checked against CIVNET.EXE's call sites (civnet-recomp tools/callsite_purges.py).
+    ('COMMDLG', 'COMMDLGEXTENDEDERROR'): 0,
+    ('GDI', 'ENUMFONTFAMILIES'): 14, ('GDI', 'GETBITMAPDIMENSIONEX'): 6,
+    ('GDI', 'GETTEXTALIGN'): 2, ('GDI', 'GETTEXTEXTENTPOINT'): 12,
+    ('KERNEL', 'ISBADHUGEREADPTR'): 8, ('KERNEL', 'ISBADSTRINGPTR'): 6,
+    ('MMSYSTEM', 'MCIGETDEVICEID'): 4, ('MMSYSTEM', 'MCISENDCOMMAND'): 12,
+    ('TOOLHELP', 'MEMMANINFO'): 4, ('TOOLHELP', 'MODULEFINDHANDLE'): 6,
+    ('TOOLHELP', 'STACKTRACECSIPFIRST'): 12, ('TOOLHELP', 'STACKTRACENEXT'): 4,
+    ('USER', 'CREATECARET'): 8, ('USER', 'DESTROYCARET'): 0, ('USER', 'HIDECARET'): 2,
+    ('USER', 'SHOWCARET'): 2, ('USER', 'GETFREESYSTEMRESOURCES'): 2,
+    ('USER', 'MAPWINDOWPOINTS'): 10, ('USER', 'SCROLLWINDOWEX'): 22, ('USER', 'SHOWSCROLLBAR'): 6,
+    # The serial port (modem play).
+    ('USER', 'OPENCOMM'): 8, ('USER', 'CLOSECOMM'): 2, ('USER', 'READCOMM'): 8,
+    ('USER', 'WRITECOMM'): 8, ('USER', 'FLUSHCOMM'): 4, ('USER', 'GETCOMMERROR'): 6,
+    ('USER', 'GETCOMMSTATE'): 6, ('USER', 'SETCOMMSTATE'): 4, ('USER', 'GETCOMMEVENTMASK'): 4,
+    ('USER', 'SETCOMMEVENTMASK'): 4, ('USER', 'ENABLECOMMNOTIFICATION'): 8,
+    ('USER', 'ESCAPECOMMFUNCTION'): 4, ('USER', 'SETCOMMBREAK'): 2, ('USER', 'CLEARCOMMBREAK'): 2,
+    ('USER', 'UNGETCOMMCHAR'): 4,
+})
+
+PURGE.update({
     ('GDI', 'ANIMATEPALETTE'): 10,     ('GDI', 'SETPALETTEENTRIES'): 10,
     ('GDI', 'CREATEPOLYGONRGN'): 8,    ('GDI', 'DPTOLP'): 8,
     ('GDI', 'GETMAPMODE'): 2,          ('GDI', 'PTINREGION'): 6,
