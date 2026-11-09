@@ -21,6 +21,7 @@
 #include <windows.h>
 
 extern CPU *g_cpu;
+uint32_t recomp_guest_color(uint32_t c);   /* win16_impl.c: PALETTEINDEX -> RGB */
 
 /* arg helpers (shim entry stack: [sp]=retIP, [sp+2]=retCS, [sp+4]=last arg) */
 static inline uint16_t b_a16(CPU *cpu, int off) {
@@ -427,6 +428,16 @@ void USER_CREATEWINDOW(CPU *cpu) {
        GetClientRect, and make the overlay a child filling it. One window, one
        drawing surface. RECOMP_DESKTOP=1 keeps the original two-window layout. */
     int as_child = 0;
+    /* real_windows (CivNet): the game ran full screen and places its pop-ups
+       in screen coordinates. Each becomes a child of the main frame where the
+       game puts it, so the main frame's client area is the guest's screen. */
+    if (recomp_game.real_windows && !getenv("RECOMP_DESKTOP") && g_main_hwnd
+        && (style & WS_POPUP) && !(style & WS_CHILD)) {
+        as_child = 1;
+        style = (style & ~(uint32_t)(WS_POPUP | WS_CAPTION | WS_SYSMENU)) | WS_CHILD;
+        parent = g_main_hwnd;
+        if (x == (int16_t)0x8000) x = y = 0;
+    } else
     if (!getenv("RECOMP_DESKTOP") && g_main_hwnd && !g_screen_hwnd
         && (style & WS_POPUP) && !(style & WS_CHILD)) {
         as_child = 1;
@@ -440,7 +451,9 @@ void USER_CREATEWINDOW(CPU *cpu) {
     HWND hw = CreateWindowExA(0, hostcls, title, (DWORD)style, x, y, w, h,
                               parent, NULL, GetModuleHandle(NULL), NULL);
     uint16_t gh = hw ? put_hwnd(hw) : 0;
-    if (hw && !g_main_hwnd) {
+    /* real_windows: the main frame is the first one with a caption (CivNet
+       makes a hidden helper window before it). */
+    if (hw && !g_main_hwnd && (!recomp_game.real_windows || (style & WS_CAPTION) == WS_CAPTION)) {
         g_main_hwnd = hw;
         if (!getenv("RECOMP_DESKTOP")) {      /* client area == the engine's screen */
             /* The engine renders a fixed 640x480 playpen and reports exactly that
@@ -458,7 +471,7 @@ void USER_CREATEWINDOW(CPU *cpu) {
                          SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         }
     }
-    if (hw && !g_screen_hwnd
+    if (hw && !g_screen_hwnd && !recomp_game.real_windows
         && (as_child || ((style & WS_POPUP) && !(style & WS_CHILD))))
         g_screen_hwnd = hw;
     if (gh) {
@@ -574,7 +587,8 @@ void USER_UPDATEWINDOW(CPU *cpu) {
  * XDrawPort's brush creation throws "exception 2" at WDRAW.CPP:1935 the moment
  * CreateSolidBrush comes back 0, which is where the first real frame died. */
 void GDI_CREATESOLIDBRUSH(CPU *cpu) {          /* (COLORREF@0) */
-    COLORREF c = (COLORREF)b_a32(cpu, 0);
+    COLORREF c = (COLORREF)recomp_guest_color(b_a32(cpu, 0));
+    if (getenv("RECOMP_LOG_COLOR")) fprintf(stderr, "[color] brush %08lX -> %06lX\n", (unsigned long)b_a32(cpu, 0), (unsigned long)c);
     cpu->ax = put_hgdi(CreateSolidBrush(c));
     b_ret(cpu, 4);
 }
@@ -582,7 +596,7 @@ void GDI_CREATESOLIDBRUSH(CPU *cpu) {          /* (COLORREF@0) */
 void GDI_CREATEPEN(CPU *cpu) {                 /* (style@6, width@4, colour@0) */
     int style = (int16_t)b_a16(cpu, 6);
     int width = (int16_t)b_a16(cpu, 4);
-    COLORREF c = (COLORREF)b_a32(cpu, 0);
+    COLORREF c = (COLORREF)recomp_guest_color(b_a32(cpu, 0));
     cpu->ax = put_hgdi(CreatePen(style, width, c));
     b_ret(cpu, 8);
 }
@@ -964,6 +978,28 @@ void GDI_TEXTOUT(CPU *cpu) {
     b_ret(cpu, 12);
 }
 
+/* GDI_BITBLT's non-WinG half (win16_impl.c). Returns 0 to let the WinG path
+ * have it. A WinG destination is bracketed like any drawing call (draw_dc). */
+int recomp_gdi_bitblt(CPU *cpu) {
+    uint16_t gd = b_a16(cpu, 18), gs = b_a16(cpu, 8);
+    int x = (int16_t)b_a16(cpu, 16), y = (int16_t)b_a16(cpu, 14);
+    int w = (int16_t)b_a16(cpu, 12), h = (int16_t)b_a16(cpu, 10);
+    int xs = (int16_t)b_a16(cpu, 6), ys = (int16_t)b_a16(cpu, 4);
+    DWORD rop = b_a32(cpu, 0);
+    HDC src = gs ? get_hdc(gs) : NULL;
+    if (gs && !src) return 0;
+    RECT r = { x, y, x + w, y + h }, used = r;
+    int wing = 0;
+    HDC dst = draw_dc(cpu, gd, r, &used, &wing);
+    cpu->ax = (uint16_t)(dst ? BitBlt(dst, x, y, w, h, src, xs, ys, rop) : 0);
+    if (dst && wing) wing_draw_end(cpu, gd, &used);
+    if (getenv("RECOMP_LOG_BLT")) { static int k; if (k++ < 200)
+        fprintf(stderr, "[gdiblt] %u(%d,%d %dx%d) <- %u(%d,%d) rop %06lX -> %u\n",
+                gd, x, y, w, h, gs, xs, ys, (unsigned long)rop, cpu->ax); }
+    b_ret(cpu, 20);
+    return 1;
+}
+
 /* ExtTextOut(hdc@20, x@18, y@16, fuOptions@14, lprc@10/12, lpString@6/8,
  * cbCount@4, lpDx@0/2): TextOut with an optional clip/opaque rectangle and
  * per-character advances. CivNet draws every label of its own controls with it. */
@@ -1050,7 +1086,7 @@ void USER_DRAWTEXT(CPU *cpu) {
     b_asciiz(cpu, ss, so, buf, sizeof buf);
     RECT used = r; int wing = 0;
     HDC dc = draw_dc(cpu, g, r, &used, &wing);
-    if (getenv("RECOMP_LOG_TEXT")) { static int n; if (n++ < 20)
+    if (getenv("RECOMP_LOG_TEXT")) { static int n; if (n++ < 2000)
         fprintf(stderr, "[text] DrawText hdc=%u \"%s\" n=%d rect=(%ld,%ld)-(%ld,%ld) fmt=%04X\n",
             g, buf, n, (long)r.left, (long)r.top, (long)r.right, (long)r.bottom, fmt); }
     cpu->ax = (uint16_t)(dc ? DrawTextA(dc, buf, len, &r, fmt) : 0);
@@ -1148,7 +1184,7 @@ void USER_FRAMERECT(CPU *cpu) {
 void GDI_SETBKCOLOR(CPU *cpu) {                /* (hdc@4, COLORREF@0) */
     uint16_t g = b_a16(cpu, 4);
     HDC dc = wing_is_dc(g) ? wing_state_dc(cpu, g) : get_hdc(g);
-    COLORREF prev = dc ? SetBkColor(dc, (COLORREF)b_a32(cpu, 0)) : 0;
+    COLORREF prev = dc ? SetBkColor(dc, (COLORREF)recomp_guest_color(b_a32(cpu, 0))) : 0;
     cpu->ax = (uint16_t)(prev & 0xFFFF); cpu->dx = (uint16_t)(prev >> 16);
     b_ret(cpu, 6);
 }
@@ -1156,7 +1192,8 @@ void GDI_SETBKCOLOR(CPU *cpu) {                /* (hdc@4, COLORREF@0) */
 void GDI_SETTEXTCOLOR(CPU *cpu) {              /* (hdc@4, COLORREF@0) */
     uint16_t g = b_a16(cpu, 4);
     HDC dc = wing_is_dc(g) ? wing_state_dc(cpu, g) : get_hdc(g);
-    COLORREF prev = dc ? SetTextColor(dc, (COLORREF)b_a32(cpu, 0)) : 0;
+    if (getenv("RECOMP_LOG_COLOR")) fprintf(stderr, "[color] text %08lX -> %06lX\n", (unsigned long)b_a32(cpu, 0), (unsigned long)recomp_guest_color(b_a32(cpu, 0)));
+    COLORREF prev = dc ? SetTextColor(dc, (COLORREF)recomp_guest_color(b_a32(cpu, 0))) : 0;
     cpu->ax = (uint16_t)(prev & 0xFFFF); cpu->dx = (uint16_t)(prev >> 16);
     b_ret(cpu, 6);
 }

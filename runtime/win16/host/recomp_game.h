@@ -84,6 +84,17 @@ typedef struct {
      * games brought up without it). */
     int destroy_message;
 
+    /* WinG blits to a window go through the game's active palette, not the
+     * surface's own colour table: WinG with an identity palette shows the
+     * palette realised on screen, which is what CivNet sets and animates (its
+     * surfaces' tables stay zero). 0: each surface's table (the PF Magic games). */
+    int wing_screen_palette;
+
+    /* Palette entries 0-9 and 246-255 show the Windows static colours, as on a
+     * 256-colour screen, where a game's palette cannot replace them. CivNet
+     * paints its dialogs with them. 0: the game's palette as is. */
+    int static_colors;
+
     /* Called once the image is loaded and the selectors are mapped, before the
      * first module entry runs. A DOS-extended game (Jazz Jackrabbit) maps its
      * video memory and starts its window and timers here. NULL: nothing. */
