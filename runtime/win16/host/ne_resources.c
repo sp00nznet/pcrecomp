@@ -37,13 +37,13 @@ typedef struct {
 static Mod g_mods[48];     /* lifted modules + LoadLibrary'd resource DLLs (Oddballz: 8 + 14 eggs) */
 static int g_nmods;
 
-static struct { Mod *m; Res *r; } g_found[512];
+static struct { Mod *m; Res *r; } g_found[8192];
 static int g_nfound;
 
 /* Petz tag table: maps a 4-char resource tag + id to the real NE integer type.
  * CATZDLL embeds records [tag(4)][00 00][0C 00][type 0xFF0x][id]; the engine asks
  * FindResource by (tag string, id) but resources are stored under the int type. */
-typedef struct { char tag[5]; uint16_t id; uint16_t type; } TagMap;
+typedef struct { char tag[5]; uint16_t id; uint16_t type; const void *mod; } TagMap;
 static TagMap g_tagmap[8192];
 static int g_ntag;
 
@@ -163,6 +163,7 @@ static void scan_tagmap(Mod *m) {
         memcpy(g_tagmap[g_ntag].tag, d + i, 4); g_tagmap[g_ntag].tag[4] = 0;
         g_tagmap[g_ntag].id   = (uint16_t)(d[i + 10] | (d[i + 11] << 8));
         g_tagmap[g_ntag].type = (uint16_t)(type & 0x7FFF);
+        g_tagmap[g_ntag].mod  = m;
         g_ntag++;
     }
 }
@@ -175,14 +176,18 @@ static void scan_tagmap(Mod *m) {
  * back to the tag alone -- but only when it is unambiguous: PALT appears under
  * both 0x7F03 and 0x7F04, and for that one the exact records are what
  * discriminate. */
-static int tag_to_type(const char *tag, int id) {
+/* `in`: a module's own records first. CivNet's nine data DLLs each number
+ * their types from 0x7F01, so STRG is 0x7F01 in one and SPRT in another, and
+ * only the module being searched can say which. NULL: every module, as the
+ * single-DLL PF Magic games always did. */
+static int tag_to_type_in(const char *tag, int id, const void *in) {
     if (id < 0 || !tag) return -1;
     for (int i = 0; i < g_ntag; i++)
-        if (g_tagmap[i].id == (uint16_t)id && ieq(g_tagmap[i].tag, tag))
+        if ((!in || g_tagmap[i].mod == in) && g_tagmap[i].id == (uint16_t)id && ieq(g_tagmap[i].tag, tag))
             return g_tagmap[i].type;
     int found = -1;
     for (int i = 0; i < g_ntag; i++) {
-        if (!ieq(g_tagmap[i].tag, tag)) continue;
+        if ((in && g_tagmap[i].mod != in) || !ieq(g_tagmap[i].tag, tag)) continue;
         if (found >= 0 && found != (int)g_tagmap[i].type) return -1;   /* ambiguous */
         found = (int)g_tagmap[i].type;
     }
@@ -318,8 +323,17 @@ static int res_matches(Res *r, int type_int, const char *type_str,
                            : (r->name_int < 0 && name_str && ieq(r->name_str, name_str));
 }
 
+/* One HRSRC per resource, as Windows gives: CivNet looks resources up
+ * thousands of times, and with a new handle each time the table filled at 512
+ * and every later FindResource failed. */
 static uint16_t register_found(Mod *m, Res *r) {
-    if (g_nfound >= (int)(sizeof g_found / sizeof g_found[0])) return 0;
+    if (getenv("RECOMP_RES_DEDUPE"))
+        for (int i = 0; i < g_nfound; i++)
+            if (g_found[i].m == m && g_found[i].r == r) return (uint16_t)(i + 1);
+    if (g_nfound >= (int)(sizeof g_found / sizeof g_found[0])) {
+        fprintf(stderr, "[ne] *** resource handle table full\n");
+        return 0;
+    }
     g_found[g_nfound].m = m; g_found[g_nfound].r = r;
     return (uint16_t)(++g_nfound);                /* HRSRC = index+1 */
 }
@@ -367,6 +381,22 @@ static uint16_t find_in(Mod *m, int ti, const char *ts, int ni, const char *ns) 
     return 0;
 }
 
+/* find_in, with a 4-char tag type resolved to the int type the resources are
+ * stored under: this module's tag records first, then everyone's. */
+static uint16_t find_tagged(Mod *m, int type_int, const char *type_str, int name_int, const char *name_str) {
+    if (type_int < 0 && type_str && name_int >= 0 && g_ntag) {
+        /* A module with records of its own answers only from them (a CivNet
+           data DLL without a STRN record has no STRN, even if another DLL's
+           STRN type number exists in it); one without any uses everyone's. */
+        int own = 0;
+        for (int i = 0; i < g_ntag && !own; i++) own = g_tagmap[i].mod == m;
+        int t = tag_to_type_in(type_str, name_int, own ? m : NULL);
+        if (getenv("RECOMP_LOG_TAGS")) fprintf(stderr, "[tag] %s/%d in %s -> type %d\n", type_str, name_int, m->name, t);
+        if (t >= 0) return find_in(m, t, NULL, name_int, name_str);
+    }
+    return find_in(m, type_int, type_str, name_int, name_str);
+}
+
 uint16_t ne_find_resource(uint16_t hinst, int type_int, const char *type_str,
                           int name_int, const char *name_str) {
     ne_init();
@@ -376,18 +406,14 @@ uint16_t ne_find_resource(uint16_t hinst, int type_int, const char *type_str,
     if (name_int < 0 && name_str && name_str[0] == '#') { name_int = atoi(name_str + 1); name_str = NULL; }
     /* Resolve a Petz 4-char tag ("APTF","PALT",...) to its real NE int type via
      * the (tag,id) table, since resources are stored under int types not the tag. */
-    if (type_int < 0 && type_str && name_int >= 0) {
-        int t = tag_to_type(type_str, name_int);
-        if (t >= 0) { type_int = t; type_str = NULL; }
-    }
     Mod *m = mod_by_hinst(hinst);
-    uint16_t h = m ? find_in(m, type_int, type_str, name_int, name_str) : 0;
+    uint16_t h = m ? find_tagged(m, type_int, type_str, name_int, name_str) : 0;
     /* The engine sometimes passes hInst=0 / the wrong module's handle (the real
      * resource handle does not always propagate cross-module yet). Fall back to
      * searching every loaded module. */
     for (int j = 0; !h && !no_fallback(m) && j < g_nmods; j++)
         if (&g_mods[j] != m)
-            h = find_in(&g_mods[j], type_int, type_str, name_int, name_str);
+            h = find_tagged(&g_mods[j], type_int, type_str, name_int, name_str);
     return h;
 }
 

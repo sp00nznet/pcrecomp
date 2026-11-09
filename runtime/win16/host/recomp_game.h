@@ -79,6 +79,11 @@ typedef struct {
      * engines and SimAnt, which were brought up without it). */
     int create_message;
 
+    /* Send the guest's WNDPROC WM_DESTROY when a window is destroyed. CivNet's
+     * framework unlinks the window from its parent there. 0: not sent (the
+     * games brought up without it). */
+    int destroy_message;
+
     /* Called once the image is loaded and the selectors are mapped, before the
      * first module entry runs. A DOS-extended game (Jazz Jackrabbit) maps its
      * video memory and starts its window and timers here. NULL: nothing. */

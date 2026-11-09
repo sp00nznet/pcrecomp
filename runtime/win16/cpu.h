@@ -325,6 +325,41 @@ static inline void mem_write32(CPU *cpu, uint16_t seg, uint16_t off, uint32_t va
     mem_write16(cpu, seg, off + 2, (uint16_t)(val >> 16));
 }
 
+/* 32-bit offsets (ADDR32 in the lifted code: `es:[edi]` in a 386 routine). A
+ * selector this host hands out for a big block is followed by its tiles in
+ * flat memory, so base + a 32-bit offset reaches all of it, as a selector with
+ * a big limit does under 386 Enhanced mode. */
+#define ADDR32(x) ((uint32_t)(x))
+static inline uint8_t mem_read8_32(CPU *cpu, uint16_t seg, uint32_t off) {
+    uint32_t a = cpu->sel_base[seg] + off;
+#ifdef RECOMP_MEM_HOOK
+    uint8_t v;
+    if (recomp_mem_read8(cpu, a, &v)) return v;
+#endif
+    return cpu->mem[a];
+}
+static inline void mem_write8_32(CPU *cpu, uint16_t seg, uint32_t off, uint8_t v) {
+    uint32_t a = cpu->sel_base[seg] + off;
+#ifdef RECOMP_MEM_HOOK
+    if (recomp_mem_write8(cpu, a, v)) return;
+#endif
+    cpu->mem[a] = v;
+}
+static inline uint16_t mem_read16_32(CPU *cpu, uint16_t seg, uint32_t off) {
+    return (uint16_t)(mem_read8_32(cpu, seg, off) | (mem_read8_32(cpu, seg, off + 1) << 8));
+}
+static inline void mem_write16_32(CPU *cpu, uint16_t seg, uint32_t off, uint16_t v) {
+    mem_write8_32(cpu, seg, off, (uint8_t)v);
+    mem_write8_32(cpu, seg, off + 1, (uint8_t)(v >> 8));
+}
+static inline uint32_t mem_read32_32(CPU *cpu, uint16_t seg, uint32_t off) {
+    return mem_read16_32(cpu, seg, off) | ((uint32_t)mem_read16_32(cpu, seg, off + 2) << 16);
+}
+static inline void mem_write32_32(CPU *cpu, uint16_t seg, uint32_t off, uint32_t v) {
+    mem_write16_32(cpu, seg, off, (uint16_t)v);
+    mem_write16_32(cpu, seg, off + 2, (uint16_t)(v >> 16));
+}
+
 /* ── Stack operations ──────────────────────────────────────── */
 
 static inline void push16(CPU *cpu, uint16_t val) {

@@ -105,7 +105,19 @@ def _mem_addr(op: Operand) -> tuple:
     else:
         off = '0'
 
+    # A 32-bit base or index (`es:[edi]`, an operand-size 386 routine in a
+    # 16-bit program) addresses past 64 KB of a selector whose limit allows it:
+    # Win16 games blit whole WinG surfaces that way. ADDR32(...) marks the offset
+    # for _read/_write, which use the 32-bit-offset accessors; anywhere else it
+    # is just the value.
+    if any(r and str(r).startswith('e') for r in (op.base, op.index)):
+        off = f'ADDR32({off})'
     return seg, off
+
+
+def _acc(fn: str, off: str) -> str:
+    """mem_read8 -> mem_read8_32 when the offset is 32-bit (ADDR32)."""
+    return fn + '_32' if off.startswith('ADDR32(') else fn
 
 def _cseg() -> str:
     """This function's code segment as a C expression (constant when known).
@@ -130,11 +142,11 @@ def _read(op: Operand) -> str:
     elif op.type == OpType.MEM or op.type == OpType.MOFFS:
         seg, off = _mem_addr(op)
         if op.size == 1:
-            return f'mem_read8(cpu, {seg}, {off})'
+            return f'{_acc("mem_read8", off)}(cpu, {seg}, {off})'
         elif op.size == 4:
-            return f'mem_read32(cpu, {seg}, {off})'
+            return f'{_acc("mem_read32", off)}(cpu, {seg}, {off})'
         else:
-            return f'mem_read16(cpu, {seg}, {off})'
+            return f'{_acc("mem_read16", off)}(cpu, {seg}, {off})'
     return '/* ??? */'
 
 def _write(op: Operand, val: str) -> str:
@@ -154,11 +166,11 @@ def _write(op: Operand, val: str) -> str:
     elif op.type == OpType.MEM or op.type == OpType.MOFFS:
         seg, off = _mem_addr(op)
         if op.size == 1:
-            return f'mem_write8(cpu, {seg}, {off}, (uint8_t)({val}));'
+            return f'{_acc("mem_write8", off)}(cpu, {seg}, {off}, (uint8_t)({val}));'
         elif op.size == 4:
-            return f'mem_write32(cpu, {seg}, {off}, (uint32_t)({val}));'
+            return f'{_acc("mem_write32", off)}(cpu, {seg}, {off}, (uint32_t)({val}));'
         else:
-            return f'mem_write16(cpu, {seg}, {off}, (uint16_t)({val}));'
+            return f'{_acc("mem_write16", off)}(cpu, {seg}, {off}, (uint16_t)({val}));'
     return f'/* write ??? = {val} */;'
 
 def _label(addr: int, prefix: str = '') -> str:
