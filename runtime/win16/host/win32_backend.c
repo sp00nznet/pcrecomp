@@ -86,15 +86,23 @@ static int g_ngdi = 1;
  * table filled, put_hgdi returned 0 and the engine reported "object created ...
  * failed" and stopped being able to make brushes and pens, which is why only a
  * couple of toys could ever be taken off the shelf. */
+/* Guest GDI handles start at GDI_BASE: Win16 lets FillRect take a system
+ * colour, (HBRUSH)(COLOR_xxx + 1), in place of a brush, and handles 1..31
+ * collided with those -- CivNet's grey dialogs filled with whatever object
+ * held handle 16. */
+#define GDI_BASE 0x100
 static uint16_t put_hgdi(HGDIOBJ h) {
     if (!h) return 0;
-    for (int i = 1; i < g_ngdi; i++) if (g_gdi[i] == h) return (uint16_t)i;
-    for (int i = 1; i < g_ngdi; i++) if (!g_gdi[i]) { g_gdi[i] = h; return (uint16_t)i; }
+    for (int i = 1; i < g_ngdi; i++) if (g_gdi[i] == h) return (uint16_t)(i + GDI_BASE);
+    for (int i = 1; i < g_ngdi; i++) if (!g_gdi[i]) { g_gdi[i] = h; return (uint16_t)(i + GDI_BASE); }
     if (g_ngdi >= MAXGDI) { handle_table_full("GDI object"); return 0; }
-    g_gdi[g_ngdi] = h; return (uint16_t)g_ngdi++;
+    g_gdi[g_ngdi] = h; return (uint16_t)(g_ngdi++ + GDI_BASE);
 }
 
-static HGDIOBJ get_hgdi(uint16_t g) { return (g && g < MAXGDI) ? g_gdi[g] : NULL; }
+static HGDIOBJ get_hgdi(uint16_t g) {
+    if (g > 0 && g <= 31) return GetSysColorBrush(g - 1);   /* COLOR_xxx + 1 */
+    return (g >= GDI_BASE && g - GDI_BASE < MAXGDI) ? g_gdi[g - GDI_BASE] : NULL;
+}
 
 /* Stock objects are singletons GDI owns. Now that one host object maps to one
  * guest handle, letting the engine delete one would strand every other holder
@@ -603,7 +611,7 @@ void GDI_CREATEPEN(CPU *cpu) {                 /* (style@6, width@4, colour@0) *
 
 void GDI_GETSTOCKOBJECT(CPU *cpu) {            /* (index@0) */
     uint16_t g = put_hgdi(GetStockObject((int)(int16_t)b_a16(cpu, 0)));
-    if (g) g_gdi_stock[g] = 1;
+    if (g) g_gdi_stock[g - GDI_BASE] = 1;
     cpu->ax = g;
     b_ret(cpu, 2);
 }
@@ -634,7 +642,7 @@ void GDI_SELECTOBJECT(CPU *cpu) {              /* (hdc@2, hgdiobj@0) -> previous
 void GDI_DELETEOBJECT(CPU *cpu) {              /* (hgdiobj@0) */
     uint16_t g = b_a16(cpu, 0);
     HGDIOBJ o = get_hgdi(g);
-    if (o && !g_gdi_stock[g]) { DeleteObject(o); g_gdi[g] = NULL; }
+    if (o && g >= GDI_BASE && !g_gdi_stock[g - GDI_BASE]) { DeleteObject(o); g_gdi[g - GDI_BASE] = NULL; }
     cpu->ax = 1;
     b_ret(cpu, 2);
 }
@@ -1230,6 +1238,9 @@ void USER_FILLRECT(CPU *cpu) {                 /* (hdc@6, lpRect@2/4, hbr@0) */
         RECT used = r; int wing = 0;
         HDC dc = draw_dc(cpu, g, r, &used, &wing);
         if (dc) FillRect(dc, &r, br);
+        if (getenv("RECOMP_LOG_COLOR")) { LOGBRUSH lb = { 0 }; GetObjectA(br, sizeof lb, &lb);
+            fprintf(stderr, "[color] fill hdc=%u (%ld,%ld)-(%ld,%ld) brush %u = %06lX%s\n", g, r.left, r.top,
+                    r.right, r.bottom, b_a16(cpu, 0), (unsigned long)lb.lbColor, wing ? " wing" : ""); }
         if (dc && wing) wing_draw_end(cpu, g, &used);
     }
     cpu->ax = 1;
