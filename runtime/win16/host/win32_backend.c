@@ -2801,6 +2801,14 @@ void GDI_STRETCHDIBITS(CPU *cpu) {
     UINT usage = b_a16(cpu, 4); DWORD rop = b_a32(cpu, 0);
     BITMAPINFO *bi = bmi_copy(cpu, b_a16(cpu, 8), b_a16(cpu, 6), usage);
     const void *bits = bi ? b_flat(cpu, b_a16(cpu, 12), b_a16(cpu, 10), dib_bytes(&bi->bmiHeader)) : NULL;
+    if (bi && usage == DIB_PAL_COLORS) {
+        extern BITMAPINFO *recomp_pal_colors_bmi(const BITMAPINFO *);
+        BITMAPINFO *rgb = recomp_pal_colors_bmi(bi);
+        if (rgb) { free(bi); bi = rgb; usage = DIB_RGB_COLORS; }
+    }
+    if (getenv("RECOMP_LOG_DIB")) { static int k; if (k++ < 60)
+        fprintf(stderr, "[dib] StretchDIBits hdc=%u %dx%d->(%d,%d %dx%d) src(%d,%d) bpp=%d usage=%u rop=%08lX\n",
+                g, ws, hs, xd, yd, wd, hd, xs, ys, bi ? bi->bmiHeader.biBitCount : 0, usage, (unsigned long)rop); }
     RECT r = { xd < xd + wd ? xd : xd + wd, yd < yd + hd ? yd : yd + hd,
                xd > xd + wd ? xd : xd + wd, yd > yd + hd ? yd : yd + hd };
     RECT used = r; int wing = 0;

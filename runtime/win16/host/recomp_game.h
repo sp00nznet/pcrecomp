@@ -99,6 +99,12 @@ typedef struct {
      * first module entry runs. A DOS-extended game (Jazz Jackrabbit) maps its
      * video memory and starts its window and timers here. NULL: nothing. */
     void (*start)(struct CPU *cpu);
+
+    /* Selector step between the 64 KB tiles of a huge block. 0 or 1: packed,
+     * the default. 8: as Windows, for a game whose own code steps huge
+     * pointers by 8 -- lift it with ne_link.py --selector-step 8 to match.
+     * Bermuda Syndrome: 8. */
+    int selector_step;
 } RecompGame;
 
 struct CPU;

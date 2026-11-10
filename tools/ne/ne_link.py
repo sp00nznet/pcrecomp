@@ -52,6 +52,7 @@ sys.path.insert(0, os.path.join(HERE, '..', 'lift'))
 from ne_parse import parse_ne
 import ne_decode
 import ne_lift
+import win16
 import gen_image
 
 
@@ -79,7 +80,13 @@ def main():
                     help='directory of hand-written Win16 shims (repeatable)')
     ap.add_argument('--stack', type=lambda v: int(v, 0), default=0,
                     help='see gen_image.py --stack; only for a DLL-only program')
+    ap.add_argument('--selector-step', type=int, default=1,
+                    help='selector delta per 64 KB tile of a huge block: 1 (the '
+                         'default host model) or 8, as Windows does, for a game '
+                         'whose own code steps huge pointers by 8 (pair with '
+                         'RecompGame.selector_step)')
     args = ap.parse_args()
+    win16.SELECTOR_STEP = args.selector_step
 
     src = os.path.join(args.work, 'src')
     rt = os.path.join(args.work, 'runtime')
@@ -88,6 +95,8 @@ def main():
     ne_lift.PREFIX = args.prefix
 
     nes = gen_image.renumber_all([parse_ne(p) for p in args.modules])
+    for ne in nes:
+        ne_lift.apply_huge_fixups(ne)
     names = [ne.module_name.upper() for ne in nes]
     xmod = {name: exports(ne) for name, ne in zip(names, nes)}
     for ne, name in zip(nes, names):

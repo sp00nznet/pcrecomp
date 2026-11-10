@@ -78,10 +78,7 @@ static uint16_t galloc(CPU *cpu, uint32_t bytes) {
                came next, and Space Bucks' file reader (_lread in 32 KB steps
                through a huge pointer) wrote its fourth chunk of credit4.lbm
                into an unrelated block below the stack. */
-            for (uint32_t off = 0x10000u; off < need; off += 0x10000u) {
-                if (cpu->next_sel == 0) break;
-                cpu->sel_base[cpu->next_sel++] = base + off;
-            }
+            cpu_tile_selectors(cpu, s, base, need);
             /* Blocks off the free list still hold the previous tenant's bytes.
                Real KERNEL grows the heap with fresh (zero) pages, and this
                engine leans on that: XApt's on-screen rect at +0xE8 is read by
@@ -152,8 +149,8 @@ void KERNEL_GLOBALREALLOC(CPU *cpu) {
     } else {                                /* grow: new block, copy, free old */
         uint16_t nsel = galloc(cpu, bytes);
         if (nsel && hMem) {
-            for (uint32_t i = 0; i < old; i++)
-                mem_write8(cpu, nsel, (uint16_t)i, mem_read8(cpu, hMem, (uint16_t)i));
+            /* Flat: a 16-bit offset wrapped a block over 64 KB onto itself. */
+            memmove(cpu->mem + cpu->sel_base[nsel], cpu->mem + cpu->sel_base[hMem], old);
             gfree(cpu, hMem);
         }
         cpu->ax = nsel;
@@ -841,10 +838,30 @@ void GDI_SETDIBITSTODEVICE(CPU *cpu) {
                               xsrc, ysrc, start, nscans,
                               cpu->mem + seg_off(cpu, bits, bito),
                               (const BITMAPINFO *)bi,
-                              usage == 1 ? DIB_PAL_COLORS : DIB_RGB_COLORS);
-    IMPL_LOG("[win16] SetDIBitsToDevice %dx%d at (%d,%d) -> %d\\n", wid, hgt, xdst, ydst, r);
+                              DIB_RGB_COLORS);   /* the table was resolved above */
+    if (getenv("RECOMP_LOG_DIB")) { static int k; if (k++ < 60)
+        fprintf(stderr, "[dib] SetDIBitsToDevice hdc=%u %dx%d at (%d,%d) src(%d,%d) scans %u+%u bpp=%d usage=%u -> %d\n",
+                ghdc, wid, hgt, xdst, ydst, xsrc, ysrc, start, nscans, h->biBitCount, usage, r); }
     cpu->ax = (uint16_t)r;
     ret(cpu, 28);
+}
+
+/* A DIB_PAL_COLORS BITMAPINFO's index table, resolved through the realized
+ * palette into a host BITMAPINFO with an RGB table (free() it). Drawn to a
+ * true-colour host DC, DIB_PAL_COLORS indexes a palette that DC never had and
+ * comes out in the wrong colours. Bermuda Syndrome blits every scene this way. */
+BITMAPINFO *recomp_pal_colors_bmi(const BITMAPINFO *in) {
+    const BITMAPINFOHEADER *h = &in->bmiHeader;
+    unsigned n = h->biBitCount <= 8 ? (h->biClrUsed ? h->biClrUsed : 1u << h->biBitCount) : 0;
+    if (n > 256) n = 256;
+    BITMAPINFO *bi = calloc(1, sizeof(BITMAPINFOHEADER) + 256 * 4);
+    if (!bi) return NULL;
+    bi->bmiHeader = *h;
+    bi->bmiHeader.biClrUsed = n;
+    const uint16_t *idx = (const uint16_t *)((const uint8_t *)in + sizeof(BITMAPINFOHEADER));
+    for (unsigned c = 0; c < n; c++)
+        memcpy(&bi->bmiColors[c], g_active_pal + (idx[c] & 0xFF) * 4, 4);
+    return bi;
 }
 
 uint16_t recomp_guest_scratch(CPU *cpu, uint32_t bytes) {
@@ -1986,7 +2003,26 @@ static FILE *g_dosfiles[64];          /* DOS handle h (>=5) -> host FILE* (slot 
 /* Map a guest DOS path to a host path under RECOMP_DATA_DIR. */
 static int map_guest_path(const char *g, char *host, int hostsz) {
     if (!g[0]) return 0;
-    char low[192]; int i = 0;
+    /* A relative path is relative to the guest's current directory, which is
+     * the install directory: Bermuda Syndrome runs from BERMUDA\SCN and opens
+     * "_01.SCN" bare and its art as "..\MENU\MENU1.WGP". Make it absolute
+     * (folding "..") before the tail match below, or a bare name is looked for
+     * only in the data root. */
+    char abs[256];
+    if (g[1] != ':' && g[0] != '\\' && g[0] != '/' && recomp_game.guest_dir) {
+        snprintf(abs, sizeof abs, "%s\\%s", recomp_game.guest_dir, g);
+        for (char *q = abs; *q; q++) if (*q == '/') *q = '\\';
+        char *d;
+        while ((d = strstr(abs, "\\..\\")) || ((d = strstr(abs, "\\..")) && !d[3])) {
+            char *up = d;
+            while (up > abs && up[-1] != '\\') up--;   /* start of the parent */
+            if (up == abs || up[-1] != '\\') break;    /* nothing to fold */
+            memmove(up - 1, d + 3, strlen(d + 3) + 1);
+        }
+        for (char *q = abs; (q = strstr(q, "\\.\\")); ) memmove(q, q + 2, strlen(q + 2) + 1);
+        g = abs;
+    }
+    char low[256]; int i = 0;
     for (; g[i]; i++) low[i] = (g[i] >= 'A' && g[i] <= 'Z') ? (char)(g[i] + 32) : g[i];
     low[i] = 0;
     char *p = recomp_game.path_anchor ? strstr(low, recomp_game.path_anchor) : NULL;
@@ -2152,6 +2188,24 @@ static int find_step(CPU *cpu, int slot, WIN32_FIND_DATAA *fd, uint8_t want, int
  * under Borland's RTM) needs more of DOS than a Windows program does: it
  * answers first, and returns 0 for what it leaves to the cases below. */
 __attribute__((weak)) int recomp_game_int21(CPU *cpu) { (void)cpu; return 0; }
+
+/* Software interrupts a Win16 program issues itself besides INT 21h. MSVC's
+ * startup seeds from INT 1Ah AH=0 (BIOS ticks since midnight, 18.2/s); the
+ * rest are logged once each. */
+void int_handler(CPU *cpu, int vec) {
+    if (vec == 0x1A && cpu->ah == 0) {
+        SYSTEMTIME t; GetLocalTime(&t);
+        uint32_t ms = ((t.wHour * 60u + t.wMinute) * 60u + t.wSecond) * 1000u + t.wMilliseconds;
+        uint32_t ticks = (uint32_t)((uint64_t)ms * 1193180 / 65536 / 1000);
+        cpu->cx = (uint16_t)(ticks >> 16); cpu->dx = (uint16_t)ticks; cpu->al = 0;
+        return;
+    }
+    static uint32_t told[8];
+    if (!(told[vec >> 5] & (1u << (vec & 31)))) {
+        told[vec >> 5] |= 1u << (vec & 31);
+        fprintf(stderr, "[int] unhandled INT 0x%02X AX=%04X\n", vec, cpu->ax);
+    }
+}
 
 void dos_int21(CPU *cpu) {
     if (recomp_game_int21(cpu)) return;

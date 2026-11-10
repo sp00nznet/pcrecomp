@@ -401,6 +401,7 @@ int main(int argc, char *argv[])
 
     CPU cpu;
     cpu_init(&cpu);
+    if (recomp_game.selector_step > 1) cpu.sel_step = (uint16_t)recomp_game.selector_step;
     g_cpu = &cpu;
 
     /* Flat image + a heap for dynamically allocated selectors (past the image).
