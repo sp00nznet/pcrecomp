@@ -835,6 +835,30 @@ static void shim_RaiseException(void) {
     g_esp += 4 + 4 * 4;
 }
 
+/* DirectInputCreateA/W/Ex and DirectInput8Create check that their HINSTANCE
+ * is a module Windows loaded; a mapped guest image is not one, and they fail
+ * with E_INVALIDARG (KotOR, Messiah, Shogo). The host's own instance stands
+ * in for a guest one. Stack arguments: (hinst, version, ...) up to 5 dwords. */
+static void dinput_create(const char* name, int nargs) {
+    static FARPROC real[4];
+    static const char* names[4] = { "DirectInputCreateA", "DirectInputCreateW", "DirectInputCreateEx",
+                                    "DirectInput8Create" };
+    uint32_t* a = (uint32_t*)(uintptr_t)(g_esp + 4);
+    int k = 0;
+    while (strcmp(names[k], name)) k++;
+    if (!real[k]) real[k] = GetProcAddress(LoadLibraryA(k == 3 ? "dinput8.dll" : "dinput.dll"), name);
+    uint32_t h = native32_in_guest(a[0]) ? (uint32_t)(uintptr_t)GetModuleHandleA(NULL) : a[0];
+    typedef uint32_t (WINAPI *f4_t)(uint32_t, uint32_t, uint32_t, uint32_t);
+    typedef uint32_t (WINAPI *f5_t)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+    g_eax = !real[k] ? 0x80004005u : nargs == 4 ? ((f4_t)real[k])(h, a[1], a[2], a[3])
+                                                : ((f5_t)real[k])(h, a[1], a[2], a[3], a[4]);
+    g_esp += 4 + 4 * nargs;
+}
+static void shim_DirectInputCreateA(void) { dinput_create("DirectInputCreateA", 4); }
+static void shim_DirectInputCreateW(void) { dinput_create("DirectInputCreateW", 4); }
+static void shim_DirectInputCreateEx(void) { dinput_create("DirectInputCreateEx", 5); }
+static void shim_DirectInput8Create(void) { dinput_create("DirectInput8Create", 5); }
+
 /* _CxxThrowException: a guest throw is dispatched over the guest's own
  * frames (eh32.c), so the guest's catch blocks run. */
 void native32_shim_CxxThrowException(void);
@@ -853,6 +877,8 @@ static native32_shim_t g_builtin[] = {
     { "TerminateThread", shim_TerminateThread },
     { "VirtualProtect", shim_VirtualProtect },
     { "VirtualAlloc", shim_VirtualAlloc },
+    { "DirectInputCreateA", shim_DirectInputCreateA }, { "DirectInputCreateW", shim_DirectInputCreateW },
+    { "DirectInputCreateEx", shim_DirectInputCreateEx }, { "DirectInput8Create", shim_DirectInput8Create },
     { "_CxxThrowException", native32_shim_CxxThrowException },
     { "_ftol", native32_shim_ftol },
     { "_CIsqrt", native32_shim_CIsqrt }, { "_CIsin", native32_shim_CIsin },

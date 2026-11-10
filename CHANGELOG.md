@@ -6,6 +6,10 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- native32: `DirectInputCreateA`/`W`/`Ex` and `DirectInput8Create` are built-in
+  shims that swap a guest `HINSTANCE` for the host's: DirectInput refuses a
+  module Windows did not load (`E_INVALIDARG`), and Shogo's engine quit on it
+  before its first frame (KotOR and Messiah had each patched it in their host).
 - lift32: `fsincos` left the sine in ST(0) and the cosine in ST(1); it is
   the other way round. MechCommander 2's camera builds its view direction
   with it, and the swapped pair laid the 35-degree camera almost flat on the
