@@ -317,6 +317,15 @@ class Lifter:
         self._flag_seq = 0       # bumped whenever the flags are written
         self._fp_depth = 0  # FPU stack depth tracking
 
+    def _branch_to(self, target: int) -> str:
+        """The statement for a taken branch to `target`: a goto when the target
+        is a block of this function, else dispatch and return -- the rule jmp
+        and jcc follow, so a branch that leaves the function never becomes a
+        goto to a label that does not exist."""
+        if self._labels is not None and target not in self._labels:
+            return f"{{ RECOMP_ITAIL(0x{target:08X}u); return; }}"
+        return f"goto L_{target:08X};"
+
     def _mm_read(self, op) -> str:
         """Read an operand as a 64-bit MMX value."""
         if op.type == X86_OP_REG and op.reg in MMX_REGS:
@@ -2081,7 +2090,7 @@ class Lifter:
             t = ops[0].imm if ops and ops[0].type == X86_OP_IMM else None
             reg = 'ecx' if m == 'jecxz' else 'LO16(ecx)'
             if t is not None:
-                lines.append(f"if ({reg} == 0) goto L_{t:08X}; {comment}")
+                lines.append(f"if ({reg} == 0) {self._branch_to(t)} {comment}")
 
         elif m in ('loop', 'loope', 'loopne'):
             # loope/loopne also test ZF (je/jne's condition), never CF. The
@@ -2092,10 +2101,10 @@ class Lifter:
             # from a corrupt destination.
             t = ops[0].imm if ops and ops[0].type == X86_OP_IMM else None
             if t is not None and m == 'loop':
-                lines.append(f"if (--ecx != 0) goto L_{t:08X}; {comment}")
+                lines.append(f"if (--ecx != 0) {self._branch_to(t)} {comment}")
             elif t is not None:
                 cond = self._make_condition('je' if m == 'loope' else 'jne')
-                lines.append(f"{{ int _zc = ({cond}); if (--ecx != 0 && _zc) goto L_{t:08X}; }} {comment}")
+                lines.append(f"{{ int _zc = ({cond}); if (--ecx != 0 && _zc) {self._branch_to(t)} }} {comment}")
 
         elif m == 'scasd':
             lines.append(f"_flag_a = eax; _flag_b = MEM32(edi); _flag_k = FK_CMP; "
