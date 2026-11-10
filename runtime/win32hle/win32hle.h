@@ -280,6 +280,7 @@ extern const win32hle_shim win32hle_user32[];
 extern const win32hle_shim win32hle_winmm[];
 extern const win32hle_shim win32hle_lz32[];          /* LZOpenFileA & co: SZDD expanded in memory (lz32.c) */
 extern const win32hle_shim win32hle_wsock32[];        /* by name and by ordinal */
+extern void (*hle_ws_broadcast_hook)(int fd, const void *buf, uint32_t len, unsigned port);   /* after a guest's broadcast sendto */
 void hle_ws_poll(void);                                /* the pump: WSAAsyncSelect notifications */
 extern const win32hle_shim win32hle_ole32[];          /* OLE32 + OLEAUT32 */
 extern const win32hle_shim win32hle_storage[];        /* structured storage: compound files */
