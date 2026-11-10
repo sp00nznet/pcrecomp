@@ -14,6 +14,27 @@ versions follow [SemVer](https://semver.org/).
   shadowed.
 
 ### Added
+- native32: `native32_set_codepage(cp)` runs the guest in its own ANSI code
+  page, whatever the system's: `CP_ACP` in `MultiByteToWideChar` /
+  `WideCharToMultiByte`, `GetACP`, `IsDBCSLeadByte`, and the A functions that
+  take text (files, window text, fonts, `TextOutA`, `ExtTextOutA`,
+  `GetTextExtentPoint32A`, `GetGlyphOutlineA`, `EnumFonts*A`, ...) read the
+  guest's strings in it and call the W functions (`codepage.c`). A Japanese
+  title's Shift-JIS (932) on a Western-locale Windows, with no locale change.
+  Off by default; the selftest checks it.
+- native32: static TLS for guest modules. A module with a TLS directory gets
+  its index, and every guest thread's TIB a copy of the template at
+  `fs:[2Ch]`: Borland's RTL reads its threadvars there from its first
+  instruction.
+- native32: guest SEH (`seh32.c`, opt-in with `native32_guest_seh`).
+  `RaiseException` walks the guest's own `fs:[0]` chain and calls its
+  handlers as guest code; `RtlUnwind` unwinds it; `native32_seh_continue(va)`
+  resumes in the function whose frame took the exception (through its
+  RECOMP_EH_ENTER landing pad), for a host to patch into the runtime's jump
+  to the except block. Borland's runtimes raise every exception this way.
+- lift32: with `computed_ret`, `jmp reg` holding the dummy return address is
+  a return: the `pop edx; ...; jmp edx` hand-made return of Delphi's
+  `_DoneExcept`.
 - pe: `pdb2_ref.py` reads a Visual C++ 5/6 PDB (MSF 2.00, `_ST` symbol
   records), which llvm-pdbutil and `pdb_ref.py` cannot, into the same
   reference JSON, plus a `--seed-functions` list for disasm32. No external

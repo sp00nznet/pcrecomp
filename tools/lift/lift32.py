@@ -1571,6 +1571,13 @@ class Lifter:
                     lines.extend(self._computed_jump(
                         f"MEM32({self._fmt_mem_addr(ops[0].mem)})", comment))
                 elif ops and ops[0].type == X86_OP_REG:
+                    if self.computed_ret:
+                        # The other half of a computed return: `pop edx; ...;
+                        # jmp edx` returns by hand (Delphi's _DoneExcept). The
+                        # address it popped is the dummy one a lifted call
+                        # pushed, so it is a return to the lifted caller.
+                        lines.append(f"if ({self._fmt_read(ops[0])} == RECOMP_RETADDR) {{"
+                                     f" RECOMP_FLAGS_OUT(); return; }}")
                     lines.extend(self._computed_jump(self._fmt_read(ops[0]), comment))
                 else:
                     lines.append(f"RECOMP_ITAIL(0); return; /* unresolved */ {comment}")

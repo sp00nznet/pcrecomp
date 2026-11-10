@@ -42,6 +42,11 @@ def main():
         if "return;" not in on:
             print("FAIL %s with computed_ret: the plain return is gone:\n%s" % (enc.hex(), on))
             bad += 1
+    # jmp edx: a return when edx holds the dummy return address it popped.
+    on, off = emit(bytes((0xFF, 0xE2)), computed_ret=True), emit(bytes((0xFF, 0xE2)))
+    if "edx == RECOMP_RETADDR" not in on or "RECOMP_RETADDR" in off:
+        print("FAIL jmp edx: the popped-return check is wrong:", on, off, sep=chr(10))
+        bad += 1
     print("computed_ret: %s" % ("FAIL" if bad else "ok"))
     return 1 if bad else 0
 
