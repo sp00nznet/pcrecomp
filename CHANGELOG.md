@@ -75,6 +75,15 @@ versions follow [SemVer](https://semver.org/).
   slots; without the defines they are `_st[i]`/`g_st_i64[i]` as before. In
   Operation Flashpoint the ring alone gave +47 % frames and 28 % shorter
   loading stalls; both run in its native Linux build.
+- win32hle: per-import timing for a host's profiler. With `hle_shim_timing`
+  set, each import's inclusive time on the thread that called
+  `hle_mark_main_thread` adds up in `hle_shim_ns_main[]` (names from
+  `hle_shim_name_at`), and `hle_in_shim_main` tells a sampling thread which
+  import that thread is in (-1: lifted code). Off by default (the clock is
+  read twice a call). The clock is `hle_ticks`: the CPU's time-stamp counter
+  where it runs at a constant rate (scaled to ns by `hle_tsc_calibrate`, which
+  a host calls at start), CLOCK_MONOTONIC otherwise. Operation Flashpoint's
+  performance log is built on it.
 - pe: `pdb2_ref.py` reads a Visual C++ 5/6 PDB (MSF 2.00, `_ST` symbol
   records), which llvm-pdbutil and `pdb_ref.py` cannot, into the same
   reference JSON, plus a `--seed-functions` list for disasm32. No external

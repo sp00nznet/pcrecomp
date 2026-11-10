@@ -129,6 +129,22 @@ extern void (*hle_on_alloc_fail)(const char *what, uint32_t n);
 /* based hosts: where "anywhere" guest reservations stop (0x7F000000, as for a
  * program that is not large-address-aware; up to 0xFFF00000) */
 extern uint32_t hle_vm_any_hi;
+/* Per-import time spent (ns) on the main thread (hle_mark_main_thread),
+ * indexed like registration order, once hle_shim_timing is set;
+ * hle_in_shim_main is the import that thread runs now, -1 in guest code. */
+extern int hle_shim_timing;
+extern uint64_t hle_shim_ns_main[];
+extern volatile int hle_in_shim_main;
+int hle_shim_total(void);
+const char *hle_shim_name_at(int i);
+void hle_mark_main_thread(void);
+uint64_t hle_mono_ns(void);                      /* CLOCK_MONOTONIC in ns */
+/* short spans, cheaply: hle_ticks_ns(hle_ticks() - t0) is ns. A host calls
+ * hle_tsc_calibrate once at start (it waits 20 ms) and may call it again (it
+ * refines the scale); before that, ticks are ns. */
+uint64_t hle_ticks(void);
+uint64_t hle_ticks_ns(uint64_t ticks);
+void hle_tsc_calibrate(void);
 
 /* ---- native -> guest ----
  * Run a lifted function (window proc, dialog proc, thread start, timer) from
