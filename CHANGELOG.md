@@ -33,6 +33,12 @@ versions follow [SemVer](https://semver.org/).
   to the community's Internet servers too, whose answers fill the game's own
   server list. Only the list (names, ping, players) has been tried; joining a
   game this way has not.
+- win32hle: `hle_vm_any_hi`, where "anywhere" guest reservations stop
+  (0x7F000000 by default, as before). A based host can raise it to
+  0xFFF00000 to give the guest the 4 GB a large-address-aware program gets on
+  a 64-bit Windows. Operation Flashpoint at long view distances runs out of
+  2 GB; with 4 GB it does not. `hle_on_alloc_fail(what, n)` is called when
+  the guest heap or a page reservation fails, for a host's log.
 - pe: `pdb2_ref.py` reads a Visual C++ 5/6 PDB (MSF 2.00, `_ST` symbol
   records), which llvm-pdbutil and `pdb_ref.py` cannot, into the same
   reference JSON, plus a `--seed-functions` list for disasm32. No external

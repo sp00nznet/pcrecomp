@@ -123,6 +123,12 @@ uint32_t hle_resolve_or_stub(const char *name);
 
 /* Human name for a synthetic shim VA (for traces/faults), or NULL. */
 const char *hle_name(uint32_t va);
+/* called when guest memory runs out (the heap or pages): a host's log may
+ * want to know */
+extern void (*hle_on_alloc_fail)(const char *what, uint32_t n);
+/* based hosts: where "anywhere" guest reservations stop (0x7F000000, as for a
+ * program that is not large-address-aware; up to 0xFFF00000) */
+extern uint32_t hle_vm_any_hi;
 
 /* ---- native -> guest ----
  * Run a lifted function (window proc, dialog proc, thread start, timer) from
