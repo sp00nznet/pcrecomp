@@ -1135,6 +1135,40 @@ recomp_func_t recomp_lookup(uint32_t va);          /* binary search in dispatch 
 recomp_func_t recomp_lookup_manual(uint32_t va);    /* manual overrides */
 recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
 
+/* An import bridge's VA, if the host says (win32hle sets it): its lookup can
+ * depend on more than the VA (a shared entry that reads which import was
+ * asked), so it is never cached, and it is looked up first, before the
+ * search of the lifted functions that cannot hold it. A host that sets it
+ * keeps its manual overrides off the import VAs. */
+RECOMP_WEAK int (*recomp_is_import)(uint32_t va) = 0;
+
+/* An indirect call's target: manual overrides, the dispatch table (a binary
+ * search), then the imports. A host where one thread at a time runs lifted
+ * code (win32hle's machine lock) can define RECOMP_RESOLVE_CACHE, a power of
+ * two, for a direct-mapped cache of the lifted answers in front of the first
+ * two: a C++ program makes millions of virtual calls a second. Imports are
+ * looked up every time (the lookup names the shim about to run). */
+#ifdef RECOMP_RESOLVE_CACHE
+typedef struct { uint32_t va; recomp_func_t fn; } recomp_resolve_slot_t;
+RECOMP_WEAK recomp_resolve_slot_t g_resolve_cache[RECOMP_RESOLVE_CACHE] = { { 0, 0 } };
+#endif
+static inline recomp_func_t recomp_resolve(uint32_t va) {
+    if (recomp_is_import && recomp_is_import(va)) return recomp_lookup_import(va);
+#ifdef RECOMP_RESOLVE_CACHE
+    recomp_resolve_slot_t *slot = &g_resolve_cache[(va ^ (va >> 14)) & (RECOMP_RESOLVE_CACHE - 1)];
+    if (slot->va == va && slot->fn) return slot->fn;
+#endif
+    recomp_func_t f = recomp_lookup_manual(va);
+    if (!f) f = recomp_lookup(va);
+    if (f) {
+#ifdef RECOMP_RESOLVE_CACHE
+        slot->va = va, slot->fn = f;
+#endif
+        return f;
+    }
+    return recomp_lookup_import(va);
+}
+
 /* The dummy return address pushed before a recompiled call. The callee's lifted
  * `ret` pops it. 0xDEAD0000 is a recognizable marker, but if a stack imbalance
  * ever leaks it into a value (e.g. a size argument) the high bits are destructive.
@@ -1153,6 +1187,45 @@ recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
  * function whose first `je` tests the helper's ZF (Bunghole in One's ball
  * never moved). */
 
+/* The indirect-call trace ring (above): two stores and two counters a call,
+ * millions a second in a game. RECOMP_NO_ICALL_TRACE leaves it out (a crash
+ * report then has no ring). */
+#ifdef RECOMP_NO_ICALL_TRACE
+#define RECOMP_ICALL_TRACE(va) ((void)0)
+#else
+#define RECOMP_ICALL_TRACE(va) do { \
+    g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = (va); \
+    g_icall_from[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = g_cur_func; \
+    g_icall_trace_idx++; \
+    g_icall_count++; \
+} while (0)
+#endif
+
+/* RECOMP_ICALL_SITE_CACHE (with RECOMP_RESOLVE_CACHE's single-thread rule, and
+ * a host that sets recomp_is_import): each indirect call site keeps the last
+ * target it resolved (most sites always call the same one), so the common
+ * case is a compare instead of a call into recomp_resolve. Imports are not
+ * kept. One 64-bit word a site, read and written whole: the guest VA, and the
+ * host function as an offset from recomp_resolve (one executable: it fits 32
+ * bits). Uses a GCC/Clang statement expression. */
+#ifdef RECOMP_ICALL_SITE_CACHE
+#define RECOMP_RESOLVE_SITE(va) ({ \
+    static uint64_t _sc; \
+    uint64_t _e = _sc; \
+    recomp_func_t _rf; \
+    if (_e && (uint32_t)(_e >> 32) == (va)) \
+        _rf = (recomp_func_t)((uintptr_t)recomp_resolve + (uintptr_t)(intptr_t)(int32_t)(uint32_t)_e); \
+    else { \
+        _rf = recomp_resolve(va); \
+        intptr_t _o = _rf ? (intptr_t)_rf - (intptr_t)recomp_resolve : 0; \
+        if (_rf && _o == (intptr_t)(int32_t)_o && recomp_is_import && !recomp_is_import(va)) \
+            _sc = ((uint64_t)(va) << 32) | (uint32_t)(int32_t)_o; \
+    } \
+    _rf; })
+#else
+#define RECOMP_RESOLVE_SITE(va) recomp_resolve(va)
+#endif
+
 /* Direct call to a known recompiled function */
 #define RECOMP_CALL(func) do { \
     uint32_t _caller = g_cur_func; \
@@ -1167,13 +1240,8 @@ recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
 /* Indirect call through dispatch */
 #define RECOMP_ICALL(target_va) do { \
     uint32_t _va = (uint32_t)(target_va); \
-    g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
-    g_icall_from[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = g_cur_func; \
-    g_icall_trace_idx++; \
-    g_icall_count++; \
-    recomp_func_t _fn = recomp_lookup_manual(_va); \
-    if (!_fn) _fn = recomp_lookup(_va); \
-    if (!_fn) _fn = recomp_lookup_import(_va); \
+    RECOMP_ICALL_TRACE(_va); \
+    recomp_func_t _fn = RECOMP_RESOLVE_SITE(_va); \
     if (_fn) { \
         uint32_t _caller = g_cur_func; \
         PUSH32(esp, RECOMP_RETADDR); \
@@ -1195,13 +1263,8 @@ recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
 /* Indirect tail call (jmp through dispatch) */
 #define RECOMP_ITAIL(target_va) do { \
     uint32_t _va = (uint32_t)(target_va); \
-    g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
-    g_icall_from[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = g_cur_func; \
-    g_icall_trace_idx++; \
-    g_icall_count++; \
-    recomp_func_t _fn = recomp_lookup_manual(_va); \
-    if (!_fn) _fn = recomp_lookup(_va); \
-    if (!_fn) _fn = recomp_lookup_import(_va); \
+    RECOMP_ICALL_TRACE(_va); \
+    recomp_func_t _fn = RECOMP_RESOLVE_SITE(_va); \
     if (_fn) { RECOMP_FLAGS_OUT(); RECOMP_REGS_OUT(); _fn(); RECOMP_REGS_IN(); } \
     else if (_va == RECOMP_RETADDR) { /* setjmp and friends return by jumping \
         to the saved return address; that is a return, not a missing target. */ } \

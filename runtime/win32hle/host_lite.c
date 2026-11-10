@@ -245,6 +245,9 @@ static void shim_entry(void) {
     g_cur_import = g_shim[i].name;
     g_shim[i].fn();
 }
+/* recomp_types.h's recomp_is_import: imports first, never cached */
+static int is_import_va(uint32_t va) { return va >= SHIM_BASE && va < SHIM_BASE + SHIM_STEP * (uint32_t)g_shim_n; }
+__attribute__((constructor)) static void install_import_test(void) { recomp_is_import = is_import_va; }
 recomp_func_t recomp_lookup_import(uint32_t va) {
     if (va < SHIM_BASE || va >= SHIM_BASE + SHIM_STEP * (uint32_t)g_shim_n) return NULL;
     uint32_t i = (va - SHIM_BASE) / SHIM_STEP;
