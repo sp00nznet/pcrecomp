@@ -5,7 +5,114 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- win32hle: DirectDraw 4's texture cache is rebuilt when `SetSurfaceDesc`
+  changes a surface's size, a render target lets go of its attached z-buffer
+  when it is freed, and each surface has its own uniqueness value;
+  `SetColorKey` and `SetSurfaceDesc` flush queued Direct3D drawing first.
+  `ddraw_selftest.c` covers them. (#158, by [@cpressland](https://github.com/cpressland))
+- win32hle: a font's `lfWidth` stretches or squeezes its text:
+  `GetTextExtentPoint32A`, `GetTextMetricsA` and `TextOutA` scale it to the
+  requested average character width. Theme Park World's ride signs no longer
+  loop forever while being fitted. (#160, by [@cpressland](https://github.com/cpressland))
+- win32hle: DirectSound's play cursor moves on between mixes by the time
+  since the last one, as a sound card's does, so a game streaming by the
+  cursor no longer writes a lap ahead (Theme Park World's movie audio).
+  (#164, by [@cpressland](https://github.com/cpressland))
+- lift32: `loop`, `loope`, `loopne`, `jecxz` and `jcxz` leave the function the
+  way `jmp` and `jcc` do. A taken branch to an address that is not a block of
+  the function being lifted was a `goto` to a label that does not exist, and the
+  generated file did not compile; it now dispatches with `RECOMP_ITAIL` and
+  returns. `tools/lift/test_loop_exits.py` (#166, by [@pete-jorgensen](https://github.com/pete-jorgensen)).
+- win32hle: `VirtualFree(MEM_RELEASE)` fails with `ERROR_INVALID_PARAMETER`,
+  as on Windows, unless it names a whole reservation by its base with size 0.
+  It released the whole reservation instead: Operation Flashpoint calls it on
+  blocks inside its own memory pool and lost the pool (#169, by [@neurocontrarian](https://github.com/neurocontrarian)).
+- win32hle: a handle closed by another thread while a wait is on it wakes the
+  wait as signalled (Windows keeps the object alive for the wait) instead of
+  failing it. Operation Flashpoint closes an event its watchdog thread waits
+  on when it exits. A handle already invalid on the first poll still fails (#169, by [@neurocontrarian](https://github.com/neurocontrarian)).
+- lift32: `fsincos` left the sine in ST(0) and the cosine in ST(1); it is
+  the other way round. MechCommander 2's camera builds its view direction
+  with it, and the swapped pair laid the 35-degree camera almost flat on the
+  ground. A difftest case covers it. Removed a dead second copy of `fpatan`
+  (with its operands swapped), `f2xm1` and `fscale` that the first copies
+  shadowed.
+
 ### Added
+- win32hle: DirectInput 3 and 5 (`dinput.c`): the system mouse (relative or
+  absolute axes, three buttons) and keyboard (DIK codes), immediate and
+  buffered, read from the same input state as the window messages; arriving
+  input sets each device's notification event. Theme Park World's menus use
+  it. (#159, by [@cpressland](https://github.com/cpressland))
+- win32hle: `screen.c` holds the mouse in the picture while the window has
+  focus (SDL 2.0.18+), letting go on focus loss, while the popup menu is
+  open, or on Ctrl+Cmd/Ctrl+Win, with a click to take it back;
+  `hle_screen_confine` turns it off. `SetCursorPos`'s warp is right on HiDPI
+  displays. (#161, by [@cpressland](https://github.com/cpressland))
+- win32hle: `hle_ws_broadcast_hook(fd, buf, len, port)`, called after a
+  guest's UDP `sendto` to 255.255.255.255 (not IPX), so a host can send the
+  same datagram elsewhere. Operation Flashpoint's LAN search is sent this way
+  to the community's Internet servers too, whose answers fill the game's own
+  server list. Only the list (names, ping, players) has been tried; joining a
+  game this way has not (#168, by [@neurocontrarian](https://github.com/neurocontrarian)).
+- win32hle: `hle_vm_any_hi`, where "anywhere" guest reservations stop
+  (0x7F000000 by default, as before). A based host can raise it to
+  0xFFF00000 to give the guest the 4 GB a large-address-aware program gets on
+  a 64-bit Windows. Operation Flashpoint at long view distances runs out of
+  2 GB; with 4 GB it does not. `hle_on_alloc_fail(what, n)` is called when
+  the guest heap or a page reservation fails, for a host's log (#170, by [@neurocontrarian](https://github.com/neurocontrarian)).
+- win32hle: GL mode for a host that draws the game itself. With
+  `hle_screen_gl` set before `hle_screen_open` (1 OpenGL, 2 Vulkan), the
+  window is made for that API with no SDL renderer, the host draws into it
+  (`hle_screen_sdl_window`) and tells where its picture lies
+  (`hle_screen_gl_picture`), so the mouse maps onto the game's coordinates,
+  including on high-DPI screens. Operation Flashpoint's Direct3D 8 layer (on
+  OpenGL and on Vulkan) draws through it (#171, by [@neurocontrarian](https://github.com/neurocontrarian)).
+- win32hle: Winsock `select` (wsock32 ordinal 18). Winsock's `fd_set` is a
+  count and an array of up to 64 sockets, not a bitmap; the shim polls them
+  with `poll()`, rewrites each set to hold only the ready sockets and returns
+  the total. A NULL timeout waits for ever, and a wait gives the machine to
+  the other guest threads. Operation Flashpoint's multiplayer screen calls it
+  and crashed on the missing import (#172, by [@neurocontrarian](https://github.com/neurocontrarian)).
+- recomp32: `RECOMP_RESOLVE_CACHE` (opt-in, a power of two): a direct-mapped
+  cache of indirect-call targets in front of `recomp_lookup_manual` and the
+  dispatch table's binary search, for hosts where one thread at a time runs
+  lifted code. Both `RECOMP_ICALL` forms now go through `recomp_resolve`;
+  without the define the lookups are the same as before. Operation
+  Flashpoint makes about two million indirect calls a second; with a
+  16384-entry cache its start-up loading stalls went from 3.8 s to 3.0 s.
+  `recomp_is_import` (set by win32hle) sends import VAs straight to
+  `recomp_lookup_import`, before the binary search: in OFP's Direct3D-heavy
+  scenes `recomp_resolve` fell from 4.1 % of the main thread to 0.5 %.
+  `RECOMP_ICALL_SITE_CACHE` (opt-in, GCC/Clang) keeps each call site's last
+  lifted target, and `RECOMP_NO_ICALL_TRACE` leaves out the indirect-call
+  trace ring; together they took 4.2 % off OFP's game code cycles per frame (#174, by [@neurocontrarian](https://github.com/neurocontrarian)).
+- recomp32: two opt-in ways to make x87-heavy lifted code faster.
+  `RECOMP_X87_RING`: the x87 stack is a pointer into a long buffer, as the
+  FPU's TOP is, so a push or pop moves a pointer instead of shuffling eight
+  globals (sixteen moves). `RECOMP_X87_LOCAL` (with the ring,
+  `RECOMP_LOCAL_REGS` and generated code): the values a function pushes live
+  in locals the compiler keeps in registers, written to the ring at every
+  call, tail call and return. generate.py emits `_ST(i)`/`_STI(i)` for the
+  slots; without the defines they are `_st[i]`/`g_st_i64[i]` as before. In
+  Operation Flashpoint the ring alone gave +47 % frames and 28 % shorter
+  loading stalls; both run in its native Linux build (#175, by [@neurocontrarian](https://github.com/neurocontrarian); C generated by this generate.py needs the matching `recomp_types.h`, and `RECOMP_X87_RING` is for win32hle hosts only).
+- win32hle: per-import timing for a host's profiler. With `hle_shim_timing`
+  set, each import's inclusive time on the thread that called
+  `hle_mark_main_thread` adds up in `hle_shim_ns_main[]` (names from
+  `hle_shim_name_at`), and `hle_in_shim_main` tells a sampling thread which
+  import that thread is in (-1: lifted code). Off by default (the clock is
+  read twice a call). The clock is `hle_ticks`: the CPU's time-stamp counter
+  where it runs at a constant rate (scaled to ns by `hle_tsc_calibrate`, which
+  a host calls at start), CLOCK_MONOTONIC otherwise. Operation Flashpoint's
+  performance log is built on it (#173, by [@neurocontrarian](https://github.com/neurocontrarian)).
+- pe: `pdb2_ref.py` reads a Visual C++ 5/6 PDB (MSF 2.00, `_ST` symbol
+  records), which llvm-pdbutil and `pdb_ref.py` cannot, into the same
+  reference JSON, plus a `--seed-functions` list for disasm32. No external
+  tool; `--selftest`. MechCommander 2 ships its release PDB on the disc:
+  9,776 functions, 5,525 with sizes. Scored against it, unseeded disasm32 is
+  89.7% precise and 85.4% complete; seeded, complete to 99.99%.
 - win32hle: a browser host (Emscripten/WebAssembly): the guest image in linear
   memory, DirectSound through a shared-memory ring an AudioWorklet drains,
   frames to the page's WebGL presenter, Bink movies played by the page. For

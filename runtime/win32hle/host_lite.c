@@ -20,6 +20,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <sched.h>
+#include <time.h>
 #include "win32hle.h"
 
 /* ------------------------------------------------------------ register file
@@ -28,6 +29,21 @@
 uint32_t  g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi, g_ebp;
 double    g_st[8];
 int       g_fp_top;
+#ifdef RECOMP_X87_RING
+/* the x87 stack, a pointer into a long buffer (recomp_types.h fp_push_ring) */
+double   g_stbuf[X87_RING], *g_stp = g_stbuf + X87_RING / 2;
+int64_t  g_sti64buf[X87_RING], *g_sti64p = g_sti64buf + X87_RING / 2;
+void recomp_x87_recentre(void) {
+    double v[8];
+    int64_t w[8];
+    memcpy(v, g_stp, sizeof v), memcpy(w, g_sti64p, sizeof w);
+    g_stp = g_stbuf + X87_RING / 2, g_sti64p = g_sti64buf + X87_RING / 2;
+    memcpy(g_stp, v, sizeof v), memcpy(g_sti64p, w, sizeof w);
+}
+#define X87_TOP g_stp                   /* st(0..7), saved and loaded with a thread */
+#else
+#define X87_TOP g_st
+#endif
 uint16_t  g_fpu_cw = 0x027F;
 uint16_t  g_seg_cs, g_seg_ds, g_seg_es, g_seg_fs, g_seg_gs, g_seg_ss;
 uint64_t  g_mm[8];
@@ -101,14 +117,14 @@ static void regs_save(regs_t *r) {
     r->eax=g_eax; r->ecx=g_ecx; r->edx=g_edx; r->esp=g_esp;
     r->ebx=g_ebx; r->esi=g_esi; r->edi=g_edi; r->ebp=g_ebp;
     r->fs=g_fs_base; r->cur=g_cur_func;
-    memcpy(r->st, g_st, sizeof g_st); r->fp_top=g_fp_top; r->fpu_cw=g_fpu_cw;
+    memcpy(r->st, X87_TOP, sizeof r->st); r->fp_top=g_fp_top; r->fpu_cw=g_fpu_cw;
     memcpy(r->mm, g_mm, sizeof g_mm);
 }
 static void regs_load(const regs_t *r) {
     g_eax=r->eax; g_ecx=r->ecx; g_edx=r->edx; g_esp=r->esp;
     g_ebx=r->ebx; g_esi=r->esi; g_edi=r->edi; g_ebp=r->ebp;
     g_fs_base=r->fs; g_cur_func=r->cur;
-    memcpy(g_st, r->st, sizeof g_st); g_fp_top=r->fp_top; g_fpu_cw=r->fpu_cw;
+    memcpy(X87_TOP, r->st, sizeof r->st); g_fp_top=r->fp_top; g_fpu_cw=r->fpu_cw;
     memcpy(g_mm, r->mm, sizeof g_mm);
 }
 
@@ -238,13 +254,73 @@ static uint32_t g_last_import_va;
  * entered through shim_entry: the lookup and the call are back to back on the
  * thread that holds the machine, so the index passes through a global. */
 static volatile uint32_t g_pending_shim;
+/* Per-import time (inclusive: a shim that runs guest callbacks counts them)
+ * on the thread that called hle_mark_main_thread (the game's main loop, so a
+ * worker blocked in a wait does not hide what the loop does), and the import
+ * that thread runs now (-1: guest code), for a host's performance log. Off
+ * until hle_shim_timing is set: the clock (hle_ticks) is read twice a call. */
+int hle_shim_timing;
+uint64_t hle_shim_ns_main[MAX_SHIMS];
+volatile int hle_in_shim_main = -1;
+static __thread int t_is_main;
+void hle_mark_main_thread(void) { t_is_main = 1; }
+int hle_shim_total(void) { return g_shim_n; }
+const char *hle_shim_name_at(int i) { return i >= 0 && i < g_shim_n ? g_shim[i].name : NULL; }
+uint64_t hle_mono_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
+/* A cheaper clock for short spans: the CPU's time-stamp counter, a few cycles
+ * to read where CLOCK_MONOTONIC takes tens of ns, scaled to ns by
+ * hle_tsc_calibrate. Until that finds a constant-rate counter, ticks are ns
+ * from CLOCK_MONOTONIC. */
+static volatile uint64_t g_tsc_mul;              /* ns per tick, 32.32 fixed point; 0: no counter */
+#if (defined(__x86_64__) || defined(__i386__)) && !defined(__EMSCRIPTEN__)
+#include <x86intrin.h>
+uint64_t hle_ticks(void) { return g_tsc_mul ? __rdtsc() : hle_mono_ns(); }
+void hle_tsc_calibrate(void) {
+    static uint64_t tsc0, ns0;
+    static int ok = -1;
+    if (ok < 0) {
+        char line[4096]; ok = 0;
+        FILE *f = fopen("/proc/cpuinfo", "r");
+        while (f && fgets(line, sizeof line, f))
+            if (!strncmp(line, "flags", 5)) { ok = strstr(line, " constant_tsc") && strstr(line, " nonstop_tsc"); break; }
+        if (f) fclose(f);
+        if (!ok) return;
+        tsc0 = __rdtsc(), ns0 = hle_mono_ns();
+        struct timespec d = { 0, 20000000 };    /* 20 ms: 1e-4 at worst; later calls refine it */
+        nanosleep(&d, NULL);
+    }
+    if (!ok) return;
+    uint64_t t = __rdtsc(), n = hle_mono_ns();
+    if (t > tsc0 && n > ns0) g_tsc_mul = (uint64_t)((double)(n - ns0) / (double)(t - tsc0) * 4294967296.0);
+}
+#else
+uint64_t hle_ticks(void) { return hle_mono_ns(); }
+void hle_tsc_calibrate(void) {}
+#endif
+uint64_t hle_ticks_ns(uint64_t d) {
+    uint64_t m = g_tsc_mul;
+#if defined(__SIZEOF_INT128__)
+    return m ? (uint64_t)(((unsigned __int128)d * m) >> 32) : d;
+#else
+    return m ? (d >> 32) * m + (((d & 0xFFFFFFFFu) * m) >> 32) : d;
+#endif
+}
 static void shim_entry(void) {
     uint32_t i = g_pending_shim;
     if (g_waiters) hle_yield();
     g_last_import_va = g_shim[i].va;                     /* again: the thread that ran meanwhile set its own */
     g_cur_import = g_shim[i].name;
+    if (!(hle_shim_timing && t_is_main)) { g_shim[i].fn(); return; }
+    int outer = hle_in_shim_main;
+    hle_in_shim_main = (int)i;
+    uint64_t t0 = hle_ticks();
     g_shim[i].fn();
+    hle_shim_ns_main[i] += hle_ticks_ns(hle_ticks() - t0);
+    hle_in_shim_main = outer;
 }
+/* recomp_types.h's recomp_is_import: imports first, never cached */
+static int is_import_va(uint32_t va) { return va >= SHIM_BASE && va < SHIM_BASE + SHIM_STEP * (uint32_t)g_shim_n; }
+__attribute__((constructor)) static void install_import_test(void) { recomp_is_import = is_import_va; }
 recomp_func_t recomp_lookup_import(uint32_t va) {
     if (va < SHIM_BASE || va >= SHIM_BASE + SHIM_STEP * (uint32_t)g_shim_n) return NULL;
     uint32_t i = (va - SHIM_BASE) / SHIM_STEP;

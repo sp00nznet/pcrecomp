@@ -26,6 +26,7 @@ typedef struct surf {
     uint8_t *keyed;                      /* ...and which of them are the colour key */
     uint32_t argb_gen;                   /* the gen it was made at; 0: none */
     void *gpu;                           /* a GPU renderer's record of it (d3d_gpu.h) */
+    int argb_w, argb_h;                  /* the size it was made at (SetSurfaceDesc can change the surface's) */
 } surf_t;
 
 /* The surface behind a DirectDraw surface object, or NULL if obj is not one. */

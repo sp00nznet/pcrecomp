@@ -111,13 +111,36 @@ extern const uint32_t recomp_dispatch_count;
 #define esi l_esi
 #define edi l_edi
 #define ebp l_ebp
-#define RECOMP_REGS_LOCALS uint32_t l_eax = g_eax, l_ecx = g_ecx, l_edx = g_edx, l_ebx = g_ebx, l_esp = g_esp, l_esi = g_esi, l_edi = g_edi, l_ebp = g_ebp;
-#define RECOMP_REGS_OUT() (g_eax = l_eax, g_ecx = l_ecx, g_edx = l_edx, g_ebx = l_ebx, g_esp = l_esp, g_esi = l_esi, g_edi = l_edi, g_ebp = l_ebp)
+#ifdef RECOMP_X87_LOCAL
+/* RECOMP_X87_LOCAL (with RECOMP_X87_RING): the top of the x87 stack in locals.
+ * The values a function pushes stay in _xs[0.._xk-1] (st0 is _xs[_xk-1]);
+ * what lies below -- the caller's values, a float a callee returned -- stays
+ * on the global ring. Every call, tail call and return writes the locals out
+ * to the ring first (RECOMP_X87_FLUSH, in RECOMP_REGS_OUT), so callees, float
+ * returns and __ftol see the stack as before. _xk changes by constants only,
+ * so the optimiser knows it at each instruction and keeps the values in host
+ * registers; where paths disagree it is a runtime index, still correct. The
+ * ring's stores, which any guest memory write may alias, were what made the
+ * float code slow. */
+#define RECOMP_X87_LOCALS double _xs[8]; int64_t _xsi[8]; int _xk = 0;
+#define RECOMP_X87_FLUSH() ({ for (int _xj = 0; _xj < _xk; _xj++) fp_push_ring(_xs[_xj], _xsi[_xj]); _xk = 0; })
+#define RECOMP_X87_CLEAR() (_xk = 0)       /* a caught throw: the stack is the ring's */
+#else
+#define RECOMP_X87_LOCALS
+#define RECOMP_X87_FLUSH() ((void)0)
+#define RECOMP_X87_CLEAR() ((void)0)
+#endif
+#define RECOMP_REGS_LOCALS uint32_t l_eax = g_eax, l_ecx = g_ecx, l_edx = g_edx, l_ebx = g_ebx, l_esp = g_esp, l_esi = g_esi, l_edi = g_edi, l_ebp = g_ebp; RECOMP_X87_LOCALS
+/* the registers back to the globals: RECOMP_REGS_OUT also hands over the x87 values (every exit and call) */
+#define RECOMP_REGS_OUT_ONLY() (g_eax = l_eax, g_ecx = l_ecx, g_edx = l_edx, g_ebx = l_ebx, g_esp = l_esp, g_esi = l_esi, g_edi = l_edi, g_ebp = l_ebp)
+#define RECOMP_REGS_OUT() (RECOMP_X87_FLUSH(), RECOMP_REGS_OUT_ONLY())
 #define RECOMP_REGS_IN() (l_eax = g_eax, l_ecx = g_ecx, l_edx = g_edx, l_ebx = g_ebx, l_esp = g_esp, l_esi = g_esi, l_edi = g_edi, l_ebp = g_ebp)
 #else
 #define RECOMP_REGS_LOCALS
 #define RECOMP_REGS_OUT() ((void)0)
+#define RECOMP_REGS_OUT_ONLY() ((void)0)
 #define RECOMP_REGS_IN() ((void)0)
+#define RECOMP_X87_CLEAR() ((void)0)
 #endif
 
 #if defined(RECOMP_GENERATED_CODE) && !defined(RECOMP_LOCAL_REGS)
@@ -132,7 +155,11 @@ extern const uint32_t recomp_dispatch_count;
 #endif
 #ifdef RECOMP_GENERATED_CODE
 /* x87 FPU stack is global; _fpu_cmp stays per-function (set+used within one fn) */
+#ifdef RECOMP_X87_RING
+#define _st g_stp                 /* st(i) is g_stp[i]: see fp_push_ring */
+#else
 #define _st g_st
+#endif
 #define _fp_top g_fp_top
 #define _fpu_cw g_fpu_cw
 /* MMX file is global too. The lifter emits _mm[n] (see lift32.MMX_REGS), so the
@@ -986,7 +1013,33 @@ static inline uint32_t sse_cmp_pred(double a, double b, int p) {
 #else
 #define RECOMP_SHARED_DATA __attribute__((weak))
 #endif
+#ifdef RECOMP_X87_RING
+/* The x87 stack as a pointer into a long buffer, as the FPU's TOP is: a push
+ * moves it down one, a pop up one, st(i) is g_stp[i]. The eight-register
+ * shuffle of fp_push_impl (sixteen moves a push or pop, through globals the
+ * compiler cannot keep in registers) was most of the cost of x87-heavy lifted
+ * code. The pointer is moved back to the middle (the eight live values with
+ * it) when it nears an end. Host: g_stbuf/g_sti64buf/g_stp/g_sti64p and
+ * recomp_x87_recentre (win32hle host_lite.c). */
+#define X87_RING 4096
+extern double  g_stbuf[X87_RING], *g_stp;
+extern int64_t g_sti64buf[X87_RING], *g_sti64p;
+void recomp_x87_recentre(void);
+#define g_st_i64 g_sti64p
+static inline void fp_push_ring(double val, int64_t shadow) {
+    if (__builtin_expect(g_stp == g_stbuf, 0)) recomp_x87_recentre();
+    --g_stp, --g_sti64p;
+    g_stp[0] = val, g_sti64p[0] = shadow;
+}
+static inline double fp_pop_ring(void) {
+    double v = g_stp[0];
+    ++g_stp, ++g_sti64p;
+    if (__builtin_expect(g_stp >= g_stbuf + X87_RING - 8, 0)) recomp_x87_recentre();
+    return v;
+}
+#else
 RECOMP_SHARED_DATA int64_t g_st_i64[8] = {0};
+#endif
 
 static inline void fp_push_impl(double* st, int* top, double val) {
     /* Shift stack down, push new value */
@@ -1005,15 +1058,32 @@ static inline double fp_pop_impl(double* st, int* top) {
     return val;
 }
 
+#if defined(RECOMP_X87_LOCAL) && defined(RECOMP_GENERATED_CODE) && defined(RECOMP_LOCAL_REGS)
+/* st(i) and its shadow: a local while the function pushed it, else the ring */
+#define _ST(i)  (*((_xk - 1 - (i)) >= 0 ? &_xs[_xk - 1 - (i)] : &g_stp[(i) - _xk]))
+#define _STI(i) (*((_xk - 1 - (i)) >= 0 ? &_xsi[_xk - 1 - (i)] : &g_sti64p[(i) - _xk]))
+/* (eight locals at most: a ninth push hands them to the ring first) */
+#define fp_push(val) do { double _pv_ = (val); if (_xk >= 8) RECOMP_X87_FLUSH(); \
+    _xs[_xk] = _pv_, _xsi[_xk] = 0, _xk++; } while (0)
+#define fp_pop()     (_xk > 0 ? _xs[--_xk] : fp_pop_ring())
+#elif defined(RECOMP_X87_RING)
+#define _ST(i)  _st[i]
+#define _STI(i) g_st_i64[i]
+#define fp_push(val) fp_push_ring((val), 0)
+#define fp_pop()     fp_pop_ring()
+#else
+#define _ST(i)  _st[i]
+#define _STI(i) g_st_i64[i]
 #define fp_push(val) fp_push_impl(_st, &_fp_top, (val))
 #define fp_pop()     fp_pop_impl(_st, &_fp_top)
+#endif
 
 /* fild qword: push with the exact value shadowed. */
 #define fp_push_i64(v) do { int64_t _pv = (int64_t)(v); \
-    fp_push((double)_pv); g_st_i64[0] = _pv; } while (0)
+    fp_push((double)_pv); _STI(0) = _pv; } while (0)
 /* fxch st(i), keeping each slot's shadow with its value. */
-#define fp_xch(i) do { double _t = _st[0]; _st[0] = _st[i]; _st[i] = _t; \
-    int64_t _ti = g_st_i64[0]; g_st_i64[0] = g_st_i64[i]; g_st_i64[i] = _ti; } while (0)
+#define fp_xch(i) do { double _t = _ST(0); _ST(0) = _ST(i); _ST(i) = _t; \
+    int64_t _ti = _STI(0); _STI(0) = _STI(i); _STI(i) = _ti; } while (0)
 
 /* fist/fistp round by the control word's RC field (bits 10-11), not by C's
  * truncating cast. MSVC's __ftol sets chop before its fistp, so a plain cast
@@ -1135,6 +1205,40 @@ recomp_func_t recomp_lookup(uint32_t va);          /* binary search in dispatch 
 recomp_func_t recomp_lookup_manual(uint32_t va);    /* manual overrides */
 recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
 
+/* An import bridge's VA, if the host says (win32hle sets it): its lookup can
+ * depend on more than the VA (a shared entry that reads which import was
+ * asked), so it is never cached, and it is looked up first, before the
+ * search of the lifted functions that cannot hold it. A host that sets it
+ * keeps its manual overrides off the import VAs. */
+RECOMP_WEAK int (*recomp_is_import)(uint32_t va) = 0;
+
+/* An indirect call's target: manual overrides, the dispatch table (a binary
+ * search), then the imports. A host where one thread at a time runs lifted
+ * code (win32hle's machine lock) can define RECOMP_RESOLVE_CACHE, a power of
+ * two, for a direct-mapped cache of the lifted answers in front of the first
+ * two: a C++ program makes millions of virtual calls a second. Imports are
+ * looked up every time (the lookup names the shim about to run). */
+#ifdef RECOMP_RESOLVE_CACHE
+typedef struct { uint32_t va; recomp_func_t fn; } recomp_resolve_slot_t;
+RECOMP_WEAK recomp_resolve_slot_t g_resolve_cache[RECOMP_RESOLVE_CACHE] = { { 0, 0 } };
+#endif
+static inline recomp_func_t recomp_resolve(uint32_t va) {
+    if (recomp_is_import && recomp_is_import(va)) return recomp_lookup_import(va);
+#ifdef RECOMP_RESOLVE_CACHE
+    recomp_resolve_slot_t *slot = &g_resolve_cache[(va ^ (va >> 14)) & (RECOMP_RESOLVE_CACHE - 1)];
+    if (slot->va == va && slot->fn) return slot->fn;
+#endif
+    recomp_func_t f = recomp_lookup_manual(va);
+    if (!f) f = recomp_lookup(va);
+    if (f) {
+#ifdef RECOMP_RESOLVE_CACHE
+        slot->va = va, slot->fn = f;
+#endif
+        return f;
+    }
+    return recomp_lookup_import(va);
+}
+
 /* The dummy return address pushed before a recompiled call. The callee's lifted
  * `ret` pops it. 0xDEAD0000 is a recognizable marker, but if a stack imbalance
  * ever leaks it into a value (e.g. a size argument) the high bits are destructive.
@@ -1153,6 +1257,45 @@ recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
  * function whose first `je` tests the helper's ZF (Bunghole in One's ball
  * never moved). */
 
+/* The indirect-call trace ring (above): two stores and two counters a call,
+ * millions a second in a game. RECOMP_NO_ICALL_TRACE leaves it out (a crash
+ * report then has no ring). */
+#ifdef RECOMP_NO_ICALL_TRACE
+#define RECOMP_ICALL_TRACE(va) ((void)0)
+#else
+#define RECOMP_ICALL_TRACE(va) do { \
+    g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = (va); \
+    g_icall_from[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = g_cur_func; \
+    g_icall_trace_idx++; \
+    g_icall_count++; \
+} while (0)
+#endif
+
+/* RECOMP_ICALL_SITE_CACHE (with RECOMP_RESOLVE_CACHE's single-thread rule, and
+ * a host that sets recomp_is_import): each indirect call site keeps the last
+ * target it resolved (most sites always call the same one), so the common
+ * case is a compare instead of a call into recomp_resolve. Imports are not
+ * kept. One 64-bit word a site, read and written whole: the guest VA, and the
+ * host function as an offset from recomp_resolve (one executable: it fits 32
+ * bits). Uses a GCC/Clang statement expression. */
+#ifdef RECOMP_ICALL_SITE_CACHE
+#define RECOMP_RESOLVE_SITE(va) ({ \
+    static uint64_t _sc; \
+    uint64_t _e = _sc; \
+    recomp_func_t _rf; \
+    if (_e && (uint32_t)(_e >> 32) == (va)) \
+        _rf = (recomp_func_t)((uintptr_t)recomp_resolve + (uintptr_t)(intptr_t)(int32_t)(uint32_t)_e); \
+    else { \
+        _rf = recomp_resolve(va); \
+        intptr_t _o = _rf ? (intptr_t)_rf - (intptr_t)recomp_resolve : 0; \
+        if (_rf && _o == (intptr_t)(int32_t)_o && recomp_is_import && !recomp_is_import(va)) \
+            _sc = ((uint64_t)(va) << 32) | (uint32_t)(int32_t)_o; \
+    } \
+    _rf; })
+#else
+#define RECOMP_RESOLVE_SITE(va) recomp_resolve(va)
+#endif
+
 /* Direct call to a known recompiled function */
 #define RECOMP_CALL(func) do { \
     uint32_t _caller = g_cur_func; \
@@ -1167,13 +1310,8 @@ recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
 /* Indirect call through dispatch */
 #define RECOMP_ICALL(target_va) do { \
     uint32_t _va = (uint32_t)(target_va); \
-    g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
-    g_icall_from[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = g_cur_func; \
-    g_icall_trace_idx++; \
-    g_icall_count++; \
-    recomp_func_t _fn = recomp_lookup_manual(_va); \
-    if (!_fn) _fn = recomp_lookup(_va); \
-    if (!_fn) _fn = recomp_lookup_import(_va); \
+    RECOMP_ICALL_TRACE(_va); \
+    recomp_func_t _fn = RECOMP_RESOLVE_SITE(_va); \
     if (_fn) { \
         uint32_t _caller = g_cur_func; \
         PUSH32(esp, RECOMP_RETADDR); \
@@ -1195,13 +1333,8 @@ recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
 /* Indirect tail call (jmp through dispatch) */
 #define RECOMP_ITAIL(target_va) do { \
     uint32_t _va = (uint32_t)(target_va); \
-    g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
-    g_icall_from[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = g_cur_func; \
-    g_icall_trace_idx++; \
-    g_icall_count++; \
-    recomp_func_t _fn = recomp_lookup_manual(_va); \
-    if (!_fn) _fn = recomp_lookup(_va); \
-    if (!_fn) _fn = recomp_lookup_import(_va); \
+    RECOMP_ICALL_TRACE(_va); \
+    recomp_func_t _fn = RECOMP_RESOLVE_SITE(_va); \
     if (_fn) { RECOMP_FLAGS_OUT(); RECOMP_REGS_OUT(); _fn(); RECOMP_REGS_IN(); } \
     else if (_va == RECOMP_RETADDR) { /* setjmp and friends return by jumping \
         to the saved return address; that is a return, not a missing target. */ } \
@@ -1259,7 +1392,7 @@ void recomp_eh_resume(recomp_ehframe_t* f, uint32_t resume);
     _ehf.entry_esp = g_esp;                                                   \
     _ehf.func = g_cur_func;                                                   \
     recomp_eh_push(&_ehf);                                                    \
-    if (setjmp(_ehf.jb)) { RECOMP_REGS_IN(); _flag_k = FK_NONE;               \
+    if (setjmp(_ehf.jb)) { RECOMP_REGS_IN(); _flag_k = FK_NONE; RECOMP_X87_CLEAR(); \
                            _itail_tgt = _ehf.resume; goto _ljump; }
 #define RECOMP_EH_LEAVE() recomp_eh_pop(&_ehf)
 /* A backward branch in lifted code: a loop. Every RECOMP_YIELD_EVERY of them,
@@ -1279,7 +1412,7 @@ RECOMP_WEAK uint32_t g_backedges;
 #define RECOMP_BACKEDGE() do { \
     if (++g_backedges >= RECOMP_YIELD_EVERY && recomp_yield_hook) { \
         g_backedges = 0; \
-        RECOMP_REGS_OUT(); recomp_yield_hook(); RECOMP_REGS_IN(); \
+        RECOMP_REGS_OUT_ONLY(); recomp_yield_hook(); RECOMP_REGS_IN(); \
     } } while (0)
 
 /* Always-callable trace dump (no-op unless RECOMP_TRACE). */

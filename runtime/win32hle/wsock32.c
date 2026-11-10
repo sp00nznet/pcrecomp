@@ -154,6 +154,9 @@ static void w_connect(void) {
 }
 static void w_listen(void) { if (listen(fd_of(A32(0)), (int)A32(1)) != 0) FAIL(2); RET(0, 2); }
 static int nettrace(void) { static int on = -1; if (on < 0) on = getenv("HLE_NETTRACE") != NULL; return on; }
+/* a datagram the guest broadcast (255.255.255.255), for a host that also
+ * sends it elsewhere (game servers on the Internet that answer a LAN search) */
+void (*hle_ws_broadcast_hook)(int fd, const void *buf, uint32_t len, unsigned port);
 static void w_sendto(void) {                             /* (s, buf, len, flags, to, tolen) */
     struct sockaddr_in a;
     ssize_t n;
@@ -162,6 +165,8 @@ static void w_sendto(void) {                             /* (s, buf, len, flags,
         else to_host((const uint8_t *)APTR(4), &a);
         n = sendto(fd_of(A32(0)), APTR(1), A32(2), MSG_NOSIGNAL, (struct sockaddr *)&a, sizeof a);
         if (nettrace()) fprintf(stderr, "[net] sendto %s:%u %u bytes -> %d%s\n", inet_ntoa(a.sin_addr), ntohs(a.sin_port), A32(2), (int)n, n < 0 ? strerror(errno) : "");
+        if (n >= 0 && hle_ws_broadcast_hook && !is_ipx(fd_of(A32(0))) && a.sin_addr.s_addr == htonl(INADDR_BROADCAST))
+            hle_ws_broadcast_hook(fd_of(A32(0)), APTR(1), A32(2), ntohs(a.sin_port));
     }
     else n = send(fd_of(A32(0)), APTR(1), A32(2), MSG_NOSIGNAL);
     if (n < 0) FAIL(6);
@@ -355,6 +360,44 @@ static void w_EnumProtocolsA(void) {
     RET(1, 3);
 }
 
+/* select(nfds, read, write, except, timeout): Winsock's fd_set is a count and
+ * an array of up to 64 SOCKETs (not a bitmap), timeval two 32-bit longs, a
+ * NULL timeout waits for ever. Done with poll(); each set is rewritten to hold
+ * only its ready sockets, and the total is returned. A wait gives the
+ * machine to the other guest threads. */
+static void w_select(void) {
+    uint32_t set[3] = { A32(1), A32(2), A32(3) }, tv = A32(4);
+    struct pollfd pf[192];
+    int which[192], n = 0;
+    for (int k = 0; k < 3; k++) {
+        if (!set[k]) continue;
+        uint32_t cnt = MEM32(set[k]);
+        if (cnt > 64) cnt = 64;
+        for (uint32_t i = 0; i < cnt; i++) {
+            int fd = fd_of(MEM32(set[k] + 4 + 4 * i));
+            if (fd < 0) { g_wsa_error = WSAENOTSOCK; RET(SOCKET_ERROR, 5); }
+            pf[n].fd = fd, pf[n].revents = 0;
+            pf[n].events = k == 0 ? POLLIN : k == 1 ? POLLOUT : POLLPRI;
+            which[n++] = k;
+        }
+    }
+    int ms = tv ? (int)(MEM32(tv) * 1000u + MEM32(tv + 4) / 1000u) : -1;
+    if (ms) hle_block_begin();
+    int r = poll(pf, (nfds_t)n, ms);
+    if (ms) hle_block_end();
+    if (r < 0) FAIL(5);
+    uint32_t total = 0, out[3] = { 0, 0, 0 };
+    for (int j = 0; j < n; j++) {
+        short ev = pf[j].revents;
+        int k = which[j];
+        int ready = k == 0 ? (ev & (POLLIN | POLLHUP | POLLERR)) != 0
+                  : k == 1 ? (ev & (POLLOUT | POLLERR)) != 0 : (ev & (POLLPRI | POLLERR)) != 0;
+        if (ready) MEM32(set[k] + 4 + 4 * out[k]++) = (uint32_t)pf[j].fd + SOCK_BASE, total++;
+    }
+    for (int k = 0; k < 3; k++) if (set[k]) MEM32(set[k]) = out[k];
+    RET(total, 5);
+}
+
 #define SHIM2(ord, name, fn) { "wsock32.dll#" #ord, fn }, { name, fn }
 const win32hle_shim win32hle_wsock32[] = {
     SHIM2(1111, "EnumProtocolsA", w_EnumProtocolsA),
@@ -373,6 +416,7 @@ const win32hle_shim win32hle_wsock32[] = {
     SHIM2(15, "ntohs", w_ntohs),
     SHIM2(16, "recv", w_recv),
     SHIM2(17, "recvfrom", w_recvfrom),
+    SHIM2(18, "select", w_select),
     SHIM2(19, "send", w_send),
     SHIM2(20, "sendto", w_sendto),
     SHIM2(21, "setsockopt", w_setsockopt),
