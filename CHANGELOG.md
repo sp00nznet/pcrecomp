@@ -65,6 +65,16 @@ versions follow [SemVer](https://semver.org/).
   `RECOMP_ICALL_SITE_CACHE` (opt-in, GCC/Clang) keeps each call site's last
   lifted target, and `RECOMP_NO_ICALL_TRACE` leaves out the indirect-call
   trace ring; together they took 4.2 % off OFP's game code cycles per frame.
+- recomp32: two opt-in ways to make x87-heavy lifted code faster.
+  `RECOMP_X87_RING`: the x87 stack is a pointer into a long buffer, as the
+  FPU's TOP is, so a push or pop moves a pointer instead of shuffling eight
+  globals (sixteen moves). `RECOMP_X87_LOCAL` (with the ring,
+  `RECOMP_LOCAL_REGS` and generated code): the values a function pushes live
+  in locals the compiler keeps in registers, written to the ring at every
+  call, tail call and return. generate.py emits `_ST(i)`/`_STI(i)` for the
+  slots; without the defines they are `_st[i]`/`g_st_i64[i]` as before. In
+  Operation Flashpoint the ring alone gave +47 % frames and 28 % shorter
+  loading stalls; both run in its native Linux build.
 - pe: `pdb2_ref.py` reads a Visual C++ 5/6 PDB (MSF 2.00, `_ST` symbol
   records), which llvm-pdbutil and `pdb_ref.py` cannot, into the same
   reference JSON, plus a `--seed-functions` list for disasm32. No external
