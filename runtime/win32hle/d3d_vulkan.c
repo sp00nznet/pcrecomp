@@ -791,6 +791,9 @@ static void v_line(const rstate_t *st, const rvert_t *a, const rvert_t *b) {
 }
 static void v_clear(surf_t *t, int l, int tp, int r, int b, uint32_t flags, uint32_t argb, float z) {
     if (!flags) return;
+    /* The clear is a quad drawn in the pass, after the triangles queued
+     * before it (flushed here first): it relies on staying in submission
+     * order with them, as d3d_raster.c's clear follows its own queue. */
     flush_batch();
     int depth = t->zbuf != NULL, colour = (flags & 1) != 0, zclear = depth && (flags & 2);
     if (!zclear && !colour) return;
