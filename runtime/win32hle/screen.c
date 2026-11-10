@@ -16,6 +16,8 @@
  * only paces, and input comes from a host's script.
  */
 #define _GNU_SOURCE
+#include <math.h>
+#include <time.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -218,7 +220,64 @@ static void web_menu(int open) {
     MAIN_THREAD_ASYNC_EM_ASM({ if (Module['ra2Menu']) Module['ra2Menu']($0); }, open);
 }
 #endif
-static void present(void) {
+/* Frame pacing, for flips: each frame stays on screen for the same number of
+ * the display's refreshes. A game making 70 frames a second on a 175 Hz
+ * display would otherwise show them for 2 or 3 refreshes in turn, which
+ * judders; held to 3 it moves evenly at 58.3. The number is the fewest the
+ * game's own time a frame fits in (10% over is let go, as an occasional
+ * late frame; gaps of a tenth of a second and more are loads, not frames),
+ * taken up at once and down only after a second of fitting, and never more
+ * than a twentieth of a second. It is never fewer than keeps the game near 60
+ * frames a second (HLE_MAX_FPS): a game of 1999 flips as fast as it can, as
+ * its monitor's refresh let it on Windows, and on a 120 Hz display it would
+ * otherwise draw twice the frames for the same picture. So 2 refreshes on a
+ * 120 Hz display, 3 on a 175, 1 on a 60, 75 or 90.
+ * The wait gives the machine up, so the game's other threads run; it sleeps
+ * to within 0.2 ms of the refresh and spins only the rest (it slept whole
+ * milliseconds and spun up to one, a sixteenth of the CPU at 60 a second). */
+static uint64_t g_paced_back;                              /* when the last paced frame went out */
+static int g_pace_k = 1, g_pace_hz;                         /* each frame held for k of the display's hz */
+static void pace(void) {
+    static uint64_t last_call;
+    static double ema;
+    static int lower;
+    int k = g_pace_k;
+    SDL_DisplayMode dm;
+    int hz = SDL_GetCurrentDisplayMode(SDL_GetWindowDisplayIndex(g_win), &dm) == 0 && dm.refresh_rate > 0 ? dm.refresh_rate : 60;
+    double freq = (double)SDL_GetPerformanceFrequency(), period = 1.0 / hz;
+    uint64_t now = SDL_GetPerformanceCounter();
+    if (g_paced_back) {
+        double work = (double)(now - g_paced_back) / freq;  /* the game's time since the last frame went out */
+        if (work < 0.1) ema = ema > 0 ? 0.9 * ema + 0.1 * work : work;   /* longer: a load, not a frame */
+        int want = (int)ceil(ema / period - 0.1), most = hz / 20 > 1 ? hz / 20 : 1;   /* never under 20 a second */
+        static int max_fps = -1;
+        if (max_fps < 0) { const char *e = getenv("HLE_MAX_FPS"); max_fps = e ? atoi(e) : 60; }
+        int least = max_fps > 0 ? (int)(hz / (double)max_fps + 0.25) : 1;
+        if (least < 1) least = 1;
+        if (want < least) want = least;
+        if (want > most) want = most;
+        if (want > k) k = want, lower = 0;
+        else if (want < k && ++lower * k >= hz) k = want, lower = 0;  /* a second of frames that fit */
+        else if (want >= k) lower = 0;
+        uint64_t due = last_call + (uint64_t)(k * period * freq);
+        if (now < due && due - now < (uint64_t)freq) {
+            hle_block_begin();
+            uint64_t spin = (uint64_t)(0.0002 * freq);   /* sleep to 0.2 ms short, then spin: sleeps overshoot */
+            if (due - now > spin) {
+                double s = (double)(due - now - spin) / freq;
+                struct timespec ts = { (time_t)s, (long)((s - (double)(time_t)s) * 1e9) };
+                nanosleep(&ts, NULL);
+            }
+            while (SDL_GetPerformanceCounter() < due) {}
+            hle_block_end();
+            now = due;
+        }
+    }
+    last_call = now;
+    g_pace_k = k, g_pace_hz = hz;
+}
+/* flip: the game flipped, and this frame is shown, paced (pace). */
+static void present(int flip) {
     const uint8_t *px;
     const uint32_t *pal;
     int w, h, pitch, bpp;
@@ -227,8 +286,8 @@ static void present(void) {
     if (!hle_dd_frame(&px, &w, &h, &pitch, &bpp, &pal, &seq) && !hle_gdi_window_frame(&px, &w, &h, &pitch, &bpp, &seq)) return;
     uint32_t now = hle_ticks_ms();
     g_src_w = w, g_src_h = h;
-    if (seq == g_shown_seq && now - g_last_present < 250) return;
-    if (now - g_last_present < 15) return;
+    if (!flip && seq == g_shown_seq && now - g_last_present < 250) return;
+    if (!flip && now - g_last_present < 15) return;
     g_shown_seq = seq, g_last_present = now;
     if (hle_screen_frame_hook) hle_screen_frame_hook(px, w, h, pitch, bpp);
     if (!g_ren) return;
@@ -378,7 +437,24 @@ static void present(void) {
         SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_NONE);
     }
     if (g_menu_depth) menu_draw();
+    if (flip) pace();
     SDL_RenderPresent(g_ren);
+    if (flip) g_paced_back = SDL_GetPerformanceCounter();
+    static int trace = -1;
+    static uint32_t t0, prev, shown, flips, worst, late;
+    if (trace < 0) trace = getenv("HLE_PRESENTTRACE") != NULL;
+    if (trace) {                                         /* HLE_PRESENTTRACE: frames shown a second, and the longest wait */
+        uint32_t t = hle_ticks_ms();
+        if (prev && t - prev > worst) worst = t - prev;
+        if (prev && flip && g_pace_hz && (t - prev) * (uint32_t)g_pace_hz > 1500u * (uint32_t)g_pace_k) late++;   /* held a refresh or more too long */
+        prev = t, shown++, flips += flip != 0;
+        if (!t0) t0 = t;
+        else if (t - t0 >= 5000) {
+            fprintf(stderr, "[screen] %.1f frames shown/s (%u of them flips), longest gap %u ms; flips held %d of %d Hz, %u late\n",
+                    shown * 1000.0 / (t - t0), flips, worst, g_pace_k, g_pace_hz, late);
+            t0 = t, shown = flips = worst = late = 0;
+        }
+    }
 }
 
 /* Who shows the cursor. A DirectDraw game draws its own into the picture, so
@@ -804,9 +880,11 @@ void hle_screen_pump(void) {
         default: break;
         }
     }
-    present();
+    present(0);
     confine_update();
 }
+
+static void present_gdi(void) { present(0); }
 
 /* The guest moved the cursor (SetCursorPos): move the real one with it. */
 static void warp(int x, int y) {
@@ -818,22 +896,24 @@ static void warp(int x, int y) {
 }
 
 /* The game drew into the primary. On the window's thread, show it (present
- * keeps to 60 a second), and keep the window's own events moving: a load
+ * keeps to 60 a second, except a flip, which is always shown), and keep the
+ * window's own events moving: a load
  * that does not pump for seconds would otherwise look hung to the desktop
  * (macOS's spinning cursor). The events wait in SDL's queue for the pump. */
 static void primary_changed(void) {
     static uint32_t last_events;
     if (!g_ren || !pthread_equal(pthread_self(), g_video_thread)) return;
     uint32_t now = hle_ticks_ms();
-    if (now - g_last_present < 15) return;
+    int flip = hle_dd_flipping();
+    if (!flip && now - g_last_present < 15) return;
     if (now - last_events >= 100) SDL_PumpEvents(), last_events = now;
-    present();
+    present(flip);
 }
 
 int hle_screen_open(const char *title, int fullscreen, int headless) {
     g_headless = headless, g_fullscreen = fullscreen;
     hle_set_pump_hook(hle_screen_pump);
-    hle_gdi_window_hook = present;                       /* a GDI game's blit shows, pumping or not (a loading bar) */
+    hle_gdi_window_hook = present_gdi;                   /* a GDI game's blit shows, pumping or not (a loading bar) */
     if (headless) return 0;
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");      /* SIGINT and SIGTERM end the process: SDL would make them a close the game can refuse */
     SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "1"); /* macOS: full screen in its own Space, as apps do */

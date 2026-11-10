@@ -286,15 +286,32 @@ static void k_QueryPerformanceCounter(void) {
     RET(1, 1);
 }
 /* Sleep gives the machine up for the wait, so another guest thread (a mixer,
- * a timer callback) runs meanwhile. Sleep(0) is a yield. */
-static void k_Sleep(void) {
-    uint32_t ms = A32(0);
+ * a timer callback) runs meanwhile. Sleep(0) is a yield. A thread that does
+ * nothing but poll with it (Theme Park World's pointer thread: read the
+ * mouse, Sleep(0), again) ran flat out, as it did on Windows, where it took
+ * every idle cycle, and it wanted the machine back at once, so the game's own
+ * thread kept handing it over. From the fourth Sleep(0) in a row, each less
+ * than 2 ms after the last, it sleeps a millisecond instead: a thousand polls
+ * a second. HLE_SLEEP0=yield keeps every Sleep(0) a yield. */
+static void guest_sleep(uint32_t ms) {
+    static int yield_only = -1;
+    static __thread uint64_t last_us;
+    static __thread unsigned run;
+    if (!ms) {
+        if (yield_only < 0) { const char *e = getenv("HLE_SLEEP0"); yield_only = e && !strcmp(e, "yield"); }
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        uint64_t now = (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+        run = now - last_us < 2000 ? run + 1 : 0;
+        last_us = now;
+        if (run >= 4 && !yield_only) ms = 1;
+    }
     hle_block_begin();
     if (ms) usleep(ms * 1000u); else sched_yield();
     hle_block_end();
-    RETV(1);
 }
-static void k_SleepEx(void) { uint32_t ms = A32(0); hle_block_begin(); if (ms) usleep(ms * 1000u); else sched_yield(); hle_block_end(); RET(0, 2); }
+static void k_Sleep(void) { guest_sleep(A32(0)); RETV(1); }
+static void k_SleepEx(void) { guest_sleep(A32(0)); RET(0, 2); }
 
 /* --- strings (KERNEL32's lstr*; the CRT has the rest) --- */
 static void k_lstrlenA(void) { char *s = ASTR(0); RET(s ? (uint32_t)strlen(s) : 0u, 1); }
