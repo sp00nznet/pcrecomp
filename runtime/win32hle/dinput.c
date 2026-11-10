@@ -44,8 +44,8 @@ typedef struct {
     int kind, acquired, absolute, exclusive;
     uint32_t data_size;                                  /* SetDataFormat's dwDataSize */
     uint32_t buffer;                                     /* DIPROP_BUFFERSIZE */
-    int last_x, last_y;                                  /* GetDeviceState's: where the last read left the cursor */
-    int buf_x, buf_y;                                    /* GetDeviceData's */
+    int last_x, last_y, last_z;                          /* GetDeviceState's: where the last read left the cursor (and wheel) */
+    int buf_x, buf_y, buf_z;                             /* GetDeviceData's */
     uint8_t buf_buttons[3], buf_keys[256];               /* what the last buffered read saw */
     ev_t q[QUEUE];
     int qn;
@@ -129,6 +129,8 @@ static void gather(dev_t_ *d) {
         if (x != d->buf_x) push(d, 0, d->absolute ? (uint32_t)x : (uint32_t)(x - d->buf_x));
         if (y != d->buf_y) push(d, 4, d->absolute ? (uint32_t)y : (uint32_t)(y - d->buf_y));
         d->buf_x = x, d->buf_y = y;
+        int z = hle_input_wheel_total();                 /* the wheel: always relative, as on Windows */
+        if (z != d->buf_z) push(d, 8, (uint32_t)(z - d->buf_z)), d->buf_z = z;
         buttons(b);
         for (int i = 0; i < 3; i++)
             if (b[i] != d->buf_buttons[i]) push(d, 12u + (uint32_t)i, b[i]), d->buf_buttons[i] = b[i];
@@ -156,6 +158,7 @@ static void arrived(void) {
 static void baseline(dev_t_ *d) {
     axes(d, &d->last_x, &d->last_y);
     d->buf_x = d->last_x, d->buf_y = d->last_y;
+    d->last_z = d->buf_z = hle_input_wheel_total();
     buttons(d->buf_buttons);
     keyboard(d->buf_keys);
     d->qn = 0, d->overflow = 0;
@@ -221,11 +224,13 @@ static void dv_GetDeviceState(void) {                    /* (this, size, data) *
         uint8_t b[3];
         axes(d, &x, &y);
         buttons(b);
+        int z = hle_input_wheel_total();
         if (n >= 12) {
             MEM32(p) = (uint32_t)(d->absolute ? x : x - d->last_x);
             MEM32(p + 4) = (uint32_t)(d->absolute ? y : y - d->last_y);
+            MEM32(p + 8) = (uint32_t)(z - d->last_z);
         }
-        d->last_x = x, d->last_y = y;
+        d->last_x = x, d->last_y = y, d->last_z = z;
         for (uint32_t i = 0; i < 3 && 12 + i < n; i++) MEM8(p + 12 + i) = b[i];
     } else {
         uint8_t k[256];

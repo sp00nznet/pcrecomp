@@ -832,6 +832,11 @@ void hle_screen_pump(void) {
             hle_input_mouse(m, gx, gy);
             break;
         }
+        case SDL_MOUSEWHEEL: {                           /* a notch is 120, as Windows counts it */
+            int y = e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -e.wheel.y : e.wheel.y;
+            if (y) hle_input_wheel(y * 120);
+            break;
+        }
         case SDL_WINDOWEVENT:
             if (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) g_menu_depth = 0;   /* placed for the old size */
             if (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED || e.window.event == SDL_WINDOWEVENT_EXPOSED) g_shown_seq = ~0u;
