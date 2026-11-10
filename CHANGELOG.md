@@ -11,6 +11,14 @@ versions follow [SemVer](https://semver.org/).
   the function being lifted was a `goto` to a label that does not exist, and the
   generated file did not compile; it now dispatches with `RECOMP_ITAIL` and
   returns. `tools/lift/test_loop_exits.py`.
+- win32hle: `VirtualFree(MEM_RELEASE)` fails with `ERROR_INVALID_PARAMETER`,
+  as on Windows, unless it names a whole reservation by its base with size 0.
+  It released the whole reservation instead: Operation Flashpoint calls it on
+  blocks inside its own memory pool and lost the pool.
+- win32hle: a handle closed by another thread while a wait is on it wakes the
+  wait as signalled (Windows keeps the object alive for the wait) instead of
+  failing it. Operation Flashpoint closes an event its watchdog thread waits
+  on when it exits. A handle already invalid on the first poll still fails.
 - lift32: `fsincos` left the sine in ST(0) and the cosine in ST(1); it is
   the other way round. MechCommander 2's camera builds its view direction
   with it, and the swapped pair laid the 35-degree camera almost flat on the
