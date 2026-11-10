@@ -6,6 +6,14 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- native32: a callback from guest code that runs natively on the guest stack
+  (gen_bridge: VCL's window procedure thunks jump to `StdWndProc`) ran its
+  host frames and the lifted function's guest frames through the same memory.
+  The trampoline now moves to the host stack below gen_bridge's anchor, and
+  the guest stack below the native caller's arguments.
+- lift32: `fninit` resets the x87 control word to 0x037F. It lifted to
+  nothing, so the FPU probe (`fninit; fnstcw; and 0x103F; cmp 0x3F`) read the
+  runtime's own control word (Borland's 0x1332) and reported no FPU.
 - lift32: `fsincos` left the sine in ST(0) and the cosine in ST(1); it is
   the other way round. MechCommander 2's camera builds its view direction
   with it, and the swapped pair laid the 35-degree camera almost flat on the
@@ -22,6 +30,12 @@ versions follow [SemVer](https://semver.org/).
   guest's strings in it and call the W functions (`codepage.c`). A Japanese
   title's Shift-JIS (932) on a Western-locale Windows, with no locale change.
   Off by default; the selftest checks it.
+- native32: `native32_redirect(name, fn)` binds an import, and every
+  `GetProcAddress` for it, to a host function: for DLLs the guest loads
+  itself (a host that wants to see each `DrawDibDraw` the guest presents).
+  With a code page set, `DefWindowProcA` keeps an A window's text in the
+  guest's code page too (`WM_NCCREATE`, `WM_SETTEXT`, `WM_GETTEXT`), so a
+  Shift-JIS caption shows in the title bar.
 - native32: static TLS for guest modules. A module with a TLS directory gets
   its index, and every guest thread's TIB a copy of the template at
   `fs:[2Ch]`: Borland's RTL reads its threadvars there from its first

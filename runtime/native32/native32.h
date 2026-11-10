@@ -45,6 +45,12 @@ typedef struct { const char* name; recomp_func_t fn; uint32_t va; } native32_shi
  * Call before native32_bind. 0 (the default) leaves the system's. */
 void native32_set_codepage(unsigned cp);
 
+/* Bind every import of this name, and every GetProcAddress for it, to a
+ * native function of the host's (same signature, called by the bridge like
+ * the real one). For DLLs the guest loads itself, which a shim by import
+ * name never sees. Call before native32_bind; up to 32. */
+void native32_redirect(const char* name, void* fn);
+
 /* Call once, before anything else. */
 void native32_init(void);
 

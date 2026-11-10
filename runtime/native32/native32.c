@@ -997,6 +997,10 @@ static uint64_t __cdecl cb_run(uint32_t va, uint32_t* sp, uint32_t ecx) {
     mach_enter();
     regs_t saved;
     regs_save(&saved);
+    /* Called from guest code run natively on the guest stack: below it. */
+    uint32_t at = (uint32_t)(uintptr_t)sp;
+    if (at >= MEM32(g_fs_base + 8) && at < MEM32(g_fs_base + 4) && at < g_esp)   /* guest TIB's stack */
+        g_esp = (at - 64) & ~15u;
     g_esp -= BRIDGE_SLOTS * 4;
     memcpy((void*)(uintptr_t)g_esp, sp + 1, BRIDGE_SLOTS * 4);
     PUSH32(g_esp, RECOMP_RETADDR);
@@ -1015,14 +1019,33 @@ static uint64_t __cdecl cb_run(uint32_t va, uint32_t* sp, uint32_t ecx) {
     return ((uint64_t)purge << 32) | eax;
 }
 
+/* Native code that is guest code run natively (gen_bridge: VCL's window
+ * procedure thunks) runs on the GUEST stack, and calls back into lifted code
+ * from there (the thunk jumps to StdWndProc). Run on that stack, the
+ * callback's host frames and the lifted function's guest frames grew down
+ * through the same memory, and the thunk's window procedure returned into
+ * garbage. So off the thread's own stack (TEB StackLimit..StackBase) the
+ * callback moves to the host stack below gen_bridge's anchor (fs:[14h]),
+ * which nothing uses while the native code runs, and cb_run puts the guest
+ * stack below the native caller's arguments. */
 static __declspec(naked) void cb_tramp(void) {
     __asm {
         mov  edx, esp            ; [ret][args]
+        cmp  esp, fs:[8]
+        jb   off_stack
+        cmp  esp, fs:[4]
+        jb   on_stack
+    off_stack:
+        mov  esp, fs:[0x14]
+        sub  esp, 16
+    on_stack:
+        push edx                 ; the native caller's esp
         push ecx
         push edx
         push eax                 ; the guest VA, planted by the VEH
         call cb_run
         add  esp, 12
+        pop  esp                 ; back on the caller's stack
         pop  ecx                 ; native return address
         add  esp, edx            ; pop what the guest callee popped
         jmp  ecx

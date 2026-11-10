@@ -115,14 +115,48 @@ static BOOL WINAPI cp_FindNextFileA(HANDLE h, LPWIN32_FIND_DATAA a) {
 static LPSTR WINAPI cp_CharNextA(LPCSTR s) { return CharNextExA((WORD)g_cp, s, 0); }
 static LPSTR WINAPI cp_CharPrevA(LPCSTR start, LPCSTR s) { return CharPrevExA((WORD)g_cp, start, s, 0); }
 
+/* An A window gets the A message, so its own procedure (and DefWindowProcA,
+ * below) sees the guest's bytes; a Unicode one the converted text. */
 static BOOL WINAPI cp_SetWindowTextA(HWND h, LPCSTR s) {
     WCHAR w[1024];
-    return SetWindowTextW(h, wide(s, w, 1024));
+    return IsWindowUnicode(h) ? SetWindowTextW(h, wide(s, w, 1024)) : SetWindowTextA(h, s);
 }
 
 static int WINAPI cp_MessageBoxA(HWND h, LPCSTR text, LPCSTR cap, UINT type) {
     WCHAR wt[4096], wc[512];
     return MessageBoxW(h, wide(text, wt, 4096), wide(cap, wc, 512), type);
+}
+
+/* A window's text, which Windows keeps as UTF-16: an A window converts it in
+ * and out of the system's code page in DefWindowProcA (WM_NCCREATE's
+ * lpszName, WM_SETTEXT, WM_GETTEXT). Done here in the guest's instead. A
+ * guest that hands the message to the real DefWindowProcA another way (a
+ * pointer it got before binding) still gets the system's. */
+static LRESULT WINAPI cp_DefWindowProcA(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    WCHAR w[1024];
+    switch (msg) {
+    case WM_NCCREATE: {
+        LRESULT r = DefWindowProcA(h, msg, wp, lp);
+        const CREATESTRUCTA* cs = (const CREATESTRUCTA*)lp;
+        if (r && cs && cs->lpszName && (uintptr_t)cs->lpszName >= 0x10000)
+            DefWindowProcW(h, WM_SETTEXT, 0, (LPARAM)wide(cs->lpszName, w, 1024));
+        return r;
+    }
+    case WM_SETTEXT:
+        return DefWindowProcW(h, msg, wp, (LPARAM)wide((const char*)lp, w, 1024));
+    case WM_GETTEXT: {
+        int n = (int)DefWindowProcW(h, WM_GETTEXT, 1024, (LPARAM)w);
+        if (!wp || !lp) return 0;
+        int k = WideCharToMultiByte(g_cp, 0, w, n, (char*)lp, (int)wp - 1, NULL, NULL);
+        ((char*)lp)[k] = 0;
+        return k;
+    }
+    case WM_GETTEXTLENGTH: {
+        int n = (int)DefWindowProcW(h, WM_GETTEXT, 1024, (LPARAM)w);
+        return WideCharToMultiByte(g_cp, 0, w, n, NULL, 0, NULL, NULL);
+    }
+    }
+    return DefWindowProcA(h, msg, wp, lp);
 }
 
 static int WINAPI cp_DrawTextA(HDC dc, LPCSTR s, int n, LPRECT r, UINT fmt) {
@@ -267,7 +301,7 @@ static const struct { const char* name; void* fn; } g_cp_funcs[] = {
     { "DeleteFileA", cp_DeleteFileA }, { "CreateDirectoryA", cp_CreateDirectoryA },
     { "FindFirstFileA", cp_FindFirstFileA }, { "FindNextFileA", cp_FindNextFileA },
     { "CharNextA", cp_CharNextA }, { "CharPrevA", cp_CharPrevA },
-    { "SetWindowTextA", cp_SetWindowTextA }, { "MessageBoxA", cp_MessageBoxA },
+    { "SetWindowTextA", cp_SetWindowTextA }, { "DefWindowProcA", cp_DefWindowProcA }, { "MessageBoxA", cp_MessageBoxA },
     { "DrawTextA", cp_DrawTextA },
     { "CreateFontIndirectA", cp_CreateFontIndirectA }, { "CreateFontA", cp_CreateFontA },
     { "GetObjectA", cp_GetObjectA },
@@ -280,10 +314,26 @@ static const struct { const char* name; void* fn; } g_cp_funcs[] = {
 
 static FARPROC WINAPI cp_GetProcAddress(HMODULE h, LPCSTR name);
 
-/* The replacement for an import by this name, or 0 (also 0 while off). */
+/* native32_redirect: a host's own native replacements, by name, for imports
+ * and for GetProcAddress (a DLL the guest loads itself: a host that wants to
+ * see what reaches DrawDibDraw). */
+#define MAX_REDIRECTS 32
+static struct { const char* name; void* fn; } g_redir[MAX_REDIRECTS];
+static int g_nredir;
+
+void native32_redirect(const char* name, void* fn) {
+    if (g_nredir < MAX_REDIRECTS) g_redir[g_nredir].name = name, g_redir[g_nredir++].fn = fn;
+}
+
+/* The replacement for an import by this name, or 0: a host redirect, then
+ * (while a code page is set) the code page's. */
 uint32_t codepage_func(const char* name) {   /* extern for the selftest */
-    if (!g_cp || (uintptr_t)name < 0x10000) return 0;
+    if ((uintptr_t)name < 0x10000) return 0;
+    for (int i = 0; i < g_nredir; i++)
+        if (!strcmp(g_redir[i].name, name)) return (uint32_t)(uintptr_t)g_redir[i].fn;
+    if (!g_cp && !g_nredir) return 0;
     if (!strcmp(name, "GetProcAddress")) return (uint32_t)(uintptr_t)cp_GetProcAddress;
+    if (!g_cp) return 0;
     for (int i = 0; i < (int)(sizeof g_cp_funcs / sizeof g_cp_funcs[0]); i++)
         if (!strcmp(g_cp_funcs[i].name, name)) return (uint32_t)(uintptr_t)g_cp_funcs[i].fn;
     return 0;
