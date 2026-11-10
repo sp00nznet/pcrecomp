@@ -1,0 +1,18 @@
+#version 450
+// A surface's pixels, in its own format, into a colour image (d3d_metal.m's
+// unpack); a channel the format lacks reads as 1.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0, rgba8) uniform writeonly image2D t;
+layout(set = 0, binding = 1) buffer B { uint w[]; } buf;
+layout(push_constant) uniform PK { uvec4 dim; uvec4 sh; uvec4 bits; uint words; uint row; } k;
+void main() {
+    uvec2 g = gl_GlobalInvocationID.xy;
+    if (g.x >= k.dim.x || g.y >= k.dim.y) return;
+    uint off = g.y * k.dim.z + g.x * (k.dim.w / 8u);
+    uint v = buf.w[off / 4u];
+    if (k.dim.w == 16u) v = (v >> ((off % 4u) * 8u)) & 0xFFFFu;
+    vec4 c;
+    for (int i = 0; i < 4; i++)
+        c[i] = k.bits[i] != 0u ? float((v >> k.sh[i]) & ((1u << k.bits[i]) - 1u)) / float((1u << k.bits[i]) - 1u) : 1.0;
+    imageStore(t, ivec2(g), c);
+}
