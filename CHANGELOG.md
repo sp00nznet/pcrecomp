@@ -40,6 +40,13 @@ versions follow [SemVer](https://semver.org/).
   shadowed.
 
 ### Added
+- win32hle: Direct3D on the GPU through Metal (macOS), `d3d_metal.m`, behind
+  the `d3d_gpu.h` seam (`hle_d3d_metal_enable`; NULL keeps `d3d_raster.c`):
+  the same triangles and state, shaded as `d3d_raster.c` shades, surfaces
+  brought back to memory before DirectDraw touches them, blits with an end on
+  the GPU done there, and a flip's frame given to the presenter
+  (`hle_dd_frame_hook`) without the game waiting. Theme Park World on an M1
+  Pro: 7 to 80 frames a second.
 - win32hle: DirectInput 3 and 5 (`dinput.c`): the system mouse (relative or
   absolute axes, three buttons) and keyboard (DIK codes), immediate and
   buffered, read from the same input state as the window messages; arriving

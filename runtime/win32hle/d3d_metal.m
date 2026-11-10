@@ -559,6 +559,9 @@ static void m_line(const rstate_t *st, const rvert_t *a, const rvert_t *b) {
 static void m_clear(surf_t *t, int l, int tp, int r, int b, uint32_t flags, uint32_t argb, float z) {
     if (!flags) return;
     @autoreleasepool {
+        /* The clear is a quad drawn in the pass, after the triangles queued
+         * before it (flushed here first): it relies on staying in submission
+         * order with them, as d3d_raster.c's clear follows its own queue. */
         flush_batch();
         int depth = t->zbuf != NULL, colour = (flags & 1) != 0;
         if ((flags & 2) && !depth && !colour) return;

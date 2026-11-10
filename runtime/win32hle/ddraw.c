@@ -83,8 +83,6 @@ static surf_t *g_primary;
 static uint32_t g_vt_dd, g_vt_dd2, g_vt_dd4, g_vt_surf, g_vt_pal, g_vt_clip;
 static uint32_t g_dd, g_dd2, g_dd4;                      /* the one DirectDraw object, all three faces */
 static volatile unsigned g_frame_seq;                    /* bumped when the primary may have changed */
-static int g_flipping;                                   /* marking the primary for a Flip */
-int hle_dd_flipping(void) { return g_flipping; }
 
 /* Hooks for Direct3D's renderer (d3d.c, ddraw_int.h): ACCESS before DirectDraw
  * reads or writes any surface, TOUCH for each one it does. */
@@ -613,9 +611,7 @@ static void sf_Flip(void) {                              /* (this, target, flags
         uint8_t *t = s->px;
         s->px = s->back->px, s->back->px = t;
         if (hle_dd_flip_hook) hle_dd_flip_hook(s, s->back);
-        g_flipping = 1;                                  /* the presenter shows every flip (screen.c) */
         mark(s);
-        g_flipping = 0;
     }
     RET(DD_OK, 3);
 }
