@@ -2143,7 +2143,11 @@ class Lifter:
                 lines.append(f"_fpu_cw = MEM16({addr}); {comment}")
 
         elif m == 'fninit' or m == 'finit':
-            lines.append(f"/* finit */ {comment}")
+            # The control word goes back to 0x037F. A no-op here left the
+            # runtime's own (Borland's 0x1332), and the classic FPU probe
+            # (`fninit; fnstcw; and 0x103F; cmp 0x3F`) concluded there was no
+            # FPU: kirikiri2 refused to start ("CPU family 4 or lesser").
+            lines.append(f"_fpu_cw = 0x037F; {comment}")
 
         elif m in MMX_BINOPS:
             expr = MMX_BINOPS[m].format(a=self._mm_read(ops[0]), b=self._mm_read(ops[1]))

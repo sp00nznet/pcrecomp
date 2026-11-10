@@ -47,10 +47,20 @@ static uint32_t seh_call(uint32_t handler, uint32_t er, uint32_t reg, uint32_t c
         return 1;    /* ExceptionContinueSearch */
     }
     uint32_t esp = g_esp, ebp = g_ebp, ebx = g_ebx, esi = g_esi, edi = g_edi, cur = g_cur_func;
-    PUSH32(g_esp, 0);
-    PUSH32(g_esp, ctx);
-    PUSH32(g_esp, reg);
-    PUSH32(g_esp, er);
+    /* The frame of ntdll's ExecuteHandler2, which makes the call: its ebp
+     * frame holds the same four arguments, and C++Builder's handler stub
+     * reads them there ([ebp+8]..[ebp+14h]), not from its own stack. */
+    for (int pass = 0; pass < 2; pass++) {
+        PUSH32(g_esp, 0);
+        PUSH32(g_esp, ctx);
+        PUSH32(g_esp, reg);
+        PUSH32(g_esp, er);
+        if (pass == 0) {
+            PUSH32(g_esp, 0);            /* its return address */
+            PUSH32(g_esp, g_ebp);
+            g_ebp = g_esp;
+        }
+    }
     PUSH32(g_esp, RECOMP_RETADDR);
     fn();
     uint32_t eax = g_eax;
@@ -85,8 +95,21 @@ static int seh_dispatch(uint32_t code, uint32_t flags, uint32_t n, uint32_t args
     if (!reg || reg == 0xFFFFFFFFu) return 0;
     uint32_t esp = g_esp, ctx;
     uint32_t er = seh_records(code, flags, n, args, &ctx);
-    if (seh_trace)
+    if (seh_trace) {
         fprintf(stderr, "[seh32] raise 0x%08X from sub_%08X, first frame 0x%08X\n", code, g_cur_func, reg);
+        /* Delphi's: [0] the raising address, [1] the object: its class name
+         * (a ShortString at VMT-44) and its message (an AnsiString at +4). */
+        uint32_t obj = n >= 2 && args ? MEM32(args + 4) : 0, vmt = obj ? MEM32(obj) : 0;
+        if (code == 0x0EEDFADEu && vmt > 0x10000u) {
+            const uint8_t* cn = (const uint8_t*)(uintptr_t)MEM32(vmt - 44);
+            const char* msg = (const char*)(uintptr_t)MEM32(obj + 4);
+            fprintf(stderr, "[seh32]   %.*s at 0x%08X: %.200s\n", cn ? cn[0] : 0, cn ? (const char*)cn + 1 : "",
+                    MEM32(args), msg && !IsBadStringPtrA(msg, 200) ? msg : "");
+        }
+        for (uint32_t r = reg; r && r != 0xFFFFFFFFu; r = MEM32(r))
+            fprintf(stderr, "[seh32]   frame 0x%08X: handler 0x%08X, %08X %08X\n", r, MEM32(r + 4),
+                    MEM32(r + 8), MEM32(r + 12));
+    }
     for (; reg && reg != 0xFFFFFFFFu; reg = MEM32(reg)) {
         uint32_t disp = seh_call(MEM32(reg + 4), er, reg, ctx);
         if (disp == 0) {             /* ExceptionContinueExecution */
