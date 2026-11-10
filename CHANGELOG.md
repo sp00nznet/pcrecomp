@@ -5,6 +5,13 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- win32hle: a thread handing the machine over (`hle_yield`, `hle_block_end`)
+  sleeps on a condition variable the taker signals, for at most 2 ms, instead
+  of spinning on `sched_yield` (the browser keeps its spin). Theme Park World
+  hands over at every import while its other threads want a turn: 6% of its
+  main thread was the spin, 1% now.
+
 ### Fixed
 - win32hle: DirectDraw 4's texture cache is rebuilt when `SetSurfaceDesc`
   changes a surface's size, a render target lets go of its attached z-buffer
