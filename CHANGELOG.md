@@ -6,6 +6,13 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- win32hle: an exclusive relative DirectInput mouse gets the mouse's
+  movement, not the desktop pointer's place, so a game moving its own cursor
+  no longer finds it stuck where the pointer met the picture's edge:
+  `hle_input_raw` counts movement past the edges, and screen.c gives SDL's
+  relative mode while the mouse is held (`hle_input_relative_hook`,
+  `hle_input_motion`). The keys that let the mouse go are named for each
+  platform (Ctrl+Cmd, Ctrl+Win, Ctrl+Super).
 - win32hle: DirectDraw 4's texture cache is rebuilt when `SetSurfaceDesc`
   changes a surface's size, a render target lets go of its attached z-buffer
   when it is freed, and each surface has its own uniqueness value;
