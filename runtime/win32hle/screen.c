@@ -387,6 +387,7 @@ static void present(void) {
  * window shows the cursor the game set, built from its resources. */
 int (*hle_screen_cursor_hook)(void);
 int (*hle_screen_key_hook)(int sdl_scancode, int down);
+void (*hle_screen_poll_hook)(void);
 
 /* The window's title, for a host that shows what is playing (a mod). */
 void hle_screen_title(const char *title) { if (g_win) SDL_SetWindowTitle(g_win, title); }
@@ -719,6 +720,7 @@ void hle_screen_confine(int on) { g_confine = on != 0; }
 static int g_want_rel, g_rel;
 static double g_rel_fx, g_rel_fy;                          /* game pixels not yet whole */
 static void want_relative(int on) { g_want_rel = on; }
+int hle_screen_relative(void) { return g_rel; }
 static void warp(int x, int y);
 static void warp_to_cursor(void) { int x, y; hle_input_position(&x, &y); warp(x, y); }
 static void confine_update(void) {
@@ -839,6 +841,7 @@ void hle_screen_pump(void) {
         default: break;
         }
     }
+    if (hle_screen_poll_hook) hle_screen_poll_hook();
     present();
     confine_update();
 }

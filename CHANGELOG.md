@@ -47,6 +47,9 @@ versions follow [SemVer](https://semver.org/).
   shadowed.
 
 ### Added
+- win32hle screen: `hle_screen_poll_hook`, called on the window's thread at
+  each pump, for a host to poll what SDL sends no events for (a game
+  controller it turns into the mouse and keys), and `hle_screen_relative`.
 - win32hle: DirectInput 3 and 5 (`dinput.c`): the system mouse (relative or
   absolute axes, three buttons) and keyboard (DIK codes), immediate and
   buffered, read from the same input state as the window messages; arriving
