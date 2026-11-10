@@ -6,6 +6,21 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- NE: a native code map, so no Win16 lift needs IDA. `tools/ne/ne_codemap.py`
+  finds code by recursive descent from CS:IP and the entry table (branches,
+  near/far calls, jump tables including MSC's sparse switch), then
+  speculative seeds kept only if they decode cleanly: far-pointer, offset and
+  selector+offset relocation targets, MSC/Borland prologues, and the bytes
+  behind each return. It writes `ida_export.py`'s JSON and is now what
+  `ne_decode`/`ne_link` use when no exported map is given (`--seeds` feed
+  it). Instruction heads agree with IDA's to 98.5-100% both ways on Bermuda
+  Syndrome, CivNet, Space Bucks and Jazz Jackrabbit, and all four run to the
+  same point without IDA. `score_recovery.py --ne` scores two code maps
+  (functions and heads); `tools/ne/test_ne_codemap.py` scores every IDA
+  export on the machine, SKIP without one.
+- `tools/ne/wine_spec_to_json.py`: the Win16 ordinal map from Wine's `.spec`
+  files, in place of IDA's `.idt` files; identical on every ordinal the four
+  Win16 recomps import.
 - win32hle, for eJay 2's engine and its MFC graphics DLL (sp00nznet/ejay):
   winmm answers as a PC with no mixer and no recording device, and has
   `waveOutSetVolume`, `waveOutGetVolume`, `waveOutGetID` (#135); MFC's
@@ -63,6 +78,10 @@ versions follow [SemVer](https://semver.org/).
   at 0 all eight showed the same tool.
 
 ### Fixed
+- Win16 host: INT 1Ah moved from a host `int_handler` to `win16_int_default`,
+  which the generated `int_handler` calls when the game has none. The host's
+  own `int_handler` collided with Jazz's and CivNet's, so neither linked
+  against the Bermuda branch.
 - `tools/drm/steamstub.py`: SteamStub 2.x builds that never encrypt the code.
   Their `steamdrm.dll` reads the unused code-range and AES fields as `[eax+0]`,
   which the field scan skipped, so it stopped at 5 of 7. Those reads count now,

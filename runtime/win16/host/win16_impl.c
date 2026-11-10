@@ -2191,8 +2191,11 @@ __attribute__((weak)) int recomp_game_int21(CPU *cpu) { (void)cpu; return 0; }
 
 /* Software interrupts a Win16 program issues itself besides INT 21h. MSVC's
  * startup seeds from INT 1Ah AH=0 (BIOS ticks since midnight, 18.2/s); the
- * rest are logged once each. */
-void int_handler(CPU *cpu, int vec) {
+ * rest are logged once each. Not int_handler itself: a game that answers
+ * interrupts of its own (Jazz, CivNet) defines that, and a MinGW static
+ * library will not resolve a weak one. gen_win16_stubs emits an int_handler
+ * that calls this when the game has none. */
+void win16_int_default(CPU *cpu, int vec) {
     if (vec == 0x1A && cpu->ah == 0) {
         SYSTEMTIME t; GetLocalTime(&t);
         uint32_t ms = ((t.wHour * 60u + t.wMinute) * 60u + t.wSecond) * 1000u + t.wMilliseconds;

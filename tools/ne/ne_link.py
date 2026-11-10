@@ -14,8 +14,9 @@ modules are lifted together, into one segment numbering and one flat image:
      of them to the lifter, which resolves a cross-module call straight to the
      target's lifted function instead of a Win16 shim;
   3. lift every code segment of every module into <work>/src/segNNN.c, using a
-     per-module code map if one was exported (tools/ida/ida_export.py writes
-     one keyed by the module's OWN segment numbers; renumber() accounts for it);
+     per-module code map: one exported into --ida-dir if there is one
+     (tools/ida/ida_export.py writes one keyed by the module's OWN segment
+     numbers; renumber() accounts for it), else one ne_codemap.py builds;
   4. write the flat image and mem_layout.h (gen_image.write), whose
      RECOMP_MODULES[] table tells the runtime where each module's segments,
      DGROUP and entry point are;
@@ -29,7 +30,7 @@ Usage, from the project root:
         game/DOGZDLL.DLL game/THINK.DLL game/NEURON.DLL game/DOGZ.WAD
 
 --ida-dir holds <MODULE-FILE-STEM>.json per module (DOGZDLL.json, ...); a module
-without one is lifted from a linear sweep.
+without one gets a native code map (ne_codemap.py) -- no IDA needed.
 
 --seeds adds function entries a code map does not know about -- typically the
 targets of indirect calls that missed at run time, found by running the game:
@@ -51,6 +52,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, '..', 'lift'))
 from ne_parse import parse_ne
 import ne_decode
+import ne_codemap
 import ne_lift
 import win16
 import gen_image
@@ -118,9 +120,16 @@ def main():
     for ne, name in zip(nes, names):
         stem = os.path.splitext(os.path.basename(ne.filename))[0]
         ida = os.path.join(args.ida_dir, stem + '.json') if args.ida_dir else None
-        data = ne_decode.load_ida_data(ne, ida if ida and os.path.exists(ida) else None)
-        if not data:
-            print(f'  {stem}: no code map, linear sweep')
+        if ida and os.path.exists(ida):
+            data = ne_decode.load_ida_data(ne, ida)
+            print(f'  {stem}: code map {ida}')
+        else:
+            # Seeds are entries the descent cannot see; give them to it, so
+            # whatever they reach is decoded as code too.
+            local = [(int(sg), int(o, 16)) for sg, offs in seeds.get(name, {}).items() for o in offs]
+            data = ne._ida_data = ne_codemap.build(ne, local)
+            print(f'  {stem}: native code map, {sum(len(v["functions"]) for v in data.values())} '
+                  f'functions, {sum(len(v["heads"]) for v in data.values())} heads')
         for seg, offs in seeds.get(name, {}).items():
             fn = data.setdefault(seg, {}).setdefault('functions', [])
             fn.extend(int(o, 16) for o in offs)

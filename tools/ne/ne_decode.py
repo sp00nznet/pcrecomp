@@ -110,10 +110,10 @@ def build_reloc_map(seg: Segment, ne: NEHeader) -> dict:
 
 
 def load_ida_data(ne: NEHeader, path: str = None) -> dict:
-    """Load an analyzer-exported code map (see tools/ida/ida_export.py) if
-    present. Maps NE segment number (str) -> {functions, heads, code_ranges}.
-    Resolution order: explicit `path` arg, then the PCRECOMP_IDA_JSON env var.
-    Cached on the NEHeader; returns {} when no file is found."""
+    """The module's code map: NE segment number (str) -> {functions, heads,
+    code_ranges}. An exported one (tools/ida/ida_export.py, or ne_codemap.py's
+    own JSON) by explicit `path`, else the PCRECOMP_IDA_JSON env var, else one
+    built natively by ne_codemap. Cached on the NEHeader."""
     cache = getattr(ne, '_ida_data', None)
     if cache is not None:
         return cache
@@ -143,6 +143,12 @@ def load_ida_data(ne: NEHeader, path: str = None) -> dict:
             print('  code map does not match this module (%d/%d heads out of '
                   'range); decoding without it' % (outside, inside + outside))
             data = {}
+    # No exported map: build one natively (tools/ne/ne_codemap.py, recursive
+    # descent) rather than linear-sweep through data-in-code. PCRECOMP_NE_SWEEP=1
+    # restores the old sweep for comparison.
+    if not data and not os.environ.get('PCRECOMP_NE_SWEEP'):
+        import ne_codemap
+        data = ne_codemap.build(ne)
     ne._ida_data = data
     return data
 

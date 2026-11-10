@@ -142,10 +142,12 @@ or IDA, whatever the architecture.
 | Tool | What it does |
 |------|--------------|
 | `ne_parse.py` | Segments, relocations, imports, entry points; flags a VBRUN-only import list as p-code |
-| `ne_decode.py` | NE-aware disassembly with cross-segment far calls and imports resolved; `--ida-json` follows IDA's code map |
+| `ne_codemap.py` | The code map (functions, instruction heads) by recursive descent from the entry table and relocations, jump tables and prologues; the default for `ne_decode`/`ne_link`, no IDA needed |
+| `ne_decode.py` | NE-aware disassembly with cross-segment far calls and imports resolved; `--ida-json` follows an exported code map instead |
 | `ne_xref.py` | Segment call graph, clusters, import usage, `--dot` |
 | `win16.py` | Ordinal -> API name, and the PASCAL stack-purge table keyed by (MODULE, API) |
-| `idt_to_json.py` | The ordinal map, built from the `.idt` files IDA ships, with no IDA run |
+| `wine_spec_to_json.py` | The ordinal map, built from Wine's 16-bit `.spec` files |
+| `idt_to_json.py` | The same map from the `.idt` files IDA ships, if you have IDA |
 | `gen_win16_stubs.py` | Prototypes, plus a correctly purging stub for every import with no shim yet; refuses an import whose purge it does not know |
 | `gen_segments_h.py` | `segments.h` generated from the lifted definitions, so prototypes cannot drift |
 | `gen_unresolved_stubs.py` | Defines the call targets nothing lifted, as stubs that **abort** rather than return |
@@ -436,13 +438,16 @@ entirely, in code that is fine. `tools/ne/win16.py` carries the accumulated
 purge table keyed by (MODULE, API); `gen_win16_stubs.py` fails rather than
 generating a stub for an import that has no entry in it.
 
-Names come from IDA, which ships the Win16 ordinal maps as `.idt` files, so no
-IDA run is needed. `win16.py` looks for `work/win16_imports.json`, then
+Names come from Wine's 16-bit `.spec` files (`wine_spec_to_json.py`, which
+downloads them), or from the `.idt` files IDA ships (`idt_to_json.py`); the
+two agree on every ordinal the Win16 recomps import. `win16.py` looks for `work/win16_imports.json`, then
 `analysis/win16_imports.json`, walking up from the project root, then falls
 back to `tools/ne/win16_imports.json`. Without any of them, imports resolve to
 `MODULE_OrdN` and the purge lookups all miss:
 
 ```bash
+python tools/ne/wine_spec_to_json.py -o tools/ne/win16_imports.json
+# or, with IDA installed:
 python tools/ne/idt_to_json.py --ida "C:/Program Files/IDA Professional 9.1" \
                                -o tools/ne/win16_imports.json
 ```
@@ -557,6 +562,10 @@ python tools/disasm/callgraph.py game.exe --bounds bounds.csv --leaves
 ```
 
 ### "I have IDA and want its analysis to drive the lifters"
+
+Not needed for NE: `ne_decode` and `ne_link` build their code map natively
+(`tools/ne/ne_codemap.py`), and `tools/ne/test_ne_codemap.py` scores it
+against IDA's exports where those exist. An IDA map, if given, still wins:
 
 ```bash
 # Export IDA's verified code map (functions + instruction heads), then feed it in
