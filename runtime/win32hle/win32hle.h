@@ -172,6 +172,14 @@ uint32_t hle_focus_window(void);
 uint32_t hle_send(uint32_t hwnd, uint32_t msg, uint32_t wParam, uint32_t lParam);   /* SendMessageA */
 extern void (*hle_dialog_hook)(uint32_t hwnd, uint32_t resource_id);   /* a dialog made from a resource */
 extern void (*hle_cursor_hook)(int x, int y);                          /* the guest moved the cursor */
+/* GL mode: set hle_screen_gl before hle_screen_open (1 OpenGL, 2 Vulkan) and
+ * the window is made for that API with no SDL renderer; the host's 3D layer
+ * draws into it (hle_screen_sdl_window) and says where its picture lies
+ * (hle_screen_gl_picture: source size, then the rectangle in drawable
+ * pixels), so the mouse maps onto the game's coordinates. */
+extern int hle_screen_gl;
+struct SDL_Window *hle_screen_sdl_window(void);
+void hle_screen_gl_picture(int src_w, int src_h, int x, int y, int w, int h);
 /* A cursor from the guest's resources (LoadCursorA), 32x32 monochrome, rows top-down. */
 typedef struct { uint32_t handle; int hot_x, hot_y; uint8_t and_mask[128], xor_mask[128]; } hle_cursor_image_t;
 const hle_cursor_image_t *hle_cursor_image(uint32_t handle);   /* NULL: not one of those (show the system arrow) */

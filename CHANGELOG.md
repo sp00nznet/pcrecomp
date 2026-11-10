@@ -39,6 +39,13 @@ versions follow [SemVer](https://semver.org/).
   a 64-bit Windows. Operation Flashpoint at long view distances runs out of
   2 GB; with 4 GB it does not. `hle_on_alloc_fail(what, n)` is called when
   the guest heap or a page reservation fails, for a host's log.
+- win32hle: GL mode for a host that draws the game itself. With
+  `hle_screen_gl` set before `hle_screen_open` (1 OpenGL, 2 Vulkan), the
+  window is made for that API with no SDL renderer, the host draws into it
+  (`hle_screen_sdl_window`) and tells where its picture lies
+  (`hle_screen_gl_picture`), so the mouse maps onto the game's coordinates,
+  including on high-DPI screens. Operation Flashpoint's Direct3D 8 layer (on
+  OpenGL and on Vulkan) draws through it.
 - pe: `pdb2_ref.py` reads a Visual C++ 5/6 PDB (MSF 2.00, `_ST` symbol
   records), which llvm-pdbutil and `pdb_ref.py` cannot, into the same
   reference JSON, plus a `--seed-functions` list for disasm32. No external
