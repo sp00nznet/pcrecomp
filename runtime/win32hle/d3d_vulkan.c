@@ -1029,8 +1029,9 @@ static int has_layer(const char *name) {
     free(lp);
     return found;
 }
-/* The GPU to draw on: one with Vulkan 1.3, dynamic rendering, and a queue
- * for drawing and computing; a real one before a software one. */
+/* The GPU to draw on: one with Vulkan 1.3, dynamic rendering and demotion
+ * (what glslang makes of discard for 1.3; every 1.3 device has both), and a
+ * queue for drawing and computing; a real one before a software one. */
 static int pick_device(void) {
     uint32_t n = 0;
     if (vkEnumeratePhysicalDevices(g_inst, &n, NULL) != VK_SUCCESS || !n) return -1;
@@ -1047,7 +1048,7 @@ static int pick_device(void) {
         VkPhysicalDeviceFeatures2 f2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
         f2.pNext = &f13;
         vkGetPhysicalDeviceFeatures2(pds[i], &f2);
-        if (!f13.dynamicRendering) continue;
+        if (!f13.dynamicRendering || !f13.shaderDemoteToHelperInvocation) continue;   /* discard, in SPIR-V 1.6 */
         uint32_t nq = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(pds[i], &nq, NULL);
         VkQueueFamilyProperties *qp = (VkQueueFamilyProperties *)calloc(nq, sizeof *qp);
@@ -1104,7 +1105,7 @@ static int start(void) {
     VkDeviceQueueCreateInfo qi = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
     qi.queueFamilyIndex = g_qfam, qi.queueCount = 1, qi.pQueuePriorities = &prio;
     VkPhysicalDeviceVulkan13Features f13 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
-    f13.dynamicRendering = VK_TRUE;
+    f13.dynamicRendering = VK_TRUE, f13.shaderDemoteToHelperInvocation = VK_TRUE;
     VkPhysicalDeviceFeatures2 f2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
     f2.pNext = &f13, f2.features.depthClamp = g_depth_clamp;
     VkDeviceCreateInfo di = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
