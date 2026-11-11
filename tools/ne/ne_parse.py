@@ -37,6 +37,7 @@ class Relocation:
     module_idx: int = 0     # Module reference index (1-based)
     ordinal: int = 0        # Ordinal or name table offset
     additive: bool = False  # If True, add to existing value; if False, replace
+    name: str = ''          # Import by name: the imported name (ordinal holds its table offset)
 
     SRC_NAMES = {0: 'LOBYTE', 2: 'SELECTOR', 3: 'FAR_PTR', 5: 'OFFSET16', 11: 'PTR48', 13: 'OFFSET32'}
     FLAG_NAMES = {0: 'INTERNAL', 1: 'IMPORT_ORD', 2: 'IMPORT_NAME', 3: 'OSFIXUP'}
@@ -313,6 +314,9 @@ def parse_ne(filepath: str) -> NEHeader:
                     elif target_type == 2:  # Import by name
                         rel.module_idx = struct.unpack_from('<H', r_data, 4)[0]
                         rel.ordinal = struct.unpack_from('<H', r_data, 6)[0]  # Name table offset
+                        at = ne.ne_offset + import_table_off + rel.ordinal
+                        if at < len(data):
+                            rel.name = data[at + 1:at + 1 + data[at]].decode('latin-1')
                     elif target_type == 3:  # OSFIXUP
                         rel.target_seg = struct.unpack_from('<H', r_data, 4)[0]
                         rel.target_off = struct.unpack_from('<H', r_data, 6)[0]

@@ -60,7 +60,7 @@ def imports_used(ne, skip=(), seen=None):
             mod = win16.module_name(ne, r.module_idx)
             if mod.upper() in skip:
                 continue            # another lifted module: a direct call, not a shim
-            imp = win16.get_import(mod, r.ordinal)
+            imp = win16.get_import(mod, r.ordinal, r.name)
             entry = seen.setdefault(imp.name, [imp, False])
             if r.src_type != 5:
                 entry[1] = True
@@ -186,6 +186,9 @@ def main():
          '/* ---- Software interrupts ---- */',
          'void int_handler(CPU *cpu, int int_num);',
          'void dos_int21(CPU *cpu);',
+         '/* INT 10h/16h: the lifter calls these directly (a DOS-extended program). */',
+         'void bios_int10(CPU *cpu);',
+         'void bios_int16(CPU *cpu);',
          '',
          f'/* ---- Win16 import shims ({len(used)} total) ---- */']
     unknown_purge = []
@@ -238,6 +241,9 @@ def main():
     if 'int_handler' not in have:
         c.append('void int_handler(CPU *cpu, int int_num) { (void)cpu; '
                  'fprintf(stderr, "[int] unhandled INT 0x%02X\\n", int_num); }')
+    for vec in ('10', '16'):
+        if 'bios_int' + vec not in have:
+            c.append('void bios_int%s(CPU *cpu) { int_handler(cpu, 0x%s); }' % (vec, vec))
     for mod in sorted(by_mod):
         for name, imp, called in sorted(by_mod[mod]):
             if name in have:

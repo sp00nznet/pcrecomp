@@ -715,7 +715,12 @@ static uint32_t mk_state(void) {
            (g_keys[VK_CONTROL] & 0x80 ? 8u : 0u) | (g_keys[0x04] & 0x80 ? 0x10u : 0u);
 }
 void (*hle_input_hook)(void);                           /* the input state changed (dinput.c) */
+/* The mouse's movement, counted without the screen's edges: DirectInput's
+ * relative axes read it. A cursor that moves counts; one put somewhere
+ * (SetCursorPos, hle_input_cursor) does not, as on Windows. */
+static int g_raw_x, g_raw_y;
 void hle_input_mouse(uint32_t message, int sx, int sy) {
+    g_raw_x += sx - g_cursor_x, g_raw_y += sy - g_cursor_y;
     g_cursor_x = sx, g_cursor_y = sy;
     uint32_t vk = message == WM_LBUTTONDOWN || message == WM_LBUTTONUP ? 1 : message == WM_RBUTTONDOWN || message == WM_RBUTTONUP ? 2
                 : message == WM_MBUTTONDOWN || message == WM_MBUTTONUP ? 4 : 0;
@@ -730,8 +735,9 @@ void hle_input_mouse(uint32_t message, int sx, int sy) {
     } else {
         t = hle_window_at(sx, sy, &cx, &cy);
     }
-    if (!t) return;
-    q_push(t, message, mk_state(), ((uint32_t)(cy & 0xFFFF) << 16) | (uint32_t)(cx & 0xFFFF));
+    /* DirectInput hears of it whether or not a window is there to message
+     * (a game reading the mouse before its window, or over none of it) */
+    if (t) q_push(t, message, mk_state(), ((uint32_t)(cy & 0xFFFF) << 16) | (uint32_t)(cx & 0xFFFF));
     if (hle_input_hook) hle_input_hook();
 }
 void hle_input_key(int down, uint32_t vk, uint32_t scan) {
@@ -743,11 +749,40 @@ void hle_input_key(int down, uint32_t vk, uint32_t scan) {
     if (vk == 0xA4 || vk == 0xA5) { if (down) g_keys[VK_MENU] |= 0x80; else g_keys[VK_MENU] &= 1; }
     uint32_t t = hle_focus_window();
     int alt = (g_keys[VK_MENU] & 0x80) != 0;
-    uint32_t l = 1u | (scan & 0xFFu) << 16 | (alt ? 1u << 29 : 0) | (down ? 0 : 3u << 30);
+    /* The keys Windows marks extended (bit 24): without it a game reading
+     * the scan code takes Delete for the keypad's ".", the arrows for its
+     * 8 4 6 2, Home for its 7 (Theme Park World's Delete, its clear-land tool). */
+    int ext = (vk >= 0x21 && vk <= 0x28) || vk == 0x2D || vk == 0x2E || vk == 0x2C || vk == 0x6F || vk == 0x90 ||
+              vk == 0xA3 || vk == 0xA5 || (vk >= 0x5B && vk <= 0x5D);
+    uint32_t l = 1u | (scan & 0xFFu) << 16 | (ext ? 1u << 24 : 0) | (alt ? 1u << 29 : 0) | (down ? 0 : 3u << 30);
     if (t) q_push(t, alt || vk == VK_MENU || vk == 0x79 ? (down ? WM_SYSKEYDOWN : WM_SYSKEYUP) : (down ? WM_KEYDOWN : WM_KEYUP), vk, l);
     if (hle_input_hook) hle_input_hook();
 }
 void hle_input_cursor(int sx, int sy) { g_cursor_x = sx, g_cursor_y = sy; }
+/* A mouse that reports movement, not a place (the host's relative mode):
+ * all of it counts, and the cursor follows as far as the screen goes. */
+void hle_input_motion(int dx, int dy) {
+    int x = g_cursor_x + dx, y = g_cursor_y + dy;
+    x = x < 0 ? 0 : x >= g_screen_w ? g_screen_w - 1 : x;
+    y = y < 0 ? 0 : y >= g_screen_h ? g_screen_h - 1 : y;
+    g_raw_x += dx - (x - g_cursor_x), g_raw_y += dy - (y - g_cursor_y);   /* hle_input_mouse counts the rest */
+    hle_input_mouse(WM_MOUSEMOVE, x, y);
+}
+void hle_input_raw(int *x, int *y) { *x = g_raw_x, *y = g_raw_y; }
+/* The wheel: WM_MOUSEWHEEL to the focused window, as Windows sends it (the
+ * cursor's screen position, the turn in the high word of wParam), and the
+ * turning counted for DirectInput's z axis. */
+static int g_wheel;
+void hle_input_wheel(int delta) {
+    if (!delta) return;
+    g_wheel += delta;
+    uint32_t t = hle_focus_window();
+    if (t) q_push(t, 0x020A /* WM_MOUSEWHEEL */, (uint32_t)(delta & 0xFFFF) << 16 | (mk_state() & 0xFFFF),
+                  ((uint32_t)(g_cursor_y & 0xFFFF) << 16) | (uint32_t)(g_cursor_x & 0xFFFF));
+    if (hle_input_hook) hle_input_hook();
+}
+int hle_input_wheel_total(void) { return g_wheel; }
+void (*hle_input_relative_hook)(int on);
 /* What the input state is, for DirectInput (dinput.c): the cursor and a key
  * or button's byte (bit 7 down), by virtual-key code. */
 void hle_input_position(int *sx, int *sy) { *sx = g_cursor_x, *sy = g_cursor_y; }
