@@ -839,6 +839,52 @@ static void shim_RaiseException(void) {
  * is a module Windows loaded; a mapped guest image is not one, and they fail
  * with E_INVALIDARG (KotOR, Messiah, Shogo). The host's own instance stands
  * in for a guest one. Stack arguments: (hinst, version, ...) up to 5 dwords. */
+/* IDirectInput(A/W)::EnumDevices for every device type (0) also walks the
+ * "other" HID devices (DIDEVTYPE_DEVICE, 1), and on Windows 11 with some
+ * vendor-defined HID collections (RGB keyboards, headsets) that walk
+ * corrupts the process heap inside dinput.dll: a plain C program dies the
+ * same way, so no game gets past it. The mouse, keyboard and joystick walks
+ * are fine. So an all-types request becomes those three, in that order, and
+ * the "other" devices (nothing a 1990s game drives) are left out. KISS Psycho
+ * Circus (LithTech 2) enumerates everything at start-up.
+ * ponytail: the interface DirectInputCreate returned only; an IDirectInput2/7
+ * from QueryInterface has its own vtable and is not wrapped. */
+typedef HRESULT (WINAPI *di_enum_t)(void*, DWORD, void*, void*, DWORD);
+typedef BOOL (WINAPI *di_cb_t)(const void*, void*);
+static di_enum_t g_di_enum[2];        /* the real EnumDevices, A and W */
+typedef struct { di_cb_t cb; void* ref; int stop; } di_split_t;
+static BOOL WINAPI di_split_cb(const void* ddi, void* ctx) {
+    di_split_t* s = (di_split_t*)ctx;
+    BOOL r = s->cb(ddi, s->ref);      /* a guest callback: runs lifted, through the trampoline */
+    if (!r) s->stop = 1;
+    return r;
+}
+static HRESULT di_enum_split(int w, void* self, DWORD type, void* cb, void* ref, DWORD flags) {
+    if (type & 0xFF) return g_di_enum[w](self, type, cb, ref, flags);
+    di_split_t s = { (di_cb_t)cb, ref, 0 };
+    static const DWORD types[3] = { 2, 3, 4 };   /* DIDEVTYPE_MOUSE, _KEYBOARD, _JOYSTICK */
+    HRESULT hr = 0;
+    for (int i = 0; i < 3 && !s.stop && hr >= 0; i++)
+        hr = g_di_enum[w](self, types[i] | (type & ~0xFFu), (void*)di_split_cb, &s, flags);
+    return hr;
+}
+static HRESULT WINAPI di_enum_a(void* self, DWORD t, void* cb, void* ref, DWORD f) { return di_enum_split(0, self, t, cb, ref, f); }
+static HRESULT WINAPI di_enum_w(void* self, DWORD t, void* cb, void* ref, DWORD f) { return di_enum_split(1, self, t, cb, ref, f); }
+/* The slot is patched in dinput's own vtable, not swapped for a copy in the
+ * object: dinput tells its interfaces apart by their vtable pointer, and an
+ * object with a copied one crashed in its own Release. */
+static void di_wrap(void*** obj, int w) {
+    void* mine = (void*)(w ? di_enum_w : di_enum_a);
+    DWORD old;
+    if (!obj || !*obj || (*obj)[4] == mine) return;
+    if (!g_di_enum[w]) g_di_enum[w] = (di_enum_t)(*obj)[4];
+    if ((*obj)[4] != (void*)g_di_enum[w]) return;     /* another vtable: not ours to patch */
+    if (VirtualProtect(&(*obj)[4], sizeof(void*), PAGE_READWRITE, &old)) {
+        (*obj)[4] = mine;
+        VirtualProtect(&(*obj)[4], sizeof(void*), old, &old);
+    }
+}
+
 static void dinput_create(const char* name, int nargs) {
     static FARPROC real[4];
     static const char* names[4] = { "DirectInputCreateA", "DirectInputCreateW", "DirectInputCreateEx",
@@ -852,6 +898,7 @@ static void dinput_create(const char* name, int nargs) {
     typedef uint32_t (WINAPI *f5_t)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
     g_eax = !real[k] ? 0x80004005u : nargs == 4 ? ((f4_t)real[k])(h, a[1], a[2], a[3])
                                                 : ((f5_t)real[k])(h, a[1], a[2], a[3], a[4]);
+    if (k < 2 && g_eax == 0 && a[2]) di_wrap((void***)(uintptr_t)MEM32(a[2]), k);
     g_esp += 4 + 4 * nargs;
 }
 static void shim_DirectInputCreateA(void) { dinput_create("DirectInputCreateA", 4); }
@@ -1065,6 +1112,8 @@ static __declspec(naked) void lin_tramp(void) {
     }
 }
 
+static int g_heap_code;
+
 static LONG CALLBACK native32_veh(EXCEPTION_POINTERS* ep) {
     EXCEPTION_RECORD* er = ep->ExceptionRecord;
     uint32_t pc = (uint32_t)(uintptr_t)er->ExceptionAddress;
@@ -1090,8 +1139,19 @@ static LONG CALLBACK native32_veh(EXCEPTION_POINTERS* ep) {
         }
         fprintf(stderr, "[callback] Windows called guest 0x%08X, which is not lifted\n", pc);
     }
+    /* native32_allow_heap_code: Windows' own code run from the heap. */
+    MEMORY_BASIC_INFORMATION mbi;
+    DWORD old;
+    if (g_heap_code && er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2 &&
+        er->ExceptionInformation[0] == 8 && !native32_in_guest((uint32_t)er->ExceptionInformation[1]) &&
+        VirtualQuery((void*)er->ExceptionInformation[1], &mbi, sizeof mbi) && mbi.Type == MEM_PRIVATE &&
+        mbi.State == MEM_COMMIT && mbi.Protect == PAGE_READWRITE &&
+        VirtualProtect(mbi.BaseAddress, mbi.RegionSize, PAGE_EXECUTE_READWRITE, &old))
+        return EXCEPTION_CONTINUE_EXECUTION;
     return EXCEPTION_CONTINUE_SEARCH;
 }
+
+void native32_allow_heap_code(void) { g_heap_code = 1; }
 
 /* ---------------------------------------------------------------- setup */
 
@@ -1132,3 +1192,29 @@ void native32_dump_icalls(int n) {
  * host's build needs no change when one is added. */
 #include "eh32.c"
 #include "x87crt.c"
+
+/* native32_headless: see the header. */
+int native32_headless(void) {
+    char name[64];
+    if (GetEnvironmentVariableA("NATIVE32_HEADLESS", NULL, 0)) return -1;   /* the child */
+    _snprintf(name, sizeof name - 1, "native32-headless-%lu", GetCurrentProcessId());
+    name[sizeof name - 1] = 0;
+    HDESK desk = CreateDesktopA(name, NULL, NULL, 0, GENERIC_ALL, NULL);
+    if (!desk) { fprintf(stderr, "[headless] CreateDesktop failed (%lu)\n", GetLastError()); return -1; }
+    SetEnvironmentVariableA("NATIVE32_HEADLESS", name);
+    STARTUPINFOA si = { sizeof si };
+    PROCESS_INFORMATION pi;
+    DWORD rc = 1;
+    si.lpDesktop = name;
+    if (!CreateProcessA(NULL, GetCommandLineA(), NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+        fprintf(stderr, "[headless] CreateProcess failed (%lu)\n", GetLastError());
+        CloseDesktop(desk);
+        return -1;
+    }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    GetExitCodeProcess(pi.hProcess, &rc);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    CloseDesktop(desk);
+    return (int)rc;
+}

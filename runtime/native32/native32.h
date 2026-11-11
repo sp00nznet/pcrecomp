@@ -110,6 +110,26 @@ int native32_lift_in_native(const uint32_t* vas, int n);
 void native32_add_generated(uint32_t lo, uint32_t size);
 int native32_is_generated(uint32_t va);
 
+/* Code a Windows DLL builds in heap memory and jumps to: Direct3D's RGB
+ * software rasteriser (d3dim/d3dim700) compiles its span loops into
+ * HeapAlloc'd memory. A 1998 process could run that; this host is /NXCOMPAT
+ * (the callback trampoline needs DEP), so the fetch faults. After this call,
+ * an execute fault in committed private read-write memory outside the guest
+ * makes that region executable and retries. Off by default: a wild jump into
+ * the heap then still faults where it happened. Shogo, Unreal Tournament
+ * (Galaxy's mixers) and KISS Psycho Circus need it. */
+void native32_allow_heap_code(void);
+
+/* Run this process again on a desktop of its own that is never shown, and
+ * wait for it: windows, DirectDraw and Direct3D work there (software
+ * rendering), but nothing reaches the user's screens, over RDP or not. Call
+ * first thing in main(); it returns the child's exit code, or -1 in the child
+ * (and on failure), which then carries on. SendInput and the foreground
+ * window still belong to the user's desktop: a harness that drives the game
+ * must post messages to its window instead, or it types into the user's
+ * session. The child finds NATIVE32_HEADLESS set in its environment. */
+int native32_headless(void);
+
 /* Diagnostics: set before running. */
 extern int native32_trace_native;     /* one line per native call */
 extern int native32_trace_callbacks;  /* one line per Windows -> guest call */

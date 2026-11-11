@@ -6,6 +6,19 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- recomp32 loader: when the image's range is already reserved, it commits
+  into the reservation only if that starts at the image base and covers the
+  whole image, and otherwise says who holds it. It used to commit into any
+  reservation, so an image based where the process had already put a heap
+  segment "mapped", and lost its tail when the heap released that segment:
+  KISS Psycho Circus (based at `0x01CA0000`) read its own IAT from freed
+  memory a minute in.
+- native32: the built-in `DirectInputCreateA`/`W` shims wrap
+  `IDirectInput::EnumDevices`. Enumerating every device type walks the
+  "other" HID devices too, and on Windows 11 with some vendor-defined HID
+  collections that walk corrupts the process heap inside `dinput.dll` (a
+  plain C program dies the same way). An all-types request now enumerates
+  mice, keyboards and joysticks and leaves the "other" class out.
 - native32: `DirectInputCreateA`/`W`/`Ex` and `DirectInput8Create` are built-in
   shims that swap a guest `HINSTANCE` for the host's: DirectInput refuses a
   module Windows did not load (`E_INVALIDARG`), and Shogo's engine quit on it
@@ -18,6 +31,15 @@ versions follow [SemVer](https://semver.org/).
   shadowed.
 
 ### Added
+- native32: `native32_headless()` runs the host again on a private desktop
+  that is never shown: windows, DirectDraw and Direct3D work there, nothing
+  reaches the user's screens, over RDP or not (REPO_RULES section 10).
+- native32: `native32_allow_heap_code()`, the opt-in for Windows' own code
+  run from heap memory (Direct3D's RGB rasteriser), which Shogo and the
+  Unreal Tournament recomp each had in their host.
+- formats: `lithrez/lithrez.py`, LithTech's REZ archives ("RezMgr Version 1",
+  LithTech 1.0 through 2.x): list and extract, `--selftest`. From the Shogo
+  recomp; KISS Psycho Circus reads the same format.
 - pe: `pdb2_ref.py` reads a Visual C++ 5/6 PDB (MSF 2.00, `_ST` symbol
   records), which llvm-pdbutil and `pdb_ref.py` cannot, into the same
   reference JSON, plus a `--seed-functions` list for disasm32. No external

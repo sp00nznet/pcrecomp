@@ -167,7 +167,7 @@ or IDA, whatever the architecture.
 | `drm/emu_unpack.py` | Unpack a compressed PE32 (PECompact 2.x, and Valve's Steam2 wrapper built on it) by running its stub under Unicorn to the OEP, then rebuild the import table. Headless: nothing is launched |
 | `assets/extract_wise.py`, `isextract.py`, `is3extract.py`, `extract_cab.sh`, `pk3_inspect.py`, `bin2iso.js` | Wise and InstallShield (3, 5, 6+) installers, CABs, PK3/ZIP, BIN/CUE -> ISO |
 | `assets/iso_peek.py` | Read an ISO's directory, locally or **over HTTP range requests**, and pull one file out without downloading the image |
-| `formats/` | FIF/FTC fractal image, M20/MVB, SPAM, DAT and string-table decoders (C) |
+| `formats/` | FIF/FTC fractal image, M20/MVB, SPAM, DAT and string-table decoders (C); LithTech REZ archives (`lithrez`, Python) |
 | `audit_repo.py` | Game material or lifted output tracked in a repo, in HEAD or in history; see [docs/PUBLISHING.md](docs/PUBLISHING.md) |
 
 ### What the 64-bit path does that the 32-bit one never needed

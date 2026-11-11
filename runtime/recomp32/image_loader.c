@@ -56,9 +56,21 @@ uint32_t recomp_load_image(const char* path, uint32_t image_base) {
     if (!view) {
         /* Already reserved for us -- a launcher that held the range through
          * loader init (see the MSVC-host case) leaves it reserved, and
-         * MEM_RESERVE over an existing reservation fails. Commit into it. */
-        view = VirtualAlloc((void*)(uintptr_t)image_base, span,
-                            MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+         * MEM_RESERVE over an existing reservation fails. Commit into it, but
+         * only into a reservation that is exactly ours: one that starts at the
+         * image base and covers the whole image. Committing into somebody
+         * else's (a heap segment the process made before main) "worked", and
+         * the image's tail vanished when its owner released it: KISS Psycho
+         * Circus, based at 0x01CA0000, lost its .rdata minutes in. */
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery((void*)(uintptr_t)image_base, &mbi, sizeof mbi) && mbi.State == MEM_RESERVE &&
+            (uint32_t)(uintptr_t)mbi.AllocationBase == image_base && mbi.RegionSize >= span)
+            view = VirtualAlloc((void*)(uintptr_t)image_base, span,
+                                MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        else if (mbi.State != MEM_FREE)
+            fprintf(stderr, "[loader] 0x%08X+0x%X is already in use (allocation at %p, state %lX): hold it "
+                    "from process start (native32_hold_image)\n", image_base, span, mbi.AllocationBase,
+                    (unsigned long)mbi.State);
     }
     if (!view) {
         fprintf(stderr, "[loader] VirtualAlloc fixed @ 0x%08X failed (link host at a high base)\n",
