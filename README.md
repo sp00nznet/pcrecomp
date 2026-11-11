@@ -59,6 +59,7 @@ pcrecomp/
     compat/        Win32 -> SDL2 mapping (the original annotated import census;
                    win32hle is the implemented successor)
   templates/       Starter CMakeLists and .gitignore for a new project
+  cmake/           pcrecomp_gen.cmake: adds the generated C to a target, unoptimised
   docs/            Pipeline, philosophy, the hybrid boundary, publishing
 ```
 
@@ -648,7 +649,11 @@ pip install capstone pefile lief unicorn cryptography
    against a linker map, a PDB or IDA. Lifting a catalog you have not scored
    means finding its gaps at runtime, 30,000 calls deep, instead of now.
 5. Drop in the appropriate `runtime/` files
-6. Build with CMake, fix, repeat
+6. Build with CMake, fix, repeat. Add the generated C with
+   `include(${PCRECOMP}/cmake/pcrecomp_gen.cmake)` and
+   `pcrecomp_gen_sources(<target>)`: it compiles `src/recomp/gen` at /Od (-O0),
+   minutes instead of half an hour, while the runtime stays optimised.
+   `-DPCRECOMP_GEN_OPT=ON` optimises it too.
 7. Before going public, run `audit_repo.py` and read
    [docs/PUBLISHING.md](docs/PUBLISHING.md). Lifted output never goes in git.
 

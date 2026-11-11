@@ -236,6 +236,11 @@ static void k_VirtualFree(void) {                        /* (addr, size, type) *
     int i = region_of(addr);
     if (i < 0) { g_last_error = ERROR_INVALID_PARAMETER; RET(0, 3); }
     if (type & MEM_RELEASE) {
+        /* as Windows: only a whole reservation, by its base and size 0. A
+         * release of a block inside one (a game freeing a chunk it
+         * committed in its own pool) fails there and must fail here, or
+         * the whole pool goes with it. */
+        if (addr != g_region[i].base || size) { g_last_error = ERROR_INVALID_PARAMETER; RET(0, 3); }
         hle_vm_release(g_region[i].base, g_region[i].size);
         g_region[i].size = 0;
     } else if (type & MEM_DECOMMIT) {
@@ -445,9 +450,14 @@ static int try_take(uint32_t h) {
     }
 }
 
+/* A handle closed while a thread waits on it (a game that signals its
+ * worker's event, then closes it and frees the worker's object, as at exit):
+ * on Windows the wait holds the object and wakes signalled; here the closed
+ * handle is seen on a later poll, so it counts as signalled then. Invalid on
+ * the first poll is invalid. */
 uint32_t hle_wait(int n, const uint32_t *h, int all, uint32_t timeout) {
     uint32_t start = ticks_ms();
-    for (;;) {
+    for (int first = 1;; first = 0) {
         if (all) {
             int ready = 1;
             for (int i = 0; i < n; i++) { int r = try_take(h[i]); if (r < 0) return WAIT_FAILED; if (!r) { ready = 0; break; } }
@@ -455,7 +465,7 @@ uint32_t hle_wait(int n, const uint32_t *h, int all, uint32_t timeout) {
         } else {
             for (int i = 0; i < n; i++) {
                 int r = try_take(h[i]);
-                if (r < 0) { g_last_error = ERROR_INVALID_HANDLE; return WAIT_FAILED; }
+                if (r < 0 && first) { g_last_error = ERROR_INVALID_HANDLE; return WAIT_FAILED; }
                 if (r) return WAIT_OBJECT_0 + (uint32_t)i;
             }
         }

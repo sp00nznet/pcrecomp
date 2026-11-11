@@ -123,6 +123,28 @@ uint32_t hle_resolve_or_stub(const char *name);
 
 /* Human name for a synthetic shim VA (for traces/faults), or NULL. */
 const char *hle_name(uint32_t va);
+/* called when guest memory runs out (the heap or pages): a host's log may
+ * want to know */
+extern void (*hle_on_alloc_fail)(const char *what, uint32_t n);
+/* based hosts: where "anywhere" guest reservations stop (0x7F000000, as for a
+ * program that is not large-address-aware; up to 0xFFF00000) */
+extern uint32_t hle_vm_any_hi;
+/* Per-import time spent (ns) on the main thread (hle_mark_main_thread),
+ * indexed like registration order, once hle_shim_timing is set;
+ * hle_in_shim_main is the import that thread runs now, -1 in guest code. */
+extern int hle_shim_timing;
+extern uint64_t hle_shim_ns_main[];
+extern volatile int hle_in_shim_main;
+int hle_shim_total(void);
+const char *hle_shim_name_at(int i);
+void hle_mark_main_thread(void);
+uint64_t hle_mono_ns(void);                      /* CLOCK_MONOTONIC in ns */
+/* short spans, cheaply: hle_ticks_ns(hle_ticks() - t0) is ns. A host calls
+ * hle_tsc_calibrate once at start (it waits 20 ms) and may call it again (it
+ * refines the scale); before that, ticks are ns. */
+uint64_t hle_ticks(void);
+uint64_t hle_ticks_ns(uint64_t ticks);
+void hle_tsc_calibrate(void);
 
 /* ---- native -> guest ----
  * Run a lifted function (window proc, dialog proc, thread start, timer) from
@@ -158,11 +180,22 @@ void     hle_input_mouse(uint32_t message, int screen_x, int screen_y);   /* WM_
 void     hle_input_key(int down, uint32_t vk, uint32_t scan);
 void     hle_input_cursor(int screen_x, int screen_y);                    /* GetCursorPos, without a message */
 void     hle_input_key_state(uint32_t vk, int down);                      /* GetKeyState, without a message */
+void     hle_input_position(int *screen_x, int *screen_y);                /* where the cursor is */
+uint8_t  hle_input_vk(uint32_t vk);                                       /* a key or button's state: bit 7 down */
+extern void (*hle_input_hook)(void);                                      /* after hle_input_mouse/_key: the state changed */
 uint32_t hle_window_at(int screen_x, int screen_y, int *client_x, int *client_y);
 uint32_t hle_focus_window(void);
 uint32_t hle_send(uint32_t hwnd, uint32_t msg, uint32_t wParam, uint32_t lParam);   /* SendMessageA */
 extern void (*hle_dialog_hook)(uint32_t hwnd, uint32_t resource_id);   /* a dialog made from a resource */
 extern void (*hle_cursor_hook)(int x, int y);                          /* the guest moved the cursor */
+/* GL mode: set hle_screen_gl before hle_screen_open (1 OpenGL, 2 Vulkan) and
+ * the window is made for that API with no SDL renderer; the host's 3D layer
+ * draws into it (hle_screen_sdl_window) and says where its picture lies
+ * (hle_screen_gl_picture: source size, then the rectangle in drawable
+ * pixels), so the mouse maps onto the game's coordinates. */
+extern int hle_screen_gl;
+struct SDL_Window *hle_screen_sdl_window(void);
+void hle_screen_gl_picture(int src_w, int src_h, int x, int y, int w, int h);
 /* A cursor from the guest's resources (LoadCursorA), 32x32 monochrome, rows top-down. */
 typedef struct { uint32_t handle; int hot_x, hot_y; uint8_t and_mask[128], xor_mask[128]; } hle_cursor_image_t;
 const hle_cursor_image_t *hle_cursor_image(uint32_t handle);   /* NULL: not one of those (show the system arrow) */
@@ -277,11 +310,13 @@ extern const win32hle_shim win32hle_user32[];
 extern const win32hle_shim win32hle_winmm[];
 extern const win32hle_shim win32hle_lz32[];          /* LZOpenFileA & co: SZDD expanded in memory (lz32.c) */
 extern const win32hle_shim win32hle_wsock32[];        /* by name and by ordinal */
+extern void (*hle_ws_broadcast_hook)(int fd, const void *buf, uint32_t len, unsigned port);   /* after a guest's broadcast sendto */
 void hle_ws_poll(void);                                /* the pump: WSAAsyncSelect notifications */
 extern const win32hle_shim win32hle_ole32[];          /* OLE32 + OLEAUT32 */
 extern const win32hle_shim win32hle_storage[];        /* structured storage: compound files */
 extern const win32hle_shim win32hle_dsound[];         /* DirectSound on SDL audio (dsound.c) */
 extern const win32hle_shim win32hle_ddraw[];          /* DirectDraw in software (ddraw.c) */
+extern const win32hle_shim win32hle_dinput[];         /* DirectInput: the system mouse and keyboard (dinput.c) */
 /* The primary surface, for a presenter: 0 until there is one. seq changes
  * when its pixels or palette may have. */
 int  hle_dd_frame(const uint8_t **px, int *w, int *h, int *pitch, int *bpp, const uint32_t **palette, unsigned *seq);
@@ -325,6 +360,7 @@ int  hle_screen_scale(const char *name);   /* sharp, smooth, crt, nearest, integ
 void hle_screen_bars(int blur);            /* the bars beside the picture: a blur of it, or black */
 extern void (*hle_screen_settings_hook)(const char *scale, int bars, int fullscreen);   /* F11/F12 changed them */
 void hle_screen_fullscreen(int on);        /* as F11 does, the settings hook told */
+void hle_screen_confine(int on);           /* hold the mouse in the picture while focused (default on) */
 const char *hle_screen_settings(int *bars, int *fullscreen);   /* the scaling now; bars and fullscreen if asked */
 /* A popup menu over the picture, the kind the Windows presenter opens on F10:
  * at the mouse, a submenu beside its item, the arrow keys, Enter and a click

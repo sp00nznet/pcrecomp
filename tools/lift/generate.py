@@ -428,6 +428,10 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
     lines.append(f'    {leave}RECOMP_REGS_OUT();')
     lines.append('}')
     out = re.sub(r'\breturn;', '{ %sRECOMP_REGS_OUT(); return; }' % leave, '\n'.join(lines))
+    # x87 slots through _ST(i)/_STI(i) (recomp_types.h): the ring's st(i),
+    # or under RECOMP_X87_LOCAL a local while the function pushed it
+    out = re.sub(r'(?<![\w])_st\[(\d+)\]', r'_ST(\1)', out)
+    out = re.sub(r'(?<![\w])g_st_i64\[(\d+)\]', r'_STI(\1)', out)
     return re.sub(r'CMP_(\w+)\(_fpu_cmp\)',
                   lambda m: f'((_fpu_cmp) {FPU_CMP.get(m.group(1), "==")} 0)', out)
 

@@ -56,6 +56,19 @@ void native32_init(void);
  * below base: run the lifted code on a thread with a large stack. */
 int native32_hold_image(const char* path, uint32_t base);
 
+/* Give this process a 16-bit (or 8-bit) DirectDraw. On a 32-bit desktop
+ * DirectDraw enumerates and sets only 32-bit modes, so a game that wants
+ * 640x480x16 fails at startup. Windows' "reduced color mode" compatibility
+ * layer (__COMPAT_LAYER=16BITCOLOR / 256COLOR) emulates them, but it is read
+ * at process start: so this runs the host again with it set, waits, and
+ * returns the child's exit code for main() to return. Returns -1 when no
+ * relaunch happened (already the child, bpp not 8/16, or CreateProcess
+ * failed): carry on. The child is marked by PCRECOMP_COLOR_CHILD, since
+ * Windows strips __COMPAT_LAYER from the environment the child sees; without
+ * that marker the child would relaunch itself forever. Call it before
+ * native32_init(), and only on the path that runs the game. */
+int native32_require_color_depth(int bpp);
+
 /* Map a PE at its preferred base (image_loader.c) and make its executable
  * sections non-executable, so every entry comes through the dispatch table or
  * the callback trampoline. Returns the mapped span, 0 on failure. */

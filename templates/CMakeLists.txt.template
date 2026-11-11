@@ -8,7 +8,7 @@
 #   - No ASLR (fixed-base memory mapping for address-dependent code)
 #   - Large stack (deep call chains from mechanically-translated code)
 #   - Relaxed warnings (generated code triggers many benign warnings)
-#   - Generated code auto-discovery via file(GLOB)
+#   - Generated code added unoptimised by pcrecomp_gen_sources() (cmake/)
 #   - Custom codegen target to regenerate recompiled sources
 # =============================================================================
 
@@ -69,20 +69,6 @@ set(RUNTIME_SOURCES
     # src/manual_overrides.c
 )
 
-# Generated recompiled code — auto-discovered via glob.
-# The code generator (tools/generate.py) produces recomp_XXXX.c files
-# in the gen/ directory, one per split chunk. This glob picks them all up
-# automatically so you don't need to list hundreds of files by hand.
-file(GLOB GENERATED_SOURCES "src/recomp/gen/recomp_*.c")
-
-# The dispatch table maps original VAs to recompiled function pointers.
-# It's generated separately and must exist for indirect calls to work.
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/recomp/gen/recomp_dispatch.c")
-    list(APPEND GENERATED_SOURCES
-        "src/recomp/gen/recomp_dispatch.c"
-    )
-endif()
-
 # =============================================================================
 # Executable Target
 # =============================================================================
@@ -90,8 +76,15 @@ endif()
 # >>> CUSTOMIZE: Set your executable name <<<
 add_executable(my_recomp
     ${RUNTIME_SOURCES}
-    ${GENERATED_SOURCES}
 )
+
+# Generated recompiled code: every .c under src/recomp/gen (recomp_*.c and
+# recomp_dispatch.c), compiled at /Od (-O0) so the build takes minutes rather
+# than half an hour; the runtime above keeps the build type's optimisation.
+# -DPCRECOMP_GEN_OPT=ON optimises the generated C too.
+set(PCRECOMP "${CMAKE_SOURCE_DIR}/../pcrecomp" CACHE PATH "pcrecomp checkout")
+include(${PCRECOMP}/cmake/pcrecomp_gen.cmake)
+pcrecomp_gen_sources(my_recomp)
 
 # >>> CUSTOMIZE: Set include paths to match your project layout <<<
 target_include_directories(my_recomp PRIVATE

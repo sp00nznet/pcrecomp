@@ -1155,6 +1155,30 @@ void native32_allow_heap_code(void) { g_heap_code = 1; }
 
 /* ---------------------------------------------------------------- setup */
 
+int native32_require_color_depth(int bpp) {
+    char layer[512] = "";
+    const char* want = bpp == 16 ? "16BITCOLOR" : bpp == 8 ? "256COLOR" : NULL;
+    STARTUPINFOA si = { sizeof si };
+    PROCESS_INFORMATION pi;
+    DWORD rc = 1;
+    if (!want || GetEnvironmentVariableA("PCRECOMP_COLOR_CHILD", NULL, 0)) return -1;
+    SetEnvironmentVariableA("PCRECOMP_COLOR_CHILD", want);   /* set before the child exists */
+    GetEnvironmentVariableA("__COMPAT_LAYER", layer, sizeof layer - 16);
+    if (layer[0]) strcat_s(layer, sizeof layer, " ");
+    strcat_s(layer, sizeof layer, want);
+    SetEnvironmentVariableA("__COMPAT_LAYER", layer);
+    fprintf(stderr, "[native32] relaunching under __COMPAT_LAYER=%s for %d-bit DirectDraw modes\n", layer, bpp);
+    if (!CreateProcessA(NULL, GetCommandLineA(), NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+        fprintf(stderr, "[native32] relaunch failed (%lu); running at the desktop's depth\n", GetLastError());
+        return -1;
+    }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    GetExitCodeProcess(pi.hProcess, &rc);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return (int)rc;
+}
+
 void native32_init(void) {
     /* Every Windows -> guest call relies on the guest's code faulting when it
      * is fetched. Windows enforces that for a /NXCOMPAT exe; Wine does not

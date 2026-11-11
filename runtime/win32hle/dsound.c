@@ -42,7 +42,9 @@ typedef struct {
     uint32_t bytes, flags;
     int channels, bits, rate, block;
     int playing, looping, primary;
-    double pos;                 /* the play cursor, in frames */
+    double pos;                 /* where the mixer has read to, in frames */
+    double pos0;                /* ...and where its last mix began */
+    int mixed;                  /* pos0 is from the last mix (not set since) */
     int volume, pan;            /* hundredths of a dB; -10000..10000 */
     float gl, gr;
 } dsbuf;
@@ -53,6 +55,8 @@ static dsbuf *g_buf[MAX_BUFS];
 static SDL_AudioDeviceID g_dev;
 static int g_audio_ok = -1;
 static float g_master = 1.0f;
+static uint64_t g_mix_at;       /* when the last mix ran (SDL's counter) */
+static int g_mix_frames;        /* ...and how many output frames it made */
 void hle_dsound_set_master(float gain) { g_master = gain; }
 
 static void gains(dsbuf *b) {
@@ -129,6 +133,7 @@ static void mix(void *ud, Uint8 *stream, int len) {
         if (!b || !b->playing || b->primary || !b->block) continue;
         uint32_t nframes = b->bytes / (uint32_t)b->block;
         double step = (double)b->rate / OUT_RATE;
+        b->pos0 = b->pos, b->mixed = 1;
         for (int f = 0; f < frames && b->playing; f++) {
             uint32_t at = (uint32_t)b->pos;
             if (at >= nframes) {
@@ -141,6 +146,7 @@ static void mix(void *ud, Uint8 *stream, int len) {
             b->pos += step;
         }
     }
+    g_mix_at = SDL_GetPerformanceCounter(), g_mix_frames = frames;
     for (int i = 0; i < MAX_STREAMS; i++) {
         if (!g_stream[i].used) continue;
         double step = (double)g_stream[i].rate / OUT_RATE;
@@ -267,6 +273,28 @@ static int audio_open(void) {
 }
 #endif
 
+/* The play cursor, in bytes. The mixer reads a callback's worth at a time,
+ * but a sound card's cursor moves smoothly: between mixes it is moved on by
+ * the time since the last one, up to where that mix read to. A game that
+ * streams by the cursor counts on that: one that refills the buffer when the
+ * cursor reaches its own write position would otherwise find them equal,
+ * take the buffer for empty and write over a lap not yet played. Under
+ * g_mix. */
+static uint32_t cursor(const dsbuf *b) {
+    if (!b->block || !b->bytes) return 0;
+    double pos = b->pos;
+    if (b->playing && b->mixed && g_mix_frames) {
+        double out = (double)(SDL_GetPerformanceCounter() - g_mix_at) * OUT_RATE / (double)SDL_GetPerformanceFrequency();
+        if (out > g_mix_frames) out = g_mix_frames;
+        double nframes = (double)(b->bytes / (uint32_t)b->block);
+        double end = b->pos < b->pos0 ? b->pos + nframes : b->pos;   /* the mix wrapped */
+        pos = b->pos0 + out * b->rate / OUT_RATE;
+        if (pos > end) pos = end;
+        if (pos >= nframes) pos -= nframes;
+    }
+    return ((uint32_t)pos * (uint32_t)b->block) % b->bytes;
+}
+
 /* the object: vtable, refs, then the buffer slot */
 #define SLOT(self) MEM32((self) + 8)
 static dsbuf *buf_of(uint32_t self) { uint32_t i = SLOT(self); return i < MAX_BUFS ? g_buf[i] : NULL; }
@@ -311,7 +339,7 @@ static void b_GetCurrentPosition(void) {                 /* (this, &play, &write
     dsbuf *b = buf_of(A32(0));
     if (!b) RET(DSERR_INVALIDPARAM, 3);
     pthread_mutex_lock(&g_mix);
-    uint32_t play = b->block ? (uint32_t)b->pos * (uint32_t)b->block : 0;
+    uint32_t play = cursor(b);
     uint32_t lead = b->block ? (uint32_t)(b->rate / 100) * (uint32_t)b->block : 0;   /* 10 ms ahead */
     pthread_mutex_unlock(&g_mix);
     if (b->bytes) play %= b->bytes;
@@ -347,7 +375,7 @@ static void b_Lock(void) {                               /* (this, offset, bytes
     if (fl & 2u) off = 0, n = b->bytes;                  /* DSBLOCK_ENTIREBUFFER */
     else if (fl & 1u) {                                  /* DSBLOCK_FROMWRITECURSOR */
         pthread_mutex_lock(&g_mix);
-        off = b->block ? ((uint32_t)b->pos * (uint32_t)b->block + (uint32_t)(b->rate / 100) * (uint32_t)b->block) % b->bytes : 0;
+        off = b->block ? (cursor(b) + (uint32_t)(b->rate / 100) * (uint32_t)b->block) % b->bytes : 0;
         pthread_mutex_unlock(&g_mix);
     }
     if (off >= b->bytes || n > b->bytes) RET(DSERR_INVALIDPARAM, 8);
@@ -363,6 +391,7 @@ static void b_Play(void) {                               /* (this, reserved, pri
     dsbuf *b = buf_of(A32(0));
     if (!b) RET(DSERR_INVALIDPARAM, 4);
     pthread_mutex_lock(&g_mix);
+    if (!b->playing) b->mixed = 0;
     b->playing = 1, b->looping = (A32(3) & DSBPLAY_LOOPING) != 0;
     pthread_mutex_unlock(&g_mix);
     RET(DS_OK, 4);
@@ -371,7 +400,7 @@ static void b_SetCurrentPosition(void) {
     dsbuf *b = buf_of(A32(0));
     if (!b || !b->block) RET(DSERR_INVALIDPARAM, 2);
     pthread_mutex_lock(&g_mix);
-    b->pos = (double)((A32(1) % (b->bytes ? b->bytes : 1)) / (uint32_t)b->block);
+    b->pos = (double)((A32(1) % (b->bytes ? b->bytes : 1)) / (uint32_t)b->block), b->mixed = 0;
     pthread_mutex_unlock(&g_mix);
     RET(DS_OK, 2);
 }
