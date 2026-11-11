@@ -182,6 +182,8 @@ void     hle_input_cursor(int screen_x, int screen_y);                    /* Get
 void     hle_input_key_state(uint32_t vk, int down);                      /* GetKeyState, without a message */
 void     hle_input_position(int *screen_x, int *screen_y);                /* where the cursor is */
 void     hle_input_motion(int dx, int dy);                                /* a relative mouse moved: the cursor stops at the screen's edge, the count does not */
+void     hle_input_wheel(int delta);                                      /* the wheel turned: WHEEL_DELTA (120) a notch, away from the user positive */
+int      hle_input_wheel_total(void);                                     /* the wheel's turning so far (DirectInput's z axis) */
 void     hle_input_raw(int *x, int *y);                                   /* the mouse's movement so far, edges or not (DirectInput's relative axes) */
 extern void (*hle_input_relative_hook)(int on);                           /* a game holds the mouse for its movement alone (an exclusive DirectInput mouse) */
 uint8_t  hle_input_vk(uint32_t vk);                                       /* a key or button's state: bit 7 down */

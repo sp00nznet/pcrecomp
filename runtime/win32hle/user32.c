@@ -769,6 +769,19 @@ void hle_input_motion(int dx, int dy) {
     hle_input_mouse(WM_MOUSEMOVE, x, y);
 }
 void hle_input_raw(int *x, int *y) { *x = g_raw_x, *y = g_raw_y; }
+/* The wheel: WM_MOUSEWHEEL to the focused window, as Windows sends it (the
+ * cursor's screen position, the turn in the high word of wParam), and the
+ * turning counted for DirectInput's z axis. */
+static int g_wheel;
+void hle_input_wheel(int delta) {
+    if (!delta) return;
+    g_wheel += delta;
+    uint32_t t = hle_focus_window();
+    if (t) q_push(t, 0x020A /* WM_MOUSEWHEEL */, (uint32_t)(delta & 0xFFFF) << 16 | (mk_state() & 0xFFFF),
+                  ((uint32_t)(g_cursor_y & 0xFFFF) << 16) | (uint32_t)(g_cursor_x & 0xFFFF));
+    if (hle_input_hook) hle_input_hook();
+}
+int hle_input_wheel_total(void) { return g_wheel; }
 void (*hle_input_relative_hook)(int on);
 /* What the input state is, for DirectInput (dinput.c): the cursor and a key
  * or button's byte (bit 7 down), by virtual-key code. */

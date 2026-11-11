@@ -77,6 +77,10 @@ versions follow [SemVer](https://semver.org/).
   shadowed.
 
 ### Added
+- win32hle: the mouse wheel. SDL's wheel becomes `WM_MOUSEWHEEL` (120 a
+  notch) and DirectInput's z axis, buffered and in `GetDeviceState`
+  (`hle_input_wheel`). Theme Park World asks for a mouse with a z axis and
+  zooms with it, which it could not do before.
 - win32hle: DirectInput 3 and 5 (`dinput.c`): the system mouse (relative or
   absolute axes, three buttons) and keyboard (DIK codes), immediate and
   buffered, read from the same input state as the window messages; arriving
