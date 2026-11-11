@@ -245,6 +245,32 @@ int main(void) {
         recomp_eh_pop(&outer);
     }
 
+    /* An MSVC exception frame's landing pad (RECOMP_EH_FRAME): a guest
+     * handler's call or jump into the body -- an __except block entered by
+     * _except_handler3, here in a frame-pointer-omitted function, whose
+     * handlers' ebp is its entry esp -- comes back to it. An address the
+     * frame does not list, or another ebp, is not taken. */
+    {
+        static const uint32_t at[] = { 0x00403010u, 0 };
+        static recomp_ehframe_t f;
+        memset(&f, 0, sizeof f);
+        f.entry_esp = 0x2000, f.func = 0x00403000u, f.off = 0, f.resume_at = at;
+        recomp_eh_push(&f);
+        CHECK(recomp_eh_jump_hook != NULL);
+        g_ebp = 0x2000;
+        CHECK(recomp_eh_jump_hook(0x00403020u) == 0);
+        g_ebp = 0x2004;
+        CHECK(recomp_eh_jump_hook(0x00403010u) == 0);
+        g_ebp = 0x2000;
+        if (!setjmp(f.jb)) {
+            recomp_eh_jump_hook(0x00403010u);
+            CHECK(!"recomp_eh_jump returned");
+        } else {
+            CHECK(f.resume == 0x00403010u && g_cur_func == 0x00403000u);
+        }
+        recomp_eh_pop(&f);
+    }
+
     /* Code the guest generates: entered with its registers, not the C ABI.
      * Inputs in esi, edi, a stack argument and mm1; outputs in eax, ebx and
      * mm1; `ret 4` pops its argument. ebp is changed and must come back to

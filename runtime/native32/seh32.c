@@ -20,10 +20,16 @@
  * (a patch at the runtime's jump), which longjmps into that body's landing pad
  * (RECOMP_EH_ENTER, eh32.c), found by the registration RtlUnwind stopped at.
  *
- * Off unless the host sets native32_guest_seh: an MSVC guest's __except
- * frames (_except_handler3) jump to their handlers in a way no patch here
- * follows yet, and it is better to crash at the raise than to resume wrong.
- * Included by native32.c.
+ * An MSVC guest's _except_handler3 enters its __except block by calling an
+ * address inside the function that registered the frame, with that
+ * function's ebp. The call misses the dispatch table and lands in the body's
+ * landing pad (RECOMP_EH_FRAME, recomp_eh_jump in eh32.c), so no patch is
+ * needed when the lift gives __try functions their frames
+ * (tools/lift/eh32.py).
+ *
+ * Off unless the host sets native32_guest_seh: a lift made before eh32.py
+ * knew __try frames has no landing pads, and it is better to crash at the
+ * raise than to resume wrong. Included by native32.c.
  *
  * ponytail: hardware faults in guest code are not offered to the guest's
  * handlers (an access violation stays a crash), and the CONTEXT a handler gets
@@ -64,6 +70,9 @@ static uint32_t seh_call(uint32_t handler, uint32_t er, uint32_t reg, uint32_t c
     PUSH32(g_esp, RECOMP_RETADDR);
     fn();
     uint32_t eax = g_eax;
+    if (seh_trace > 0)
+        fprintf(stderr, "[seh32]   handler 0x%08X of frame 0x%08X%s -> %u\n", handler, reg,
+                MEM32(er + 4) & SEH_UNWINDING ? " (unwinding)" : "", eax);
     g_esp = esp, g_ebp = ebp, g_ebx = ebx, g_esi = esi, g_edi = edi, g_cur_func = cur;
     return eax;
 }
@@ -96,7 +105,8 @@ static int seh_dispatch(uint32_t code, uint32_t flags, uint32_t n, uint32_t args
     uint32_t esp = g_esp, ctx;
     uint32_t er = seh_records(code, flags, n, args, &ctx);
     if (seh_trace) {
-        fprintf(stderr, "[seh32] raise 0x%08X from sub_%08X, first frame 0x%08X\n", code, g_cur_func, reg);
+        fprintf(stderr, "[seh32] raise 0x%08X from sub_%08X, first frame 0x%08X, esp 0x%08X (stack 0x%08X-0x%08X)\n",
+                code, g_cur_func, reg, g_esp, MEM32(g_fs_base + 8), MEM32(g_fs_base + 4));
         /* Delphi's: [0] the raising address, [1] the object: its class name
          * (a ShortString at VMT-44) and its message (an AnsiString at +4). */
         uint32_t obj = n >= 2 && args ? MEM32(args + 4) : 0, vmt = obj ? MEM32(obj) : 0;
@@ -142,6 +152,7 @@ static void shim_RtlUnwind(void) {
         MEM32(g_fs_base) = reg;
     }
     t_unwind_target = target;
+    if (seh_trace > 0) fprintf(stderr, "[seh32] RtlUnwind to frame 0x%08X done\n", target);
     g_esp = esp + 4 + 4 * 4;
     g_eax = ret;
 }

@@ -244,7 +244,8 @@ def push_return_label(insn, nxt, leaders, body=()):
 
 
 def lift_function_linear(lifter, name, instructions, leaders, func_start,
-                         indirect_targets=None, eh_resume=None, alias_entries=None):
+                         indirect_targets=None, eh_resume=None, alias_entries=None,
+                         eh_off=None):
     """Lift a linearly-disassembled function to C code.
 
     The preamble comes from `lift32.FUNCTION_LOCALS`, not from a list written
@@ -268,7 +269,11 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
     `eh_resume`: where this function continues after one of its own catch
     blocks (eh32.resume_points). Those become labels in the local dispatch and
     the body gets a landing pad (RECOMP_EH_ENTER) that the runtime longjmps to
-    on a caught guest throw (runtime/native32/eh32.c).
+    on a caught guest throw (runtime/native32/eh32.c). With `eh_off` (the
+    second half of eh32.frame()) the pad is an MSVC exception frame's,
+    RECOMP_EH_FRAME: the runtime also takes a guest handler's indirect call
+    or jump to one of these addresses back into it (an __except block, a
+    catch's continuation reached by the guest's own frame handler).
 
     `alias_entries`: addresses inside this body that are also entries (catalog
     aliases). Each gets a label and a case in the local dispatch, and the
@@ -283,8 +288,13 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
     lines.append('    RECOMP_REGS_LOCALS')   # empty unless RECOMP_LOCAL_REGS
     lines.append(f'    RECOMP_ENTER(0x{va:08X}u);')
     eh = sorted(a for a in (eh_resume or ()) if a in {i.address for i in instructions})
-    if eh:
+    if eh and eh_off is not None:
+        lines.append('    static const uint32_t _eh_at[] = { %s, 0 };'
+                     % ', '.join('0x%08Xu' % a for a in eh))
+        lines.append('    RECOMP_EH_FRAME(%du, _eh_at);' % eh_off)
+    elif eh:
         lines.append('    RECOMP_EH_ENTER();')
+    if eh:
         leaders = set(leaders) | set(eh)
     aliases = sorted(a for a in (alias_entries or ()) if a in {i.address for i in instructions})
     if aliases:
@@ -510,7 +520,7 @@ def _jump_table(ins, code, code_start, lo, hi, limit=1024):
 
 
 def true_extent(md, code, code_start, start, hard_end, entries, reached=None, behind=None,
-                called=None):
+                called=None, seeds=()):
     """Exact end of the body at `start`: the highest address reached by
     fallthrough and direct branches. Returns (end, clean).
 
@@ -551,10 +561,15 @@ def true_extent(md, code, code_start, start, hard_end, entries, reached=None, be
 
     Pass a set as `called` to collect the targets of direct calls in the body:
     a lift driver needs every one of them dispatchable, catalogued or not.
+
+    `seeds`: more addresses in this body that nothing in it branches to. An
+    __except block is one: only _except_handler3 reaches it, through the
+    scope table, and it must be in the body for the landing pad to reach it
+    (eh32.frame).
     """
     view = memoryview(code)
     seen = reached if reached is not None else set()
-    work, top, clean = [start], start, False
+    work, top, clean = [start] + [s for s in seeds if start < s < hard_end], start, False
     low = max(code_start, start - BACK_REACH)
     deferred = set()        # branches to entries: tail calls, unless inside our span
     while True:

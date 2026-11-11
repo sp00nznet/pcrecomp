@@ -863,12 +863,35 @@ static void shim_VirtualAlloc(void) {
     g_esp += 4 + 4 * 4;
 }
 
+/* VirtualQuery on a lifted module reports what Windows would for a loaded
+ * image: MEM_IMAGE, allocated at the module's base. native32_map commits the
+ * image as private memory, and VC8+ CRTs check before they trust an
+ * exception registration: _ValidateEH3RN only runs a __try's scope table
+ * when VirtualQuery says the table is in an image, and otherwise declines
+ * the exception, so every __except was skipped. */
+static void shim_VirtualQuery(void) {
+    uint32_t* a = (uint32_t*)(uintptr_t)(g_esp + 4);
+    MEMORY_BASIC_INFORMATION* m = (MEMORY_BASIC_INFORMATION*)(uintptr_t)a[1];
+    g_eax = (uint32_t)VirtualQuery((void*)(uintptr_t)a[0], m, a[2]);
+    for (int i = 0; g_eax >= sizeof *m && i < g_mod_n; i++)
+        if (!g_mods[i].native && a[0] - g_mods[i].base < g_mods[i].span) {
+            m->AllocationBase = (void*)(uintptr_t)g_mods[i].base;
+            m->Type = MEM_IMAGE;
+        }
+    g_esp += 4 + 3 * 4;
+}
+
 /* With native32_guest_seh, any other code goes to the guest's own SEH chain
  * first (seh32.c), and is raised for real only if no guest frame takes it. */
 #include "seh32.c"
 
+/* A C++ throw from a statically linked CRT goes to eh32's dispatch first
+ * (native32_cxx_raise returns only if nothing in the guest catches it). */
+int native32_cxx_raise(uint32_t n, uint32_t args);
+
 static void shim_RaiseException(void) {
     uint32_t* a = (uint32_t*)(uintptr_t)(g_esp + 4);
+    if (a[0] == 0xE06D7363u) native32_cxx_raise(a[2], a[3]);
     if (a[0] != 0x406D1388u && !(native32_guest_seh && seh_dispatch(a[0], a[1], a[2], a[3])))
         RaiseException(a[0], a[1], a[2], (const ULONG_PTR*)(uintptr_t)a[3]);
     g_esp += 4 + 4 * 4;
@@ -896,6 +919,7 @@ static native32_shim_t g_builtin[] = {
     { "TerminateThread", shim_TerminateThread },
     { "VirtualProtect", shim_VirtualProtect },
     { "VirtualAlloc", shim_VirtualAlloc },
+    { "VirtualQuery", shim_VirtualQuery },
     { "_CxxThrowException", native32_shim_CxxThrowException },
     { "_ftol", native32_shim_ftol },
     { "_CIsqrt", native32_shim_CIsqrt }, { "_CIsin", native32_shim_CIsin },
@@ -1136,7 +1160,10 @@ static LONG CALLBACK native32_veh(EXCEPTION_POINTERS* ep) {
 
 /* ---------------------------------------------------------------- setup */
 
+static void eh32_init(void);
+
 void native32_init(void) {
+    eh32_init();
     /* Every Windows -> guest call relies on the guest's code faulting when it
      * is fetched. Windows enforces that for a /NXCOMPAT exe; Wine does not
      * unless DEP is asked for, and otherwise answers the first fetch by making

@@ -5,6 +5,43 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- native32 / lift: MSVC exception frames, generically. `tools/lift/eh32.py`
+  `frame()` finds every prologue that installs an MSVC frame and says where
+  its handlers continue and which ebp they use: C++ frames with
+  `push ebp; mov ebp, esp` (ebp = entry esp - 4) and frame-pointer-omitted
+  ones (ebp = entry esp; VC6 /O2 builds most C++ frames that way, 488 of 489
+  in Galactic Battlegrounds, and eh32 used to skip them all), and
+  `__try/__except` frames (`_except_handler3`, scope table, ebp = record +
+  16). `generate.lift_function_linear(eh_off=)` gives such a body a
+  `RECOMP_EH_FRAME(off, list)` landing pad; `true_extent(seeds=)` keeps an
+  `__except` block, which only the scope table reaches, inside its body.
+  An indirect call or jump that misses the dispatch table now asks
+  `recomp_eh_jump_hook` (native32 sets it) before reporting an unresolved
+  target: `_except_handler3` calling an `__except` block, or a guest
+  `__CxxFrameHandler`'s jump to a catch's continuation, longjmps back into
+  the lifted body that owns that ebp and address. With `native32_guest_seh`
+  set, `__try/__except` therefore runs end to end as guest code (seh32.c's
+  note that MSVC frames were not followed no longer applies).
+- native32: a guest with the CRT linked in statically has no
+  `_CxxThrowException` import; its `RaiseException(0xE06D7363)` now goes to
+  eh32's catch dispatch first (`native32_cxx_raise`), on by default: before,
+  that throw went to the host's SEH and ended the process.
+- native32: VirtualQuery on a lifted module reports MEM_IMAGE at the module's
+  base. VC8+ CRTs (`_ValidateEH3RN`) skip a `__try` whose scope table is not
+  in an image, so every `__except` was passed over.
+- `tools/lift/msvceh_probe/run.cmd`: MSVC exception handling end to end. It
+  compiles a probe (C++ catch, nested, rethrow, `__except`, `__finally`) with
+  MSVC, catalogs, lifts and builds it on native32, and runs it: 5/5.
+- native32_selftest: the jump hook (taken for a listed address with the
+  frame's ebp, refused otherwise). eh32.py selftest: FPO and `__try` frames.
+
+### Changed
+- eh32's catch dispatch matches a landing pad by the frame's own ebp offset
+  (`recomp_ehframe_t.off`), not by assuming `push ebp; mov ebp, esp`.
+  `RECOMP_EH_ENTER()` is `RECOMP_EH_FRAME(4, NULL)`, so existing lifts (and
+  setjmp landing pads) behave as before.
+
 ### Fixed
 - native32: a callback from guest code that runs natively on the guest stack
   (gen_bridge: VCL's window procedure thunks jump to `StdWndProc`) ran its
