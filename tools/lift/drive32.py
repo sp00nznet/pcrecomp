@@ -88,11 +88,11 @@ def lift_image(img, catalog, out, seeds=(), split=400, log=print, precise_carry=
     def walk(addr):
         reached, behind, called = set(), set(), set()
         end, clean = true_extent(md, code, cs, addr, min(addr + EXTENT_REACH, ce), starts,
-                                 reached=reached, behind=behind, called=called)
+                                 reached=reached, behind=behind, called=called, read=read)
         for r in eh_at.get(addr, ()):
             if cs <= r < ce:
                 e2, _ = true_extent(md, code, cs, r, min(r + EXTENT_REACH, ce), starts,
-                                    reached=reached, behind=behind, called=called)
+                                    reached=reached, behind=behind, called=called, read=read)
                 end = max(end, e2)
         return end, clean, reached, {t for t in behind if t not in reached} | called
 

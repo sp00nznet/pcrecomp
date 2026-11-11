@@ -475,13 +475,23 @@ EXTENT_REACH = 0x40000      # cap on how far one function's body may reach
 BACK_REACH = 0x100          # ...and how far below its entry a chunk may sit
 
 
-def _jump_table(ins, code, code_start, lo, hi, limit=1024):
-    """Arms of `jmp dword ptr [reg*4 + table]`, read while they land in [lo, hi)."""
+def _jump_table(ins, code, code_start, lo, hi, limit=1024, read=None):
+    """Arms of `jmp dword ptr [reg*4 + table]`, read while they land in [lo, hi).
+
+    read(va, n), when given, reads a table outside `code`: CodeWarrior keeps
+    its switch tables in .data, and an unread table left the arms out of the
+    body, each lifted as an entry of its own that jumped back in through the
+    dispatcher -- one host stack frame per character its strtoul scanned,
+    until the stack ran out (Tribes 2, 0x006D0EF0)."""
     if not ins.operands or ins.operands[0].type != X86_OP_MEM:
         return []
     mem = ins.operands[0].mem
     if mem.base or not mem.index or mem.scale != 4:
         return []
+    disp = mem.disp & 0xFFFFFFFF
+    if read is not None and not 0 <= disp - code_start < len(code):
+        buf = read(disp - 64, 64 + 4 * limit) or b''
+        return _jump_table(ins, buf, disp - 64, lo, hi, limit) if len(buf) > 64 else []
     # A table's first entries can be unused: CRT memmove indexes one with
     # `edi & 3` on a path where that is never 0, and its slot 0 overlaps the
     # bytes of the jmp before it. Stopping at the first bad entry lost every
@@ -524,7 +534,7 @@ def _jump_table(ins, code, code_start, lo, hi, limit=1024):
 
 
 def true_extent(md, code, code_start, start, hard_end, entries, reached=None, behind=None,
-                called=None, seeds=()):
+                called=None, seeds=(), read=None):
     """Exact end of the body at `start`: the highest address reached by
     fallthrough and direct branches. Returns (end, clean).
 
@@ -617,7 +627,7 @@ def true_extent(md, code, code_start, start, hard_end, entries, reached=None, be
                     work.append(t)
                 if m == 'jmp':
                     if t is None:
-                        arms = _jump_table(ins, code, code_start, start, hard_end)
+                        arms = _jump_table(ins, code, code_start, start, hard_end, read=read)
                         work.extend(a for a in arms if a not in entries)
                         deferred.update(a for a in arms if a in entries)
                         clean = clean or not arms   # an indirect tail call ends the body
@@ -928,6 +938,14 @@ def _selftest():
     code = code + bytes([0xFF, 0x24, 0x85, 0x07, 0x10, 0x00, 0x00, 0xC3])
     second = next(md.disasm(code[0xC:0x13], 0x100C))
     assert _jump_table(second, code, 0x1000, 0x1000, 0x1014) == [0x100B]
+
+    # A table outside the code section (CodeWarrior's .data) is read through
+    # read(va, n): jmp [eax*4 + 0x5000], table {1003, 1007}.
+    far = next(md.disasm(bytes([0xFF, 0x24, 0x85, 0x00, 0x50, 0x00, 0x00]), 0x1000))
+    data = {0x5000 + i: b for i, b in enumerate(bytes.fromhex('03100000071000000000ffff'))}
+    rd = lambda va, n: bytes(data.get(va + i, 0) for i in range(n))  # noqa: E731
+    assert _jump_table(far, code, 0x1000, 0x1000, 0x1014, read=rd) == [0x1003, 0x1007]
+    assert _jump_table(far, code, 0x1000, 0x1000, 0x1014) == []
 
     # The _stat shape: a jump to a catalogued "entry" that lies inside this
     # body's own span is internal, not a tail call.
