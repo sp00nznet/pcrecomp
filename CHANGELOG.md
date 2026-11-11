@@ -22,6 +22,10 @@ versions follow [SemVer](https://semver.org/).
 - native32: `native32_on_present(cb)`: the surface a game blits to its
   primary (or the primary after a Flip), for screenshots and recordings under
   `native32_headless`, where a GDI copy of the window is black.
+- native32: `PCRECOMP_MUTE=1` sets the process's audio session to volume 0
+  in `native32_init` (DirectSound, waveOut and mixer DLLs share it), for
+  silent test runs; `PCRECOMP_MUTE=0` restores it, since Windows remembers
+  a program's session volume.
 - disasm32: aligned runs of code pointers inside code sections that no
   decoded instruction covers are function seeds too. Sim Theme Park's
   hand-written software renderer (`cseg`) keeps its span routines in such a
