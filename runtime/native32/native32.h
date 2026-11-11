@@ -51,6 +51,16 @@ void native32_set_codepage(unsigned cp);
  * name never sees. Call before native32_bind; up to 32. */
 void native32_redirect(const char* name, void* fn);
 
+/* Serve the registry subtrees a .reg file names (regedit 4: [HKEY_...\path]
+ * sections, "name"="text", dword:, hex:) from that file instead of the real
+ * registry: the guest's RegOpenKey/RegCreateKey/RegQueryValueEx/RegSetValueEx
+ * (A, Ex) on keys inside them read and write a copy, saved back to the file
+ * on every change. A Win9x game finds what its installer wrote there, and
+ * nothing needs administrator rights. Call before native32_bind (it uses
+ * native32_redirect). Returns the number of subtrees, 0 if the file is
+ * missing or names none (reg32.c). */
+int native32_registry(const char* file);
+
 /* Call once, before anything else. */
 void native32_init(void);
 
@@ -163,6 +173,23 @@ int native32_headless(void);
  * needs a landing pad (generate.py eh_resume). */
 void native32_seh_continue(uint32_t va);
 extern int native32_guest_seh;   /* 1: RaiseException goes to the guest chain */
+
+/* The guest's frames as it presents them: cb gets the surface blitted to the
+ * primary (a windowed game) or the primary after a Flip, and its interface
+ * version (1, 4 or 7: the DDSURFACEDESC Lock wants). For screenshots and
+ * recordings under native32_headless, where a GDI copy of the window is
+ * black. Runs on the guest's thread, inside its present. */
+void native32_on_present(void (*cb)(void* surface, int version));
+
+/* Synthetic DirectInput (dinput32.c): every system mouse and keyboard the
+ * guest creates reads its state from these calls instead of the hardware, so
+ * a harness can drive a game that polls DirectInput. On by default under
+ * native32_headless, where real devices cannot be acquired; dx/dy/dz add up
+ * until the next GetDeviceState; b is the button (0 left), dik a DIK_ code. */
+void native32_input_synthetic(int on);
+void native32_input_mouse(int dx, int dy, int dz);
+void native32_input_button(int b, int down);
+void native32_input_key(int dik, int down);
 
 /* Diagnostics: set before running. */
 extern int native32_trace_native;     /* one line per native call */

@@ -711,9 +711,8 @@ class Disassembler:
         """
         found = set()
         probed = rejected = mid = padded = in_run = 0
+        in_code = 0
         for s in self.sections:
-            if s.is_code:
-                continue
             base = self.image_base + s.virtual_address
             data = self.read_bytes(base, s.raw_size)
             if not data:
@@ -722,6 +721,18 @@ class Disassembler:
                 va = int.from_bytes(data[off:off + 4], 'little')
                 if not (code_start <= va < code_end):
                     continue
+                # In a code section only an aligned run of code pointers that
+                # no decoded instruction covers: a hand-written renderer's
+                # table of span routines between its functions (Sim Theme
+                # Park's assembler `cseg`, reached by `jmp [table + eax*4]`).
+                if s.is_code:
+                    at = base + off
+                    if off % 4 or interior is None or not (code_start <= at and at + 4 <= code_end) \
+                            or any(interior[at - code_start + k] for k in range(4)) \
+                            or not any(0 <= o <= len(data) - 4 and code_start <= int.from_bytes(data[o:o + 4], 'little') < code_end
+                                       for o in (off - 4, off + 4)):
+                        continue
+                    in_code += 1
                 if va in queued or va in found:
                     continue
                 if va in covered:
@@ -756,6 +767,8 @@ class Disassembler:
                     rejected += 1
                     continue
                 found.add(va)
+        if in_code:
+            print(f"[*] Data scan: {in_code} pointers in tables inside code sections")
         if padded:
             print(f"[*] Data scan: {padded} pointer targets start a function after padding "
                   f"that another body ran through")

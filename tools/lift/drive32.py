@@ -63,10 +63,12 @@ def lift_image(img, catalog, out, seeds=(), split=400, log=print, precise_carry=
 
     md = Cs(CS_ARCH_X86, CS_MODE_32)
     md.detail = True
-    text = [s for s in info.sections if s.name == '.text'][0]
-    code = open(img, 'rb').read()[text.raw_offset:text.raw_offset + text.raw_size]
     mapped = pefile.PE(img).get_memory_mapped_image()
     base = info.image_base
+    # Every code section, as mapped: [cs, ce) spans them all (pe_analyze), and
+    # an image with a second one (Sim Theme Park's assembler `cseg` after
+    # .text) has functions there that the raw .text bytes do not hold.
+    code = mapped[cs - base:ce - base].ljust(ce - cs, b'\0')
     read = lambda va, n: mapped[va - base:va - base + n] if 0 <= va - base < len(mapped) else None  # noqa: E731
     # precise carry: adc/sbb take their carry from the flag state that set it
     # (64-bit adds and subtracts; ra2's run_lift.py has the history).

@@ -6,6 +6,44 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- native32: `native32_registry(file)` (`reg32.c`): the registry subtrees a
+  regedit 4 file names are served from that file, so a Win9x game finds what
+  its installer wrote under `HKLM\Software\<publisher>` without an installer,
+  administrator rights or the VirtualStore. Writes are saved back to the file.
+  Keys above a subtree are followed, for games that open the path a step at a
+  time. Opt-in; everything else goes to the real registry (Sim Theme Park).
+- native32: synthetic DirectInput (`dinput32.c`, `native32_input_mouse`,
+  `_button`, `_key`, `_synthetic`). Every system mouse and keyboard the guest
+  creates reads its state from the host instead of the hardware, and devices
+  waiting on `SetEventNotification` are signalled. On by default under
+  `native32_headless`, where real devices can never be acquired (the private
+  desktop is never in the foreground), so a harness can now drive games that
+  poll DirectInput (KISS Psycho Circus's roadmap item).
+- native32: `native32_on_present(cb)`: the surface a game blits to its
+  primary (or the primary after a Flip), for screenshots and recordings under
+  `native32_headless`, where a GDI copy of the window is black.
+- disasm32: aligned runs of code pointers inside code sections that no
+  decoded instruction covers are function seeds too. Sim Theme Park's
+  hand-written software renderer (`cseg`) keeps its span routines in such a
+  table and reaches them by `jmp [table + eax*4]`; 8 of 9 were missing, the
+  first frame ended in an unresolved ITAIL.
+
+### Fixed
+- native32 DirectDraw (built-in `DirectDrawCreate`/`Ex` shims, patched in
+  ddraw's vtables and re-applied on every `QueryInterface`, because Windows'
+  own DirectDraw compatibility shims hook `CreateSurface` again there):
+  `GetDeviceIdentifier(DDGDI_GETHOSTIDENTIFIER)` answers `DDERR_NOTFOUND` on
+  Windows 10/11 and fails outright on a private desktop; a failed host query
+  is asked again without the flag, then answered with a vendorless identifier.
+  A surface asked for in video memory where there is no HAL (`DDERR_NOHAL`,
+  the headless desktop) is made again in system memory.
+- native32: `GetForegroundWindow` under `native32_headless` answers the
+  process's own top-level window instead of NULL. DirectSound's
+  `SetCooperativeLevel(NULL)` failed with `E_INVALIDARG`, and Sim Theme Park
+  then used the DirectSound object it had released.
+- drive32: `lift_image` lifts every code section. It read only `.text`'s raw
+  bytes, so functions in a second code section (Sim Theme Park's `cseg`)
+  decoded as zeros.
 - native32 / lift: MSVC exception frames, generically. `tools/lift/eh32.py`
   `frame()` finds every prologue that installs an MSVC frame and says where
   its handlers continue and which ebp they use: C++ frames with

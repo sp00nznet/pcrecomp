@@ -947,6 +947,7 @@ static void di_wrap(void*** obj, int w) {
     }
 }
 
+static void di_wrap_devices(void*** di, int w);   /* dinput32.c */
 static void dinput_create(const char* name, int nargs) {
     static FARPROC real[4];
     static const char* names[4] = { "DirectInputCreateA", "DirectInputCreateW", "DirectInputCreateEx",
@@ -960,13 +961,185 @@ static void dinput_create(const char* name, int nargs) {
     typedef uint32_t (WINAPI *f5_t)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
     g_eax = !real[k] ? 0x80004005u : nargs == 4 ? ((f4_t)real[k])(h, a[1], a[2], a[3])
                                                 : ((f5_t)real[k])(h, a[1], a[2], a[3], a[4]);
-    if (k < 2 && g_eax == 0 && a[2]) di_wrap((void***)(uintptr_t)MEM32(a[2]), k);
+    if (k < 2 && g_eax == 0 && a[2]) {
+        di_wrap((void***)(uintptr_t)MEM32(a[2]), k);
+        di_wrap_devices((void***)(uintptr_t)MEM32(a[2]), k);
+    }
     g_esp += 4 + 4 * nargs;
 }
 static void shim_DirectInputCreateA(void) { dinput_create("DirectInputCreateA", 4); }
 static void shim_DirectInputCreateW(void) { dinput_create("DirectInputCreateW", 4); }
 static void shim_DirectInputCreateEx(void) { dinput_create("DirectInputCreateEx", 5); }
 static void shim_DirectInput8Create(void) { dinput_create("DirectInput8Create", 5); }
+
+/* DirectDraw as a 1999 game expects it, on a Windows that differs:
+ *
+ * - IDirectDraw4/7::GetDeviceIdentifier(DDGDI_GETHOSTIDENTIFIER) answers
+ *   DDERR_NOTFOUND on Windows 10/11, and on native32_headless's private
+ *   desktop it fails without the flag too. Sim Theme Park takes that as "no
+ *   DirectDraw" and quits. A failed host query is asked again without the
+ *   flag, and if that fails as well the guest gets an identifier with no
+ *   vendor, which games treat as an unknown card.
+ * - On a desktop with no display driver behind it (native32_headless) there
+ *   is no HAL, so a surface asked for in video memory fails with
+ *   DDERR_NOHAL / DDERR_NODIRECTDRAWHW. It is made again in system memory,
+ *   where DirectDraw's emulation and Direct3D's software rasterisers work.
+ *
+ * Patched in ddraw's own vtables, as di_wrap does (interfaces are told apart
+ * by vtable pointer), the first time the guest creates DirectDraw. */
+typedef HRESULT (WINAPI *dd_ident_t)(void*, void*, DWORD);
+typedef HRESULT (WINAPI *dd_create_t)(void*, void*, void**, void*);
+static dd_ident_t g_dd_ident[4];
+static dd_create_t g_dd_surf[4];
+static HRESULT WINAPI dd_ident(int k, void* self, void* out, DWORD flags) {
+    HRESULT hr = g_dd_ident[k](self, out, flags);
+    if (hr < 0 && (flags & 1)) hr = g_dd_ident[k](self, out, flags & ~1u);
+    if (hr == (HRESULT)0x887600FFu && out) {
+        /* DDDEVICEIDENTIFIER: 1024 bytes of names, then 8 + 4*4 + 16; the 7
+         * version adds a DWORD. */
+        memset(out, 0, 1024 + 8 + 16 + 16 + (k == 3 ? 4 : 0));
+        strcpy((char*)out, "display");
+        strcpy((char*)out + 512, "Display adapter");
+        hr = 0;
+    }
+    return hr;
+}
+typedef HRESULT (WINAPI *dd_blt_t)(void*, RECT*, void*, RECT*, DWORD, void*);
+typedef HRESULT (WINAPI *dd_flip_t)(void*, void*, DWORD);
+static dd_blt_t g_dd_blt[4];
+static dd_flip_t g_dd_flip[4];
+static void* g_dd_primary[4];
+static void* g_dd_blt_mine[4];
+static void* g_dd_flip_mine[4];
+static void dd_patch(void** slot, void* mine, void** real);
+static HRESULT WINAPI dd_surf(int k, void* self, void* desc, void** out, void* outer) {
+    HRESULT hr = g_dd_surf[k](self, desc, out, outer);
+    DWORD* caps = desc ? (DWORD*)((uint8_t*)desc + 0x68) : NULL;   /* ddsCaps, both desc sizes */
+    if ((hr == (HRESULT)0x88760233u || hr == (HRESULT)0x887600FAu) && caps && (*caps & 0x4000)) {
+        DWORD was = *caps;
+        *caps = (was & ~(0x4000u | 0x10000000u | 0x08000000u)) | 0x800;   /* VIDEOMEMORY -> SYSTEMMEMORY */
+        hr = g_dd_surf[k](self, desc, out, outer);
+        *caps = was;
+    }
+    if (hr >= 0 && caps && (*caps & 0x200) && out && *out) {      /* DDSCAPS_PRIMARYSURFACE */
+        g_dd_primary[k] = *out;
+        dd_patch(&(*(void***)*out)[5], g_dd_blt_mine[k], (void**)&g_dd_blt[k]);    /* Blt */
+        dd_patch(&(*(void***)*out)[11], g_dd_flip_mine[k], (void**)&g_dd_flip[k]); /* Flip */
+    }
+    return hr;
+}
+
+/* native32_on_present: the guest's frames as it shows them. A blit to the
+ * primary surface (a windowed game) hands the callback its source, a Flip
+ * the primary after the flip. A host saves screenshots and recordings from
+ * there: on native32_headless's private desktop a GDI copy of the window
+ * is black. */
+static void (*g_present_cb)(void* surface, int version);
+void native32_on_present(void (*cb)(void* surface, int version)) { g_present_cb = cb; }
+static const int g_dd_surf_ver[4] = { 1, 1, 4, 7 };
+static HRESULT WINAPI dd_blt(int k, void* self, RECT* dr, void* src, RECT* sr, DWORD f, void* fx) {
+    if (g_present_cb && src && self == g_dd_primary[k]) g_present_cb(src, g_dd_surf_ver[k]);
+    return g_dd_blt[k](self, dr, src, sr, f, fx);
+}
+static HRESULT WINAPI dd_flip(int k, void* self, void* to, DWORD f) {
+    HRESULT hr = g_dd_flip[k](self, to, f);
+    if (g_present_cb && hr >= 0 && self == g_dd_primary[k]) g_present_cb(self, g_dd_surf_ver[k]);
+    return hr;
+}
+#define DD_SURF_HOOKS(n, k) \
+    static HRESULT WINAPI dd_blt##n(void* s, RECT* d, void* o, RECT* r, DWORD f, void* x) { return dd_blt(k, s, d, o, r, f, x); } \
+    static HRESULT WINAPI dd_flip##n(void* s, void* t, DWORD f) { return dd_flip(k, s, t, f); }
+DD_SURF_HOOKS(1, 0) DD_SURF_HOOKS(2, 1) DD_SURF_HOOKS(4, 2) DD_SURF_HOOKS(7, 3)
+static void* g_dd_blt_mine[4] = { (void*)dd_blt1, (void*)dd_blt2, (void*)dd_blt4, (void*)dd_blt7 };
+static void* g_dd_flip_mine[4] = { (void*)dd_flip1, (void*)dd_flip2, (void*)dd_flip4, (void*)dd_flip7 };
+static HRESULT WINAPI dd_ident4(void* s, void* o, DWORD f) { return dd_ident(2, s, o, f); }
+static HRESULT WINAPI dd_ident7(void* s, void* o, DWORD f) { return dd_ident(3, s, o, f); }
+static HRESULT WINAPI dd_surf1(void* s, void* d, void** o, void* u) { return dd_surf(0, s, d, o, u); }
+static HRESULT WINAPI dd_surf2(void* s, void* d, void** o, void* u) { return dd_surf(1, s, d, o, u); }
+static HRESULT WINAPI dd_surf4(void* s, void* d, void** o, void* u) { return dd_surf(2, s, d, o, u); }
+static HRESULT WINAPI dd_surf7(void* s, void* d, void** o, void* u) { return dd_surf(3, s, d, o, u); }
+
+static void dd_patch(void** slot, void* mine, void** real) {
+    DWORD old;
+    if (*slot == mine || (*real && *slot != *real)) return;   /* done, or a vtable not ours */
+    if (VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old)) {
+        *real = *slot;
+        *slot = mine;
+        VirtualProtect(slot, sizeof(void*), old, &old);
+    }
+}
+
+static const GUID g_dd_iid[4] = {
+    { 0x6c14db80, 0xa733, 0x11ce, { 0xa5, 0x21, 0x00, 0x20, 0xaf, 0x0b, 0xe5, 0x60 } },   /* IDirectDraw */
+    { 0xb3a6f3e0, 0x2b43, 0x11cf, { 0xa2, 0xde, 0x00, 0xaa, 0x00, 0xb9, 0x33, 0x56 } },   /* IDirectDraw2 */
+    { 0x9c59509a, 0x39bd, 0x11d1, { 0x8c, 0x4a, 0x00, 0xc0, 0x4f, 0xd9, 0x30, 0xc5 } },   /* IDirectDraw4 */
+    { 0x15e65ec0, 0x3b9c, 0x11d2, { 0xb9, 0x2f, 0x00, 0x60, 0x97, 0x97, 0xea, 0x5b } },   /* IDirectDraw7 */
+};
+typedef HRESULT (WINAPI *dd_qi_t)(void*, const GUID*, void**);
+static dd_qi_t g_dd_qi[4];
+static void dd_fix(void*** obj, int k);
+/* Windows' own DirectDraw compatibility shims hook CreateSurface again on
+ * every QueryInterface, over a patch made before it; so each QI for a
+ * DirectDraw interface re-applies ours to what it returns. */
+static HRESULT WINAPI dd_qi(int k, void* self, const GUID* riid, void** out) {
+    HRESULT hr = g_dd_qi[k](self, riid, out);
+    for (int j = 0; hr >= 0 && out && *out && j < 4; j++)
+        if (!memcmp(riid, &g_dd_iid[j], sizeof(GUID))) dd_fix((void***)*out, j);
+    return hr;
+}
+static HRESULT WINAPI dd_qi1(void* s, const GUID* r, void** o) { return dd_qi(0, s, r, o); }
+static HRESULT WINAPI dd_qi2(void* s, const GUID* r, void** o) { return dd_qi(1, s, r, o); }
+static HRESULT WINAPI dd_qi4(void* s, const GUID* r, void** o) { return dd_qi(2, s, r, o); }
+static HRESULT WINAPI dd_qi7(void* s, const GUID* r, void** o) { return dd_qi(3, s, r, o); }
+
+static void dd_fix(void*** obj, int k) {
+    void* qi[4] = { (void*)dd_qi1, (void*)dd_qi2, (void*)dd_qi4, (void*)dd_qi7 };
+    void* surf[4] = { (void*)dd_surf1, (void*)dd_surf2, (void*)dd_surf4, (void*)dd_surf7 };
+    void* ident[4] = { NULL, NULL, (void*)dd_ident4, (void*)dd_ident7 };
+    dd_patch(&(*obj)[0], qi[k], (void**)&g_dd_qi[k]);                      /* QueryInterface */
+    dd_patch(&(*obj)[6], surf[k], (void**)&g_dd_surf[k]);                  /* CreateSurface */
+    if (ident[k]) dd_patch(&(*obj)[27], ident[k], (void**)&g_dd_ident[k]); /* GetDeviceIdentifier */
+}
+
+static void ddraw_create(const char* name, int nargs) {
+    static FARPROC real[2];
+    uint32_t* a = (uint32_t*)(uintptr_t)(g_esp + 4);
+    int k = nargs == 4;                                 /* DirectDrawCreateEx */
+    if (!real[k]) real[k] = GetProcAddress(LoadLibraryA("ddraw.dll"), name);
+    typedef uint32_t (WINAPI *f3_t)(uint32_t, uint32_t, uint32_t);
+    typedef uint32_t (WINAPI *f4_t)(uint32_t, uint32_t, uint32_t, uint32_t);
+    g_eax = !real[k] ? 0x80004005u : k ? ((f4_t)real[k])(a[0], a[1], a[2], a[3])
+                                       : ((f3_t)real[k])(a[0], a[1], a[2]);
+    if (g_eax == 0 && a[1] && MEM32(a[1])) dd_fix((void***)(uintptr_t)MEM32(a[1]), k ? 3 : 0);
+    g_esp += 4 + 4 * nargs;
+}
+/* GetForegroundWindow: on native32_headless's private desktop nothing is in
+ * the foreground (the foreground belongs to the user's desktop), so it
+ * answers NULL, and a game that hands that to DirectSound's
+ * SetCooperativeLevel gets E_INVALIDARG (Sim Theme Park then dereferences
+ * the DirectSound it released). There the answer is this process's own
+ * visible top-level window, which is what the game would be in front with. */
+static BOOL CALLBACK fg_find(HWND w, LPARAM out) {
+    DWORD pid;
+    GetWindowThreadProcessId(w, &pid);
+    if (pid == GetCurrentProcessId() && IsWindowVisible(w) && !GetWindow(w, GW_OWNER)) {
+        *(HWND*)out = w;
+        return FALSE;
+    }
+    return TRUE;
+}
+static void shim_GetForegroundWindow(void) {
+    HWND w = GetForegroundWindow();
+    if (!w && GetEnvironmentVariableA("NATIVE32_HEADLESS", NULL, 0)) EnumWindows(fg_find, (LPARAM)&w);
+    g_eax = (uint32_t)(uintptr_t)w;
+    g_esp += 4;
+}
+
+/* native32_input_*: synthetic DirectInput for a harness (dinput32.c). */
+#include "dinput32.c"
+
+static void shim_DirectDrawCreate(void) { ddraw_create("DirectDrawCreate", 3); }
+static void shim_DirectDrawCreateEx(void) { ddraw_create("DirectDrawCreateEx", 4); }
 
 /* _CxxThrowException: a guest throw is dispatched over the guest's own
  * frames (eh32.c), so the guest's catch blocks run. */
@@ -983,6 +1156,9 @@ X87CRT(controlfp) X87CRT(control87)
 /* native32_set_codepage: the guest's ANSI code page (codepage.c). */
 #include "codepage.c"
 
+/* native32_registry: the guest's own registry subtrees, from a .reg file. */
+#include "reg32.c"
+
 static native32_shim_t g_builtin[] = {
     { "CreateThread", shim_CreateThread },
     { "RaiseException", shim_RaiseException },
@@ -992,7 +1168,9 @@ static native32_shim_t g_builtin[] = {
     { "VirtualAlloc", shim_VirtualAlloc },
     { "DirectInputCreateA", shim_DirectInputCreateA }, { "DirectInputCreateW", shim_DirectInputCreateW },
     { "DirectInputCreateEx", shim_DirectInputCreateEx }, { "DirectInput8Create", shim_DirectInput8Create },
-    { "VirtualQuery", shim_VirtualQuery },
+ { "DirectDrawCreate", shim_DirectDrawCreate },
+    { "DirectDrawCreateEx", shim_DirectDrawCreateEx },
+    { "GetForegroundWindow", shim_GetForegroundWindow },
     { "_CxxThrowException", native32_shim_CxxThrowException },
     { "_ftol", native32_shim_ftol },
     { "_CIsqrt", native32_shim_CIsqrt }, { "_CIsin", native32_shim_CIsin },
@@ -1271,7 +1449,27 @@ int native32_require_color_depth(int bpp) {
 }
 static void eh32_init(void);
 
+/* PCRECOMP_MUTE=1: the process's audio session at volume 0. On Vista and
+ * later the legacy wave volume is the session's, which DirectSound, waveOut
+ * and every mixer DLL in the process share; set before the guest makes a
+ * sound, so test runs are silent without touching the game's audio code. */
+#include <mmsystem.h>
+#pragma comment(lib, "winmm.lib")
+static void native32_mute(void) {
+    char v[8] = "";
+    GetEnvironmentVariableA("PCRECOMP_MUTE", v, sizeof v);
+    if (v[0] && v[0] != '0') {
+        waveOutSetVolume(NULL, 0);
+        fprintf(stderr, "[native32] PCRECOMP_MUTE: audio session muted\n");
+    } else if (v[0] == '0') {
+        /* Windows remembers an app's session volume, so a muted test run
+         * would leave the next real one silent: PCRECOMP_MUTE=0 undoes it. */
+        waveOutSetVolume(NULL, 0xFFFFFFFFu);
+    }
+}
+
 void native32_init(void) {
+    native32_mute();
     eh32_init();
     /* Every Windows -> guest call relies on the guest's code faulting when it
      * is fetched. Windows enforces that for a /NXCOMPAT exe; Wine does not
