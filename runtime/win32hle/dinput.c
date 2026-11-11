@@ -9,6 +9,9 @@
  *
  * The mouse reports relative axes, each read the movement since the last,
  * unless the game sets DIPROP_AXISMODE to absolute; three buttons. The
+ * movement does not stop at the screen's edge (hle_input_raw), and while a
+ * relative mouse is held exclusively the host is asked for movement alone
+ * (hle_input_relative_hook), as Windows gives it. The
  * keyboard reports DIK scan codes. Both answer GetDeviceState (immediate)
  * and GetDeviceData (buffered: each change as an event, recorded as input
  * arrives, with the device's notification event set then).
@@ -38,7 +41,7 @@ enum { MOUSE = 1, KEYBOARD = 2 };
 #define QUEUE 256
 typedef struct { uint32_t ofs, data, time, seq; } ev_t;    /* DIDEVICEOBJECTDATA */
 typedef struct {
-    int kind, acquired, absolute;
+    int kind, acquired, absolute, exclusive;
     uint32_t data_size;                                  /* SetDataFormat's dwDataSize */
     uint32_t buffer;                                     /* DIPROP_BUFFERSIZE */
     int last_x, last_y;                                  /* GetDeviceState's: where the last read left the cursor */
@@ -94,6 +97,24 @@ static void buttons(uint8_t out[3]) {
     out[0] = hle_input_vk(1) & 0x80, out[1] = hle_input_vk(2) & 0x80, out[2] = hle_input_vk(4) & 0x80;
 }
 
+/* The mouse's axes: the cursor, absolute; else the movement, which does not
+ * stop at the screen's edge (hle_input_raw). */
+static void axes(const dev_t_ *d, int *x, int *y) {
+    if (d->absolute) hle_input_position(x, y); else hle_input_raw(x, y);
+}
+/* A relative mouse held exclusively: the host gives movement alone, as
+ * Windows does (the desktop's pointer stops at an edge; the mouse does not). */
+static void relative(void) {
+    int on = 0;
+    for (int i = 0; i < MAX_DEV; i++) {
+        if (!g_devs[i]) continue;
+        dev_t_ *d = (dev_t_ *)hle_ptr(MEM32(g_devs[i] + 8));
+        if (d->kind == MOUSE && d->acquired && d->exclusive && !d->absolute) on = 1;
+    }
+    static int was = -1;
+    if (on != was && hle_input_relative_hook) hle_input_relative_hook(on);
+    was = on;
+}
 static void push(dev_t_ *d, uint32_t ofs, uint32_t data) {
     if (d->qn >= QUEUE || (d->buffer && (uint32_t)d->qn >= d->buffer)) { d->overflow = 1; return; }
     ev_t *e = &d->q[d->qn++];
@@ -104,7 +125,7 @@ static void gather(dev_t_ *d) {
     if (d->kind == MOUSE) {
         int x, y;
         uint8_t b[3];
-        hle_input_position(&x, &y);
+        axes(d, &x, &y);
         if (x != d->buf_x) push(d, 0, d->absolute ? (uint32_t)x : (uint32_t)(x - d->buf_x));
         if (y != d->buf_y) push(d, 4, d->absolute ? (uint32_t)y : (uint32_t)(y - d->buf_y));
         d->buf_x = x, d->buf_y = y;
@@ -133,7 +154,7 @@ static void arrived(void) {
     }
 }
 static void baseline(dev_t_ *d) {
-    hle_input_position(&d->last_x, &d->last_y);
+    axes(d, &d->last_x, &d->last_y);
     d->buf_x = d->last_x, d->buf_y = d->last_y;
     buttons(d->buf_buttons);
     keyboard(d->buf_keys);
@@ -154,6 +175,7 @@ static void dv_Release(void) {
         for (int i = 0; i < MAX_DEV; i++) if (g_devs[i] == self) g_devs[i] = 0;
         hle_free(DEV(self));
         hle_com_free(self);
+        relative();
     }
     RET(n, 1);
 }
@@ -179,15 +201,16 @@ static void dv_SetProperty(void) {
     uint32_t id = A32(1), h = A32(2);
     T("SetProperty %u = %u\n", id, h ? MEM32(h + 16) : 0);
     if (id == 1) d->buffer = MEM32(h + 16) > QUEUE ? QUEUE : MEM32(h + 16);
-    else if (id == 2) d->absolute = MEM32(h + 16) == 1;  /* DIPROPAXISMODE_ABS */
+    else if (id == 2) d->absolute = MEM32(h + 16) == 1, relative();   /* DIPROPAXISMODE_ABS */
     RET(DI_OK, 3);
 }
 static void dv_Acquire(void) {
     dev_t_ *d = DEV(A32(0));
     if (!d->acquired) baseline(d), d->acquired = 1;
+    relative();
     RET(DI_OK, 1);
 }
-static void dv_Unacquire(void) { DEV(A32(0))->acquired = 0; RET(DI_OK, 1); }
+static void dv_Unacquire(void) { DEV(A32(0))->acquired = 0; relative(); RET(DI_OK, 1); }
 static void dv_GetDeviceState(void) {                    /* (this, size, data) */
     dev_t_ *d = DEV(A32(0));
     uint32_t n = A32(1), p = A32(2);
@@ -196,7 +219,7 @@ static void dv_GetDeviceState(void) {                    /* (this, size, data) *
     if (d->kind == MOUSE) {                              /* DIMOUSESTATE: lX, lY, lZ, four buttons */
         int x, y;
         uint8_t b[3];
-        hle_input_position(&x, &y);
+        axes(d, &x, &y);
         buttons(b);
         if (n >= 12) {
             MEM32(p) = (uint32_t)(d->absolute ? x : x - d->last_x);
@@ -248,13 +271,18 @@ static void dv_SetDataFormat(void) {                     /* DIDATAFORMAT: size, 
     dev_t_ *d = DEV(A32(0));
     uint32_t f = A32(1);
     d->data_size = MEM32(f + 12);
-    if (MEM32(f + 8) & 1) d->absolute = 1;               /* DIDF_ABSAXIS */
+    if (MEM32(f + 8) & 1) d->absolute = 1, relative();   /* DIDF_ABSAXIS */
     T("SetDataFormat on the %s: %u bytes, %u objects, flags %X\n", d->kind == MOUSE ? "mouse" : "keyboard",
       d->data_size, MEM32(f + 16), MEM32(f + 8));
     RET(DI_OK, 2);
 }
 static void dv_SetEventNotification(void) { DEV(A32(0))->event = A32(1); RET(DI_OK, 2); }
-static void dv_SetCooperativeLevel(void) { T("SetCooperativeLevel %X\n", A32(2)); RET(DI_OK, 3); }
+static void dv_SetCooperativeLevel(void) {             /* (this, hwnd, flags): DISCL_EXCLUSIVE is 1 */
+    T("SetCooperativeLevel %X\n", A32(2));
+    DEV(A32(0))->exclusive = (A32(2) & 1) != 0;
+    relative();
+    RET(DI_OK, 3);
+}
 static void dv_GetObjectInfo(void) { RET(DIERR_OBJECTNOTFOUND, 4); }
 static void put_instance(uint32_t p, int kind) {         /* DIDEVICEINSTANCEA */
     uint32_t size = MEM32(p) ? MEM32(p) : 0x234;
