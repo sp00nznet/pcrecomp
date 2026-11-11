@@ -12,6 +12,9 @@ versions follow [SemVer](https://semver.org/).
   code took Delete for the keypad's `.` and the arrows for its 8 4 6 2:
   Theme Park World's Delete (clear land), arrows (turn the park) and Home
   (back to the gates) did nothing.
+- win32hle: `CreateFontA`'s width stretches or squeezes its text as
+  `CreateFontIndirectA`'s `lfWidth` does; `gdi_selftest.c` measures both,
+  where a TrueType font is installed. (#160 follow-up)
 - win32hle: DirectDraw 4's texture cache is rebuilt when `SetSurfaceDesc`
   changes a surface's size, a render target lets go of its attached z-buffer
   when it is freed, and each surface has its own uniqueness value;
