@@ -17,7 +17,8 @@
  * replacement too. The host process keeps the system's code page.
  *
  * ponytail: the functions a Japanese visual novel's engine (VCL and a script
- * interpreter) and the Win9x titles around it reached; a guest calling another
+ * interpreter; an MSVC 5 C engine with a static CRT) and the Win9x titles
+ * around them reached; a guest calling another
  * A function with non-ASCII text still gets the system's code page. Add each
  * as a title needs it. Window messages (WM_CHAR, WM_SETTEXT to an A window)
  * are not converted.
@@ -88,6 +89,79 @@ static BOOL WINAPI cp_DeleteFileA(LPCSTR p) {
 static BOOL WINAPI cp_CreateDirectoryA(LPCSTR p, LPSECURITY_ATTRIBUTES sa) {
     WCHAR w[MAX_PATH * 2];
     return CreateDirectoryW(wide(p, w, MAX_PATH * 2), sa);
+}
+
+/* Paths Windows hands back. CreateFileA and the rest read the guest's paths
+ * in g_cp, so the paths it is given have to be in g_cp too: the system's ANSI
+ * code page would hand a 932 guest a user folder spelled with an e acute as
+ * 0xE9, which 932 reads as a lead byte. A path that g_cp cannot spell comes
+ * back as its 8.3 short name,
+ * which is ASCII, and the guest can still open what is inside. A-function
+ * results: the length without the NUL, or the size needed with it when n is
+ * too small. */
+static DWORD path_a(const WCHAR* w, DWORD wn, char* out, DWORD n) {
+    WCHAR sh[MAX_PATH * 2];
+    BOOL lossy = FALSE;
+    if (!wn) return 0;
+    int need = WideCharToMultiByte(g_cp, 0, w, -1, NULL, 0, NULL, &lossy);
+    if (lossy) {
+        DWORD k = GetShortPathNameW(w, sh, MAX_PATH * 2);
+        if (k && k < MAX_PATH * 2) w = sh, need = WideCharToMultiByte(g_cp, 0, w, -1, NULL, 0, NULL, NULL);
+    }
+    if (!out || (DWORD)need > n) return (DWORD)need;
+    WideCharToMultiByte(g_cp, 0, w, -1, out, (int)n, NULL, NULL);
+    return (DWORD)need - 1;
+}
+
+static DWORD WINAPI cp_GetModuleFileNameA(HMODULE h, LPSTR buf, DWORD n) {
+    WCHAR w[MAX_PATH * 2];
+    DWORD r = path_a(w, GetModuleFileNameW(h, w, MAX_PATH * 2), buf, n);
+    if (r >= n && n) {   /* this one truncates instead */
+        char full[MAX_PATH * 4];
+        path_a(w, 1, full, sizeof full);
+        lstrcpynA(buf, full, (int)n);
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return n;
+    }
+    return r;
+}
+
+static DWORD WINAPI cp_GetCurrentDirectoryA(DWORD n, LPSTR buf) {
+    WCHAR w[MAX_PATH * 2];
+    return path_a(w, GetCurrentDirectoryW(MAX_PATH * 2, w), buf, n);
+}
+
+static BOOL WINAPI cp_SetCurrentDirectoryA(LPCSTR p) {
+    WCHAR w[MAX_PATH * 2];
+    return SetCurrentDirectoryW(wide(p, w, MAX_PATH * 2));
+}
+
+static UINT WINAPI cp_GetWindowsDirectoryA(LPSTR buf, UINT n) {
+    WCHAR w[MAX_PATH * 2];
+    return path_a(w, GetWindowsDirectoryW(w, MAX_PATH * 2), buf, n);
+}
+
+static UINT WINAPI cp_GetSystemDirectoryA(LPSTR buf, UINT n) {
+    WCHAR w[MAX_PATH * 2];
+    return path_a(w, GetSystemDirectoryW(w, MAX_PATH * 2), buf, n);
+}
+
+static DWORD WINAPI cp_GetTempPathA(DWORD n, LPSTR buf) {
+    WCHAR w[MAX_PATH * 2];
+    return path_a(w, GetTempPathW(MAX_PATH * 2, w), buf, n);
+}
+
+static DWORD WINAPI cp_GetFullPathNameA(LPCSTR p, DWORD n, LPSTR buf, LPSTR* part) {
+    WCHAR in[MAX_PATH * 2], w[MAX_PATH * 2];
+    DWORD r = path_a(w, GetFullPathNameW(wide(p, in, MAX_PATH * 2), MAX_PATH * 2, w, NULL), buf, n);
+    if (part && r && r < n) {
+        char* s = NULL;   /* the last separator, not a 0x5C trail byte */
+        for (char* c = buf; *c; c++)
+            if (IsDBCSLeadByteEx(g_cp, (BYTE)*c) && c[1]) c++;
+            else if (*c == 0x5C) s = c;
+        *part = s && s[1] ? s + 1 : NULL;
+    }
+    return r;
 }
 
 static void find_a(const WIN32_FIND_DATAW* w, WIN32_FIND_DATAA* a) {
@@ -300,6 +374,10 @@ static const struct { const char* name; void* fn; } g_cp_funcs[] = {
     { "CreateFileA", cp_CreateFileA }, { "GetFileAttributesA", cp_GetFileAttributesA },
     { "DeleteFileA", cp_DeleteFileA }, { "CreateDirectoryA", cp_CreateDirectoryA },
     { "FindFirstFileA", cp_FindFirstFileA }, { "FindNextFileA", cp_FindNextFileA },
+    { "GetModuleFileNameA", cp_GetModuleFileNameA }, { "GetCurrentDirectoryA", cp_GetCurrentDirectoryA },
+    { "SetCurrentDirectoryA", cp_SetCurrentDirectoryA }, { "GetWindowsDirectoryA", cp_GetWindowsDirectoryA },
+    { "GetSystemDirectoryA", cp_GetSystemDirectoryA }, { "GetTempPathA", cp_GetTempPathA },
+    { "GetFullPathNameA", cp_GetFullPathNameA },
     { "CharNextA", cp_CharNextA }, { "CharPrevA", cp_CharPrevA },
     { "SetWindowTextA", cp_SetWindowTextA }, { "DefWindowProcA", cp_DefWindowProcA }, { "MessageBoxA", cp_MessageBoxA },
     { "DrawTextA", cp_DrawTextA },
