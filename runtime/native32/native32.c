@@ -1082,6 +1082,7 @@ int native32_require_color_depth(int bpp) {
     strcat_s(layer, sizeof layer, want);
     SetEnvironmentVariableA("__COMPAT_LAYER", layer);
     fprintf(stderr, "[native32] relaunching under __COMPAT_LAYER=%s for %d-bit DirectDraw modes\n", layer, bpp);
+    fflush(stderr);   /* the parent then waits in WaitForSingleObject; killed there, an unflushed line is lost */
     if (!CreateProcessA(NULL, GetCommandLineA(), NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
         fprintf(stderr, "[native32] relaunch failed (%lu); running at the desktop's depth\n", GetLastError());
         return -1;
