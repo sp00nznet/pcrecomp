@@ -1081,11 +1081,9 @@ int native32_require_color_depth(int bpp) {
     if (layer[0]) strcat_s(layer, sizeof layer, " ");
     strcat_s(layer, sizeof layer, want);
     SetEnvironmentVariableA("__COMPAT_LAYER", layer);
-    fprintf(stderr, "[native32] relaunching under __COMPAT_LAYER=%s for %d-bit DirectDraw modes
-", layer, bpp);
+    fprintf(stderr, "[native32] relaunching under __COMPAT_LAYER=%s for %d-bit DirectDraw modes\n", layer, bpp);
     if (!CreateProcessA(NULL, GetCommandLineA(), NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
-        fprintf(stderr, "[native32] relaunch failed (%lu); running at the desktop's depth
-", GetLastError());
+        fprintf(stderr, "[native32] relaunch failed (%lu); running at the desktop's depth\n", GetLastError());
         return -1;
     }
     WaitForSingleObject(pi.hProcess, INFINITE);
