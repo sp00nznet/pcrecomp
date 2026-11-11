@@ -36,6 +36,10 @@
 #include <intrin.h>
 #else
 #define _GNU_SOURCE              /* REG_ERR, FNM_CASEFOLD */
+#ifdef __APPLE__
+#define _XOPEN_SOURCE 700        /* ucontext.h */
+#define _DARWIN_C_SOURCE         /* and the BSD names _XOPEN_SOURCE hides */
+#endif
 #endif
 #include <fcntl.h>
 #include <sys/stat.h>
