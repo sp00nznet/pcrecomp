@@ -6,6 +6,24 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- native32: `native32_net_loopback_only()` (`net32.c`) keeps a lifted network
+  program on this machine: `connect` and `sendto` only to 127/8, `bind` of
+  `INADDR_ANY` becomes 127.0.0.1, `gethostbyname` answers only localhost
+  names; each refusal is a `[net] refused` line. For old clients and servers
+  run against a local test server (Napster 2.0).
+- native32: `native32_registry_sandbox(name)` (`reg32.c`) gives the guest its
+  own HKLM and HKCU under `HKCU\Software\pcrecomp\sandbox\<name>`: its Reg*A
+  imports write there and read there first, then the real registry
+  read-only. Two instances of one program run side by side as two users,
+  and HKLM is never written. Windows' own code in the process is unaffected.
+- native32: ATL 3/7 window thunks (`mov [esp+4], this; jmp` or `mov ecx,
+  this; jmp`, built on the heap) are emulated in the VEH. DEP is on and a
+  `/NXCOMPAT` host gets no ATL thunk emulation from Windows, so any ATL
+  window (`AtlAxWin`, an embedded browser) faulted on its first message.
+- `tools/assets/extract_vise.py`: MindVision Installer VISE (Windows), read
+  without running it: raw deflate through 16-bit big-endian words, the stub's
+  records and the install file table; a record is written only when its
+  stream inflates to its stated size. `--selftest`.
 - native32: `modules32.c`, the loader's part for a program made of several
   lifted modules. It maps each rebased module at its base, binds them all with
   one shim array, runs each DLL's `DllMain` after the guest modules it imports,
@@ -34,6 +52,19 @@ versions follow [SemVer](https://semver.org/).
   without running the installer.
 
 ### Fixed
+- modules32: a DLL that is not a guest module is looked for in the guest's
+  own folder first (the one `GetModuleFileName` reports), as Windows would
+  for the guest, then by the normal search. Windows' "application folder" is
+  the host's build folder. Napster loads its file-type plug-ins by bare name
+  (`LoadLibrary("VMP3.NVM")`) and found them only through the current
+  directory. A native load that fails is now one `[load] ... not found` line.
+- native32: a host redirect by name (`native32_redirect`) now also covers an
+  import by ordinal of that name, looked up in the DLL's export table.
+  Napster imports all of WSOCK32 by ordinal (`#4` is `connect`).
+- native32: `native32_call_guest` enters a module set native
+  (`native32_set_native`) through the bridge, so its `DllMain` and the EXE's
+  entry point run. It exited with "no lifted function" before, which made a
+  whole program impossible to run on its original code under its host.
 - win32hle: DirectDraw 4's texture cache is rebuilt when `SetSurfaceDesc`
   changes a surface's size, a render target lets go of its attached z-buffer
   when it is freed, and each surface has its own uniqueness value;
