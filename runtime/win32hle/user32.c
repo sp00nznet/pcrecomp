@@ -743,7 +743,12 @@ void hle_input_key(int down, uint32_t vk, uint32_t scan) {
     if (vk == 0xA4 || vk == 0xA5) { if (down) g_keys[VK_MENU] |= 0x80; else g_keys[VK_MENU] &= 1; }
     uint32_t t = hle_focus_window();
     int alt = (g_keys[VK_MENU] & 0x80) != 0;
-    uint32_t l = 1u | (scan & 0xFFu) << 16 | (alt ? 1u << 29 : 0) | (down ? 0 : 3u << 30);
+    /* The keys Windows marks extended (bit 24): without it a game reading
+     * the scan code takes Delete for the keypad's ".", the arrows for its
+     * 8 4 6 2, Home for its 7 (Theme Park World's Delete, its clear-land tool). */
+    int ext = (vk >= 0x21 && vk <= 0x28) || vk == 0x2D || vk == 0x2E || vk == 0x2C || vk == 0x6F || vk == 0x90 ||
+              vk == 0xA3 || vk == 0xA5 || (vk >= 0x5B && vk <= 0x5D);
+    uint32_t l = 1u | (scan & 0xFFu) << 16 | (ext ? 1u << 24 : 0) | (alt ? 1u << 29 : 0) | (down ? 0 : 3u << 30);
     if (t) q_push(t, alt || vk == VK_MENU || vk == 0x79 ? (down ? WM_SYSKEYDOWN : WM_SYSKEYUP) : (down ? WM_KEYDOWN : WM_KEYUP), vk, l);
     if (hle_input_hook) hle_input_hook();
 }

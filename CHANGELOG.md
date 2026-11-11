@@ -6,6 +6,12 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- win32hle: `WM_KEYDOWN`/`WM_KEYUP` set lParam's extended-key bit (24) for
+  the keys Windows marks extended: the arrows, Insert, Delete, Home, End,
+  Page Up and Down, and the right-hand Ctrl and Alt. A game reading the scan
+  code took Delete for the keypad's `.` and the arrows for its 8 4 6 2:
+  Theme Park World's Delete (clear land), arrows (turn the park) and Home
+  (back to the gates) did nothing.
 - win32hle: DirectDraw 4's texture cache is rebuilt when `SetSurfaceDesc`
   changes a surface's size, a render target lets go of its attached z-buffer
   when it is freed, and each surface has its own uniqueness value;
