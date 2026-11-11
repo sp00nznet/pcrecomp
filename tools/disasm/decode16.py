@@ -160,7 +160,11 @@ WRAP_NEAR_TARGETS = True
 # the modrm byte as the next instruction (`CD 37 07` = fild [bx], not pop es).
 # Off by default: a program that really means INT 34h..3Dh is not unheard of.
 EMU87_INTS = False
-_EMU87_SEG = {0: 'cs', 1: 'ss', 2: 'es', 3: 'ds'}   # top bits after CD 3C
+# Segment in the top two bits after CD 3C. From the emulator's own fixups
+# (FJ?RQQ step the ESC byte by 40h): 0 DS, 1 CS, 2 SS, 3 ES. 3 is proven on
+# Mario Is Missing (all 54 follow `pop es`/`les`; a DS override would be
+# pointless); Wing Commander's lift agrees.
+_EMU87_SEG = {0: 'ds', 1: 'cs', 2: 'ss', 3: 'es'}
 
 
 def _near(target: int) -> int:
