@@ -445,6 +445,30 @@ void USER_CREATEWINDOW(CPU *cpu) {
         g_hwnd_proc_seg[gh] = c ? c->seg : g_wndproc_seg;
         g_hwnd_proc_off[gh] = c ? c->off : g_wndproc_off;
     }
+    /* WM_CREATE, for a game that does its setup there (recomp_game.h,
+       create_message). Win32's carried a host CREATESTRUCT the guest can't
+       read, so it was never forwarded; here it is sent once the guest's
+       WNDPROC is attached, with the 34-byte Win16 CREATESTRUCT in guest
+       memory. -1 fails the creation, as on Windows. */
+    if (gh && recomp_game.create_message && g_hwnd_proc_seg[gh]) {
+        extern uint16_t recomp_guest_scratch(CPU *, uint32_t);
+        uint16_t sg = recomp_guest_scratch(cpu, 34);
+        if (sg) {
+            const uint16_t cs[17] = {
+                b_a16(cpu, 0), b_a16(cpu, 2),          /* lpCreateParams */
+                b_a16(cpu, 4), b_a16(cpu, 6), b_a16(cpu, 8),   /* hInstance hMenu hwndParent */
+                (uint16_t)h, (uint16_t)w, (uint16_t)y, (uint16_t)x,  /* cy cx y x (as asked) */
+                (uint16_t)b_a32(cpu, 18), (uint16_t)(b_a32(cpu, 18) >> 16),
+                toff, tseg, coff, cseg, 0, 0,          /* name, class, dwExStyle */
+            };
+            for (int k = 0; k < 17; k++) mem_write16(cpu, sg, (uint16_t)(k * 2), cs[k]);
+            uint16_t sp = cpu->sp;
+            uint16_t r = call_guest_wndproc(g_hwnd_proc_seg[gh], g_hwnd_proc_off[gh], gh,
+                                            WM_CREATE, 0, (uint32_t)sg << 16);
+            cpu->sp = sp;
+            if (r == 0xFFFF) { DestroyWindow(hw); gh = 0; hw = NULL; }
+        }
+    }
     fprintf(stderr, "[win32] CreateWindow(\"%s\" title=\"%s\" style=%08lX %dx%d parent=%p) "
                     "-> real=%p guest=%u proc=seg%u:%04X err=%lu\n",
             cname, title, (unsigned long)style, w, h, (void *)parent, (void *)hw, gh,
@@ -2700,3 +2724,7 @@ void USER_TRANSLATEACCELERATOR(CPU *cpu) {     /* (hwnd@6, hAccTable@4, lpMsg@0/
                 GetKeyState(VK_SHIFT) < 0, GetKeyState(VK_CONTROL) < 0, cpu->ax);
     b_ret(cpu, 8);
 }
+
+/* GetWindowDC(hwnd): the whole window's DC, frame included. The guest draws
+ * only into the client area the host gives it, so the client DC answers. */
+void USER_GETWINDOWDC(CPU *cpu) { USER_GETDC(cpu); }

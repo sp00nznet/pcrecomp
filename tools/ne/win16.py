@@ -259,6 +259,171 @@ SELECTOR_STEP = 1       # selector delta per 64 KB tile in the host model
 WINFLAGS = 0x0403       # WF_ENHANCED | WF_PMODE | WF_80x87, as GetWinFlags reports
 
 
+# Space Bucks (Sierra, 1996). The GDI/USER/WinG sizes are the documented
+# Win16 prototypes. Smacker (SMACKW16) and Miles (WAIL16) are imported BY
+# NAME; their sizes are each export's own `retf N`, read off the shipped DLLs
+# (spacebucks-recomp tools/dll_purges.py).
+PURGE.update({
+    ('GDI', 'ANIMATEPALETTE'): 10,     ('GDI', 'SETPALETTEENTRIES'): 10,
+    ('GDI', 'CREATEPOLYGONRGN'): 8,    ('GDI', 'DPTOLP'): 8,
+    ('GDI', 'GETMAPMODE'): 2,          ('GDI', 'PTINREGION'): 6,
+    ('USER', 'GETWINDOWDC'): 2,
+    ('WING', 'WINGGETDIBPOINTER'): 6,  ('WING', 'WINGSETDIBCOLORTABLE'): 10,
+    ('WING', 'WINGGETDIBCOLORTABLE'): 10, ('WING', 'WINGBITBLT'): 16,
+    ('WING', 'WINGCREATEHALFTONEPALETTE'): 0, ('WING', 'WINGCREATEHALFTONEBRUSH'): 6,
+    ('SMACKW16', 'DISPDIBPROC'): 10,
+    ('SMACKW16', 'SMACKBUFFERBLIT'): 18,
+    ('SMACKW16', 'SMACKBUFFERCLEAR'): 6,
+    ('SMACKW16', 'SMACKBUFFERCLOSE'): 4,
+    ('SMACKW16', 'SMACKBUFFERCOPYPALETTE'): 10,
+    ('SMACKW16', 'SMACKBUFFERFOCUSED'): 4,
+    ('SMACKW16', 'SMACKBUFFERFROMSCREEN'): 10,
+    ('SMACKW16', 'SMACKBUFFERGET'): 8,
+    ('SMACKW16', 'SMACKBUFFERNEWPALETTE'): 10,
+    ('SMACKW16', 'SMACKBUFFEROPEN'): 12,
+    ('SMACKW16', 'SMACKBUFFERSETPALETTE'): 4,
+    ('SMACKW16', 'SMACKBUFFERSTRING'): 6,
+    ('SMACKW16', 'SMACKBUFFERTOBUFFER'): 20,
+    ('SMACKW16', 'SMACKBUFFERTOBUFFERTRANS'): 22,
+    ('SMACKW16', 'SMACKCLOSE'): 4,
+    ('SMACKW16', 'SMACKCOLORREMAP'): 16,
+    ('SMACKW16', 'SMACKCOLORTRANS'): 8,
+    ('SMACKW16', 'SMACKDOFRAME'): 4,
+    ('SMACKW16', 'SMACKFRAMERATE'): 4,
+    ('SMACKW16', 'SMACKGET'): 8,
+    ('SMACKW16', 'SMACKGETTRACKDATA'): 12,
+    ('SMACKW16', 'SMACKGOTO'): 8,
+    ('SMACKW16', 'SMACKNEXTFRAME'): 4,
+    ('SMACKW16', 'SMACKOPEN'): 12,
+    ('SMACKW16', 'SMACKSIMULATE'): 4,
+    ('SMACKW16', 'SMACKSOUNDCHECK'): 0,
+    ('SMACKW16', 'SMACKSOUNDINTRACK'): 8,
+    ('SMACKW16', 'SMACKSOUNDONOFF'): 8,
+    ('SMACKW16', 'SMACKSOUNDUSEMSS'): 4,
+    ('SMACKW16', 'SMACKSUMMARY'): 8,
+    ('SMACKW16', 'SMACKTOBUFFER'): 28,
+    ('SMACKW16', 'SMACKTOBUFFERRECT'): 8,
+    ('SMACKW16', 'SMACKTOSCREEN'): 24,
+    ('SMACKW16', 'SMACKVOLUMEPAN'): 16,
+    ('SMACKW16', 'SMACKWAIT'): 4,
+    ('WAIL16', 'AIL_ACTIVE_SAMPLE_COUNT'): 4,
+    ('WAIL16', 'AIL_ACTIVE_SEQUENCE_COUNT'): 4,
+    ('WAIL16', 'AIL_ALLOCATE_FILE_SAMPLE'): 12,
+    ('WAIL16', 'AIL_ALLOCATE_SAMPLE_HANDLE'): 4,
+    ('WAIL16', 'AIL_ALLOCATE_SEQUENCE_HANDLE'): 4,
+    ('WAIL16', 'AIL_BACKGROUND'): 0,
+    ('WAIL16', 'AIL_BRANCH_INDEX'): 8,
+    ('WAIL16', 'AIL_CHANNEL_NOTES'): 8,
+    ('WAIL16', 'AIL_CONTROLLER_VALUE'): 12,
+    ('WAIL16', 'AIL_CREATE_WAVE_SYNTHESIZER'): 16,
+    ('WAIL16', 'AIL_DELAY'): 4,
+    ('WAIL16', 'AIL_DESTROY_WAVE_SYNTHESIZER'): 4,
+    ('WAIL16', 'AIL_DIGITAL_MASTER_VOLUME'): 4,
+    ('WAIL16', 'AIL_END_SAMPLE'): 4,
+    ('WAIL16', 'AIL_END_SEQUENCE'): 4,
+    ('WAIL16', 'AIL_GET_PREFERENCE'): 4,
+    ('WAIL16', 'AIL_INIT_SAMPLE'): 4,
+    ('WAIL16', 'AIL_INIT_SEQUENCE'): 12,
+    ('WAIL16', 'AIL_LAST_ERROR'): 0,
+    ('WAIL16', 'AIL_LOAD_SAMPLE_BUFFER'): 16,
+    ('WAIL16', 'AIL_LOCK'): 0,
+    ('WAIL16', 'AIL_LOCK_CHANNEL'): 4,
+    ('WAIL16', 'AIL_MAP_SEQUENCE_CHANNEL'): 12,
+    ('WAIL16', 'AIL_MIDIOUTCLOSE'): 4,
+    ('WAIL16', 'AIL_MIDIOUTOPEN'): 12,
+    ('WAIL16', 'AIL_MINIMUM_SAMPLE_BUFFER_SIZE'): 12,
+    ('WAIL16', 'AIL_REGISTER_BEAT_CALLBACK'): 8,
+    ('WAIL16', 'AIL_REGISTER_EOB_CALLBACK'): 8,
+    ('WAIL16', 'AIL_REGISTER_EOF_CALLBACK'): 8,
+    ('WAIL16', 'AIL_REGISTER_EOS_CALLBACK'): 8,
+    ('WAIL16', 'AIL_REGISTER_EVENT_CALLBACK'): 8,
+    ('WAIL16', 'AIL_REGISTER_ICA_ARRAY'): 8,
+    ('WAIL16', 'AIL_REGISTER_PREFIX_CALLBACK'): 8,
+    ('WAIL16', 'AIL_REGISTER_SEQUENCE_CALLBACK'): 8,
+    ('WAIL16', 'AIL_REGISTER_SOB_CALLBACK'): 8,
+    ('WAIL16', 'AIL_REGISTER_TIMBRE_CALLBACK'): 8,
+    ('WAIL16', 'AIL_REGISTER_TIMER'): 4,
+    ('WAIL16', 'AIL_REGISTER_TRIGGER_CALLBACK'): 8,
+    ('WAIL16', 'AIL_RELEASE_ALL_TIMERS'): 0,
+    ('WAIL16', 'AIL_RELEASE_CHANNEL'): 8,
+    ('WAIL16', 'AIL_RELEASE_SAMPLE_HANDLE'): 4,
+    ('WAIL16', 'AIL_RELEASE_SEQUENCE_HANDLE'): 4,
+    ('WAIL16', 'AIL_RELEASE_TIMER_HANDLE'): 4,
+    ('WAIL16', 'AIL_RESUME_SAMPLE'): 4,
+    ('WAIL16', 'AIL_RESUME_SEQUENCE'): 4,
+    ('WAIL16', 'AIL_SAMPLE_BUFFER_READY'): 4,
+    ('WAIL16', 'AIL_SAMPLE_LOOP_COUNT'): 4,
+    ('WAIL16', 'AIL_SAMPLE_PAN'): 4,
+    ('WAIL16', 'AIL_SAMPLE_PLAYBACK_RATE'): 4,
+    ('WAIL16', 'AIL_SAMPLE_POSITION'): 4,
+    ('WAIL16', 'AIL_SAMPLE_STATUS'): 4,
+    ('WAIL16', 'AIL_SAMPLE_USER_DATA'): 8,
+    ('WAIL16', 'AIL_SAMPLE_VOLUME'): 4,
+    ('WAIL16', 'AIL_SEND_CHANNEL_VOICE_MESSAGE'): 20,
+    ('WAIL16', 'AIL_SEND_SYSEX_MESSAGE'): 8,
+    ('WAIL16', 'AIL_SEQUENCE_LOOP_COUNT'): 4,
+    ('WAIL16', 'AIL_SEQUENCE_POSITION'): 12,
+    ('WAIL16', 'AIL_SEQUENCE_STATUS'): 4,
+    ('WAIL16', 'AIL_SEQUENCE_TEMPO'): 4,
+    ('WAIL16', 'AIL_SEQUENCE_USER_DATA'): 8,
+    ('WAIL16', 'AIL_SEQUENCE_VOLUME'): 4,
+    ('WAIL16', 'AIL_SERVE'): 0,
+    ('WAIL16', 'AIL_SET_DIGITAL_MASTER_VOLUME'): 8,
+    ('WAIL16', 'AIL_SET_ERROR'): 4,
+    ('WAIL16', 'AIL_SET_PREFERENCE'): 8,
+    ('WAIL16', 'AIL_SET_SAMPLE_ADDRESS'): 12,
+    ('WAIL16', 'AIL_SET_SAMPLE_FILE'): 12,
+    ('WAIL16', 'AIL_SET_SAMPLE_LOOP_COUNT'): 8,
+    ('WAIL16', 'AIL_SET_SAMPLE_PAN'): 8,
+    ('WAIL16', 'AIL_SET_SAMPLE_PLAYBACK_RATE'): 8,
+    ('WAIL16', 'AIL_SET_SAMPLE_POSITION'): 8,
+    ('WAIL16', 'AIL_SET_SAMPLE_TYPE'): 12,
+    ('WAIL16', 'AIL_SET_SAMPLE_USER_DATA'): 12,
+    ('WAIL16', 'AIL_SET_SAMPLE_VOLUME'): 8,
+    ('WAIL16', 'AIL_SET_SEQUENCE_LOOP_COUNT'): 8,
+    ('WAIL16', 'AIL_SET_SEQUENCE_TEMPO'): 12,
+    ('WAIL16', 'AIL_SET_SEQUENCE_USER_DATA'): 12,
+    ('WAIL16', 'AIL_SET_SEQUENCE_VOLUME'): 12,
+    ('WAIL16', 'AIL_SET_TIMER_DIVISOR'): 8,
+    ('WAIL16', 'AIL_SET_TIMER_FREQUENCY'): 8,
+    ('WAIL16', 'AIL_SET_TIMER_PERIOD'): 8,
+    ('WAIL16', 'AIL_SET_TIMER_USER'): 8,
+    ('WAIL16', 'AIL_SET_XMIDI_MASTER_VOLUME'): 8,
+    ('WAIL16', 'AIL_SHUTDOWN'): 0,
+    ('WAIL16', 'AIL_STARTUP'): 0,
+    ('WAIL16', 'AIL_START_ALL_TIMERS'): 0,
+    ('WAIL16', 'AIL_START_SAMPLE'): 4,
+    ('WAIL16', 'AIL_START_SEQUENCE'): 4,
+    ('WAIL16', 'AIL_START_TIMER'): 4,
+    ('WAIL16', 'AIL_STOP_ALL_TIMERS'): 0,
+    ('WAIL16', 'AIL_STOP_SAMPLE'): 4,
+    ('WAIL16', 'AIL_STOP_SEQUENCE'): 4,
+    ('WAIL16', 'AIL_STOP_TIMER'): 4,
+    ('WAIL16', 'AIL_TRUE_SEQUENCE_CHANNEL'): 8,
+    ('WAIL16', 'AIL_UNLOCK'): 0,
+    ('WAIL16', 'AIL_VOC_EOS'): 4,
+    ('WAIL16', 'AIL_WAVEOUTCLOSE'): 4,
+    ('WAIL16', 'AIL_WAVEOUTOPEN'): 16,
+    ('WAIL16', 'AIL_WAV_EOS'): 4,
+    ('WAIL16', 'AIL_XMIDI_MASTER_VOLUME'): 4,
+    ('WAIL16', 'API_TIMER'): 16,
+    ('WAIL16', 'FILE_ERROR'): 0,
+    ('WAIL16', 'FILE_READ'): 8,
+    ('WAIL16', 'FILE_SIZE'): 4,
+    ('WAIL16', 'FILE_WRITE'): 12,
+    ('WAIL16', 'MEM_ALLOC_LOCK'): 4,
+    ('WAIL16', 'MEM_FREE_LOCK'): 4,
+    ('WAIL16', 'SS_FOREGROUND_SERVICE'): 10,
+    ('WAIL16', 'SS_SERVE'): 4,
+    ('WAIL16', 'SS_WOM_DONE'): 16,
+    ('WAIL16', 'TIME_CALLBACK'): 4,
+    ('WAIL16', 'XDIG_MIDI_TRAP'): 20,
+    ('WAIL16', 'XDIG_TIMB_TRAP'): 12,
+    ('WAIL16', 'XMI_SERVE'): 4,
+    ('WAIL16', '___EXPORTEDSTUB'): 0,
+})
+
+
 def get_value(module: str, api: str):
     """Value for an absolute-value import, or None if it is a real routine.
 
@@ -310,15 +475,22 @@ def _sanitize(api: str) -> str:
     return ''.join(out)
 
 
-def get_import(module: str, ordinal: int) -> Win16Import:
-    """Resolve a (module, ordinal) import to a Win16Import shim descriptor."""
+def get_import(module: str, ordinal: int, name: str = '') -> Win16Import:
+    """Resolve a (module, ordinal) import to a Win16Import shim descriptor.
+
+    `name` is set for an import BY NAME (the relocation's `name`): then
+    `ordinal` is only an offset into the importer's name table, and the name
+    is the answer. Smacker and Miles' WAIL16 are imported this way."""
     mod = (module or 'UNK').upper()
     cat = _CATEGORY_BY_MODULE.get(mod, 'unknown')
 
     api = None
     known = False
     idamap = _load_map().get(mod)
-    if idamap and ordinal in idamap:
+    if name:
+        api = name
+        known = True
+    elif idamap and ordinal in idamap:
         api = idamap[ordinal]
         known = True
     elif mod in _SEED and ordinal in _SEED[mod]:
