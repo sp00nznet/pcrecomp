@@ -1582,9 +1582,15 @@ static const char *w16_ctl_class(uint8_t ord) {
 }
 
 /* Returns the dialog's own size in dialog units converted to pixels, or 0. */
-static int dlg_build(CPU *cpu, uint16_t hinst, uint16_t tmpl, HWND dlg,
+static int dlg_build(CPU *cpu, uint16_t hinst, uint16_t tseg, uint16_t tmpl, HWND dlg,
                      int *out_w, int *out_h, char *cap, int capsz) {
-    uint16_t hr = ne_find_resource(hinst, 5 /* RT_DIALOG */, NULL, (int)tmpl, NULL);
+    /* lpTemplateName is a far string when its segment is non-zero, else an id
+       (MAKEINTRESOURCE). Space Bucks opens its menu as "OPEN0". */
+    char name[64] = "";
+    if (tseg) b_asciiz(cpu, tseg, tmpl, name, sizeof name);
+    uint16_t hr = ne_find_resource(hinst, 5 /* RT_DIALOG */, NULL, tseg ? -1 : (int)tmpl,
+                                   tseg ? name : NULL);
+    if (tseg) fprintf(stderr, "[win32] dialog template \"%s\" -> rsrc %u\n", name, hr);
     uint32_t len = 0;
     const uint8_t *p = hr ? ne_resource_bytes(hr, &len) : NULL;
     if (!p || len < 14) return 0;
@@ -1696,7 +1702,7 @@ static void create_dialog_common(CPU *cpu, int purge, uint32_t param) {
     if (h) {
         int tw = 0, th = 0;
         char cap[128] = "";
-        if (dlg_build(cpu, b_a16(cpu, 14 - k), tmpl, h, &tw, &th, cap, sizeof cap)
+        if (dlg_build(cpu, b_a16(cpu, 14 - k), b_a16(cpu, 12 - k), tmpl, h, &tw, &th, cap, sizeof cap)
                 && tw > 16 && th > 16) {
             if (cap[0]) SetWindowTextA(h, cap);
             RECT want = { 0, 0, tw, th };
@@ -1750,7 +1756,7 @@ void USER_DIALOGBOXPARAM(CPU *cpu) {
     if (h) {
         int tw = 0, th = 0;
         char cap[128] = "";
-        if (dlg_build(cpu, b_a16(cpu, 14), tmpl, h, &tw, &th, cap, sizeof cap)
+        if (dlg_build(cpu, b_a16(cpu, 14), b_a16(cpu, 12), tmpl, h, &tw, &th, cap, sizeof cap)
                 && tw > 16 && th > 16) {
             if (cap[0]) SetWindowTextA(h, cap);
             RECT want = { 0, 0, tw, th };
