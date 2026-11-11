@@ -94,8 +94,9 @@ _CATEGORY_BY_MODULE = {
 _SEED = {
     'KERNEL': {
         5: 'LocalAlloc', 6: 'LocalLock', 7: 'LocalFree', 8: 'LocalUnlock',
-        15: 'GlobalAlloc', 16: 'GlobalFree', 17: 'GlobalReAlloc', 18: 'GlobalLock',
-        19: 'GlobalUnlock', 20: 'GlobalSize', 23: 'LockSegment', 24: 'UnlockSegment',
+        15: 'GlobalAlloc', 16: 'GlobalReAlloc', 17: 'GlobalFree', 18: 'GlobalLock',
+        19: 'GlobalUnlock', 20: 'GlobalSize', 21: 'GlobalHandle', 22: 'GlobalFlags',
+        23: 'LockSegment', 24: 'UnlockSegment',
         30: 'WaitEvent', 47: 'GetModuleHandle', 49: 'GetModuleFileName',
         50: 'GetProcAddress', 51: 'MakeProcInstance', 52: 'FreeProcInstance',
         74: 'OpenFile', 81: '_lclose', 82: '_lread', 83: '_lcreat', 84: '_llseek',
@@ -103,6 +104,9 @@ _SEED = {
         91: 'InitTask', 95: 'LoadLibrary', 96: 'FreeLibrary', 97: 'GetTempDrive',
         127: 'GetPrivateProfileInt', 128: 'GetPrivateProfileString',
         129: 'WritePrivateProfileString', 130: 'GetProfileInt', 131: 'GetProfileString',
+        132: 'GetWinFlags', 170: 'AllocCStoDSAlias', 171: 'AllocDStoCSAlias',
+        175: 'AllocSelector', 176: 'FreeSelector', 177: 'PrestoChangoSelector',
+        184: 'GlobalDOSAlloc', 185: 'GlobalDOSFree',
     },
     'GDI': {
         27: 'CreateCompatibleDC', 31: 'SetPixel', 34: 'BitBlt', 35: 'StretchBlt',
