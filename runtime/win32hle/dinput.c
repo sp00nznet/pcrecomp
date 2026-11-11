@@ -214,6 +214,7 @@ static void dv_GetDeviceState(void) {                    /* (this, size, data) *
 static void dv_GetDeviceData(void) {                     /* (this, objsize, rgdod, &inout, flags) */
     dev_t_ *d = DEV(A32(0));
     uint32_t sz = A32(1), out = A32(2), io = A32(3), flags = A32(4);
+    if (out && !io) RET(DIERR_INVALIDPARAM, 5);          /* reading needs a count to read up to */
     uint32_t want = io ? MEM32(io) : 0;
     gather(d);
     uint32_t hr = d->overflow ? DI_BUFFEROVERFLOW : DI_OK;

@@ -730,8 +730,9 @@ void hle_input_mouse(uint32_t message, int sx, int sy) {
     } else {
         t = hle_window_at(sx, sy, &cx, &cy);
     }
-    if (!t) return;
-    q_push(t, message, mk_state(), ((uint32_t)(cy & 0xFFFF) << 16) | (uint32_t)(cx & 0xFFFF));
+    /* DirectInput hears of it whether or not a window is there to message
+     * (a game reading the mouse before its window, or over none of it) */
+    if (t) q_push(t, message, mk_state(), ((uint32_t)(cy & 0xFFFF) << 16) | (uint32_t)(cx & 0xFFFF));
     if (hle_input_hook) hle_input_hook();
 }
 void hle_input_key(int down, uint32_t vk, uint32_t scan) {
