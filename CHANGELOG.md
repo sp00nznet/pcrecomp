@@ -81,6 +81,9 @@ versions follow [SemVer](https://semver.org/).
   notch) and DirectInput's z axis, buffered and in `GetDeviceState`
   (`hle_input_wheel`). Theme Park World asks for a mouse with a z axis and
   zooms with it, which it could not do before.
+- win32hle screen: `hle_screen_poll_hook`, called on the window's thread at
+  each pump, for a host to poll what SDL sends no events for (a game
+  controller it turns into the mouse and keys), and `hle_screen_relative`.
 - win32hle: DirectInput 3 and 5 (`dinput.c`): the system mouse (relative or
   absolute axes, three buttons) and keyboard (DIK codes), immediate and
   buffered, read from the same input state as the window messages; arriving

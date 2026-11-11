@@ -352,6 +352,13 @@ extern const win32hle_shim win32hle_bink[];           /* binkw32 on ffmpeg (bink
 int  hle_screen_open(const char *title, int fullscreen, int headless);
 void hle_screen_pump(void);
 extern int (*hle_screen_key_hook)(int sdl_scancode, int down);   /* nonzero: the host took the key */
+/* Called on the window's thread at each pump, after the window's events, holding
+ * the machine: a host polls what SDL has no events for here (a game controller
+ * it turns into the mouse and keys, through hle_input_*). */
+extern void (*hle_screen_poll_hook)(void);
+/* Whether the window gives the game the mouse's movement alone (SDL's relative
+ * mode, for an exclusive DirectInput mouse). */
+int hle_screen_relative(void);
 void hle_screen_title(const char *title);
 extern int (*hle_screen_cursor_hook)(void);   /* nonzero: show the cursor the guest set (its Win32 menus); unset: the game draws its own */
 extern void (*hle_screen_frame_hook)(const uint8_t *px, int w, int h, int pitch, int bpp);   /* each shown frame */
