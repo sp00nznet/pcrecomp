@@ -144,8 +144,11 @@ static void shim_FreeLibrary(void) {
 static void shim_GetProcAddress(void) {
     uint32_t h = ARG(0);
     const char* nm = (const char*)(uintptr_t)ARG(1);
-    g_eax = native32_module_by_base(h) ? native32_export(h, nm)
-                                       : (uint32_t)(uintptr_t)GetProcAddress((HMODULE)(uintptr_t)h, nm);
+    uint32_t codepage_func(const char* name);
+    /* A host's native32_redirect covers a native DLL's run-time lookups too
+     * (opengl32's wglSwapBuffers, found by GetProcAddress, never by import). */
+    g_eax = native32_module_by_base(h) ? native32_export(h, nm) : codepage_func(nm);
+    if (!g_eax) g_eax = (uint32_t)(uintptr_t)GetProcAddress((HMODULE)(uintptr_t)h, nm);
     if (!g_eax) SetLastError(ERROR_PROC_NOT_FOUND);
     g_esp += 12;
 }

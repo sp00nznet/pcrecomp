@@ -1998,6 +1998,21 @@ class Lifter:
             # both sides are no-ops the stack is exactly where it was.
             lines.append(f"/* {m}: FPU state is not a memory image here */ {comment}")
 
+        elif m == 'fbld':
+            addr = self._fmt_mem_addr(ops[0].mem)
+            lines.append(f"fp_push_i64(fp_bcd_ld((const uint8_t*)ADDR({addr}))); {comment}")
+
+        elif m == 'fbstp':
+            addr = self._fmt_mem_addr(ops[0].mem)
+            lines.append(f"{{ int64_t _q = fp_st0_to_i64(_st[0], g_st_i64[0], _fpu_cw); (void)fp_pop(); "
+                         f"fp_bcd_st((uint8_t*)ADDR({addr}), _q); }} {comment}")
+
+        elif m == 'fxtract':
+            # ST(0) = x becomes the exponent, then the significand is pushed:
+            # ST(0) in [1, 2), ST(1) the unbiased exponent (0: -inf, 0).
+            lines.append(f"{{ int _e; double _f = frexp(_st[0], &_e); "
+                         f"_st[0] = _f == 0.0 ? -INFINITY : (double)(_e - 1); fp_push(_f * 2.0); }} {comment}")
+
         elif m == 'fld1':
             lines.append(f"fp_push(1.0); {comment}")
 
