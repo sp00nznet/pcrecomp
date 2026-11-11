@@ -1580,6 +1580,13 @@ class Lifter:
                     lines.extend(self._computed_jump(
                         f"MEM32({self._fmt_mem_addr(ops[0].mem)})", comment))
                 elif ops and ops[0].type == X86_OP_REG:
+                    if self.computed_ret:
+                        # The other half of a computed return: `pop edx; ...;
+                        # jmp edx` returns by hand (Delphi's _DoneExcept). The
+                        # address it popped is the dummy one a lifted call
+                        # pushed, so it is a return to the lifted caller.
+                        lines.append(f"if ({self._fmt_read(ops[0])} == RECOMP_RETADDR) {{"
+                                     f" RECOMP_FLAGS_OUT(); return; }}")
                     lines.extend(self._computed_jump(self._fmt_read(ops[0]), comment))
                 else:
                     lines.append(f"RECOMP_ITAIL(0); return; /* unresolved */ {comment}")
@@ -2145,7 +2152,11 @@ class Lifter:
                 lines.append(f"_fpu_cw = MEM16({addr}); {comment}")
 
         elif m == 'fninit' or m == 'finit':
-            lines.append(f"/* finit */ {comment}")
+            # The control word goes back to 0x037F. A no-op here left the
+            # runtime's own (Borland's 0x1332), and the classic FPU probe
+            # (`fninit; fnstcw; and 0x103F; cmp 0x3F`) concluded there was no
+            # FPU: kirikiri2 refused to start ("CPU family 4 or lesser").
+            lines.append(f"_fpu_cw = 0x037F; {comment}")
 
         elif m in MMX_BINOPS:
             expr = MMX_BINOPS[m].format(a=self._mm_read(ops[0]), b=self._mm_read(ops[1]))

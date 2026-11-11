@@ -5,6 +5,43 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- native32 / lift: MSVC exception frames, generically. `tools/lift/eh32.py`
+  `frame()` finds every prologue that installs an MSVC frame and says where
+  its handlers continue and which ebp they use: C++ frames with
+  `push ebp; mov ebp, esp` (ebp = entry esp - 4) and frame-pointer-omitted
+  ones (ebp = entry esp; VC6 /O2 builds most C++ frames that way, 488 of 489
+  in Galactic Battlegrounds, and eh32 used to skip them all), and
+  `__try/__except` frames (`_except_handler3`, scope table, ebp = record +
+  16). `generate.lift_function_linear(eh_off=)` gives such a body a
+  `RECOMP_EH_FRAME(off, list)` landing pad; `true_extent(seeds=)` keeps an
+  `__except` block, which only the scope table reaches, inside its body.
+  An indirect call or jump that misses the dispatch table now asks
+  `recomp_eh_jump_hook` (native32 sets it) before reporting an unresolved
+  target: `_except_handler3` calling an `__except` block, or a guest
+  `__CxxFrameHandler`'s jump to a catch's continuation, longjmps back into
+  the lifted body that owns that ebp and address. With `native32_guest_seh`
+  set, `__try/__except` therefore runs end to end as guest code (seh32.c's
+  note that MSVC frames were not followed no longer applies).
+- native32: a guest with the CRT linked in statically has no
+  `_CxxThrowException` import; its `RaiseException(0xE06D7363)` now goes to
+  eh32's catch dispatch first (`native32_cxx_raise`), on by default: before,
+  that throw went to the host's SEH and ended the process.
+- native32: VirtualQuery on a lifted module reports MEM_IMAGE at the module's
+  base. VC8+ CRTs (`_ValidateEH3RN`) skip a `__try` whose scope table is not
+  in an image, so every `__except` was passed over.
+- `tools/lift/msvceh_probe/run.cmd`: MSVC exception handling end to end. It
+  compiles a probe (C++ catch, nested, rethrow, `__except`, `__finally`) with
+  MSVC, catalogs, lifts and builds it on native32, and runs it: 5/5.
+- native32_selftest: the jump hook (taken for a listed address with the
+  frame's ebp, refused otherwise). eh32.py selftest: FPO and `__try` frames.
+
+### Changed
+- eh32's catch dispatch matches a landing pad by the frame's own ebp offset
+  (`recomp_ehframe_t.off`), not by assuming `push ebp; mov ebp, esp`.
+  `RECOMP_EH_ENTER()` is `RECOMP_EH_FRAME(4, NULL)`, so existing lifts (and
+  setjmp landing pads) behave as before.
+
 ### Fixed
 - recomp32 loader: when the image's range is already reserved, it commits
   into the reservation only if that starts at the image base and covers the
@@ -49,6 +86,14 @@ versions follow [SemVer](https://semver.org/).
   wait as signalled (Windows keeps the object alive for the wait) instead of
   failing it. Operation Flashpoint closes an event its watchdog thread waits
   on when it exits. A handle already invalid on the first poll still fails (#169, by [@neurocontrarian](https://github.com/neurocontrarian)).
+- native32: a callback from guest code that runs natively on the guest stack
+  (gen_bridge: VCL's window procedure thunks jump to `StdWndProc`) ran its
+  host frames and the lifted function's guest frames through the same memory.
+  The trampoline now moves to the host stack below gen_bridge's anchor, and
+  the guest stack below the native caller's arguments.
+- lift32: `fninit` resets the x87 control word to 0x037F. It lifted to
+  nothing, so the FPU probe (`fninit; fnstcw; and 0x103F; cmp 0x3F`) read the
+  runtime's own control word (Borland's 0x1332) and reported no FPU.
 - lift32: `fsincos` left the sine in ST(0) and the cosine in ST(1); it is
   the other way round. MechCommander 2's camera builds its view direction
   with it, and the swapped pair laid the 35-degree camera almost flat on the
@@ -133,6 +178,33 @@ versions follow [SemVer](https://semver.org/).
   where it runs at a constant rate (scaled to ns by `hle_tsc_calibrate`, which
   a host calls at start), CLOCK_MONOTONIC otherwise. Operation Flashpoint's
   performance log is built on it (#173, by [@neurocontrarian](https://github.com/neurocontrarian)).
+- native32: `native32_set_codepage(cp)` runs the guest in its own ANSI code
+  page, whatever the system's: `CP_ACP` in `MultiByteToWideChar` /
+  `WideCharToMultiByte`, `GetACP`, `IsDBCSLeadByte`, and the A functions that
+  take text (files, window text, fonts, `TextOutA`, `ExtTextOutA`,
+  `GetTextExtentPoint32A`, `GetGlyphOutlineA`, `EnumFonts*A`, ...) read the
+  guest's strings in it and call the W functions (`codepage.c`). A Japanese
+  title's Shift-JIS (932) on a Western-locale Windows, with no locale change.
+  Off by default; the selftest checks it.
+- native32: `native32_redirect(name, fn)` binds an import, and every
+  `GetProcAddress` for it, to a host function: for DLLs the guest loads
+  itself (a host that wants to see each `DrawDibDraw` the guest presents).
+  With a code page set, `DefWindowProcA` keeps an A window's text in the
+  guest's code page too (`WM_NCCREATE`, `WM_SETTEXT`, `WM_GETTEXT`), so a
+  Shift-JIS caption shows in the title bar.
+- native32: static TLS for guest modules. A module with a TLS directory gets
+  its index, and every guest thread's TIB a copy of the template at
+  `fs:[2Ch]`: Borland's RTL reads its threadvars there from its first
+  instruction.
+- native32: guest SEH (`seh32.c`, opt-in with `native32_guest_seh`).
+  `RaiseException` walks the guest's own `fs:[0]` chain and calls its
+  handlers as guest code; `RtlUnwind` unwinds it; `native32_seh_continue(va)`
+  resumes in the function whose frame took the exception (through its
+  RECOMP_EH_ENTER landing pad), for a host to patch into the runtime's jump
+  to the except block. Borland's runtimes raise every exception this way.
+- lift32: with `computed_ret`, `jmp reg` holding the dummy return address is
+  a return: the `pop edx; ...; jmp edx` hand-made return of Delphi's
+  `_DoneExcept`.
 - pe: `pdb2_ref.py` reads a Visual C++ 5/6 PDB (MSF 2.00, `_ST` symbol
   records), which llvm-pdbutil and `pdb_ref.py` cannot, into the same
   reference JSON, plus a `--seed-functions` list for disasm32. No external
