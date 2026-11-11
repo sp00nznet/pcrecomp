@@ -120,4 +120,20 @@ int native32_in_guest(uint32_t va);
 /* Print the last indirect calls, newest first. */
 void native32_dump_icalls(int n);
 
+/* ---- modules32.c: the loader's part for several lifted modules ----------
+ * Map each (rebased, tools/pe/rebase.py) module from map_dir at its base;
+ * GetModuleFileName reports report_dir\<name>. Bind all of them with the
+ * host's shims plus LoadLibrary{A,W,ExA}, FreeLibrary, GetProcAddress,
+ * GetModuleHandle{A,W} and GetModuleFileName{A,W} over the table (a host
+ * shim of the same name wins). A guest DLL is attached (DllMain, after the
+ * guest modules it imports) when something loads it; attach_imports does
+ * that for everything a module imports, before entering it. */
+typedef struct { const char* name; uint32_t base; int attached; } native32_module_t;
+int native32_modules_map(const char* map_dir, const char* report_dir, native32_module_t* m, int n);
+int native32_modules_bind(const native32_shim_t* host, int nhost);   /* unresolved count */
+int native32_attach(uint32_t base);
+int native32_attach_imports(uint32_t base);
+native32_module_t* native32_module_by_name(const char* path);
+native32_module_t* native32_module_by_base(uint32_t base);
+
 #endif
