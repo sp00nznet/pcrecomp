@@ -11,6 +11,14 @@ versions follow [SemVer](https://semver.org/).
   of spinning on `sched_yield` (the browser keeps its spin). Theme Park World
   hands over at every import while its other threads want a turn: 6% of its
   main thread was the spin, 1% now.
+- win32hle screen: every flip is shown, held for the same number of the
+  display's refreshes (the fewest the game's own frame time fits, never under
+  20 a second), instead of at most one frame each 15 ms, which showed some
+  frames twice and some never; the wait sleeps to 0.2 ms short and spins
+  the rest. From the fourth `Sleep(0)` in a row, each under 2 ms after the
+  last, it sleeps a millisecond (`HLE_SLEEP0=yield` keeps it a yield).
+  `HLE_PRESENTTRACE=1` prints frames shown a second and the longest gap.
+  (Split from #163.)
 
 ### Fixed
 - win32hle: `WM_KEYDOWN`/`WM_KEYUP` set lParam's extended-key bit (24) for
