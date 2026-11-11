@@ -77,6 +77,31 @@ static DWORD g_mach_tls = TLS_OUT_OF_INDEXES;
 /* A guest thread's TIB. Lifted code reads fs:[n] as MEM32(g_fs_base + n); the
  * real TEB stays the host's, so a guest SEH frame never lands on a chain
  * Windows walks. The PEB is the real one: code that reads fs:[30h] wants it. */
+/* The exe's implicit TLS (__declspec(thread)). Windows' loader would give each
+ * thread a copy of the template and point TEB[0x2C] at an array holding it;
+ * our guest TIB is our own, so we do it. Only the exe: the first module mapped
+ * gets index 0. Rise of Nations EE reads it 127 times, the first at startup. */
+static uint32_t g_tls_lo, g_tls_size, g_tls_zero;
+
+static void tls_setup(IMAGE_NT_HEADERS32* nt, uint32_t base) {
+    IMAGE_DATA_DIRECTORY dd = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    if (!dd.VirtualAddress) return;
+    IMAGE_TLS_DIRECTORY32* t = (IMAGE_TLS_DIRECTORY32*)(uintptr_t)(base + dd.VirtualAddress);
+    g_tls_lo = t->StartAddressOfRawData;
+    g_tls_size = t->EndAddressOfRawData - t->StartAddressOfRawData;
+    g_tls_zero = t->SizeOfZeroFill;
+    if (t->AddressOfIndex) *(uint32_t*)(uintptr_t)t->AddressOfIndex = 0;
+}
+
+static uint32_t tls_block(void) {
+    /* ponytail: one slot, the exe's; guest DLLs with their own TLS need more */
+    uint32_t n = g_tls_size + g_tls_zero;
+    uint32_t* arr = (uint32_t*)VirtualAlloc(NULL, 0x40 + n, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    memcpy((char*)arr + 0x40, (void*)(uintptr_t)g_tls_lo, g_tls_size);
+    arr[0] = (uint32_t)(uintptr_t)arr + 0x40;
+    return (uint32_t)(uintptr_t)arr;
+}
+
 static uint32_t make_tib(uint32_t lo, uint32_t hi) {
     uint32_t* t = (uint32_t*)VirtualAlloc(NULL, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     t[0] = 0xFFFFFFFFu;                          /* ExceptionList: end of chain */
@@ -85,6 +110,7 @@ static uint32_t make_tib(uint32_t lo, uint32_t hi) {
     t[0x18 / 4] = (uint32_t)(uintptr_t)t;        /* Self                        */
     t[0x24 / 4] = GetCurrentThreadId();
     t[0x30 / 4] = __readfsdword(0x30);
+    if (g_tls_size + g_tls_zero) t[0x2C / 4] = tls_block();
     return (uint32_t)(uintptr_t)t;
 }
 
@@ -377,6 +403,7 @@ uint32_t native32_map(const char* path, uint32_t base) {
     g_mods[g_mod_n].span = span;
     strncpy(g_mods[g_mod_n++].name, file ? file + 1 : path, MAX_PATH - 1);
     IMAGE_NT_HEADERS32* nt = (IMAGE_NT_HEADERS32*)(uintptr_t)(base + ((IMAGE_DOS_HEADER*)(uintptr_t)base)->e_lfanew);
+    if (g_mod_n == 1) tls_setup(nt, base);
     IMAGE_SECTION_HEADER* s = IMAGE_FIRST_SECTION(nt);
     for (int i = 0; i < nt->FileHeader.NumberOfSections; i++, s++) {
         DWORD old;
