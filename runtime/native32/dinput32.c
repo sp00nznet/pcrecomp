@@ -13,8 +13,9 @@
  *
  * Patched in dinput's own device vtable (shared by all of a version's
  * devices) from IDirectInput::CreateDevice, which di_wrap patches beside
- * EnumDevices. ponytail: GetDeviceData (buffered input) answers no events;
- * add a queue when a game reads its mouse that way.
+ * EnumDevices. Buffered readers (GetDeviceData) get the same input as
+ * events from a ring per device kind; each device keeps its own read cursor.
+ * ponytail: 256 events per kind, older ones are dropped by a slow reader.
  */
 typedef HRESULT (WINAPI *di_create_dev_t)(void*, const GUID*, void**, void*);
 typedef HRESULT (WINAPI *di_dev1_t)(void*);
@@ -27,7 +28,15 @@ static di_state_t g_di_state;
 static di_data_t g_di_data;
 static di_coop_t g_di_coop;
 static int g_di_synth = -1;                 /* -1: decide at first use (on under headless) */
-static struct { void* dev; int kind; HANDLE ev; } g_di_devs[16];   /* kind 1 mouse, 2 keyboard */
+static struct { void* dev; int kind; HANDLE ev; LONG seq; } g_di_devs[16];
+typedef struct { DWORD ofs, data, time, seq; } di_evt_t;
+static di_evt_t g_di_ring[3][256];
+static volatile LONG g_di_seq[3];
+static void di_push(int kind, DWORD ofs, DWORD data) {
+    LONG s = InterlockedIncrement(&g_di_seq[kind]);
+    di_evt_t* e = &g_di_ring[kind][s & 255];
+    e->ofs = ofs; e->data = data; e->time = GetTickCount(); e->seq = (DWORD)s;
+}   /* kind 1 mouse, 2 keyboard */
 typedef HRESULT (WINAPI *di_event_t)(void*, HANDLE);
 static di_event_t g_di_event;
 static volatile LONG g_mouse_dx, g_mouse_dy, g_mouse_dz;
@@ -42,10 +51,23 @@ void native32_input_mouse(int dx, int dy, int dz) {
     InterlockedExchangeAdd(&g_mouse_dx, dx);
     InterlockedExchangeAdd(&g_mouse_dy, dy);
     InterlockedExchangeAdd(&g_mouse_dz, dz);
+    if (dx) di_push(1, 0, (DWORD)dx);
+    if (dy) di_push(1, 4, (DWORD)dy);
+    if (dz) di_push(1, 8, (DWORD)dz);
     di_signal(1);
 }
-void native32_input_button(int b, int down) { if (b >= 0 && b < 8) g_mouse_btn[b] = down ? 0x80 : 0; di_signal(1); }
-void native32_input_key(int dik, int down) { if (dik >= 0 && dik < 256) g_keys256[dik] = down ? 0x80 : 0; di_signal(2); }
+void native32_input_button(int b, int down) {
+    if (b < 0 || b >= 8) return;
+    g_mouse_btn[b] = down ? 0x80 : 0;
+    di_push(1, 12 + b, down ? 0x80 : 0);
+    di_signal(1);
+}
+void native32_input_key(int dik, int down) {
+    if (dik < 0 || dik >= 256) return;
+    g_keys256[dik] = down ? 0x80 : 0;
+    di_push(2, (DWORD)dik, down ? 0x80 : 0);
+    di_signal(2);
+}
 
 static int di_synth(void) {
     if (g_di_synth < 0) g_di_synth = GetEnvironmentVariableA("NATIVE32_HEADLESS", NULL, 0) != 0;
@@ -89,8 +111,20 @@ static HRESULT WINAPI di_event(void* self, HANDLE ev) {
     return g_di_event(self, ev);
 }
 static HRESULT WINAPI di_data(void* self, DWORD cb, void* rg, DWORD* n, DWORD flags) {
-    if (!(di_synth() && di_kind(self))) return g_di_data(self, cb, rg, n, flags);
-    if (n) *n = 0;
+    int kind = di_synth() ? di_kind(self) : 0, i;
+    if (!kind) return g_di_data(self, cb, rg, n, flags);
+    if (!n) return E_POINTER;
+    for (i = 0; i < 16 && g_di_devs[i].dev != self; i++) ;
+    LONG last = g_di_seq[kind], cur = g_di_devs[i].seq;
+    if (last - cur > 256) cur = last - 256;
+    DWORD want = *n, got = 0;
+    for (; cur != last && got < want; got++) {          /* rg NULL: flush */
+        const di_evt_t* e = &g_di_ring[kind][(cur + 1) & 255];
+        if (rg) { memset((uint8_t*)rg + got * cb, 0, cb); memcpy((uint8_t*)rg + got * cb, e, cb < 16 ? cb : 16); }
+        cur++;
+    }
+    if (!(flags & 1)) g_di_devs[i].seq = cur;           /* DIGDD_PEEK leaves them */
+    *n = got;
     return 0;
 }
 
@@ -101,7 +135,7 @@ static HRESULT di_create_dev(int w, void* self, const GUID* g, void** out, void*
     int kind = !memcmp(g, &mouse, sizeof mouse) ? 1 : !memcmp(g, &kbd, sizeof kbd) ? 2 : 0;
     if (hr < 0 || !out || !*out || !kind) return hr;
     for (int i = 0; i < 16; i++)
-        if (!g_di_devs[i].dev) { g_di_devs[i].dev = *out; g_di_devs[i].kind = kind; break; }
+        if (!g_di_devs[i].dev) { g_di_devs[i].dev = *out; g_di_devs[i].kind = kind; g_di_devs[i].seq = g_di_seq[kind]; break; }
     void** vt = *(void***)*out;
     dd_patch(&vt[7], (void*)di_acquire, (void**)&g_di_acquire);
     dd_patch(&vt[8], (void*)di_unacquire, (void**)&g_di_unacquire);
