@@ -134,7 +134,95 @@ static void mci_send(CPU *cpu) {
     ret32(cpu, e, 12);
 }
 
+/* ---- the multimedia timer ------------------------------------------------
+ * timeSetEvent's callback runs at interrupt time on Windows 3.1, so a game may
+ * busy-wait for what its callback sets without ever pumping messages (CivNet's
+ * movie player). Here a due callback runs from recomp_mmtimer_poll(), which a
+ * game built with RECOMP_IRQ calls from its recomp_tick (at lifted function
+ * entries and loop back-edges), and which a Win32 thread timer also calls from
+ * the message loop. Both are on the thread that owns the guest CPU. CivNet's
+ * PCTIMER.CPP gives up (ERR_TIMERSETFAILED) without timeSetEvent. */
+uint16_t recomp_call_guest(uint16_t pseg, uint16_t poff, const uint16_t *argw, int n);  /* win32_backend.c */
+
+#define MAX_MMTIMERS 16
+static struct { int on; uint16_t seg, off, flags; uint32_t user, period, due; } g_mmt[MAX_MMTIMERS];
+static UINT_PTR g_mm_pump;
+static int g_mm_busy;
+
+void recomp_mmtimer_poll(void) {
+    if (g_mm_busy) return;                  /* a callback is running */
+    g_mm_busy = 1;
+    DWORD now = timeGetTime();
+    for (int i = 0; i < MAX_MMTIMERS; i++) {
+        if (!g_mmt[i].on || (int)(now - g_mmt[i].due) < 0) continue;
+        if (g_mmt[i].flags & TIME_PERIODIC) {
+            g_mmt[i].due += g_mmt[i].period;
+            if ((int)(now - g_mmt[i].due) > (int)(8 * g_mmt[i].period)) g_mmt[i].due = now + g_mmt[i].period;
+        } else {
+            g_mmt[i].on = 0;
+        }
+        /* TimeProc(uID, uMsg, dwUser, dw1, dw2): PASCAL, DWORDs high word first. */
+        uint16_t a[8] = { (uint16_t)(i + 1), 0, (uint16_t)(g_mmt[i].user >> 16), (uint16_t)g_mmt[i].user,
+                          0, 0, 0, 0 };
+        static int fired;
+        if (fired++ < 3 || getenv("RECOMP_LOG_MMTIMER"))
+            fprintf(stderr, "[mm] timer %d fires %04X:%04X\n", i + 1, g_mmt[i].seg, g_mmt[i].off);
+        recomp_call_guest(g_mmt[i].seg, g_mmt[i].off, a, 8);
+    }
+    g_mm_busy = 0;
+}
+
+static void CALLBACK mm_pump(HWND h, UINT m, UINT_PTR id, DWORD t) {
+    (void)h; (void)m; (void)id; (void)t;
+    recomp_mmtimer_poll();
+}
+
+/* timeSetEvent(uDelay@12, uResolution@10, lpFunction@6, dwUser@2, uFlags@0) */
+void MMSYSTEM_TIMESETEVENT(CPU *cpu) {
+    UINT delay = a16(cpu, 12);
+    uint32_t fn = a32(cpu, 6), user = a32(cpu, 2);
+    uint16_t flags = a16(cpu, 0);
+    int i = 0;
+    while (i < MAX_MMTIMERS && g_mmt[i].on) i++;
+    cpu->ax = 0;
+    if (i < MAX_MMTIMERS && fn) {
+        g_mmt[i].seg = (uint16_t)(fn >> 16); g_mmt[i].off = (uint16_t)fn;
+        g_mmt[i].user = user; g_mmt[i].flags = flags;
+        g_mmt[i].period = delay ? delay : 1;
+        g_mmt[i].due = timeGetTime() + g_mmt[i].period;
+        g_mmt[i].on = 1;
+        if (!g_mm_pump) g_mm_pump = SetTimer(NULL, 0, 10, mm_pump);
+        cpu->ax = (uint16_t)(i + 1);
+    }
+    fprintf(stderr, "[mm] timeSetEvent(%u ms, %04X:%04X, %s) -> %u\n", delay, (unsigned)(fn >> 16),
+            (unsigned)(fn & 0xFFFF), flags & TIME_PERIODIC ? "periodic" : "once", cpu->ax);
+    ret(cpu, 14);
+}
+
+void MMSYSTEM_TIMEKILLEVENT(CPU *cpu) {
+    UINT id = a16(cpu, 0);
+    cpu->ax = MMSYSERR_INVALPARAM;
+    if (id >= 1 && id <= MAX_MMTIMERS && g_mmt[id - 1].on) {
+        g_mmt[id - 1].on = 0;
+        cpu->ax = 0;
+    }
+    ret(cpu, 2);
+}
+
+void MMSYSTEM_TIMEBEGINPERIOD(CPU *cpu) { cpu->ax = 0; ret(cpu, 2); }
+void MMSYSTEM_TIMEENDPERIOD(CPU *cpu) { cpu->ax = 0; ret(cpu, 2); }
+
+void MMSYSTEM_TIMEGETDEVCAPS(CPU *cpu);   /* win32_backend.c */
+
+/* The calls above, imported rather than looked up. */
+void MMSYSTEM_MCISENDCOMMAND(CPU *cpu) { mci_send(cpu); }
+
 static const struct { const char *name; void (*fn)(CPU *); } g_mm[] = {
+    { "timeSetEvent",           MMSYSTEM_TIMESETEVENT },
+    { "timeKillEvent",          MMSYSTEM_TIMEKILLEVENT },
+    { "timeBeginPeriod",        MMSYSTEM_TIMEBEGINPERIOD },
+    { "timeEndPeriod",          MMSYSTEM_TIMEENDPERIOD },
+    { "timeGetDevCaps",         MMSYSTEM_TIMEGETDEVCAPS },
     { "waveOutGetNumDevs",      wave_numdevs },
     { "midiOutGetNumDevs",      midi_numdevs },
     { "waveOutOpen",            wave_open },

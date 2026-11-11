@@ -564,6 +564,40 @@ void WING_WINGRECOMMENDDIBFORMAT(CPU *cpu) {/* WinGRecommendDIBFormat(BITMAPINFO
 static uint8_t g_active_pal[256 * 4];       /* RGBQUAD order: B,G,R,0 */
 static int     g_have_pal;
 
+/* A Win16 COLORREF as plain RGB. PALETTEINDEX(n) (0x01000000 | n) names an
+ * entry of the palette selected into the DC; on a window DC the host has none
+ * selected, so Windows resolved it against its default 20 colours -- CivNet's
+ * dialogs came out brown and green. Resolved here against the game's active
+ * palette. PALETTERGB (0x02000000 | rgb) is the RGB. */
+/* The palette as a 256-colour Windows 3.1 screen shows it: entries 0-9 and
+ * 246-255 are the system's static colours, which no game palette displaces.
+ * CivNet draws its dialogs with them (index 7 is the light grey); through its
+ * own palette they came out brown. RGBQUAD order. */
+static const uint8_t k_static[20][3] = {   /* R, G, B */
+    {0,0,0},{128,0,0},{0,128,0},{128,128,0},{0,0,128},{128,0,128},{0,128,128},{192,192,192},
+    {192,220,192},{166,202,240},
+    {255,251,240},{160,160,164},{128,128,128},{255,0,0},{0,255,0},{255,255,0},{0,0,255},
+    {255,0,255},{0,255,255},{255,255,255}};
+const uint8_t *recomp_screen_palette(void) {
+    static uint8_t p[256 * 4];
+    memcpy(p, g_active_pal, sizeof p);
+    if (recomp_game.static_colors)
+        for (int k = 0; k < 20; k++) {
+            int i = k < 10 ? k : 236 + k;
+            p[i * 4 + 0] = k_static[k][2]; p[i * 4 + 1] = k_static[k][1]; p[i * 4 + 2] = k_static[k][0];
+        }
+    return p;
+}
+
+uint32_t recomp_guest_color(uint32_t c) {
+    if ((c >> 24) == 1 && g_have_pal) {
+        const uint8_t *e = &recomp_screen_palette()[(c & 0xFF) * 4];
+        return (uint32_t)e[2] | ((uint32_t)e[1] << 8) | ((uint32_t)e[0] << 16);
+    }
+    if ((c >> 24) == 2) return c & 0xFFFFFF;
+    return c;
+}
+
 #define MAXPAL 16
 typedef struct { uint16_t h; uint8_t rgbq[256 * 4]; } GuestPalette;
 static GuestPalette g_pals[MAXPAL];
@@ -1089,7 +1123,16 @@ void WING_WINGSTRETCHBLT(CPU *cpu);
  *
  * Win16 args: dwRop@0(4) nYSrc@4 nXSrc@6 hdcSrc@8 nHeight@10 nWidth@12
  *             nYDest@14 nXDest@16 hdcDest@18 */
+int recomp_gdi_bitblt(CPU *cpu);   /* win32_backend.c */
+
+/* BitBlt(hdcDest@18, x@16, y@14, w@12, h@10, hdcSrc@8, xSrc@6, ySrc@4, dwRop@0/2).
+ * A WinG source goes the WinG way below (the PF Magic games only ever blit
+ * from WinG surfaces). Any other source -- a memory DC holding a LoadBitmap'd
+ * icon or a CreateBitmap mask, or none for a pattern ROP -- is a real GDI
+ * BitBlt with the game's raster operation: routed to WinG, CivNet's icons and
+ * buttons all came out as whichever WinG surface was used last. */
 void GDI_BITBLT(CPU *cpu) {
+    if (!wing_is_dc(a16(cpu, 8)) && recomp_gdi_bitblt(cpu)) return;
     uint16_t a[10];
     a[9] = a16(cpu, 18); a[8] = a16(cpu, 16); a[7] = a16(cpu, 14);  /* hdc x y  */
     a[6] = a16(cpu, 12); a[5] = a16(cpu, 10);                       /* w h dest */
@@ -1274,7 +1317,8 @@ void WING_WINGSTRETCHBLT(CPU *cpu) {
     h->biBitCount = (WORD)g_wing[i].bpp;
     h->biCompression = BI_RGB;
     if (g_wing[i].bpp <= 8)
-        memcpy(bi + sizeof(BITMAPINFOHEADER), g_wing[i].pal, 256 * 4);
+        memcpy(bi + sizeof(BITMAPINFOHEADER),
+               recomp_game.wing_screen_palette && g_have_pal ? recomp_screen_palette() : g_wing[i].pal, 256 * 4);
 
     /* RECOMP_DUMP_BLIT=<n>: write the nth source surface out as a .bmp so the
        actual pixels and colour table can be inspected directly. Diagnostic. */

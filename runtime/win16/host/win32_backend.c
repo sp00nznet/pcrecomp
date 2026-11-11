@@ -21,6 +21,7 @@
 #include <windows.h>
 
 extern CPU *g_cpu;
+uint32_t recomp_guest_color(uint32_t c);   /* win16_impl.c: PALETTEINDEX -> RGB */
 
 /* arg helpers (shim entry stack: [sp]=retIP, [sp+2]=retCS, [sp+4]=last arg) */
 static inline uint16_t b_a16(CPU *cpu, int off) {
@@ -85,15 +86,23 @@ static int g_ngdi = 1;
  * table filled, put_hgdi returned 0 and the engine reported "object created ...
  * failed" and stopped being able to make brushes and pens, which is why only a
  * couple of toys could ever be taken off the shelf. */
+/* Guest GDI handles start at GDI_BASE: Win16 lets FillRect take a system
+ * colour, (HBRUSH)(COLOR_xxx + 1), in place of a brush, and handles 1..31
+ * collided with those -- CivNet's grey dialogs filled with whatever object
+ * held handle 16. */
+#define GDI_BASE 0x100
 static uint16_t put_hgdi(HGDIOBJ h) {
     if (!h) return 0;
-    for (int i = 1; i < g_ngdi; i++) if (g_gdi[i] == h) return (uint16_t)i;
-    for (int i = 1; i < g_ngdi; i++) if (!g_gdi[i]) { g_gdi[i] = h; return (uint16_t)i; }
+    for (int i = 1; i < g_ngdi; i++) if (g_gdi[i] == h) return (uint16_t)(i + GDI_BASE);
+    for (int i = 1; i < g_ngdi; i++) if (!g_gdi[i]) { g_gdi[i] = h; return (uint16_t)(i + GDI_BASE); }
     if (g_ngdi >= MAXGDI) { handle_table_full("GDI object"); return 0; }
-    g_gdi[g_ngdi] = h; return (uint16_t)g_ngdi++;
+    g_gdi[g_ngdi] = h; return (uint16_t)(g_ngdi++ + GDI_BASE);
 }
 
-static HGDIOBJ get_hgdi(uint16_t g) { return (g && g < MAXGDI) ? g_gdi[g] : NULL; }
+static HGDIOBJ get_hgdi(uint16_t g) {
+    if (g > 0 && g <= 31) return GetSysColorBrush(g - 1);   /* COLOR_xxx + 1 */
+    return (g >= GDI_BASE && g - GDI_BASE < MAXGDI) ? g_gdi[g - GDI_BASE] : NULL;
+}
 
 /* Stock objects are singletons GDI owns. Now that one host object maps to one
  * guest handle, letting the engine delete one would strand every other holder
@@ -107,7 +116,7 @@ static char g_gdi_stock[MAXGDI];
  * the one that blits the WinG surface -- never ran. Key the proc by class name,
  * and remember which proc each HWND was created with. */
 #define MAXCLS 32
-typedef struct { char name[64]; uint16_t seg, off; } GuestClass;
+typedef struct { char name[64]; uint16_t seg, off, style, cls_extra, wnd_extra, hinst; } GuestClass;
 static GuestClass g_cls[MAXCLS];
 static int g_ncls;
 
@@ -143,10 +152,12 @@ static void hwnd_proc(HWND h, uint16_t *seg, uint16_t *off) {
     *seg = g_wndproc_seg; *off = g_wndproc_off;
 }
 
-/* Call the guest WNDPROC(hWnd, uMsg, wParam, lParam) via the far dispatcher.
- * Win16 PASCAL: push args left-to-right; lParam is a DWORD (hi word first). */
-static uint16_t call_guest_wndproc(uint16_t pseg, uint16_t poff,
-                                   uint16_t hwnd, uint16_t msg, uint16_t wparam, uint32_t lparam) {
+/* Call a guest far PASCAL procedure from the host: argw[] are the argument
+ * words in push order (a DWORD is its high word, then its low word). The
+ * guest may be mid-call (a WNDPROC delivered inside CreateWindow, a timer
+ * callback inside the message loop), so its whole state comes back after.
+ * Returns AX. */
+uint16_t recomp_call_guest(uint16_t pseg, uint16_t poff, const uint16_t *argw, int n) {
     CPU *cpu = g_cpu;
     if (!pseg) return 0;
     /* The WNDPROC runs re-entrantly (CreateWindow delivers WM_NCCREATE/CREATE
@@ -167,11 +178,7 @@ static uint16_t call_guest_wndproc(uint16_t pseg, uint16_t poff,
     uint16_t saved_exc_head    = mem_read16(cpu, cpu->ss, 0x14);
     uint16_t saved_exc_head_16 = mem_read16(cpu, cpu->ss, 0x16);
     cpu->ds = cpu->es = recomp_dgroup_of_seg(pseg);   /* the proc's own module */
-    push16(cpu, hwnd);
-    push16(cpu, msg);
-    push16(cpu, wparam);
-    push16(cpu, (uint16_t)(lparam >> 16));
-    push16(cpu, (uint16_t)(lparam & 0xFFFF));
+    for (int i = 0; i < n; i++) push16(cpu, argw[i]);
     push16(cpu, cpu->cs); push16(cpu, 0);          /* far return frame */
     dispatch_far(cpu, pseg, poff);
     uint16_t ret = cpu->ax;
@@ -186,6 +193,13 @@ static uint16_t call_guest_wndproc(uint16_t pseg, uint16_t poff,
     mem_write16(cpu, cpu->ss, 0x14, saved_exc_head);
     mem_write16(cpu, cpu->ss, 0x16, saved_exc_head_16);
     return ret;
+}
+
+/* WNDPROC(hWnd, uMsg, wParam, lParam). */
+static uint16_t call_guest_wndproc(uint16_t pseg, uint16_t poff,
+                                   uint16_t hwnd, uint16_t msg, uint16_t wparam, uint32_t lparam) {
+    uint16_t a[5] = { hwnd, msg, wparam, (uint16_t)(lparam >> 16), (uint16_t)lparam };
+    return recomp_call_guest(pseg, poff, a, 5);
 }
 
 /* Structural/creation messages carry host-only data (CREATESTRUCT/MINMAXINFO/
@@ -239,6 +253,15 @@ static LRESULT CALLBACK host_wndproc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
        which is exactly what happened the first time a valid serial let the
        wizard actually finish a dialog. */
     if (msg == WM_DESTROY) {
+        /* RecompGame.destroy_message: the guest hears it first. CivNet's
+           framework unlinks a child window from its parent's list there; not
+           told, it re-linked a new child at the freed one's address and the
+           parent's list became a loop. */
+        if (recomp_game.destroy_message) {
+            uint16_t ps, po;
+            hwnd_proc(hWnd, &ps, &po);
+            call_guest_wndproc(ps, po, put_hwnd(hWnd), WM_DESTROY, 0, 0);
+        }
         if (hWnd == g_main_hwnd) { PostQuitMessage(0); return 0; }
         return 0;
     }
@@ -360,7 +383,13 @@ void USER_REGISTERCLASS(CPU *cpu) {
         wc.lpszClassName = c->name;
         RegisterClassA(&wc);
     }
-    if (c) { c->seg = pseg; c->off = poff; }
+    if (c) {
+        c->seg = pseg; c->off = poff;
+        c->style     = mem_read16(cpu, seg, off);
+        c->cls_extra = mem_read16(cpu, seg, (uint16_t)(off + 6));
+        c->wnd_extra = mem_read16(cpu, seg, (uint16_t)(off + 8));
+        c->hinst     = mem_read16(cpu, seg, (uint16_t)(off + 10));
+    }
 
     fprintf(stderr, "[win32] RegisterClass(\"%s\") -> guest WNDPROC seg%u:%04X\n",
             name, pseg, poff);
@@ -407,6 +436,16 @@ void USER_CREATEWINDOW(CPU *cpu) {
        GetClientRect, and make the overlay a child filling it. One window, one
        drawing surface. RECOMP_DESKTOP=1 keeps the original two-window layout. */
     int as_child = 0;
+    /* real_windows (CivNet): the game ran full screen and places its pop-ups
+       in screen coordinates. Each becomes a child of the main frame where the
+       game puts it, so the main frame's client area is the guest's screen. */
+    if (recomp_game.real_windows && !getenv("RECOMP_DESKTOP") && g_main_hwnd
+        && (style & WS_POPUP) && !(style & WS_CHILD)) {
+        as_child = 1;
+        style = (style & ~(uint32_t)(WS_POPUP | WS_CAPTION | WS_SYSMENU)) | WS_CHILD;
+        parent = g_main_hwnd;
+        if (x == (int16_t)0x8000) x = y = 0;
+    } else
     if (!getenv("RECOMP_DESKTOP") && g_main_hwnd && !g_screen_hwnd
         && (style & WS_POPUP) && !(style & WS_CHILD)) {
         as_child = 1;
@@ -420,7 +459,9 @@ void USER_CREATEWINDOW(CPU *cpu) {
     HWND hw = CreateWindowExA(0, hostcls, title, (DWORD)style, x, y, w, h,
                               parent, NULL, GetModuleHandle(NULL), NULL);
     uint16_t gh = hw ? put_hwnd(hw) : 0;
-    if (hw && !g_main_hwnd) {
+    /* real_windows: the main frame is the first one with a caption (CivNet
+       makes a hidden helper window before it). */
+    if (hw && !g_main_hwnd && (!recomp_game.real_windows || (style & WS_CAPTION) == WS_CAPTION)) {
         g_main_hwnd = hw;
         if (!getenv("RECOMP_DESKTOP")) {      /* client area == the engine's screen */
             /* The engine renders a fixed 640x480 playpen and reports exactly that
@@ -438,7 +479,7 @@ void USER_CREATEWINDOW(CPU *cpu) {
                          SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         }
     }
-    if (hw && !g_screen_hwnd
+    if (hw && !g_screen_hwnd && !recomp_game.real_windows
         && (as_child || ((style & WS_POPUP) && !(style & WS_CHILD))))
         g_screen_hwnd = hw;
     if (gh) {
@@ -554,7 +595,8 @@ void USER_UPDATEWINDOW(CPU *cpu) {
  * XDrawPort's brush creation throws "exception 2" at WDRAW.CPP:1935 the moment
  * CreateSolidBrush comes back 0, which is where the first real frame died. */
 void GDI_CREATESOLIDBRUSH(CPU *cpu) {          /* (COLORREF@0) */
-    COLORREF c = (COLORREF)b_a32(cpu, 0);
+    COLORREF c = (COLORREF)recomp_guest_color(b_a32(cpu, 0));
+    if (getenv("RECOMP_LOG_COLOR")) fprintf(stderr, "[color] brush %08lX -> %06lX\n", (unsigned long)b_a32(cpu, 0), (unsigned long)c);
     cpu->ax = put_hgdi(CreateSolidBrush(c));
     b_ret(cpu, 4);
 }
@@ -562,14 +604,14 @@ void GDI_CREATESOLIDBRUSH(CPU *cpu) {          /* (COLORREF@0) */
 void GDI_CREATEPEN(CPU *cpu) {                 /* (style@6, width@4, colour@0) */
     int style = (int16_t)b_a16(cpu, 6);
     int width = (int16_t)b_a16(cpu, 4);
-    COLORREF c = (COLORREF)b_a32(cpu, 0);
+    COLORREF c = (COLORREF)recomp_guest_color(b_a32(cpu, 0));
     cpu->ax = put_hgdi(CreatePen(style, width, c));
     b_ret(cpu, 8);
 }
 
 void GDI_GETSTOCKOBJECT(CPU *cpu) {            /* (index@0) */
     uint16_t g = put_hgdi(GetStockObject((int)(int16_t)b_a16(cpu, 0)));
-    if (g) g_gdi_stock[g] = 1;
+    if (g) g_gdi_stock[g - GDI_BASE] = 1;
     cpu->ax = g;
     b_ret(cpu, 2);
 }
@@ -600,7 +642,7 @@ void GDI_SELECTOBJECT(CPU *cpu) {              /* (hdc@2, hgdiobj@0) -> previous
 void GDI_DELETEOBJECT(CPU *cpu) {              /* (hgdiobj@0) */
     uint16_t g = b_a16(cpu, 0);
     HGDIOBJ o = get_hgdi(g);
-    if (o && !g_gdi_stock[g]) { DeleteObject(o); g_gdi[g] = NULL; }
+    if (o && g >= GDI_BASE && !g_gdi_stock[g - GDI_BASE]) { DeleteObject(o); g_gdi[g - GDI_BASE] = NULL; }
     cpu->ax = 1;
     b_ret(cpu, 2);
 }
@@ -622,6 +664,99 @@ void GDI_DELETEDC(CPU *cpu) {                  /* (hdc@0) */
     b_ret(cpu, 2);
 }
 
+static uint8_t *b_flat(CPU *cpu, uint16_t seg, uint16_t off, uint32_t len);
+
+/* EnumFontFamilies(hdc@12, lpszFamily@8/10, lpEnumFontProc@4/6, lParam@0):
+ * purge 14. Each family Windows has is handed to the
+ * guest's FONTENUMPROC(lpelf, lpntm, FontType, lParam) as a Win16 ENUMLOGFONT
+ * and NEWTEXTMETRIC in guest memory; a 0 from it stops the walk. CivNet looks
+ * for its own font (CIVFONTS.FON, added with AddFontResource) this way and,
+ * told of none, drew no text at all. */
+static struct { uint16_t sel; uint32_t proc, lparam; uint16_t ret; int called; } g_efs;
+
+static int CALLBACK efs_cb(const LOGFONTA *lf, const TEXTMETRICA *tm, DWORD type, LPARAM unused) {
+    (void)unused;
+    CPU *cpu = g_cpu;
+    uint16_t s = g_efs.sel;
+    /* ENUMLOGFONT at 0: LOGFONT (50) + elfFullName[64] + elfStyle[32] */
+    for (int i = 0; i < 256; i++) mem_write8(cpu, s, (uint16_t)i, 0);
+    int16_t w5[5] = { (int16_t)lf->lfHeight, (int16_t)lf->lfWidth, (int16_t)lf->lfEscapement,
+                      (int16_t)lf->lfOrientation, (int16_t)lf->lfWeight };
+    for (int i = 0; i < 5; i++) mem_write16(cpu, s, (uint16_t)(i * 2), (uint16_t)w5[i]);
+    uint8_t b8[8] = { lf->lfItalic, lf->lfUnderline, lf->lfStrikeOut, lf->lfCharSet, lf->lfOutPrecision,
+                      lf->lfClipPrecision, lf->lfQuality, lf->lfPitchAndFamily };
+    for (int i = 0; i < 8; i++) mem_write8(cpu, s, (uint16_t)(10 + i), b8[i]);
+    for (int i = 0; i < 31 && lf->lfFaceName[i]; i++) {
+        mem_write8(cpu, s, (uint16_t)(18 + i), (uint8_t)lf->lfFaceName[i]);
+        mem_write8(cpu, s, (uint16_t)(50 + i), (uint8_t)lf->lfFaceName[i]);   /* elfFullName */
+    }
+    /* NEWTEXTMETRIC at 160: 8 ints, 9 bytes, 3 ints, then ntm fields */
+    uint16_t t = 160;
+    int16_t ti[8] = { (int16_t)tm->tmHeight, (int16_t)tm->tmAscent, (int16_t)tm->tmDescent,
+                      (int16_t)tm->tmInternalLeading, (int16_t)tm->tmExternalLeading,
+                      (int16_t)tm->tmAveCharWidth, (int16_t)tm->tmMaxCharWidth, (int16_t)tm->tmWeight };
+    for (int i = 0; i < 8; i++) mem_write16(cpu, s, (uint16_t)(t + i * 2), (uint16_t)ti[i]);
+    uint8_t tb[9] = { tm->tmItalic, tm->tmUnderlined, tm->tmStruckOut, (uint8_t)tm->tmFirstChar,
+                      (uint8_t)tm->tmLastChar, (uint8_t)tm->tmDefaultChar, (uint8_t)tm->tmBreakChar,
+                      tm->tmPitchAndFamily, tm->tmCharSet };
+    for (int i = 0; i < 9; i++) mem_write8(cpu, s, (uint16_t)(t + 16 + i), tb[i]);
+    int16_t t3[3] = { (int16_t)tm->tmOverhang, (int16_t)tm->tmDigitizedAspectX, (int16_t)tm->tmDigitizedAspectY };
+    for (int i = 0; i < 3; i++) mem_write16(cpu, s, (uint16_t)(t + 25 + i * 2), (uint16_t)t3[i]);
+    /* PASCAL: lpelf (seg, off), lpntm (seg, off), FontType, lParam (hi, lo) */
+    uint16_t args[7] = { s, 0, s, t, (uint16_t)(type & 7), (uint16_t)(g_efs.lparam >> 16), (uint16_t)g_efs.lparam };
+    g_efs.called++;
+    g_efs.ret = recomp_call_guest((uint16_t)(g_efs.proc >> 16), (uint16_t)g_efs.proc, args, 7);
+    return g_efs.ret != 0;
+}
+
+void GDI_ENUMFONTFAMILIES(CPU *cpu) {
+    uint32_t lparam = b_a32(cpu, 0);
+    uint16_t po = b_a16(cpu, 4), ps = b_a16(cpu, 6);
+    uint16_t fo = b_a16(cpu, 8), fs = b_a16(cpu, 10);
+    uint16_t g = b_a16(cpu, 12);
+    char fam[64] = "";
+    if (fs) b_asciiz(cpu, fs, fo, fam, sizeof fam);
+    if (!g_efs.sel) g_efs.sel = cpu_alloc_selector(cpu, 256);
+    g_efs.proc = ((uint32_t)ps << 16) | po;
+    g_efs.lparam = lparam;
+    g_efs.ret = 1;
+    g_efs.called = 0;
+    HDC dc = get_hdc(g), own = NULL;
+    if (!dc) dc = own = GetDC(NULL);
+    LOGFONTA lf = { 0 };
+    lf.lfCharSet = DEFAULT_CHARSET;
+    if (fam[0]) lstrcpynA(lf.lfFaceName, fam, LF_FACESIZE);
+    if (ps) EnumFontFamiliesExA(dc, &lf, (FONTENUMPROCA)efs_cb, 0, 0);
+    if (own) ReleaseDC(NULL, own);
+    fprintf(stderr, "[gdi] EnumFontFamilies(\"%s\") -> %d to the guest\n", fam, g_efs.called);
+    cpu->ax = g_efs.ret;
+    b_ret(cpu, 14);
+}
+
+/* CreateBitmap(nWidth@10, nHeight@8, cPlanes@6, cBitsPixel@4, lpBits@0/2).
+ * Win16 and Win32 both want each row padded to a WORD, so the bits go as is.
+ * CivNet makes its buttons' and list icons' masks with it. */
+void GDI_CREATEBITMAP(CPU *cpu) {
+    int w = (int16_t)b_a16(cpu, 10), h = (int16_t)b_a16(cpu, 8);
+    UINT planes = b_a16(cpu, 6) & 0xFF, bpp = b_a16(cpu, 4) & 0xFF;
+    uint16_t bo = b_a16(cpu, 0), bs = b_a16(cpu, 2);
+    const void *bits = NULL;
+    if (bs && w > 0 && h > 0)
+        bits = b_flat(cpu, bs, bo, (uint32_t)(((w * (int)bpp + 15) / 16) * 2) * (uint32_t)h * planes);
+    HBITMAP bm = (w > 0 && h > 0) ? CreateBitmap(w, h, planes, bpp, bits) : NULL;
+    cpu->ax = bm ? put_hgdi(bm) : 0;
+    b_ret(cpu, 12);
+}
+
+/* GetBitmapDimensionEx(hbm@4, lpSize@0/2): the dimension SetBitmapDimensionEx
+ * recorded, which nobody sets: 0 x 0. */
+void GDI_GETBITMAPDIMENSIONEX(CPU *cpu) {
+    uint16_t po = b_a16(cpu, 0), ps = b_a16(cpu, 2);
+    if (ps) { mem_write16(cpu, ps, po, 0); mem_write16(cpu, ps, (uint16_t)(po + 2), 0); }
+    cpu->ax = 1;
+    b_ret(cpu, 6);
+}
+
 void GDI_CREATECOMPATIBLEBITMAP(CPU *cpu) {    /* (hdc@4, w@2, h@0) */
     uint16_t g0 = b_a16(cpu, 4);
     HDC dc = wing_is_dc(g0) ? wing_state_dc(cpu, g0) : get_hdc(g0);
@@ -638,6 +773,30 @@ void GDI_CREATECOMPATIBLEBITMAP(CPU *cpu) {    /* (hdc@4, w@2, h@0) */
  * given rectangles like (5,25)-(5,38), zero columns across, so DrawText clipped
  * them to nothing and all that survived was the underline under the accelerator.
  * That is the mangled text at the top of the shelf. */
+/* GetTextExtentPoint(hdc@10, lpsz@6/8, cb@4, lpSize@0/2) -> BOOL, the size
+ * written to *lpSize. Unanswered, CivNet sized its dialog's text lines from
+ * whatever the stack held: 8,619 pixels wide. */
+void GDI_GETTEXTEXTENTPOINT(CPU *cpu) {
+    uint16_t g = b_a16(cpu, 10);
+    uint16_t so = b_a16(cpu, 6), ss = b_a16(cpu, 8);
+    int n = (int16_t)b_a16(cpu, 4);
+    uint16_t po = b_a16(cpu, 0), ps = b_a16(cpu, 2);
+    extern HDC wing_state_dc(CPU *, uint16_t);
+    HDC dc = wing_is_dc(g) ? wing_state_dc(cpu, g) : get_hdc(g);
+    char buf[512] = "";
+    if (ss) b_asciiz(cpu, ss, so, buf, sizeof buf);
+    if (n < 0 || n > (int)strlen(buf)) n = (int)strlen(buf);
+    SIZE sz = { 0, 0 };
+    if (dc) GetTextExtentPoint32A(dc, buf, n, &sz);
+    if (getenv("RECOMP_LOG_TEXT")) fprintf(stderr, "[extp] \"%.*s\" -> %ldx%ld\n", n, buf, (long)sz.cx, (long)sz.cy);
+    if (ps) {
+        mem_write16(cpu, ps, po, (uint16_t)sz.cx);
+        mem_write16(cpu, ps, (uint16_t)(po + 2), (uint16_t)sz.cy);
+    }
+    cpu->ax = 1;
+    b_ret(cpu, 12);
+}
+
 void GDI_GETTEXTEXTENT(CPU *cpu) {
     uint16_t g  = b_a16(cpu, 6);
     uint16_t so = b_a16(cpu, 2), ss = b_a16(cpu, 4);
@@ -827,6 +986,67 @@ void GDI_TEXTOUT(CPU *cpu) {
     b_ret(cpu, 12);
 }
 
+/* GDI_BITBLT's non-WinG half (win16_impl.c). Returns 0 to let the WinG path
+ * have it. A WinG destination is bracketed like any drawing call (draw_dc). */
+int recomp_gdi_bitblt(CPU *cpu) {
+    uint16_t gd = b_a16(cpu, 18), gs = b_a16(cpu, 8);
+    int x = (int16_t)b_a16(cpu, 16), y = (int16_t)b_a16(cpu, 14);
+    int w = (int16_t)b_a16(cpu, 12), h = (int16_t)b_a16(cpu, 10);
+    int xs = (int16_t)b_a16(cpu, 6), ys = (int16_t)b_a16(cpu, 4);
+    DWORD rop = b_a32(cpu, 0);
+    HDC src = gs ? get_hdc(gs) : NULL;
+    if (gs && !src) return 0;
+    RECT r = { x, y, x + w, y + h }, used = r;
+    int wing = 0;
+    HDC dst = draw_dc(cpu, gd, r, &used, &wing);
+    cpu->ax = (uint16_t)(dst ? BitBlt(dst, x, y, w, h, src, xs, ys, rop) : 0);
+    if (dst && wing) wing_draw_end(cpu, gd, &used);
+    if (getenv("RECOMP_LOG_BLT")) { static int k; if (k++ < 200)
+        fprintf(stderr, "[gdiblt] %u(%d,%d %dx%d) <- %u(%d,%d) rop %06lX -> %u\n",
+                gd, x, y, w, h, gs, xs, ys, (unsigned long)rop, cpu->ax); }
+    b_ret(cpu, 20);
+    return 1;
+}
+
+/* ExtTextOut(hdc@20, x@18, y@16, fuOptions@14, lprc@10/12, lpString@6/8,
+ * cbCount@4, lpDx@0/2): TextOut with an optional clip/opaque rectangle and
+ * per-character advances. CivNet draws every label of its own controls with it. */
+void GDI_EXTTEXTOUT(CPU *cpu) {
+    uint16_t g = b_a16(cpu, 20);
+    int x = (int16_t)b_a16(cpu, 18), y = (int16_t)b_a16(cpu, 16);
+    UINT opt = b_a16(cpu, 14);
+    uint16_t ro = b_a16(cpu, 10), rs = b_a16(cpu, 12);
+    uint16_t so = b_a16(cpu, 6), ss = b_a16(cpu, 8);
+    int n = (int16_t)b_a16(cpu, 4);
+    uint16_t dxo = b_a16(cpu, 0), dxs = b_a16(cpu, 2);
+    char buf[512];
+    INT dx[512];
+    if (n < 0 || !ss) n = 0;
+    if (n > (int)sizeof buf) n = sizeof buf;
+    for (int i = 0; i < n; i++) buf[i] = (char)mem_read8(cpu, ss, (uint16_t)(so + i));
+    for (int i = 0; dxs && i < n; i++) dx[i] = (int16_t)mem_read16(cpu, dxs, (uint16_t)(dxo + i * 2));
+    RECT rc = { 0 }, *prc = NULL;
+    if (rs) {
+        rc.left = (int16_t)mem_read16(cpu, rs, ro); rc.top = (int16_t)mem_read16(cpu, rs, (uint16_t)(ro + 2));
+        rc.right = (int16_t)mem_read16(cpu, rs, (uint16_t)(ro + 4)); rc.bottom = (int16_t)mem_read16(cpu, rs, (uint16_t)(ro + 6));
+        prc = &rc;
+    }
+    RECT r = prc ? rc : (RECT){ x, y - 64, x + 2048, y + 64 }, used = r;
+    int wing = 0;
+    HDC dc = (n || prc) ? draw_dc(cpu, g, r, &used, &wing) : NULL;
+    if (getenv("RECOMP_LOG_TEXT")) { static int k; if (k++ < 60)
+        fprintf(stderr, "[text] ExtTextOut hdc=%u (%d,%d) opt=%X \"%.*s\"\n", g, x, y, opt, n, buf); }
+    cpu->ax = (uint16_t)(dc ? ExtTextOutA(dc, x, y, opt, prc, buf, (UINT)n, dxs ? dx : NULL) : 0);
+    if (dc && wing) wing_draw_end(cpu, g, &used);
+    b_ret(cpu, 22);
+}
+
+void GDI_GETTEXTALIGN(CPU *cpu) {              /* (hdc@0) */
+    HDC dc = get_hdc(b_a16(cpu, 0));
+    cpu->ax = (uint16_t)(dc ? GetTextAlign(dc) : 0);
+    b_ret(cpu, 2);
+}
+
 /* UnrealizeObject(hgdiobj): resets a brush origin or a palette's mapping;
  * Win32 does both for itself. */
 void GDI_UNREALIZEOBJECT(CPU *cpu) { cpu->ax = 1; b_ret(cpu, 2); }
@@ -874,7 +1094,7 @@ void USER_DRAWTEXT(CPU *cpu) {
     b_asciiz(cpu, ss, so, buf, sizeof buf);
     RECT used = r; int wing = 0;
     HDC dc = draw_dc(cpu, g, r, &used, &wing);
-    if (getenv("RECOMP_LOG_TEXT")) { static int n; if (n++ < 20)
+    if (getenv("RECOMP_LOG_TEXT")) { static int n; if (n++ < 2000)
         fprintf(stderr, "[text] DrawText hdc=%u \"%s\" n=%d rect=(%ld,%ld)-(%ld,%ld) fmt=%04X\n",
             g, buf, n, (long)r.left, (long)r.top, (long)r.right, (long)r.bottom, fmt); }
     cpu->ax = (uint16_t)(dc ? DrawTextA(dc, buf, len, &r, fmt) : 0);
@@ -972,7 +1192,7 @@ void USER_FRAMERECT(CPU *cpu) {
 void GDI_SETBKCOLOR(CPU *cpu) {                /* (hdc@4, COLORREF@0) */
     uint16_t g = b_a16(cpu, 4);
     HDC dc = wing_is_dc(g) ? wing_state_dc(cpu, g) : get_hdc(g);
-    COLORREF prev = dc ? SetBkColor(dc, (COLORREF)b_a32(cpu, 0)) : 0;
+    COLORREF prev = dc ? SetBkColor(dc, (COLORREF)recomp_guest_color(b_a32(cpu, 0))) : 0;
     cpu->ax = (uint16_t)(prev & 0xFFFF); cpu->dx = (uint16_t)(prev >> 16);
     b_ret(cpu, 6);
 }
@@ -980,7 +1200,8 @@ void GDI_SETBKCOLOR(CPU *cpu) {                /* (hdc@4, COLORREF@0) */
 void GDI_SETTEXTCOLOR(CPU *cpu) {              /* (hdc@4, COLORREF@0) */
     uint16_t g = b_a16(cpu, 4);
     HDC dc = wing_is_dc(g) ? wing_state_dc(cpu, g) : get_hdc(g);
-    COLORREF prev = dc ? SetTextColor(dc, (COLORREF)b_a32(cpu, 0)) : 0;
+    if (getenv("RECOMP_LOG_COLOR")) fprintf(stderr, "[color] text %08lX -> %06lX\n", (unsigned long)b_a32(cpu, 0), (unsigned long)recomp_guest_color(b_a32(cpu, 0)));
+    COLORREF prev = dc ? SetTextColor(dc, (COLORREF)recomp_guest_color(b_a32(cpu, 0))) : 0;
     cpu->ax = (uint16_t)(prev & 0xFFFF); cpu->dx = (uint16_t)(prev >> 16);
     b_ret(cpu, 6);
 }
@@ -1017,6 +1238,9 @@ void USER_FILLRECT(CPU *cpu) {                 /* (hdc@6, lpRect@2/4, hbr@0) */
         RECT used = r; int wing = 0;
         HDC dc = draw_dc(cpu, g, r, &used, &wing);
         if (dc) FillRect(dc, &r, br);
+        if (getenv("RECOMP_LOG_COLOR")) { LOGBRUSH lb = { 0 }; GetObjectA(br, sizeof lb, &lb);
+            fprintf(stderr, "[color] fill hdc=%u (%ld,%ld)-(%ld,%ld) brush %u = %06lX%s\n", g, r.left, r.top,
+                    r.right, r.bottom, b_a16(cpu, 0), (unsigned long)lb.lbColor, wing ? " wing" : ""); }
         if (dc && wing) wing_draw_end(cpu, g, &used);
     }
     cpu->ax = 1;
@@ -1070,6 +1294,50 @@ void MMSYSTEM_TIMEGETDEVCAPS(CPU *cpu) {   /* (lpTimeCaps@2/4, cb@0) */
     cpu->ax = 0;                            /* TIMERR_NOERROR */
     b_ret(cpu, 6);
 }
+
+/* ---- window queries (CivNet) ---- */
+void USER_GETPARENT(CPU *cpu) {            /* (hwnd@0) */
+    HWND p = GetParent(get_hwnd(b_a16(cpu, 0)));
+    cpu->ax = p ? put_hwnd(p) : 0;
+    b_ret(cpu, 2);
+}
+void USER_ISWINDOW(CPU *cpu) {             /* (hwnd@0) */
+    HWND h = get_hwnd(b_a16(cpu, 0));
+    cpu->ax = h && IsWindow(h);
+    b_ret(cpu, 2);
+}
+void USER_ISCHILD(CPU *cpu) {              /* (hwndParent@2, hwnd@0) */
+    cpu->ax = (uint16_t)IsChild(get_hwnd(b_a16(cpu, 2)), get_hwnd(b_a16(cpu, 0)));
+    b_ret(cpu, 4);
+}
+void USER_VALIDATERECT(CPU *cpu) {         /* (hwnd@4, lpRect@0/2) */
+    uint16_t off = b_a16(cpu, 0), seg = b_a16(cpu, 2);
+    HWND h = get_hwnd(b_a16(cpu, 4));
+    if (seg) {
+        RECT r = { (int16_t)mem_read16(cpu, seg, off), (int16_t)mem_read16(cpu, seg, (uint16_t)(off + 2)),
+                   (int16_t)mem_read16(cpu, seg, (uint16_t)(off + 4)), (int16_t)mem_read16(cpu, seg, (uint16_t)(off + 6)) };
+        ValidateRect(h, &r);
+    } else {
+        ValidateRect(h, NULL);
+    }
+    b_ret(cpu, 6);
+}
+/* MapWindowPoints(hwndFrom@8, hwndTo@6, lpPoints@2/4, cPoints@0) */
+void USER_MAPWINDOWPOINTS(CPU *cpu) {
+    HWND from = get_hwnd(b_a16(cpu, 8)), to = get_hwnd(b_a16(cpu, 6));
+    uint16_t off = b_a16(cpu, 2), seg = b_a16(cpu, 4), n = b_a16(cpu, 0);
+    for (uint16_t i = 0; seg && i < n; i++) {
+        uint16_t o = (uint16_t)(off + i * 4);
+        POINT p = { (int16_t)mem_read16(cpu, seg, o), (int16_t)mem_read16(cpu, seg, (uint16_t)(o + 2)) };
+        MapWindowPoints(from, to, &p, 1);
+        mem_write16(cpu, seg, o, (uint16_t)p.x);
+        mem_write16(cpu, seg, (uint16_t)(o + 2), (uint16_t)p.y);
+    }
+    b_ret(cpu, 10);
+}
+/* GetFreeSystemResources(fuSysResource@0): a percentage. 0 made CivNet warn
+ * that "system resources are dangerously low" at every start. */
+void USER_GETFREESYSTEMRESOURCES(CPU *cpu) { cpu->ax = 90; b_ret(cpu, 2); }
 
 void USER_GETDLGITEMINT(CPU *cpu) {        /* (hwnd@8, id@6, lpXlated@2/4, sgn@0) */
     uint16_t off = b_a16(cpu, 2), seg = b_a16(cpu, 4);
@@ -1718,6 +1986,11 @@ void USER_PEEKMESSAGE(CPU *cpu) {
     MSG m;
     BOOL r = PeekMessageA(&m, filt, lo, hi, wRemove ? PM_REMOVE : PM_NOREMOVE);
     if (r) write_msg(cpu, mseg, moff, &m);
+    /* RECOMP_LOG_INPUT: the keys and clicks the game's own loop takes. */
+    if (r && wRemove && getenv("RECOMP_LOG_INPUT") &&
+        ((m.message >= WM_KEYFIRST && m.message <= WM_KEYLAST) || (m.message >= WM_MOUSEFIRST && m.message <= WM_MOUSELAST)))
+        fprintf(stderr, "[input] peek %04X wp=%u lp=%08lX hwnd=%p (guest %u)\n", m.message, (unsigned)m.wParam,
+                (unsigned long)m.lParam, (void *)m.hwnd, put_hwnd(m.hwnd));
     cpu->ax = (uint16_t)(r ? 1 : 0);
     b_ret(cpu, 12);
 }
@@ -1932,7 +2205,24 @@ void USER_SETWINDOWWORD(CPU *cpu) {         /* (hwnd@4, nIndex@2, wNewWord@0) */
     b_ret(cpu, 6);
 }
 
-void USER_GETCLASSWORD(CPU *cpu) { cpu->ax = 0; b_ret(cpu, 4); }   /* (hwnd, nIndex) */
+/* GetClassWord(hwnd@2, nIndex@0): what RegisterClass was given. CivNet
+ * subclasses its controls and keeps the old WNDPROC in the window's last
+ * extra bytes, found from GCW_CBWNDEXTRA; answered 0, it read GWL_WNDPROC
+ * instead, called itself, and recursed until the host stack ran out. */
+void USER_GETCLASSWORD(CPU *cpu) {
+    HWND h = get_hwnd(b_a16(cpu, 2));
+    int idx = (int16_t)b_a16(cpu, 0);
+    char nm[64] = "";
+    GuestClass *c = h && GetClassNameA(h, nm, sizeof nm) ? cls_find(nm) : NULL;
+    cpu->ax = 0;
+    if (c) switch (idx) {
+        case -18: cpu->ax = c->wnd_extra; break;   /* GCW_CBWNDEXTRA */
+        case -20: cpu->ax = c->cls_extra; break;   /* GCW_CBCLSEXTRA */
+        case -26: cpu->ax = c->style; break;       /* GCW_STYLE */
+        case -16: cpu->ax = c->hinst; break;       /* GCW_HMODULE */
+    }
+    b_ret(cpu, 4);
+}
 void USER_SETCLASSWORD(CPU *cpu) { cpu->ax = 0; b_ret(cpu, 6); }   /* (hwnd, nIndex, w) */
 
 void USER_GETCLASSNAME(CPU *cpu) {          /* (hwnd@6, lpClassName@2/4, nMax@0) */
