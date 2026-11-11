@@ -41,6 +41,32 @@ versions follow [SemVer](https://semver.org/).
   (`recomp_ehframe_t.off`), not by assuming `push ebp; mov ebp, esp`.
   `RECOMP_EH_ENTER()` is `RECOMP_EH_FRAME(4, NULL)`, so existing lifts (and
   setjmp landing pads) behave as before.
+- native32: `modules32.c`, the loader's part for a program made of several
+  lifted modules. It maps each rebased module at its base, binds them all with
+  one shim array, runs each DLL's `DllMain` after the guest modules it imports,
+  and answers `LoadLibrary{A,W,ExA}`, `FreeLibrary`, `GetProcAddress`,
+  `GetModuleHandle{A,W}` and `GetModuleFileName{A,W}` for guest modules from the
+  table. Every multi-module host carried its own copy (gunman, ut99, kf, tw,
+  shogo...). Opt-in: a host that does not call `native32_modules_map` is
+  unchanged. First user: Sambar Server (plug-in DLLs loaded from its config).
+- `tools/pe/rebase.py`: give every module its own base before disassembly
+  (applies the HIGHLOW relocations to a copy), keeping a module's linked base
+  when it is free and otherwise the lowest free 1 MB slot above it; writes the
+  layout as JSON for the host. Extracted from gunman's and ut99's copies.
+- `tools/lift/drive32.py`: `lift_image()`, the per-module lift loop the
+  project drivers each carried: find_splits, C++ catch resume points, targets
+  outside the catalog in rounds, and alias stubs. An entry whose code another
+  body already lifts is a stub into that body's local dispatch
+  (`generate.alias_stub`) instead of a copy of the rest of the body, and only
+  when the host body really has the case. On Sambar Server it took the C from
+  ~220 MB to 105 MB; one 20 KB function with ~50 aliases had been an 84 MB
+  file that MSVC could not finish in an hour. A body whose indirect jumps are
+  all jump tables labels only the tables' arms (`indirect_targets`), not every
+  instruction: that function's local switch went from 8,018 cases to 155, and
+  the whole Sambar build from over an hour at `/O2` to 3 minutes.
+- `tools/assets/extract_nsis.py`: extract the NSIS 2.0 betas (2002-2006,
+  24-byte script entries) that 7-Zip lists as `NSIS-2 BadCmd=` with 0 files,
+  without running the installer.
 
 ### Fixed
 - recomp32 loader: when the image's range is already reserved, it commits
