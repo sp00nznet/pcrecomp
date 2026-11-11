@@ -156,10 +156,11 @@ versions follow [SemVer](https://semver.org/).
   `IDirectSound3DListener`; the mix applies inverse-distance attenuation
   (minimum and maximum distance, listener roll-off) and pans by the side of
   the listener the sound is on, in normal and head-relative modes. Cones,
-  velocity and Doppler are accepted and ignored. `DirectSoundCreate8`,
-  `CLSID_DirectSound8` and the `IDirectSoundBuffer8` methods answer, without
-  effects (`SetFX` returns `DSERR_CONTROLUNAVAIL`). Operation Flashpoint
-  places its sounds with it (#176, by [@neurocontrarian](https://github.com/neurocontrarian)).
+  velocity and Doppler are accepted and ignored; a 3D buffer has no pan
+  (as on Windows), and its 3D interface keeps the buffer alive.
+  `DirectSoundCreate8`, `CLSID_DirectSound8` and the `IDirectSoundBuffer8`
+  methods answer, without effects (`SetFX` returns `DSERR_CONTROLUNAVAIL`).
+  Operation Flashpoint places its sounds with it (#176, by [@neurocontrarian](https://github.com/neurocontrarian)).
 - pe: `pdb2_ref.py` reads a Visual C++ 5/6 PDB (MSF 2.00, `_ST` symbol
   records), which llvm-pdbutil and `pdb_ref.py` cannot, into the same
   reference JSON, plus a `--seed-functions` list for disasm32. No external
