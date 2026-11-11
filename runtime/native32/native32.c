@@ -74,6 +74,16 @@ static DWORD g_mach_tls = TLS_OUT_OF_INDEXES;
 
 #define GUEST_STACK (4u << 20)
 
+/* Static TLS (__declspec(thread), Borland's threadvars): the guest reads its
+ * block as fs:[2Ch][index]. Windows sets that up only for modules its loader
+ * loaded, and the guest TIB is ours, so a guest module with a TLS directory
+ * (native32_map) gets a slot here, and each guest thread a copy of the
+ * template in make_tib. ponytail: TLS callbacks are not run; no title has had
+ * one. */
+#define MAX_TLS 8
+static struct { uint32_t start, end, zero; } g_tls[MAX_TLS];
+static int g_tls_n;
+
 /* A guest thread's TIB. Lifted code reads fs:[n] as MEM32(g_fs_base + n); the
  * real TEB stays the host's, so a guest SEH frame never lands on a chain
  * Windows walks. The PEB is the real one: code that reads fs:[30h] wants it. */
@@ -85,6 +95,16 @@ static uint32_t make_tib(uint32_t lo, uint32_t hi) {
     t[0x18 / 4] = (uint32_t)(uintptr_t)t;        /* Self                        */
     t[0x24 / 4] = GetCurrentThreadId();
     t[0x30 / 4] = __readfsdword(0x30);
+    if (g_tls_n) {
+        uint32_t* slots = (uint32_t*)calloc(MAX_TLS, 4);
+        for (int i = 0; i < g_tls_n; i++) {
+            uint32_t n = g_tls[i].end - g_tls[i].start;
+            uint8_t* blk = (uint8_t*)calloc(1, n + g_tls[i].zero + 16);
+            memcpy(blk, (void*)(uintptr_t)g_tls[i].start, n);
+            slots[i] = (uint32_t)(uintptr_t)blk;
+        }
+        t[0x2C / 4] = (uint32_t)(uintptr_t)slots;
+    }
     return (uint32_t)(uintptr_t)t;
 }
 
@@ -377,6 +397,21 @@ uint32_t native32_map(const char* path, uint32_t base) {
     g_mods[g_mod_n].span = span;
     strncpy(g_mods[g_mod_n++].name, file ? file + 1 : path, MAX_PATH - 1);
     IMAGE_NT_HEADERS32* nt = (IMAGE_NT_HEADERS32*)(uintptr_t)(base + ((IMAGE_DOS_HEADER*)(uintptr_t)base)->e_lfanew);
+    IMAGE_DATA_DIRECTORY td = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    IMAGE_TLS_DIRECTORY32* tl = td.VirtualAddress ? (IMAGE_TLS_DIRECTORY32*)(uintptr_t)(base + td.VirtualAddress) : NULL;
+    /* Only an image whose TLS directory names its own memory: a copy mapped
+     * away from its base with no relocations still names the original's
+     * (the selftest maps a copy of itself, whose index is the host's own). */
+    if (tl && g_tls_n < MAX_TLS && tl->AddressOfIndex - base < span && tl->StartAddressOfRawData - base < span) {
+        /* Its index, as the loader would write it. A thread whose TIB was
+         * made before this map has no block: map before running guest code. */
+        IMAGE_TLS_DIRECTORY32* t = tl;
+        g_tls[g_tls_n].start = t->StartAddressOfRawData;
+        g_tls[g_tls_n].end = t->EndAddressOfRawData;
+        g_tls[g_tls_n].zero = t->SizeOfZeroFill;
+        if (t->AddressOfIndex) *(uint32_t*)(uintptr_t)t->AddressOfIndex = (uint32_t)g_tls_n;
+        g_tls_n++;
+    }
     IMAGE_SECTION_HEADER* s = IMAGE_FIRST_SECTION(nt);
     for (int i = 0; i < nt->FileHeader.NumberOfSections; i++, s++) {
         DWORD old;
@@ -828,9 +863,36 @@ static void shim_VirtualAlloc(void) {
     g_esp += 4 + 4 * 4;
 }
 
+/* VirtualQuery on a lifted module reports what Windows would for a loaded
+ * image: MEM_IMAGE, allocated at the module's base. native32_map commits the
+ * image as private memory, and VC8+ CRTs check before they trust an
+ * exception registration: _ValidateEH3RN only runs a __try's scope table
+ * when VirtualQuery says the table is in an image, and otherwise declines
+ * the exception, so every __except was skipped. */
+static void shim_VirtualQuery(void) {
+    uint32_t* a = (uint32_t*)(uintptr_t)(g_esp + 4);
+    MEMORY_BASIC_INFORMATION* m = (MEMORY_BASIC_INFORMATION*)(uintptr_t)a[1];
+    g_eax = (uint32_t)VirtualQuery((void*)(uintptr_t)a[0], m, a[2]);
+    for (int i = 0; g_eax >= sizeof *m && i < g_mod_n; i++)
+        if (!g_mods[i].native && a[0] - g_mods[i].base < g_mods[i].span) {
+            m->AllocationBase = (void*)(uintptr_t)g_mods[i].base;
+            m->Type = MEM_IMAGE;
+        }
+    g_esp += 4 + 3 * 4;
+}
+
+/* With native32_guest_seh, any other code goes to the guest's own SEH chain
+ * first (seh32.c), and is raised for real only if no guest frame takes it. */
+#include "seh32.c"
+
+/* A C++ throw from a statically linked CRT goes to eh32's dispatch first
+ * (native32_cxx_raise returns only if nothing in the guest catches it). */
+int native32_cxx_raise(uint32_t n, uint32_t args);
+
 static void shim_RaiseException(void) {
     uint32_t* a = (uint32_t*)(uintptr_t)(g_esp + 4);
-    if (a[0] != 0x406D1388u)
+    if (a[0] == 0xE06D7363u) native32_cxx_raise(a[2], a[3]);
+    if (a[0] != 0x406D1388u && !(native32_guest_seh && seh_dispatch(a[0], a[1], a[2], a[3])))
         RaiseException(a[0], a[1], a[2], (const ULONG_PTR*)(uintptr_t)a[3]);
     g_esp += 4 + 4 * 4;
 }
@@ -847,12 +909,17 @@ X87CRT(CIacos) X87CRT(CIatan) X87CRT(CIexp) X87CRT(CIlog) X87CRT(CIlog10) X87CRT
 X87CRT(CIcosh) X87CRT(CItanh) X87CRT(CIpow) X87CRT(CIfmod) X87CRT(CIatan2)
 X87CRT(controlfp) X87CRT(control87)
 
+/* native32_set_codepage: the guest's ANSI code page (codepage.c). */
+#include "codepage.c"
+
 static native32_shim_t g_builtin[] = {
     { "CreateThread", shim_CreateThread },
     { "RaiseException", shim_RaiseException },
+    { "RtlUnwind", shim_RtlUnwind },
     { "TerminateThread", shim_TerminateThread },
     { "VirtualProtect", shim_VirtualProtect },
     { "VirtualAlloc", shim_VirtualAlloc },
+    { "VirtualQuery", shim_VirtualQuery },
     { "_CxxThrowException", native32_shim_CxxThrowException },
     { "_ftol", native32_shim_ftol },
     { "_CIsqrt", native32_shim_CIsqrt }, { "_CIsin", native32_shim_CIsin },
@@ -920,6 +987,7 @@ int native32_bind(uint32_t base, native32_shim_t* shims, int nshims) {
                     va = shims[i].va;
                     shimmed++;
                 }
+            if (!va && !guest && !by_ord && (va = codepage_func(nm)) != 0) shimmed++;
             if (!va) {
                 if (!guest && !h) h = LoadLibraryA(dll);
                 va = guest ? native32_export(guest, nm)
@@ -953,6 +1021,10 @@ static uint64_t __cdecl cb_run(uint32_t va, uint32_t* sp, uint32_t ecx) {
     mach_enter();
     regs_t saved;
     regs_save(&saved);
+    /* Called from guest code run natively on the guest stack: below it. */
+    uint32_t at = (uint32_t)(uintptr_t)sp;
+    if (at >= MEM32(g_fs_base + 8) && at < MEM32(g_fs_base + 4) && at < g_esp)   /* guest TIB's stack */
+        g_esp = (at - 64) & ~15u;
     g_esp -= BRIDGE_SLOTS * 4;
     memcpy((void*)(uintptr_t)g_esp, sp + 1, BRIDGE_SLOTS * 4);
     PUSH32(g_esp, RECOMP_RETADDR);
@@ -971,14 +1043,33 @@ static uint64_t __cdecl cb_run(uint32_t va, uint32_t* sp, uint32_t ecx) {
     return ((uint64_t)purge << 32) | eax;
 }
 
+/* Native code that is guest code run natively (gen_bridge: VCL's window
+ * procedure thunks) runs on the GUEST stack, and calls back into lifted code
+ * from there (the thunk jumps to StdWndProc). Run on that stack, the
+ * callback's host frames and the lifted function's guest frames grew down
+ * through the same memory, and the thunk's window procedure returned into
+ * garbage. So off the thread's own stack (TEB StackLimit..StackBase) the
+ * callback moves to the host stack below gen_bridge's anchor (fs:[14h]),
+ * which nothing uses while the native code runs, and cb_run puts the guest
+ * stack below the native caller's arguments. */
 static __declspec(naked) void cb_tramp(void) {
     __asm {
         mov  edx, esp            ; [ret][args]
+        cmp  esp, fs:[8]
+        jb   off_stack
+        cmp  esp, fs:[4]
+        jb   on_stack
+    off_stack:
+        mov  esp, fs:[0x14]
+        sub  esp, 16
+    on_stack:
+        push edx                 ; the native caller's esp
         push ecx
         push edx
         push eax                 ; the guest VA, planted by the VEH
         call cb_run
         add  esp, 12
+        pop  esp                 ; back on the caller's stack
         pop  ecx                 ; native return address
         add  esp, edx            ; pop what the guest callee popped
         jmp  ecx
@@ -1069,7 +1160,10 @@ static LONG CALLBACK native32_veh(EXCEPTION_POINTERS* ep) {
 
 /* ---------------------------------------------------------------- setup */
 
+static void eh32_init(void);
+
 void native32_init(void) {
+    eh32_init();
     /* Every Windows -> guest call relies on the guest's code faulting when it
      * is fetched. Windows enforces that for a /NXCOMPAT exe; Wine does not
      * unless DEP is asked for, and otherwise answers the first fetch by making

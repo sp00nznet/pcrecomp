@@ -39,6 +39,18 @@
  * DLL compared without regard to case. */
 typedef struct { const char* name; recomp_func_t fn; uint32_t va; } native32_shim_t;
 
+/* Run the guest in another ANSI code page than the system's (932 for a
+ * Japanese title on a Western Windows): CP_ACP in MultiByteToWideChar and the
+ * A functions that take text read the guest's strings in it (codepage.c).
+ * Call before native32_bind. 0 (the default) leaves the system's. */
+void native32_set_codepage(unsigned cp);
+
+/* Bind every import of this name, and every GetProcAddress for it, to a
+ * native function of the host's (same signature, called by the bridge like
+ * the real one). For DLLs the guest loads itself, which a shim by import
+ * name never sees. Call before native32_bind; up to 32. */
+void native32_redirect(const char* name, void* fn);
+
 /* Call once, before anything else. */
 void native32_init(void);
 
@@ -109,6 +121,16 @@ int native32_lift_in_native(const uint32_t* vas, int n);
  * by the built-in shims; a host can add a range itself. */
 void native32_add_generated(uint32_t lo, uint32_t size);
 int native32_is_generated(uint32_t va);
+
+/* Guest SEH (seh32.c): a guest exception is dispatched over the guest's own
+ * fs:[0] chain, and RtlUnwind unwinds it. A handler that takes an exception
+ * continues in its frame's function by a jump the lift cannot follow into a
+ * body further up the host stack; the host patches that jump (Delphi's
+ * _HandleAnyException `jmp ebx`) into this, which resumes at va inside the
+ * function that registered the frame RtlUnwind last stopped at. That function
+ * needs a landing pad (generate.py eh_resume). */
+void native32_seh_continue(uint32_t va);
+extern int native32_guest_seh;   /* 1: RaiseException goes to the guest chain */
 
 /* Diagnostics: set before running. */
 extern int native32_trace_native;     /* one line per native call */

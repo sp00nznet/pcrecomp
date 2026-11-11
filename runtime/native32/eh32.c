@@ -33,9 +33,26 @@
  *
  * Included at the end of native32.c, so hosts need no change to their build.
  *
- * ponytail: C++ frames only. A __try/__except (SEH, _except_handler3) frame
- * is skipped, not asked: its filter could catch a C++ throw, and its __finally
- * blocks do not run on the way past. Add when a title catches that way.
+ * A frame's ebp is the record + 12 whichever way its function was compiled:
+ * with `push ebp; mov ebp, esp` first, that is the function's own ebp (entry
+ * esp - 4); in a frame-pointer-omitted function (VC6 /O2 builds most C++
+ * frames that way: 488 of 489 in Galactic Battlegrounds) it is entry esp
+ * itself. The lifter says which (RECOMP_EH_FRAME's `off`).
+ *
+ * A game with the CRT linked in statically has no _CxxThrowException import:
+ * its own copy raises 0xE06D7363 with RaiseException, and native32_cxx_raise
+ * takes that to the same dispatch.
+ *
+ * __try/__except (_except_handler3) frames are guest code end to end, run by
+ * seh32.c over the guest's chain. The one step that is not an ordinary call
+ * is the handler's entry into the __except block, an indirect call to an
+ * address inside the function that installed the frame; recomp_eh_jump below
+ * takes it back to that body's landing pad, as it does __CxxFrameHandler's
+ * jump to a catch's continuation when the guest's own frame handler runs.
+ *
+ * ponytail: the C++ dispatch skips __try frames, not asks them: a filter
+ * could take a C++ throw, and __finally blocks do not run on the way past.
+ * Add when a title catches that way.
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -80,15 +97,48 @@ void recomp_eh_resume(recomp_ehframe_t* f, uint32_t resume) {
     longjmp(f->jb, 1);
 }
 
-/* The FuncInfo a C++ frame's handler stub names, or 0 if it is not one. */
+/* The frame whose handlers use guest ebp `ebp`: its body is the one live on
+ * the host stack. */
+static recomp_ehframe_t* eh_frame_at(uint32_t ebp) {
+    for (recomp_ehframe_t* f = t_frames; f; f = f->prev)
+        if (f->entry_esp == ebp + f->off) return f;
+    return NULL;
+}
+
+static int eh_trace = -1;
+
+/* recomp_eh_jump_hook: a guest handler continuing at `va` with the frame's
+ * ebp. Only an address the frame lists, so a genuinely unresolved target is
+ * still reported as one. */
+static int recomp_eh_jump(uint32_t va) {
+    if (eh_trace > 0 || seh_trace > 0)
+        fprintf(stderr, "[eh32] miss at 0x%08X with ebp 0x%08X: is it a handler's continuation?\n", va, g_ebp);
+    for (recomp_ehframe_t* f = t_frames; f; f = f->prev) {
+        if (!f->resume_at || f->entry_esp != g_ebp + f->off) continue;
+        for (const uint32_t* r = f->resume_at; *r; r++)
+            if (*r == va) {
+                if (eh_trace > 0)
+                    fprintf(stderr, "[eh32] continue at 0x%08X in sub_%08X (ebp 0x%08X)\n", va, f->func, g_ebp);
+                recomp_eh_resume(f, va);
+            }
+    }
+    return 0;
+}
+
+/* The FuncInfo a C++ frame's handler stub names, or 0 if it is not one. The
+ * stub is `mov eax, FuncInfo; jmp __CxxFrameHandler`, after a /GS cookie
+ * check in VC8 and later, so the mov is looked for in its first 40 bytes. */
 static uint32_t funcinfo(uint32_t handler) {
     const uint8_t* h = (const uint8_t*)(uintptr_t)handler;
-    if (handler < 0x10000u || IsBadReadPtr(h, 11) || h[0] != 0xB8) return 0;
-    if (h[5] != 0xE9 && !(h[5] == 0xFF && h[6] == 0x25)) return 0;
-    uint32_t fi = *(const uint32_t*)(h + 1);
-    if (IsBadReadPtr((void*)(uintptr_t)fi, 20)) return 0;
-    uint32_t magic = MEM32(fi);
-    return magic == EH_MAGIC_VC6 || magic == EH_MAGIC_VC7 || magic == EH_MAGIC_VC8 ? fi : 0;
+    if (handler < 0x10000u || IsBadReadPtr(h, 47)) return 0;
+    for (int k = 0; k < 40; k++) {
+        if (h[k] != 0xB8 || (h[k + 5] != 0xE9 && !(h[k + 5] == 0xFF && h[k + 6] == 0x25))) continue;
+        uint32_t fi = *(const uint32_t*)(h + k + 1);
+        if (IsBadReadPtr((void*)(uintptr_t)fi, 20)) continue;
+        uint32_t magic = MEM32(fi);
+        if (magic == EH_MAGIC_VC6 || magic == EH_MAGIC_VC7 || magic == EH_MAGIC_VC8) return fi;
+    }
+    return 0;
 }
 
 /* Run guest code at va as MSVC's _CallSettingFrame does: ebp = the frame's,
@@ -156,11 +206,10 @@ static void bind_catch_object(uint32_t handler, uint32_t ct, uint32_t obj, uint3
 }
 
 /* NATIVE32_TRACE_EH=1: one line per guest throw, and where it lands. */
-static int eh_trace = -1;
 
 static const char* throw_type(uint32_t info) {
     uint32_t arr = info ? MEM32(info + 12) : 0;
-    return arr && MEM32(arr) ? (const char*)(uintptr_t)(MEM32(MEM32(MEM32(arr + 4) + 4)) + 8) : "?";
+    return arr && MEM32(arr) ? (const char*)(uintptr_t)(MEM32(MEM32(arr + 4) + 4) + 8) : "?";
 }
 
 static int dispatch(uint32_t obj, uint32_t info) {
@@ -199,14 +248,12 @@ static int dispatch(uint32_t obj, uint32_t info) {
                 t_cur_obj = prev_obj, t_cur_info = prev_info;
                 /* The catch returned: continue in the frame's own function,
                  * on its stack as its prologue left it ([ebp-0x10]). */
-                for (recomp_ehframe_t* f = t_frames; f; f = f->prev) {
-                    if (f->entry_esp != ebp + 4) continue;
-                    t_frames = f;
+                recomp_ehframe_t* f = eh_frame_at(ebp);
+                if (f) {
                     g_ebp = ebp;
                     g_esp = MEM32(ebp - 0x10);
                     g_eax = resume;
-                    f->resume = resume;
-                    longjmp(f->jb, 1);
+                    recomp_eh_resume(f, resume);
                 }
                 fprintf(stderr, "[eh32] frame 0x%08X caught, but no lifted body owns it (resume 0x%08X)\n",
                         ebp, resume);
@@ -235,3 +282,23 @@ void native32_shim_CxxThrowException(void) {
     if (!real) real = (cxx_throw_t)GetProcAddress(LoadLibraryA("msvcrt.dll"), "_CxxThrowException");
     real((void*)(uintptr_t)obj, (void*)(uintptr_t)info);
 }
+
+/* RaiseException(0xE06D7363, ...): a throw from a statically linked CRT's
+ * _CxxThrowException. ExceptionInformation is {magic, object, ThrowInfo}.
+ * Returns only if no guest frame catches it. */
+int native32_cxx_raise(uint32_t n, uint32_t args) {
+    if (eh_trace < 0) eh_trace = getenv("NATIVE32_TRACE_EH") != NULL;
+    if (n < 3 || !args) return 0;
+    uint32_t magic = MEM32(args), obj = MEM32(args + 4), info = MEM32(args + 8);
+    if (magic != EH_MAGIC_VC6 && magic != EH_MAGIC_VC7 && magic != EH_MAGIC_VC8) return 0;
+    if (eh_trace)
+        fprintf(stderr, "[eh32] raise %s 0x%08X from sub_%08X\n", info ? throw_type(info) : "(rethrow)",
+                obj, g_cur_func);
+    if (!info) obj = t_cur_obj, info = t_cur_info;          /* `throw;` */
+    if (info) dispatch(obj, info);
+    if (eh_trace) fprintf(stderr, "[eh32] %s: no guest frame catches it\n", throw_type(info));
+    return 0;
+}
+
+/* Set once, before any guest code runs (native32_init). */
+static void eh32_init(void) { recomp_eh_jump_hook = recomp_eh_jump; }

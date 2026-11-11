@@ -12,8 +12,20 @@
 #include <string.h>
 #include "native32.h"
 
-const recomp_dispatch_entry_t recomp_dispatch_table[1];
-const uint32_t recomp_dispatch_count = 0;
+/* Two "lifted" guest SEH handlers at made-up addresses (seh32.c's check). */
+static uint32_t seh_seen, seh_unwinds;
+static void seh_skip(void) {           /* ExceptionContinueSearch; counts unwinds */
+    uint32_t er = MEM32(g_esp + 4);
+    if (MEM32(er + 4) & 2) seh_unwinds++;
+    g_eax = 1; g_esp += 4;
+}
+static void seh_take(void) {           /* ExceptionContinueExecution */
+    seh_seen = MEM32(MEM32(g_esp + 4));
+    g_eax = 0; g_esp += 4;
+}
+const recomp_dispatch_entry_t recomp_dispatch_table[2] = {
+    { 0x7FFE0000u, seh_skip }, { 0x7FFE0010u, seh_take } };
+const uint32_t recomp_dispatch_count = 2;
 recomp_func_t recomp_lookup_manual(uint32_t va) { (void)va; return NULL; }
 
 static int __stdcall add3(int a, int b, int c) { return a + b * 10 + c * 100; }
@@ -167,6 +179,19 @@ int main(void) {
             __try { call((void*)(uintptr_t)slot, 4, args, &after); }
             __except (GetExceptionCode() == 0xE0001234u) { raised = 1; }
             CHECK(raised);
+            g_esp = esp0;                /* the real raise left the shim's pop undone */
+            /* With native32_guest_seh the guest's own chain is asked: the
+             * first frame passes, the second continues execution. */
+            native32_guest_seh = 1;
+            uint32_t regs[4] = { 0, 0x7FFE0000u, 0xFFFFFFFFu, 0x7FFE0010u };
+            regs[0] = (uint32_t)(uintptr_t)&regs[2];
+            uint32_t head = MEM32(g_fs_base);
+            MEM32(g_fs_base) = (uint32_t)(uintptr_t)regs;
+            args[0] = 0x0EEDFADEu;
+            call((void*)(uintptr_t)slot, 4, args, &after);
+            CHECK(seh_seen == 0x0EEDFADEu && after == esp0);
+            MEM32(g_fs_base) = head;
+            native32_guest_seh = 0;
             g_esp = esp0;
             mach_leave();
         }
@@ -220,6 +245,32 @@ int main(void) {
         recomp_eh_pop(&outer);
     }
 
+    /* An MSVC exception frame's landing pad (RECOMP_EH_FRAME): a guest
+     * handler's call or jump into the body -- an __except block entered by
+     * _except_handler3, here in a frame-pointer-omitted function, whose
+     * handlers' ebp is its entry esp -- comes back to it. An address the
+     * frame does not list, or another ebp, is not taken. */
+    {
+        static const uint32_t at[] = { 0x00403010u, 0 };
+        static recomp_ehframe_t f;
+        memset(&f, 0, sizeof f);
+        f.entry_esp = 0x2000, f.func = 0x00403000u, f.off = 0, f.resume_at = at;
+        recomp_eh_push(&f);
+        CHECK(recomp_eh_jump_hook != NULL);
+        g_ebp = 0x2000;
+        CHECK(recomp_eh_jump_hook(0x00403020u) == 0);
+        g_ebp = 0x2004;
+        CHECK(recomp_eh_jump_hook(0x00403010u) == 0);
+        g_ebp = 0x2000;
+        if (!setjmp(f.jb)) {
+            recomp_eh_jump_hook(0x00403010u);
+            CHECK(!"recomp_eh_jump returned");
+        } else {
+            CHECK(f.resume == 0x00403010u && g_cur_func == 0x00403000u);
+        }
+        recomp_eh_pop(&f);
+    }
+
     /* Code the guest generates: entered with its registers, not the C ABI.
      * Inputs in esi, edi, a stack argument and mm1; outputs in eax, ebx and
      * mm1; `ret 4` pops its argument. ebp is changed and must come back to
@@ -251,6 +302,35 @@ int main(void) {
         CHECK(after == esp0);                            /* ret 4: the callee popped its argument */
         g_ebp = ebp0;
         VirtualFree(code, 0, MEM_RELEASE);
+    }
+
+    /* Code page 932 for the guest: "\x93\xfa\x96\x7b" is Shift-JIS for U+65E5 U+672C,
+     * whatever the system's ANSI code page is. */
+    {
+        uint32_t codepage_func(const char* name);
+        CHECK(codepage_func("MultiByteToWideChar") == 0);          /* off by default */
+        native32_set_codepage(932);
+        uint32_t mb = codepage_func("MultiByteToWideChar"), acp = codepage_func("GetACP");
+        uint32_t ext = codepage_func("GetTextExtentPoint32A");
+        CHECK(mb && acp && ext && codepage_func("lstrlenA") == 0);
+        WCHAR w[8] = { 0 };
+        uint32_t a[6] = { CP_ACP, 0, (uint32_t)(uintptr_t)"\x93\xfa\x96\x7b", 4,
+                          (uint32_t)(uintptr_t)w, 8 }, after;
+        CHECK(call((void*)(uintptr_t)mb, 6, a, &after) == 2 && w[0] == 0x65E5 && w[1] == 0x672C);
+        CHECK(call((void*)(uintptr_t)acp, 0, a, &after) == 932);
+        /* Two DBCS characters measure as two glyphs of the same width, not four bytes. */
+        HDC dc = CreateCompatibleDC(NULL);
+        HFONT f = CreateFontA(16, 0, 0, 0, 0, 0, 0, 0, SHIFTJIS_CHARSET, 0, 0, 0, FIXED_PITCH, NULL);
+        SelectObject(dc, f);
+        SIZE one, two;
+        uint32_t b[4] = { (uint32_t)(uintptr_t)dc, (uint32_t)(uintptr_t)"\x93\xfa", 2, (uint32_t)(uintptr_t)&one };
+        call((void*)(uintptr_t)ext, 4, b, &after);
+        b[1] = (uint32_t)(uintptr_t)"\x93\xfa\x96\x7b"; b[2] = 4; b[3] = (uint32_t)(uintptr_t)&two;
+        call((void*)(uintptr_t)ext, 4, b, &after);
+        CHECK(one.cx > 0 && two.cx == 2 * one.cx);
+        DeleteDC(dc);
+        DeleteObject(f);
+        native32_set_codepage(0);
     }
 
     printf("native32 selftest: %s\n", fails ? "FAILED" : "ok");
