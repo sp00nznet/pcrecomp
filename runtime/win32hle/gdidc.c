@@ -276,6 +276,7 @@ static void g_CreateFontA(void) {                        /* (h, w, esc, orient, 
             font_t *f = &g_font[i];
             memset(f, 0, sizeof *f);
             f->used = 1, f->height = (int)A32(0), f->weight = (int)A32(4), f->italic = A32(5) != 0, f->quality = (int)A32(11);
+            f->width = (int)A32(1);                       /* as LOGFONT's lfWidth (#160) */
             f->underline = A32(6) != 0;
             snprintf(f->face, sizeof f->face, "%s", ASTR(13) ? ASTR(13) : "Arial");
             RET(FONT_BASE + (uint32_t)i, 14);

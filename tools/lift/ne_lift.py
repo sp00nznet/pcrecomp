@@ -112,7 +112,7 @@ class NELifter(Lifter):
                     if xm is not None and r.ordinal in xm:
                         s, o = xm[r.ordinal]
                         return f'seg{s:03d}_{o:04X}'
-                    imp = get_import(mod, r.ordinal)
+                    imp = get_import(mod, r.ordinal, r.name)
                     return imp.name
         return None
 
@@ -353,11 +353,27 @@ class NELifter(Lifter):
                     # protected mode uses 3/8 because selectors are 8 apart;
                     # our selectors are consecutive, so the pair is 0/1 and
                     # cpu_alloc_selector tiles a huge block one selector per 64K.
-                    if tt in (1, 2) and module_name(self.ne, r.module_idx).upper() == 'KERNEL'                             and r.ordinal in (113, 114):
+                    if tt == 1 and module_name(self.ne, r.module_idx).upper() == 'KERNEL'                             and r.ordinal in (113, 114):
                         val = 0 if r.ordinal == 113 else 1
                         self._emit(_put(f'0x{val:04X}'),
                                    f'{orig} -- KERNEL.{r.ordinal} '
                                    f'({"__AHSHIFT" if r.ordinal == 113 else "__AHINCR"})')
+                        return
+                    # KERNEL's selectors to fixed real-mode memory: __A000H
+                    # (174), __B000H (181), __B800H (182), __0040H (193),
+                    # __F000H (194), __C000H (195), __D000H (179), __E000H (190);
+                    # not __0000H (183), whose number would be the null selector. A DOS-extended program (Borland's RTM)
+                    # draws to VGA memory through __A000H. They become the
+                    # paragraph number itself, which no other selector uses
+                    # (dynamic ones start at 0x4000, NE segments are small);
+                    # the host maps sel_base[] for the ones it supports.
+                    _absel = {174: 0xA000, 181: 0xB000, 182: 0xB800, 193: 0x0040,
+                              194: 0xF000, 195: 0xC000, 179: 0xD000, 190: 0xE000}
+                    if tt == 1 and module_name(self.ne, r.module_idx).upper() == 'KERNEL' \
+                            and r.ordinal in _absel:
+                        self._emit(_put(f'0x{_absel[r.ordinal]:04X}'),
+                                   f'{orig} -- KERNEL.{r.ordinal} (selector for real-mode '
+                                   f'{_absel[r.ordinal]:04X}:0000)')
                         return
                     if tt == 0:
                         self._emit(_put(f'0x{r.target_off & 0xFFFF:04X}'),

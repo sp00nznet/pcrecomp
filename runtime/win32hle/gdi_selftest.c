@@ -5,7 +5,9 @@
  *   - a 16-bit 5-5-5 bottom-up DIB section, selected into a memory DC and
  *     BitBlt to a window DC, lands in the window surface the right way up
  *     and converted to 32-bit, and a clip region keeps a column out;
- *   - mmioDescend finds a RIFF form and a chunk in it, mmioRead reads it.
+ *   - mmioDescend finds a RIFF form and a chunk in it, mmioRead reads it;
+ *   - CreateFontA's width stretches its text as CreateFontIndirectA's lfWidth
+ *     does (where a TrueType font is installed to measure).
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -79,6 +81,39 @@ int main(void) {
     uint8_t *got = (uint8_t *)hle_alloc(4);
     ok("read data", call("mmioRead", 3, (uint32_t[]){ h, A(got), 4 }) == 2 && got[0] == 9 && got[1] == 9);
     call("mmioClose", 2, (uint32_t[]){ h, 0 });
+
+    /* a font's width: CreateFontA's as LOGFONT's lfWidth */
+    {
+        uint32_t dc = call("CreateCompatibleDC", 1, (uint32_t[]){ 0 });
+        const char *face = "Arial";
+        uint32_t fa = hle_scratch_copy(face, (uint32_t)strlen(face) + 1);
+        uint32_t *sz = (uint32_t *)hle_alloc(8);
+        uint32_t text = hle_scratch_copy("MMMM", 5);
+        int cx[3];
+        for (int i = 0; i < 3; i++) {
+            uint32_t f;
+            if (i < 2) {
+                uint32_t a[14] = { (uint32_t)-20, i ? 20u : 0u, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 0, fa };
+                f = call("CreateFontA", 14, a);
+            } else {                                     /* LOGFONTA: height, width, ..., face at +28 */
+                uint8_t *lf = (uint8_t *)hle_alloc(60);
+                memset(lf, 0, 60);
+                ((int32_t *)lf)[0] = -20, ((int32_t *)lf)[1] = 20, ((int32_t *)lf)[4] = 400;
+                memcpy(lf + 28, face, strlen(face) + 1);
+                f = call("CreateFontIndirectA", 1, (uint32_t[]){ A(lf) });
+            }
+            call("SelectObject", 2, (uint32_t[]){ dc, f });
+            sz[0] = sz[1] = 0;
+            call("GetTextExtentPoint32A", 4, (uint32_t[]){ dc, text, 4, A(sz) });
+            cx[i] = (int)sz[0];
+        }
+        if (cx[0] > 0) {
+            ok("CreateFontA's width widens its text", cx[1] > cx[0]);
+            ok("...as CreateFontIndirectA's lfWidth does", cx[1] == cx[2]);
+        } else {
+            printf("(no TrueType font to measure: CreateFontA's width not checked)\n");
+        }
+    }
 
     printf("%s: %d failure(s)\n", fails ? "FAIL" : "ok", fails);
     return fails != 0;

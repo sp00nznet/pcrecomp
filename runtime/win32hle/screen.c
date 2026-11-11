@@ -16,6 +16,8 @@
  * only paces, and input comes from a host's script.
  */
 #define _GNU_SOURCE
+#include <math.h>
+#include <time.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -218,7 +220,64 @@ static void web_menu(int open) {
     MAIN_THREAD_ASYNC_EM_ASM({ if (Module['ra2Menu']) Module['ra2Menu']($0); }, open);
 }
 #endif
-static void present(void) {
+/* Frame pacing, for flips: each frame stays on screen for the same number of
+ * the display's refreshes. A game making 70 frames a second on a 175 Hz
+ * display would otherwise show them for 2 or 3 refreshes in turn, which
+ * judders; held to 3 it moves evenly at 58.3. The number is the fewest the
+ * game's own time a frame fits in (10% over is let go, as an occasional
+ * late frame; gaps of a tenth of a second and more are loads, not frames),
+ * taken up at once and down only after a second of fitting, and never more
+ * than a twentieth of a second. It is never fewer than keeps the game near 60
+ * frames a second (HLE_MAX_FPS): a game of 1999 flips as fast as it can, as
+ * its monitor's refresh let it on Windows, and on a 120 Hz display it would
+ * otherwise draw twice the frames for the same picture. So 2 refreshes on a
+ * 120 Hz display, 3 on a 175, 1 on a 60, 75 or 90.
+ * The wait gives the machine up, so the game's other threads run; it sleeps
+ * to within 0.2 ms of the refresh and spins only the rest (it slept whole
+ * milliseconds and spun up to one, a sixteenth of the CPU at 60 a second). */
+static uint64_t g_paced_back;                              /* when the last paced frame went out */
+static int g_pace_k = 1, g_pace_hz;                         /* each frame held for k of the display's hz */
+static void pace(void) {
+    static uint64_t last_call;
+    static double ema;
+    static int lower;
+    int k = g_pace_k;
+    SDL_DisplayMode dm;
+    int hz = SDL_GetCurrentDisplayMode(SDL_GetWindowDisplayIndex(g_win), &dm) == 0 && dm.refresh_rate > 0 ? dm.refresh_rate : 60;
+    double freq = (double)SDL_GetPerformanceFrequency(), period = 1.0 / hz;
+    uint64_t now = SDL_GetPerformanceCounter();
+    if (g_paced_back) {
+        double work = (double)(now - g_paced_back) / freq;  /* the game's time since the last frame went out */
+        if (work < 0.1) ema = ema > 0 ? 0.9 * ema + 0.1 * work : work;   /* longer: a load, not a frame */
+        int want = (int)ceil(ema / period - 0.1), most = hz / 20 > 1 ? hz / 20 : 1;   /* never under 20 a second */
+        static int max_fps = -1;
+        if (max_fps < 0) { const char *e = getenv("HLE_MAX_FPS"); max_fps = e ? atoi(e) : 60; }
+        int least = max_fps > 0 ? (int)(hz / (double)max_fps + 0.25) : 1;
+        if (least < 1) least = 1;
+        if (want < least) want = least;
+        if (want > most) want = most;
+        if (want > k) k = want, lower = 0;
+        else if (want < k && ++lower * k >= hz) k = want, lower = 0;  /* a second of frames that fit */
+        else if (want >= k) lower = 0;
+        uint64_t due = last_call + (uint64_t)(k * period * freq);
+        if (now < due && due - now < (uint64_t)freq) {
+            hle_block_begin();
+            uint64_t spin = (uint64_t)(0.0002 * freq);   /* sleep to 0.2 ms short, then spin: sleeps overshoot */
+            if (due - now > spin) {
+                double s = (double)(due - now - spin) / freq;
+                struct timespec ts = { (time_t)s, (long)((s - (double)(time_t)s) * 1e9) };
+                nanosleep(&ts, NULL);
+            }
+            while (SDL_GetPerformanceCounter() < due) {}
+            hle_block_end();
+            now = due;
+        }
+    }
+    last_call = now;
+    g_pace_k = k, g_pace_hz = hz;
+}
+/* flip: the game flipped, and this frame is shown, paced (pace). */
+static void present(int flip) {
     const uint8_t *px;
     const uint32_t *pal;
     int w, h, pitch, bpp;
@@ -227,8 +286,8 @@ static void present(void) {
     if (!hle_dd_frame(&px, &w, &h, &pitch, &bpp, &pal, &seq) && !hle_gdi_window_frame(&px, &w, &h, &pitch, &bpp, &seq)) return;
     uint32_t now = hle_ticks_ms();
     g_src_w = w, g_src_h = h;
-    if (seq == g_shown_seq && now - g_last_present < 250) return;
-    if (now - g_last_present < 15) return;
+    if (!flip && seq == g_shown_seq && now - g_last_present < 250) return;
+    if (!flip && now - g_last_present < 15) return;
     g_shown_seq = seq, g_last_present = now;
     if (hle_screen_frame_hook) hle_screen_frame_hook(px, w, h, pitch, bpp);
     if (!g_ren) return;
@@ -378,7 +437,24 @@ static void present(void) {
         SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_NONE);
     }
     if (g_menu_depth) menu_draw();
+    if (flip) pace();
     SDL_RenderPresent(g_ren);
+    if (flip) g_paced_back = SDL_GetPerformanceCounter();
+    static int trace = -1;
+    static uint32_t t0, prev, shown, flips, worst, late;
+    if (trace < 0) trace = getenv("HLE_PRESENTTRACE") != NULL;
+    if (trace) {                                         /* HLE_PRESENTTRACE: frames shown a second, and the longest wait */
+        uint32_t t = hle_ticks_ms();
+        if (prev && t - prev > worst) worst = t - prev;
+        if (prev && flip && g_pace_hz && (t - prev) * (uint32_t)g_pace_hz > 1500u * (uint32_t)g_pace_k) late++;   /* held a refresh or more too long */
+        prev = t, shown++, flips += flip != 0;
+        if (!t0) t0 = t;
+        else if (t - t0 >= 5000) {
+            fprintf(stderr, "[screen] %.1f frames shown/s (%u of them flips), longest gap %u ms; flips held %d of %d Hz, %u late\n",
+                    shown * 1000.0 / (t - t0), flips, worst, g_pace_k, g_pace_hz, late);
+            t0 = t, shown = flips = worst = late = 0;
+        }
+    }
 }
 
 /* Who shows the cursor. A DirectDraw game draws its own into the picture, so
@@ -387,6 +463,7 @@ static void present(void) {
  * window shows the cursor the game set, built from its resources. */
 int (*hle_screen_cursor_hook)(void);
 int (*hle_screen_key_hook)(int sdl_scancode, int down);
+void (*hle_screen_poll_hook)(void);
 
 /* The window's title, for a host that shows what is playing (a mod). */
 void hle_screen_title(const char *title) { if (g_win) SDL_SetWindowTitle(g_win, title); }
@@ -701,10 +778,27 @@ static SDL_Rect to_points(SDL_Rect r) {
  * draws its own cursor, from its messages or DirectInput, and those stop at
  * the window's edge; the desktop's pointer would go on past it, and a click
  * there would land on another window. It is let go when the window loses
- * focus, while the popup menu is open, or on Ctrl+Cmd (Ctrl+Win); a click
- * in the window takes it back. A host turns it off with hle_screen_confine. */
+ * focus, while the popup menu is open, or on Ctrl+Cmd (Ctrl+Win, Ctrl+Super);
+ * a click in the window takes it back. A host turns it off with
+ * hle_screen_confine. */
+#if defined(__APPLE__)
+#define RELEASE_KEYS "Ctrl+Cmd"
+#elif defined(_WIN32)
+#define RELEASE_KEYS "Ctrl+Win"
+#else
+#define RELEASE_KEYS "Ctrl+Super"
+#endif
 static int g_confine = 1, g_released, g_regrab_up;
 void hle_screen_confine(int on) { g_confine = on != 0; }
+/* A game holding the mouse for its movement alone (dinput.c): while the
+ * mouse is held, the window gives that (SDL's relative mode), so the game's
+ * cursor goes on where the desktop's pointer would stop at the edge. */
+static int g_want_rel, g_rel;
+static double g_rel_fx, g_rel_fy;                          /* game pixels not yet whole */
+static void want_relative(int on) { g_want_rel = on; }
+int hle_screen_relative(void) { return g_rel; }
+static void warp(int x, int y);
+static void warp_to_cursor(void) { int x, y; hle_input_position(&x, &y); warp(x, y); }
 static void confine_update(void) {
 #if !defined(__EMSCRIPTEN__) && SDL_VERSION_ATLEAST(2, 0, 18)
     static int held;
@@ -713,6 +807,13 @@ static void confine_update(void) {
     int want = g_confine && !g_released && !g_menu_depth && g_dst.w > 0 && g_dst.h > 0
                && (SDL_GetWindowFlags(g_win) & SDL_WINDOW_INPUT_FOCUS);
     SDL_Rect r = want ? to_points(g_dst) : (SDL_Rect){ 0, 0, 0, 0 };
+    int rel = want && g_want_rel;
+    if (rel != g_rel) {
+        SDL_SetRelativeMouseMode(rel ? SDL_TRUE : SDL_FALSE);
+        g_rel = rel, g_rel_fx = g_rel_fy = 0;
+        if (!rel && want) warp_to_cursor();              /* the desktop's pointer where the game's cursor is */
+        fprintf(stderr, "[screen] mouse %s\n", rel ? "relative: the game has its movement" : "absolute");
+    }
     if (want == held && (!want || !memcmp(&r, &at, sizeof r))) return;
     SDL_SetWindowMouseRect(g_win, want ? &r : NULL);
     SDL_SetWindowMouseGrab(g_win, want ? SDL_TRUE : SDL_FALSE);
@@ -753,10 +854,10 @@ void hle_screen_pump(void) {
             SDL_Scancode sc = e.key.keysym.scancode;
             /* a key the host keeps for itself (a mod switch): the game never sees it */
             if (hle_screen_key_hook && hle_screen_key_hook((int)sc, e.type == SDL_KEYDOWN)) break;
-            /* Ctrl+Cmd (Ctrl+Win), as a virtual machine's: let the mouse go */
+            /* Ctrl+Cmd (Ctrl+Win, Ctrl+Super), as a virtual machine's: let the mouse go */
             if (e.type == SDL_KEYDOWN && (e.key.keysym.mod & KMOD_CTRL) && (e.key.keysym.mod & KMOD_GUI)
                 && (sc == SDL_SCANCODE_LCTRL || sc == SDL_SCANCODE_RCTRL || sc == SDL_SCANCODE_LGUI || sc == SDL_SCANCODE_RGUI)) {
-                if (!g_released) fprintf(stderr, "[screen] mouse let go; click the window to hold it again\n");
+                if (!g_released) fprintf(stderr, "[screen] mouse let go (" RELEASE_KEYS "); click the window to hold it again\n");
                 g_released = 1;
                 break;
             }
@@ -778,6 +879,17 @@ void hle_screen_pump(void) {
             break;
         }
         case SDL_MOUSEMOTION: {
+            if (g_rel) {                                 /* movement alone, in game pixels as the picture shows them */
+                SDL_Rect pd = to_points(g_dst);
+                int w = g_src_w, h = g_src_h, bpp;
+                if (w <= 0 || h <= 0) hle_dd_mode(&w, &h, &bpp);
+                if (pd.w <= 0 || pd.h <= 0) break;
+                g_rel_fx += (double)e.motion.xrel * w / pd.w, g_rel_fy += (double)e.motion.yrel * h / pd.h;
+                int dx = (int)g_rel_fx, dy = (int)g_rel_fy;
+                g_rel_fx -= dx, g_rel_fy -= dy;
+                if (dx || dy) hle_input_motion(dx, dy);
+                break;
+            }
             int gx, gy;
             to_game(e.motion.x, e.motion.y, &gx, &gy);
             hle_input_mouse(WM_MOUSEMOVE, gx, gy);
@@ -790,11 +902,17 @@ void hle_screen_pump(void) {
             }
             if (g_regrab_up && e.type == SDL_MOUSEBUTTONUP) { g_regrab_up = 0; break; }
             int gx, gy, down = e.type == SDL_MOUSEBUTTONDOWN;
-            to_game(e.button.x, e.button.y, &gx, &gy);
+            if (g_rel) hle_input_position(&gx, &gy);       /* where the movement has put the cursor */
+            else to_game(e.button.x, e.button.y, &gx, &gy);
             uint32_t m = e.button.button == SDL_BUTTON_RIGHT ? (down ? WM_RBUTTONDOWN : WM_RBUTTONUP)
                        : e.button.button == SDL_BUTTON_MIDDLE ? (down ? WM_MBUTTONDOWN : WM_MBUTTONUP)
                        : (down ? WM_LBUTTONDOWN : WM_LBUTTONUP);
             hle_input_mouse(m, gx, gy);
+            break;
+        }
+        case SDL_MOUSEWHEEL: {                           /* a notch is 120, as Windows counts it */
+            int y = e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -e.wheel.y : e.wheel.y;
+            if (y) hle_input_wheel(y * 120);
             break;
         }
         case SDL_WINDOWEVENT:
@@ -804,36 +922,42 @@ void hle_screen_pump(void) {
         default: break;
         }
     }
-    present();
+    if (hle_screen_poll_hook) hle_screen_poll_hook();
+    present(0);
     confine_update();
 }
+
+static void present_gdi(void) { present(0); }
 
 /* The guest moved the cursor (SetCursorPos): move the real one with it. */
 static void warp(int x, int y) {
     int w, h, bpp;
     hle_dd_mode(&w, &h, &bpp);
-    if (!g_win || !g_ren || g_dst.w <= 0 || w <= 0 || h <= 0) return;
+    if (!g_win || !g_ren || g_rel || g_dst.w <= 0 || w <= 0 || h <= 0) return;   /* relative: there is no pointer to move */
     SDL_Rect p = to_points((SDL_Rect){ g_dst.x + x * g_dst.w / w, g_dst.y + y * g_dst.h / h, 0, 0 });
     SDL_WarpMouseInWindow(g_win, p.x, p.y);
 }
 
 /* The game drew into the primary. On the window's thread, show it (present
- * keeps to 60 a second), and keep the window's own events moving: a load
+ * keeps to 60 a second, except a flip, which is always shown), and keep the
+ * window's own events moving: a load
  * that does not pump for seconds would otherwise look hung to the desktop
  * (macOS's spinning cursor). The events wait in SDL's queue for the pump. */
 static void primary_changed(void) {
     static uint32_t last_events;
     if (!g_ren || !pthread_equal(pthread_self(), g_video_thread)) return;
     uint32_t now = hle_ticks_ms();
-    if (now - g_last_present < 15) return;
+    int flip = hle_dd_flipping();
+    if (!flip && now - g_last_present < 15) return;
     if (now - last_events >= 100) SDL_PumpEvents(), last_events = now;
-    present();
+    present(flip);
 }
 
 int hle_screen_open(const char *title, int fullscreen, int headless) {
     g_headless = headless, g_fullscreen = fullscreen;
     hle_set_pump_hook(hle_screen_pump);
-    hle_gdi_window_hook = present;                       /* a GDI game's blit shows, pumping or not (a loading bar) */
+    hle_input_relative_hook = want_relative;
+    hle_gdi_window_hook = present_gdi;                   /* a GDI game's blit shows, pumping or not (a loading bar) */
     if (headless) return 0;
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");      /* SIGINT and SIGTERM end the process: SDL would make them a close the game can refuse */
     SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "1"); /* macOS: full screen in its own Space, as apps do */
@@ -870,6 +994,6 @@ int hle_screen_open(const char *title, int fullscreen, int headless) {
     g_video_thread = pthread_self();
     hle_dd_primary_hook = primary_changed;
     fprintf(stderr, "[screen] %s, renderer %s, scaling %s (F12), fullscreen F11%s\n", SDL_GetCurrentVideoDriver(), ri.name,
-            k_modes[g_mode], g_confine ? ", mouse held in the picture (Ctrl+Cmd lets go)" : "");
+            k_modes[g_mode], g_confine ? ", mouse held in the picture (" RELEASE_KEYS " lets go)" : "");
     return 0;
 }

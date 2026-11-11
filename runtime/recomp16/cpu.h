@@ -651,4 +651,15 @@ void cpu_free(CPU *cpu);
 /* Load binary into memory at segment:offset */
 int cpu_load(CPU *cpu, const char *path, uint16_t seg, uint16_t off);
 
+
+/* 32-bit offsets (ADDR32, a 386 `[edi]` in 16-bit code): real mode cuts them
+ * to 16 bits, as the CPU's 64 KB segment limit would fault on anything past. */
+#define ADDR32(x) ((uint16_t)(x))
+#define mem_read8_32(c, s, o)      mem_read8((c), (s), (uint16_t)(o))
+#define mem_read16_32(c, s, o)     mem_read16((c), (s), (uint16_t)(o))
+#define mem_read32_32(c, s, o)     mem_read32((c), (s), (uint16_t)(o))
+#define mem_write8_32(c, s, o, v)  mem_write8((c), (s), (uint16_t)(o), (v))
+#define mem_write16_32(c, s, o, v) mem_write16((c), (s), (uint16_t)(o), (v))
+#define mem_write32_32(c, s, o, v) mem_write32((c), (s), (uint16_t)(o), (v))
+
 #endif /* CIV_RECOMP_CPU_H */

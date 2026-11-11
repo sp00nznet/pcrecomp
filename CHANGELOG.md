@@ -5,7 +5,44 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- win32hle: a thread handing the machine over (`hle_yield`, `hle_block_end`)
+  sleeps on a condition variable the taker signals, for at most 2 ms, instead
+  of spinning on `sched_yield` (the browser keeps its spin). Theme Park World
+  hands over at every import while its other threads want a turn: 6% of its
+  main thread was the spin, 1% now.
+- win32hle screen: every flip is shown, held for the same number of the
+  display's refreshes (the fewest the game's own frame time fits, never under
+  20 a second), instead of at most one frame each 15 ms, which showed some
+  frames twice and some never; the wait sleeps to 0.2 ms short and spins
+  the rest. From the fourth `Sleep(0)` in a row, each under 2 ms after the
+  last, it sleeps a millisecond (`HLE_SLEEP0=yield` keeps it a yield).
+  `HLE_PRESENTTRACE=1` prints frames shown a second and the longest gap.
+  (Split from #163.)
+
 ### Fixed
+- win32hle: `WM_KEYDOWN`/`WM_KEYUP` set lParam's extended-key bit (24) for
+  the keys Windows marks extended: the arrows, Insert, Delete, Home, End,
+  Page Up and Down, and the right-hand Ctrl and Alt. A game reading the scan
+  code took Delete for the keypad's `.` and the arrows for its 8 4 6 2:
+  Theme Park World's Delete (clear land), arrows (turn the park) and Home
+  (back to the gates) did nothing.
+- win32hle: `CreateFontA`'s width stretches or squeezes its text as
+  `CreateFontIndirectA`'s `lfWidth` does; `gdi_selftest.c` measures both,
+  where a TrueType font is installed. (#160 follow-up)
+- win32hle: DirectInput hears of mouse input with no window to message it
+  to (`hle_input_mouse` ran the input hook only after finding one), and
+  `GetDeviceData` reading without a count to read up to is
+  `DIERR_INVALIDPARAM` rather than a write through a null pointer.
+  `dinput_selftest.c` covers buffered events, peeks, counts and flushes.
+  (#159 follow-ups)
+- win32hle: an exclusive relative DirectInput mouse gets the mouse's
+  movement, not the desktop pointer's place, so a game moving its own cursor
+  no longer finds it stuck where the pointer met the picture's edge:
+  `hle_input_raw` counts movement past the edges, and screen.c gives SDL's
+  relative mode while the mouse is held (`hle_input_relative_hook`,
+  `hle_input_motion`). The keys that let the mouse go are named for each
+  platform (Ctrl+Cmd, Ctrl+Win, Ctrl+Super).
 - win32hle: DirectDraw 4's texture cache is rebuilt when `SetSurfaceDesc`
   changes a surface's size, a render target lets go of its attached z-buffer
   when it is freed, and each surface has its own uniqueness value;
@@ -56,6 +93,13 @@ versions follow [SemVer](https://semver.org/).
   the GPU done there, and a flip's frame given to the presenter
   (`hle_dd_frame_hook`) without the game waiting. Theme Park World on an M1
   Pro: 7 to 80 frames a second.
+- win32hle: the mouse wheel. SDL's wheel becomes `WM_MOUSEWHEEL` (120 a
+  notch) and DirectInput's z axis, buffered and in `GetDeviceState`
+  (`hle_input_wheel`). Theme Park World asks for a mouse with a z axis and
+  zooms with it, which it could not do before.
+- win32hle screen: `hle_screen_poll_hook`, called on the window's thread at
+  each pump, for a host to poll what SDL sends no events for (a game
+  controller it turns into the mouse and keys), and `hle_screen_relative`.
 - win32hle: DirectInput 3 and 5 (`dinput.c`): the system mouse (relative or
   absolute axes, three buttons) and keyboard (DIK codes), immediate and
   buffered, read from the same input state as the window messages; arriving
@@ -129,6 +173,22 @@ versions follow [SemVer](https://semver.org/).
   tool; `--selftest`. MechCommander 2 ships its release PDB on the disc:
   9,776 functions, 5,525 with sizes. Scored against it, unseeded disasm32 is
   89.7% precise and 85.4% complete; seeded, complete to 99.99%.
+- `ports/`: the console, Android and browser build kit from SkiFree and Link's
+  Awakening DX portable: the Docker driver with the game taken out
+  (`setup-consoles.sh`), `sdl2lite` for toolchains with no SDL2, and each
+  target's build recipe. docs/PORTS.md has the targets and what a lift needs.
+- dos32: `DOS32_SMALL_HOST` puts guest memory in one block (`DOS32_MEM`,
+  default 64 MB) instead of a 4 GB reservation, with the frame buffer and the
+  default handlers at its top, for 32-bit hosts. Theme Park passes its
+  conformance script (6/6) this way on Linux.
+- dos32 on a console: in small-host mode the heap starts just past the
+  program (not at 16 MB), a second program reuses the block instead of
+  unmapping 4 GB it never mapped, and a host without signals (the 3DS)
+  builds. Theme Park needs 16 MB in all and runs on a 3DS with 24.
+- recomp32: `RECOMP_ITAIL` is a `musttail` call under clang, and its
+  unresolved-target report moved out of line. Without that, wasm turned each
+  jump between the pieces of a split loop into a nested call, and Theme Park's
+  intro overflowed the browser's stack in seconds.
 - win32hle: a browser host (Emscripten/WebAssembly): the guest image in linear
   memory, DirectSound through a shared-memory ring an AudioWorklet drains,
   frames to the page's WebGL presenter, Bink movies played by the page. For

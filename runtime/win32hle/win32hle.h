@@ -181,6 +181,11 @@ void     hle_input_key(int down, uint32_t vk, uint32_t scan);
 void     hle_input_cursor(int screen_x, int screen_y);                    /* GetCursorPos, without a message */
 void     hle_input_key_state(uint32_t vk, int down);                      /* GetKeyState, without a message */
 void     hle_input_position(int *screen_x, int *screen_y);                /* where the cursor is */
+void     hle_input_motion(int dx, int dy);                                /* a relative mouse moved: the cursor stops at the screen's edge, the count does not */
+void     hle_input_wheel(int delta);                                      /* the wheel turned: WHEEL_DELTA (120) a notch, away from the user positive */
+int      hle_input_wheel_total(void);                                     /* the wheel's turning so far (DirectInput's z axis) */
+void     hle_input_raw(int *x, int *y);                                   /* the mouse's movement so far, edges or not (DirectInput's relative axes) */
+extern void (*hle_input_relative_hook)(int on);                           /* a game holds the mouse for its movement alone (an exclusive DirectInput mouse) */
 uint8_t  hle_input_vk(uint32_t vk);                                       /* a key or button's state: bit 7 down */
 extern void (*hle_input_hook)(void);                                      /* after hle_input_mouse/_key: the state changed */
 uint32_t hle_window_at(int screen_x, int screen_y, int *client_x, int *client_y);
@@ -322,6 +327,7 @@ extern const win32hle_shim win32hle_dinput[];         /* DirectInput: the system
 int  hle_dd_frame(const uint8_t **px, int *w, int *h, int *pitch, int *bpp, const uint32_t **palette, unsigned *seq);
 void hle_dd_mode(int *w, int *h, int *bpp);
 extern void (*hle_dd_primary_hook)(void);            /* the primary's pixels or palette changed (a blit, an Unlock, a Flip) */
+int  hle_dd_flipping(void);                          /* 1 inside that hook for a Flip: a frame to show, each one */
 int  hle_dd_surface_pixels(uint32_t obj, uint8_t **px, int *w, int *h, int *pitch, int *bpp);   /* 0: not a surface */
 void hle_dsound_set_master(float gain);              /* 0 mutes */
 /* A host's answer to IDirectDrawSurface::QueryInterface for an interface the
@@ -346,6 +352,13 @@ extern const win32hle_shim win32hle_bink[];           /* binkw32 on ffmpeg (bink
 int  hle_screen_open(const char *title, int fullscreen, int headless);
 void hle_screen_pump(void);
 extern int (*hle_screen_key_hook)(int sdl_scancode, int down);   /* nonzero: the host took the key */
+/* Called on the window's thread at each pump, after the window's events, holding
+ * the machine: a host polls what SDL has no events for here (a game controller
+ * it turns into the mouse and keys, through hle_input_*). */
+extern void (*hle_screen_poll_hook)(void);
+/* Whether the window gives the game the mouse's movement alone (SDL's relative
+ * mode, for an exclusive DirectInput mouse). */
+int hle_screen_relative(void);
 void hle_screen_title(const char *title);
 extern int (*hle_screen_cursor_hook)(void);   /* nonzero: show the cursor the guest set (its Win32 menus); unset: the game draws its own */
 extern void (*hle_screen_frame_hook)(const uint8_t *px, int w, int h, int pitch, int bpp);   /* each shown frame */

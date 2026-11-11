@@ -421,6 +421,8 @@ int main(int argc, char *argv[])
     for (uint32_t n = 0; n <= RECOMP_NUM_SEG; ++n)
         cpu.sel_base[n] = SEG_SEGMENT_BASE[n];
 
+    if (recomp_game.start) recomp_game.start(&cpu);
+
     printf("%s recomp - starting\n", recomp_game.title);
     printf("  image: %s (%.2f MB), %d modules\n", img, RECOMP_IMAGE_SIZE / 1048576.0,
            RECOMP_NUM_MODULES);

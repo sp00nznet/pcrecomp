@@ -156,6 +156,11 @@ void dump_guest_stack(CPU *cpu, int max);
 void recomp_enter(const char *fn);
 void recomp_trace_dump(const char *why);
 #define RECOMP_ENTER(name) recomp_enter(name)
+#elif defined(RECOMP_IRQ)
+/* A loop that the code map split into several functions has no back-edge to
+ * tick on, only tail calls -- a wait for a timer-driven counter then waits
+ * forever. Every lifted function's entry ticks too (RECOMP_TICK below). */
+#define RECOMP_ENTER(name) RECOMP_TICK(cpu)
 #else
 #define RECOMP_ENTER(name) ((void)0)
 #endif
@@ -207,7 +212,22 @@ static inline int cpu_lsl(CPU *cpu, uint16_t sel, uint16_t *out) {
     return 1;
 }
 
+/* Not all of the address space is plain memory. A planar VGA in an unchained
+ * mode turns one byte address into four pixels, one per plane, so a write there
+ * cannot be a store and a read cannot be a load. Defining RECOMP_MEM_HOOK routes
+ * every access through a pair the project supplies, with the flat address;
+ * returning 0 means `not mine, plain memory'. The same contract as
+ * runtime/recomp16/cpu.h. Word and dword accesses become byte accesses. */
+#ifdef RECOMP_MEM_HOOK
+int recomp_mem_write8(CPU *cpu, uint32_t addr, uint8_t val);   /* 1 = handled */
+int recomp_mem_read8(CPU *cpu, uint32_t addr, uint8_t *out);   /* 1 = handled */
+#endif
+
 static inline uint8_t mem_read8(CPU *cpu, uint16_t seg, uint16_t off) {
+#ifdef RECOMP_MEM_HOOK
+    uint8_t v;
+    if (recomp_mem_read8(cpu, seg_off(cpu, seg, off), &v)) return v;
+#endif
     return cpu->mem[seg_off(cpu, seg, off)];
 }
 
@@ -240,6 +260,9 @@ void recomp_sel_write(uint16_t seg, uint16_t off, uint16_t val);
 static inline void mem_write8(CPU *cpu, uint16_t seg, uint16_t off, uint8_t val) {
     RECOMP_WATCH_CHECK(seg, off, val);
     RECOMP_SELW(seg, off, val);
+#ifdef RECOMP_MEM_HOOK
+    if (recomp_mem_write8(cpu, seg_off(cpu, seg, off), val)) return;
+#endif
     cpu->mem[seg_off(cpu, seg, off)] = val;
 }
 
@@ -250,8 +273,13 @@ static inline uint16_t mem_read16(CPU *cpu, uint16_t seg, uint16_t off) {
         if (off == 0x6C) return (uint16_t)(cpu->bios_ticks++);
         if (off == 0x6E) return (uint16_t)(cpu->bios_ticks >> 16);
     }
+#ifdef RECOMP_MEM_HOOK
+    return (uint16_t)mem_read8(cpu, seg, off) |
+           ((uint16_t)mem_read8(cpu, seg, (uint16_t)(off + 1)) << 8);
+#else
     uint32_t addr = seg_off(cpu, seg, off);
     return (uint16_t)cpu->mem[addr] | ((uint16_t)cpu->mem[addr + 1] << 8);
+#endif
 }
 
 static inline void mem_write16(CPU *cpu, uint16_t seg, uint16_t off, uint16_t val) {
@@ -277,8 +305,14 @@ static inline void mem_write16(CPU *cpu, uint16_t seg, uint16_t off, uint16_t va
         fprintf(stderr, "\n");
     }
 #endif
+#ifdef RECOMP_MEM_HOOK
+    (void)addr;
+    mem_write8(cpu, seg, off, (uint8_t)(val & 0xFF));
+    mem_write8(cpu, seg, (uint16_t)(off + 1), (uint8_t)(val >> 8));
+#else
     cpu->mem[addr] = (uint8_t)(val & 0xFF);
     cpu->mem[addr + 1] = (uint8_t)(val >> 8);
+#endif
 }
 
 static inline uint32_t mem_read32(CPU *cpu, uint16_t seg, uint16_t off) {
@@ -289,6 +323,41 @@ static inline uint32_t mem_read32(CPU *cpu, uint16_t seg, uint16_t off) {
 static inline void mem_write32(CPU *cpu, uint16_t seg, uint16_t off, uint32_t val) {
     mem_write16(cpu, seg, off, (uint16_t)(val & 0xFFFF));
     mem_write16(cpu, seg, off + 2, (uint16_t)(val >> 16));
+}
+
+/* 32-bit offsets (ADDR32 in the lifted code: `es:[edi]` in a 386 routine). A
+ * selector this host hands out for a big block is followed by its tiles in
+ * flat memory, so base + a 32-bit offset reaches all of it, as a selector with
+ * a big limit does under 386 Enhanced mode. */
+#define ADDR32(x) ((uint32_t)(x))
+static inline uint8_t mem_read8_32(CPU *cpu, uint16_t seg, uint32_t off) {
+    uint32_t a = cpu->sel_base[seg] + off;
+#ifdef RECOMP_MEM_HOOK
+    uint8_t v;
+    if (recomp_mem_read8(cpu, a, &v)) return v;
+#endif
+    return cpu->mem[a];
+}
+static inline void mem_write8_32(CPU *cpu, uint16_t seg, uint32_t off, uint8_t v) {
+    uint32_t a = cpu->sel_base[seg] + off;
+#ifdef RECOMP_MEM_HOOK
+    if (recomp_mem_write8(cpu, a, v)) return;
+#endif
+    cpu->mem[a] = v;
+}
+static inline uint16_t mem_read16_32(CPU *cpu, uint16_t seg, uint32_t off) {
+    return (uint16_t)(mem_read8_32(cpu, seg, off) | (mem_read8_32(cpu, seg, off + 1) << 8));
+}
+static inline void mem_write16_32(CPU *cpu, uint16_t seg, uint32_t off, uint16_t v) {
+    mem_write8_32(cpu, seg, off, (uint8_t)v);
+    mem_write8_32(cpu, seg, off + 1, (uint8_t)(v >> 8));
+}
+static inline uint32_t mem_read32_32(CPU *cpu, uint16_t seg, uint32_t off) {
+    return mem_read16_32(cpu, seg, off) | ((uint32_t)mem_read16_32(cpu, seg, off + 2) << 16);
+}
+static inline void mem_write32_32(CPU *cpu, uint16_t seg, uint32_t off, uint32_t v) {
+    mem_write16_32(cpu, seg, off, (uint16_t)v);
+    mem_write16_32(cpu, seg, off + 2, (uint16_t)(v >> 16));
 }
 
 /* ── Stack operations ──────────────────────────────────────── */
@@ -706,8 +775,18 @@ static inline void cpu_free(CPU *cpu) {
     cpu->sel_base = NULL;
 }
 
-/* ── Port I/O stubs ────────────────────────────────────────── */
+/* ── Port I/O ──────────────────────────────────────────────── */
 
+/* A Windows program does no port I/O, so these are no-ops. A DOS-extended NE
+ * program (Borland's RTM: Jazz Jackrabbit) programs the VGA, the PIT and the
+ * keyboard controller directly: defining RECOMP_PORT_IO makes all four
+ * functions extern, for the project to supply. */
+#ifdef RECOMP_PORT_IO
+uint8_t  port_in8(CPU *cpu, uint16_t port);
+void     port_out8(CPU *cpu, uint16_t port, uint8_t val);
+uint16_t port_in16(CPU *cpu, uint16_t port);
+void     port_out16(CPU *cpu, uint16_t port, uint16_t val);
+#else
 static inline uint8_t port_in8(CPU *cpu, uint16_t port) {
     (void)cpu; (void)port;
     return 0;
@@ -716,6 +795,7 @@ static inline uint8_t port_in8(CPU *cpu, uint16_t port) {
 static inline void port_out8(CPU *cpu, uint16_t port, uint8_t val) {
     (void)cpu; (void)port; (void)val;
 }
+#endif
 
 
 /* ---- Ported from runtime/recomp16/cpu.h ----
@@ -852,6 +932,7 @@ void recomp_tick(CPU *cpu);
 
 /* 16-bit port I/O, same stub contract as the 8-bit pair above. `outsw`/`insw`
  * in the lifted stream need these; VBRUN300 has 35 such sites. */
+#ifndef RECOMP_PORT_IO
 static inline uint16_t port_in16(CPU *cpu, uint16_t port) {
     (void)cpu; (void)port;
     return 0;
@@ -860,5 +941,6 @@ static inline uint16_t port_in16(CPU *cpu, uint16_t port) {
 static inline void port_out16(CPU *cpu, uint16_t port, uint16_t val) {
     (void)cpu; (void)port; (void)val;
 }
+#endif
 
 #endif /* RECOMP_WIN16_CPU_H */

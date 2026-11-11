@@ -97,12 +97,51 @@ static volatile unsigned g_owner_gen;   /* bumped on every take */
 
 extern volatile unsigned hle_dbg_takes;
 int hle_debug_waiters(void) { return g_waiters; }
+/* A thread letting a waiter have the machine waits for it to be taken. It
+ * spun on sched_yield until then, a system call a turn: on macOS a game that
+ * hands over often (Theme Park World, at every import while its other threads
+ * want a turn) spent a twentieth of its main thread there. Off the browser it
+ * sleeps on a condition variable instead, which the taker signals, for at
+ * most 2 ms (a missed signal costs no more than that). */
+#ifndef __EMSCRIPTEN__
+static pthread_mutex_t g_hand_mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_hand_cv = PTHREAD_COND_INITIALIZER;
+static volatile int    g_hand_watchers;
+#endif
 static void mach_take(void) {
     __sync_fetch_and_add(&g_waiters, 1);
     pthread_mutex_lock(&g_mach);
     __sync_fetch_and_sub(&g_waiters, 1);
     g_owner_gen++;
     hle_dbg_takes++;
+#ifndef __EMSCRIPTEN__
+    __sync_synchronize();                     /* the new owner, before reading the watchers */
+    if (g_hand_watchers) {
+        pthread_mutex_lock(&g_hand_mx);
+        pthread_cond_broadcast(&g_hand_cv);
+        pthread_mutex_unlock(&g_hand_mx);
+    }
+#endif
+}
+/* Until another thread has taken the machine since gen, nobody waits for it,
+ * or the turn has been long enough. */
+static void hand_wait(unsigned gen) {
+#ifdef __EMSCRIPTEN__
+    for (int spins = 0; g_waiters && g_owner_gen == gen && spins < HLE_SPINS; spins++) HLE_SPIN();
+#else
+    if (!g_waiters || g_owner_gen != gen) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_nsec += 2000000;
+    if (ts.tv_nsec >= 1000000000) ts.tv_sec++, ts.tv_nsec -= 1000000000;
+    pthread_mutex_lock(&g_hand_mx);
+    g_hand_watchers++;
+    __sync_synchronize();                     /* watching, before reading the owner */
+    while (g_waiters && g_owner_gen == gen)
+        if (pthread_cond_timedwait(&g_hand_cv, &g_hand_mx, &ts)) break;
+    g_hand_watchers--;
+    pthread_mutex_unlock(&g_hand_mx);
+#endif
 }
 
 typedef struct {
@@ -184,7 +223,7 @@ void hle_block_begin(void) {
  * first lets a waiter have its turn. */
 void hle_block_end(void) {
     if (!g_ms.depth) return;
-    for (int spins = 0; g_waiters && g_owner_gen == g_block_gen && spins < HLE_SPINS; spins++) HLE_SPIN();
+    hand_wait(g_block_gen);
     mach_take();
     regs_load(&g_ms.r);
 }
@@ -197,9 +236,8 @@ void hle_yield(void) {
     unsigned gen = g_owner_gen;
     hle_dbg_yields++;
     hle_block_begin();
-    int spins = 0;
-    for (; g_waiters && g_owner_gen == gen && spins < HLE_SPINS; spins++) HLE_SPIN();
-    if (g_owner_gen != gen) hle_dbg_handed++; else if (spins >= HLE_SPINS) hle_dbg_timeouts++;
+    hand_wait(gen);
+    if (g_owner_gen != gen) hle_dbg_handed++; else if (g_waiters) hle_dbg_timeouts++;
     hle_block_end();
 }
 

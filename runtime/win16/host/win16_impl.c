@@ -72,6 +72,16 @@ static uint16_t galloc(CPU *cpu, uint32_t bytes) {
             if (cpu->next_sel == 0) return 0;
             uint16_t s = cpu->next_sel++;
             cpu->sel_base[s] = base; g_sel_base[s] = base; g_sel_size[s] = bsz;
+            /* A reused block over 64 KB needs its tiles too, as a fresh one
+               gets them (cpu_alloc_selector): huge-pointer code reaches the
+               second 64 KB as sel+1. Without them sel+1 was whatever selector
+               came next, and Space Bucks' file reader (_lread in 32 KB steps
+               through a huge pointer) wrote its fourth chunk of credit4.lbm
+               into an unrelated block below the stack. */
+            for (uint32_t off = 0x10000u; off < need; off += 0x10000u) {
+                if (cpu->next_sel == 0) break;
+                cpu->sel_base[cpu->next_sel++] = base + off;
+            }
             /* Blocks off the free list still hold the previous tenant's bytes.
                Real KERNEL grows the heap with fresh (zero) pages, and this
                engine leans on that: XApt's on-screen rect at +0xE8 is read by
@@ -554,6 +564,40 @@ void WING_WINGRECOMMENDDIBFORMAT(CPU *cpu) {/* WinGRecommendDIBFormat(BITMAPINFO
 static uint8_t g_active_pal[256 * 4];       /* RGBQUAD order: B,G,R,0 */
 static int     g_have_pal;
 
+/* A Win16 COLORREF as plain RGB. PALETTEINDEX(n) (0x01000000 | n) names an
+ * entry of the palette selected into the DC; on a window DC the host has none
+ * selected, so Windows resolved it against its default 20 colours -- CivNet's
+ * dialogs came out brown and green. Resolved here against the game's active
+ * palette. PALETTERGB (0x02000000 | rgb) is the RGB. */
+/* The palette as a 256-colour Windows 3.1 screen shows it: entries 0-9 and
+ * 246-255 are the system's static colours, which no game palette displaces.
+ * CivNet draws its dialogs with them (index 7 is the light grey); through its
+ * own palette they came out brown. RGBQUAD order. */
+static const uint8_t k_static[20][3] = {   /* R, G, B */
+    {0,0,0},{128,0,0},{0,128,0},{128,128,0},{0,0,128},{128,0,128},{0,128,128},{192,192,192},
+    {192,220,192},{166,202,240},
+    {255,251,240},{160,160,164},{128,128,128},{255,0,0},{0,255,0},{255,255,0},{0,0,255},
+    {255,0,255},{0,255,255},{255,255,255}};
+const uint8_t *recomp_screen_palette(void) {
+    static uint8_t p[256 * 4];
+    memcpy(p, g_active_pal, sizeof p);
+    if (recomp_game.static_colors)
+        for (int k = 0; k < 20; k++) {
+            int i = k < 10 ? k : 236 + k;
+            p[i * 4 + 0] = k_static[k][2]; p[i * 4 + 1] = k_static[k][1]; p[i * 4 + 2] = k_static[k][0];
+        }
+    return p;
+}
+
+uint32_t recomp_guest_color(uint32_t c) {
+    if ((c >> 24) == 1 && g_have_pal) {
+        const uint8_t *e = &recomp_screen_palette()[(c & 0xFF) * 4];
+        return (uint32_t)e[2] | ((uint32_t)e[1] << 8) | ((uint32_t)e[0] << 16);
+    }
+    if ((c >> 24) == 2) return c & 0xFFFFFF;
+    return c;
+}
+
 #define MAXPAL 16
 typedef struct { uint16_t h; uint8_t rgbq[256 * 4]; } GuestPalette;
 static GuestPalette g_pals[MAXPAL];
@@ -702,6 +746,43 @@ void USER_REALIZEPALETTE(CPU *cpu) {         /* (hdc@0) */
     cpu->ax = 0;
     ret(cpu, 2);
 }
+
+/* Get/SetPaletteEntries and AnimatePalette(hpal, start, n, PALETTEENTRY far *):
+ * args p@0 n@4 start@6 hpal@8. A PALETTEENTRY is R G B flags; the table keeps
+ * RGBQUADs (B G R 0). Setting the active palette's entries changes the active
+ * colours too, which is all AnimatePalette is for: Space Bucks fades its
+ * credits and logo with it, and reads the table back with GetPaletteEntries
+ * to start each fade. */
+static void pal_entries(CPU *cpu, int set) {
+    uint16_t poff = a16(cpu, 0), pseg = a16(cpu, 2), n = a16(cpu, 4), start = a16(cpu, 6);
+    uint16_t h = a16(cpu, 8);
+    GuestPalette *p = NULL;
+    for (int i = 0; i < g_npal; i++) if (g_pals[i].h == h) p = &g_pals[i];
+    uint16_t done = 0;
+    if (p) {
+        int active = g_have_pal && !memcmp(g_active_pal, p->rgbq, sizeof g_active_pal);
+        for (; done < n && start + done < 256; done++) {
+            uint8_t *q = &p->rgbq[(start + done) * 4];
+            uint16_t o = (uint16_t)(poff + done * 4);
+            if (set) {
+                q[2] = mem_read8(cpu, pseg, o);
+                q[1] = mem_read8(cpu, pseg, (uint16_t)(o + 1));
+                q[0] = mem_read8(cpu, pseg, (uint16_t)(o + 2));
+            } else {
+                mem_write8(cpu, pseg, o, q[2]);
+                mem_write8(cpu, pseg, (uint16_t)(o + 1), q[1]);
+                mem_write8(cpu, pseg, (uint16_t)(o + 2), q[0]);
+                mem_write8(cpu, pseg, (uint16_t)(o + 3), 0);
+            }
+        }
+        if (set && active) memcpy(g_active_pal, p->rgbq, sizeof g_active_pal);
+    }
+    cpu->ax = done;
+    ret(cpu, 10);
+}
+void GDI_GETPALETTEENTRIES(CPU *cpu) { pal_entries(cpu, 0); }
+void GDI_SETPALETTEENTRIES(CPU *cpu) { pal_entries(cpu, 1); }
+void GDI_ANIMATEPALETTE(CPU *cpu)    { pal_entries(cpu, 1); cpu->ax = 0; }
 
 /* A scratch guest block for marshalling host structures the engine expects to
  * read through a far pointer (WM_DRAWITEM's DRAWITEMSTRUCT, so far). One
@@ -1042,7 +1123,16 @@ void WING_WINGSTRETCHBLT(CPU *cpu);
  *
  * Win16 args: dwRop@0(4) nYSrc@4 nXSrc@6 hdcSrc@8 nHeight@10 nWidth@12
  *             nYDest@14 nXDest@16 hdcDest@18 */
+int recomp_gdi_bitblt(CPU *cpu);   /* win32_backend.c */
+
+/* BitBlt(hdcDest@18, x@16, y@14, w@12, h@10, hdcSrc@8, xSrc@6, ySrc@4, dwRop@0/2).
+ * A WinG source goes the WinG way below (the PF Magic games only ever blit
+ * from WinG surfaces). Any other source -- a memory DC holding a LoadBitmap'd
+ * icon or a CreateBitmap mask, or none for a pattern ROP -- is a real GDI
+ * BitBlt with the game's raster operation: routed to WinG, CivNet's icons and
+ * buttons all came out as whichever WinG surface was used last. */
 void GDI_BITBLT(CPU *cpu) {
+    if (!wing_is_dc(a16(cpu, 8)) && recomp_gdi_bitblt(cpu)) return;
     uint16_t a[10];
     a[9] = a16(cpu, 18); a[8] = a16(cpu, 16); a[7] = a16(cpu, 14);  /* hdc x y  */
     a[6] = a16(cpu, 12); a[5] = a16(cpu, 10);                       /* w h dest */
@@ -1053,6 +1143,71 @@ void GDI_BITBLT(CPU *cpu) {
         mem_write16(cpu, cpu->ss, (uint16_t)(cpu->sp + 4 + k * 2), a[k]);
     WING_WINGSTRETCHBLT(cpu);            /* pops 4 + 20, which is what we owe */
 }
+
+/* WinGBitBlt(hdcDest, xDest, yDest, w, h, hdcSrc, xSrc, ySrc): StretchBlt at
+ * one size. Args: ySrc@0 xSrc@2 hdcSrc@4 h@6 w@8 yDest@10 xDest@12 hdcDest@14,
+ * 16 bytes where WinGStretchBlt takes 20: the far return frame moves down 4
+ * bytes (below sp is free), so its pop of 4 + 20 is exactly our 4 + 16.
+ * Space Bucks puts every frame on screen with it. */
+void WING_WINGBITBLT(CPU *cpu) {
+    uint16_t a[10];
+    a[9] = a16(cpu, 14); a[8] = a16(cpu, 12); a[7] = a16(cpu, 10);   /* hdcDest x y */
+    a[6] = a16(cpu, 8);  a[5] = a16(cpu, 6);                         /* w h dest    */
+    a[4] = a16(cpu, 4);  a[3] = a16(cpu, 2);  a[2] = a16(cpu, 0);    /* hdcSrc x y  */
+    a[1] = a16(cpu, 8);  a[0] = a16(cpu, 6);                         /* w h src     */
+    uint16_t ro = mem_read16(cpu, cpu->ss, cpu->sp), rs = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 2));
+    cpu->sp -= 4;
+    mem_write16(cpu, cpu->ss, cpu->sp, ro);
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->sp + 2), rs);
+    for (int k = 0; k < 10; k++)
+        mem_write16(cpu, cpu->ss, (uint16_t)(cpu->sp + 4 + k * 2), a[k]);
+    WING_WINGSTRETCHBLT(cpu);
+}
+
+/* WinGGetDIBPointer(HBITMAP, BITMAPINFO far *pbi) -> void far *: the surface's
+ * pixels, sel:0000, and its header into *pbi. A game that asks for the pointer
+ * this way (Space Bucks) and gets NULL hmemcpy's a whole frame over low
+ * memory, the stack included. */
+void WING_WINGGETDIBPOINTER(CPU *cpu) {
+    uint16_t poff = a16(cpu, 0), pseg = a16(cpu, 2), hbm = a16(cpu, 4);
+    int i = wing_index_of(hbm);
+    cpu->ax = 0; cpu->dx = 0;
+    if (i >= 0) {
+        cpu->dx = g_wing[i].sel;
+        if (pseg || poff) {
+            mem_write32(cpu, pseg, poff + 0, 40);
+            mem_write32(cpu, pseg, poff + 4, (uint32_t)g_wing[i].w);
+            mem_write32(cpu, pseg, poff + 8, (uint32_t)(g_wing[i].topdown ? -g_wing[i].h : g_wing[i].h));
+            mem_write16(cpu, pseg, poff + 12, 1);
+            mem_write16(cpu, pseg, poff + 14, (uint16_t)g_wing[i].bpp);
+            for (int k = 16; k < 40; k += 4) mem_write32(cpu, pseg, (uint16_t)(poff + k), 0);
+        }
+    }
+    ret(cpu, 6);
+}
+
+/* WinGSetDIBColorTable / WinGGetDIBColorTable(HDC, UINT start, UINT n,
+ * RGBQUAD far *): the colour table of the surface selected into the WinG DC.
+ * Args: p@0 n@4 start@6 hdc@8. Returns the entries copied. */
+static void wing_colors(CPU *cpu, int set) {
+    uint16_t poff = a16(cpu, 0), pseg = a16(cpu, 2), n = a16(cpu, 4), start = a16(cpu, 6);
+    int d = (int)a16(cpu, 8) - WING_DC_HANDLE;
+    int i = (d >= 0 && d < WING_DC_MAX) ? wing_index_of(g_wingdc_sel[d]) : -1;
+    if (i < 0) i = g_wing_cur;
+    uint16_t done = 0;
+    for (; i >= 0 && done < n && start + done < 256; done++) {
+        uint8_t *q = &g_wing[i].pal[(start + done) * 4];
+        uint16_t o = (uint16_t)(poff + done * 4);
+        for (int c = 0; c < 4; c++) {
+            if (set) q[c] = mem_read8(cpu, pseg, (uint16_t)(o + c));
+            else     mem_write8(cpu, pseg, (uint16_t)(o + c), q[c]);
+        }
+    }
+    cpu->ax = done;
+    ret(cpu, 10);
+}
+void WING_WINGSETDIBCOLORTABLE(CPU *cpu) { wing_colors(cpu, 1); }
+void WING_WINGGETDIBCOLORTABLE(CPU *cpu) { wing_colors(cpu, 0); }
 
 void GDI_STRETCHBLT(CPU *cpu) {
     if (getenv("RECOMP_LOG_ROP")) { static int n; if (n++ < 40)
@@ -1162,7 +1317,8 @@ void WING_WINGSTRETCHBLT(CPU *cpu) {
     h->biBitCount = (WORD)g_wing[i].bpp;
     h->biCompression = BI_RGB;
     if (g_wing[i].bpp <= 8)
-        memcpy(bi + sizeof(BITMAPINFOHEADER), g_wing[i].pal, 256 * 4);
+        memcpy(bi + sizeof(BITMAPINFOHEADER),
+               recomp_game.wing_screen_palette && g_have_pal ? recomp_screen_palette() : g_wing[i].pal, 256 * 4);
 
     /* RECOMP_DUMP_BLIT=<n>: write the nth source surface out as a .bmp so the
        actual pixels and colour table can be inspected directly. Diagnostic. */
@@ -1992,7 +2148,13 @@ static int find_step(CPU *cpu, int slot, WIN32_FIND_DATAA *fd, uint8_t want, int
     }
 }
 
+/* A game whose program is DOS-extended rather than Windows (Jazz Jackrabbit,
+ * under Borland's RTM) needs more of DOS than a Windows program does: it
+ * answers first, and returns 0 for what it leaves to the cases below. */
+__attribute__((weak)) int recomp_game_int21(CPU *cpu) { (void)cpu; return 0; }
+
 void dos_int21(CPU *cpu) {
+    if (recomp_game_int21(cpu)) return;
     switch (cpu->ah) {
     case 0x4C:                              /* terminate process */
         printf("[INT21/4C] program exit, code=%u\n", cpu->al);
