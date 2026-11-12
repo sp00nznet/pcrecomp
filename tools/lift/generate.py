@@ -524,7 +524,7 @@ def _jump_table(ins, code, code_start, lo, hi, limit=1024):
 
 
 def true_extent(md, code, code_start, start, hard_end, entries, reached=None, behind=None,
-                called=None, seeds=()):
+                called=None, seeds=(), far=None):
     """Exact end of the body at `start`: the highest address reached by
     fallthrough and direct branches. Returns (end, clean).
 
@@ -566,6 +566,12 @@ def true_extent(md, code, code_start, start, hard_end, entries, reached=None, be
     Pass a set as `called` to collect the targets of direct calls in the body:
     a lift driver needs every one of them dispatchable, catalogued or not.
 
+    Pass a set as `far` to collect direct branch targets past `hard_end`
+    that are not entries. The lifter makes them tail dispatches, so a driver
+    has to make them dispatchable. CA-Visual Objects' class-init stubs end
+    `je <shared failure tail>` megabytes away, in the middle of another body
+    (Retail Plus Lite: `je 0x0077A9FB` from 0x004723C8).
+
     `seeds`: more addresses in this body that nothing in it branches to. An
     __except block is one: only _except_handler3 reaches it, through the
     scope table, and it must be in the body for the landing pad to reach it
@@ -606,6 +612,9 @@ def true_extent(md, code, code_start, start, hard_end, entries, reached=None, be
                 if (behind is not None and branch and t is not None and t < start
                         and t not in entries):
                     behind.add(t)
+                if (far is not None and branch and t is not None and t >= hard_end
+                        and t not in entries):
+                    far.add(t)
                 if branch and t is not None and start < t < hard_end:
                     (deferred.add if t in entries else work.append)(t)
                 # Hand-written CRT routines (strchr, strlen) put a shared exit
