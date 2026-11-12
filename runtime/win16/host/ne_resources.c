@@ -155,13 +155,20 @@ static void scan_tagmap(Mod *m) {
         int ok = 1;
         for (int k = 0; k < 4; k++) { uint8_t c = d[i + k]; if (c < 0x20 || c > 0x7E) { ok = 0; break; } }
         if (!ok) continue;
-        if (d[i + 4] || d[i + 5]) continue;
-        if (d[i + 6] != 0x0C || d[i + 7] != 0x00) continue;
-        uint16_t type = (uint16_t)(d[i + 8] | (d[i + 9] << 8));
+        int before = recomp_game.resource_tags == 2;
+        const uint8_t *h = before ? (i >= 8 ? d + i - 8 : NULL) : d + i + 4;   /* the [00 00][0C 00] */
+        if (!h || h[0] || h[1] || h[2] != 0x0C || h[3]) continue;
+        /* resource_tags == 2: the record is [00 00][0C 00][type][id][tag], so a
+           tag's type and id are the 4 bytes before it, not the 4 after. The
+           bytes are the same chain either way; read the other way round every
+           CivNet record names its neighbour's id, and CvPc 2001 (the terrain
+           sheet, in CIVDATA4) was served from CIVDATA0 as #137. */
+        long t0 = before ? i - 4 : i + 8;
+        uint16_t type = (uint16_t)(d[t0] | (d[t0 + 1] << 8));
         if (type < 0xFF00 || type > 0xFF20) continue;      /* Petz custom types */
         if (g_ntag >= (int)(sizeof g_tagmap / sizeof g_tagmap[0])) break;
         memcpy(g_tagmap[g_ntag].tag, d + i, 4); g_tagmap[g_ntag].tag[4] = 0;
-        g_tagmap[g_ntag].id   = (uint16_t)(d[i + 10] | (d[i + 11] << 8));
+        g_tagmap[g_ntag].id   = (uint16_t)(d[t0 + 2] | (d[t0 + 3] << 8));
         g_tagmap[g_ntag].type = (uint16_t)(type & 0x7FFF);
         g_tagmap[g_ntag].mod  = m;
         g_ntag++;
@@ -393,6 +400,10 @@ static uint16_t find_tagged(Mod *m, int type_int, const char *type_str, int name
         int t = tag_to_type_in(type_str, name_int, own ? m : NULL);
         if (getenv("RECOMP_LOG_TAGS")) fprintf(stderr, "[tag] %s/%d in %s -> type %d\n", type_str, name_int, m->name, t);
         if (t >= 0) return find_in(m, t, NULL, name_int, name_str);
+        /* A module with records of its own that cannot place this tag does not
+           have it; its type-15 resource is that record table, not a Windows
+           name table, and reading it as one hands back a stranger. */
+        if (own) return 0;
     }
     return find_in(m, type_int, type_str, name_int, name_str);
 }
@@ -404,6 +415,12 @@ uint16_t ne_find_resource(uint16_t hinst, int type_int, const char *type_str,
        and MAKEINTRESOURCE both produce it); Dogz asks for type "#123". */
     if (type_int < 0 && type_str && type_str[0] == '#') { type_int = atoi(type_str + 1); type_str = NULL; }
     if (name_int < 0 && name_str && name_str[0] == '#') { name_int = atoi(name_str + 1); name_str = NULL; }
+    /* An integer id comes with an empty string beside it (res_arg). Left
+       non-NULL, find_in took it for a named query and fell through to the
+       module's "name table" -- for a CivNet data DLL its tag records -- and
+       answered CvPc 2001 (CIVDATA4's terrain sheet) with CIVDATA0's #137. */
+    if (name_int >= 0) name_str = NULL;
+    if (type_int >= 0) type_str = NULL;
     /* Resolve a Petz 4-char tag ("APTF","PALT",...) to its real NE int type via
      * the (tag,id) table, since resources are stored under int types not the tag. */
     Mod *m = mod_by_hinst(hinst);

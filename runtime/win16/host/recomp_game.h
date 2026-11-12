@@ -44,7 +44,8 @@ typedef struct {
     /* PF Magic's engines (Dogz, Catz, Oddballz) ask FindResource by a 4-char
      * tag ("PALT", "STBL") and embed [tag][00 00][0C 00][type][id] records that
      * say which integer type the tag means. Non-zero: scan every module for
-     * them. See ne_resources.c. */
+     * them; 2: the type and id come before the tag ([00 00][0C 00][type][id]
+     * [tag], CivNet). See ne_resources.c. */
     int resource_tags;
 
     /* When a LoadString/FindResource misses in the module it names, search the
