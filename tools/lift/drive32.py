@@ -114,6 +114,11 @@ def lift_image(img, catalog, out, seeds=(), split=400, log=print, precise_carry=
     st = {'lifted': 0, 'alias_stubs': 0, 'added': 0, 'errors': 0, 'no_terminator': 0,
           'catch': 0, 'unimplemented': {}}
     bodies, entries = {}, []
+    # Jump-table arms outside the body that owns the `jmp [reg*4 + table]`:
+    # the catalog cut a big switch (Afterlife's window procedure) into
+    # pieces, so an arm lives in a neighbour's body and is no entry of its
+    # own. Each one becomes an entry, or the jump ends in ITAIL.
+    arms_out = set()
 
     def lift(addr, w, aliases=None):
         name = 'sub_%08X' % addr
@@ -128,6 +133,8 @@ def lift_image(img, catalog, out, seeds=(), split=400, log=print, precise_carry=
             ind = jump_tables(insns)
             if ind is not None and leaders is not None:
                 leaders |= ind & {i.address for i in insns}
+            if ind:
+                arms_out.update(ind - {i.address for i in insns})
             eh = eh_at.get(addr)
             st['catch'] += bool(eh)
             body = (lift_function_linear(lifter, name, insns, leaders, addr, eh_resume=eh,
@@ -175,6 +182,7 @@ def lift_image(img, catalog, out, seeds=(), split=400, log=print, precise_carry=
             outside |= w[3]
             lift(a, w)
     # Later rounds: targets outside the catalog, lifted as their own bodies.
+    outside |= arms_out
     todo = sorted(t for t in outside if cs <= t < ce and t not in bodies)
     while todo:
         outside = set()
@@ -184,6 +192,7 @@ def lift_image(img, catalog, out, seeds=(), split=400, log=print, precise_carry=
             outside |= w[3]
             lift(t, w)
         st['added'] += len(todo)
+        outside |= arms_out
         todo = sorted(t for t in outside if cs <= t < ce and t not in bodies)
 
     entries = sorted(bodies)
