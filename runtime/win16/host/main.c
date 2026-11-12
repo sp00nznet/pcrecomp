@@ -451,11 +451,11 @@ int main(int argc, char *argv[])
         printf("%s init returned (ax=%04X)\n", m->name, cpu.ax);
     }
 
-#ifdef RECOMP_WATCHDOG
-    CreateThread(NULL, 0, watchdog_thread, NULL, 0, NULL);
-#else
-    (void)watchdog_thread;
+#ifndef RECOMP_WATCHDOG
+    if (getenv("RECOMP_WATCHDOG_SECS"))     /* a run can ask for it without a rebuild */
 #endif
+    CreateThread(NULL, 0, watchdog_thread, NULL, 0, NULL);
+    { extern void win16_sim_input_start(void); win16_sim_input_start(); }
 
     /* 2) The host EXE's startup (Borland C0 -> InitTask -> WinMain): window and
      *    message loop, calling into the DLLs through the cross-module calls the

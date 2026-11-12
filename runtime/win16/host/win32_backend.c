@@ -3032,3 +3032,70 @@ void USER_TRANSLATEACCELERATOR(CPU *cpu) {     /* (hwnd@6, hAccTable@4, lpMsg@0/
 /* GetWindowDC(hwnd): the whole window's DC, frame included. The guest draws
  * only into the client area the host gives it, so the client DC answers. */
 void USER_GETWINDOWDC(CPU *cpu) { USER_GETDC(cpu); }
+
+/* ---- Simulated input (RECOMP_INPUT) ----
+ * The Win16 counterpart of native32's synthetic DirectInput: a headless or
+ * offstage run can press the game's buttons without a real mouse. The game's
+ * windows are real Win32 windows, so input is posted to them.
+ *
+ * RECOMP_INPUT="DELAY:STEP;DELAY:STEP;..." -- each DELAY (seconds, may be
+ * fractional) is counted from the previous step. STEP is one of
+ *   X,Y    left click at client X,Y of the process's topmost visible window
+ *          (the open dialog, else the game window), delivered to the child
+ *          control under the point
+ *   rX,Y   the same with the right button
+ *   kVK    press and release virtual key VK (decimal)
+ * Each step is logged as [input]. ponytail: posted messages, so GetKeyState /
+ * GetAsyncKeyState don't see them; hook those when a game polls. */
+static BOOL CALLBACK sim_top(HWND h, LPARAM lp) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (pid != GetCurrentProcessId() || !IsWindowVisible(h)) return TRUE;
+    *(HWND *)lp = h;
+    return FALSE;                                   /* EnumWindows goes top-down */
+}
+
+static DWORD WINAPI sim_input_thread(LPVOID arg) {
+    const char *p = (const char *)arg;
+    while (*p) {
+        double delay = strtod(p, (char **)&p);
+        if (*p == ':') p++;
+        Sleep((DWORD)(delay * 1000));
+        HWND top = NULL;
+        EnumWindows(sim_top, (LPARAM)&top);
+        if (*p == 'k') {
+            int vk = (int)strtol(p + 1, (char **)&p, 10);
+            HWND f = top ? (GetFocus() ? GetFocus() : top) : NULL;
+            fprintf(stderr, "[input] key %d -> %p\n", vk, (void *)f);
+            if (f) { PostMessageA(f, WM_KEYDOWN, vk, 1); PostMessageA(f, WM_KEYUP, vk, 0xC0000001); }
+        } else {
+            int right = (*p == 'r');
+            if (right) p++;
+            int x = (int)strtol(p, (char **)&p, 10);
+            if (*p == ',') p++;
+            int y = (int)strtol(p, (char **)&p, 10);
+            if (top) {
+                POINT pt = { x, y };
+                HWND c = ChildWindowFromPointEx(top, pt, CWP_SKIPINVISIBLE | CWP_SKIPDISABLED);
+                if (!c) c = top;
+                if (c != top) MapWindowPoints(top, c, &pt, 1);
+                LPARAM at = MAKELPARAM(pt.x, pt.y);
+                UINT dn = right ? WM_RBUTTONDOWN : WM_LBUTTONDOWN;
+                fprintf(stderr, "[input] %s click %d,%d -> %p (child %p at %ld,%ld)\n",
+                        right ? "right" : "left", x, y, (void *)top, (void *)c, pt.x, pt.y);
+                PostMessageA(c, WM_MOUSEMOVE, 0, at);
+                PostMessageA(c, dn, right ? MK_RBUTTON : MK_LBUTTON, at);
+                PostMessageA(c, dn + 1, 0, at);
+            }
+        }
+        fflush(stderr);
+        while (*p && *p != ';') p++;
+        if (*p == ';') p++;
+    }
+    return 0;
+}
+
+void win16_sim_input_start(void) {
+    const char *s = getenv("RECOMP_INPUT");
+    if (s && *s) CreateThread(NULL, 0, sim_input_thread, (LPVOID)s, 0, NULL);
+}
