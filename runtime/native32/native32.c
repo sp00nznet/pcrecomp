@@ -1071,7 +1071,7 @@ static LONG CALLBACK native32_veh(EXCEPTION_POINTERS* ep) {
 
 int native32_require_color_depth(int bpp) {
     char layer[512] = "";
-    const char* want = bpp == 16 ? "16BITCOLOR" : bpp == 8 ? "256COLOR" : NULL;
+    const char* want = bpp == 16 ? "DWM8And16BitMitigation 16BITCOLOR" : bpp == 8 ? "256COLOR" : NULL;
     STARTUPINFOA si = { sizeof si };
     PROCESS_INFORMATION pi;
     DWORD rc = 1;
