@@ -32,6 +32,10 @@ static inline uint32_t b_a32(CPU *cpu, int off) {
 }
 static inline void b_ret(CPU *cpu, int purge) { cpu->sp += 4 + purge; }
 static void b_asciiz(CPU *cpu, uint16_t seg, uint16_t off, char *out, int max);
+/* RECOMP_INPUT's pointer: once a scripted click has happened, GetCursorPos and
+   the mouse-button key states answer from here, for games that poll the mouse
+   instead of reading their messages. Host screen coordinates. */
+static volatile LONG g_sim_on, g_sim_x, g_sim_y, g_sim_btn;   /* btn: bit0 left, bit1 right */
 
 /* ---- guest HWND/HDC handle tables (16-bit guest handle <-> real) ---- */
 #define MAXH 256
@@ -838,6 +842,11 @@ void USER_GETASYNCKEYSTATE(CPU *cpu) {         /* (vKey@0) */
         b_ret(cpu, 2);
         return;
     }
+    if (g_sim_on && (vk == VK_LBUTTON || vk == VK_RBUTTON)) {
+        cpu->ax = (g_sim_btn & (vk == VK_LBUTTON ? 1 : 2)) ? 0x8000 : 0;
+        b_ret(cpu, 2);
+        return;
+    }
     cpu->ax = (uint16_t)GetAsyncKeyState(vk);
     b_ret(cpu, 2);
 }
@@ -1370,6 +1379,7 @@ void USER_GETCURSORPOS(CPU *cpu) {         /* (lpPoint@0/2) */
         p.y = c ? atoi(c + 1) : 0;
     } else {
         GetCursorPos(&p);
+        if (g_sim_on) { p.x = g_sim_x; p.y = g_sim_y; }
         HWND h = g_screen_hwnd ? g_screen_hwnd : g_main_hwnd;
         POINT raw = p;
         if (h) ScreenToClient(h, &p);
@@ -2964,7 +2974,11 @@ void USER_GETCAPTURE(CPU *cpu) {
     b_ret(cpu, 0);
 }
 void USER_GETKEYSTATE(CPU *cpu) {              /* (nVirtKey@0) */
-    cpu->ax = (uint16_t)GetKeyState(b_a16(cpu, 0));
+    int vk = b_a16(cpu, 0);
+    if (g_sim_on && (vk == VK_LBUTTON || vk == VK_RBUTTON))
+        cpu->ax = (g_sim_btn & (vk == VK_LBUTTON ? 1 : 2)) ? 0xFF80 : 0;
+    else
+        cpu->ax = (uint16_t)GetKeyState(vk);
     b_ret(cpu, 2);
 }
 
@@ -3083,8 +3097,15 @@ static DWORD WINAPI sim_input_thread(LPVOID arg) {
                 UINT dn = right ? WM_RBUTTONDOWN : WM_LBUTTONDOWN;
                 fprintf(stderr, "[input] %s click %d,%d -> %p (child %p at %ld,%ld)\n",
                         right ? "right" : "left", x, y, (void *)top, (void *)c, pt.x, pt.y);
+                POINT sp = { x, y };
+                ClientToScreen(top, &sp);
+                g_sim_x = sp.x; g_sim_y = sp.y; g_sim_on = 1;
                 PostMessageA(c, WM_MOUSEMOVE, 0, at);
+                Sleep(100);
+                g_sim_btn |= right ? 2 : 1;
                 PostMessageA(c, dn, right ? MK_RBUTTON : MK_LBUTTON, at);
+                Sleep(150);                 /* held long enough for a polling loop to see it */
+                g_sim_btn &= right ? ~2 : ~1;
                 PostMessageA(c, dn + 1, 0, at);
             }
         }
