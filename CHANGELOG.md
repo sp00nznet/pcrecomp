@@ -6,6 +6,22 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- native32: `native32_add_guest_abi(lo, size)`: a compiled language runtime
+  that is not the C ABI (CA-Visual Objects' `CAVORT20` and friends: helpers
+  read the caller's frame through ebp, `__chkstk` moves esp, results come in
+  eax:edx and in the flags) is entered on the guest stack with the guest's
+  registers, like generated code, but with the x87 left alone (an st(0) result
+  goes onto the lifted FPU stack), EFLAGS returned to the lifted caller, the
+  TEB's stack bounds covering the guest stack (so Windows' own `__try` frames
+  there are valid), and callbacks from it given the caller's registers.
+  Retail Plus Lite, the first VO program.
+- `tools/assets/extract_clickteam.py`: Clickteam Install Maker installers,
+  unpacked without running them.
+- disasm32 `--tail-jumps`: a jmp to another candidate is a tail call. VO's
+  chained class-init stubs made the catalog quadratic (hours, 16+ GB).
+- generate `true_extent(far=...)`: forward branch targets past the extent,
+  for a driver to make dispatchable (VO's `je <shared failure tail>`).
+
 - native32: `native32_registry(file)` (`reg32.c`): the registry subtrees a
   regedit 4 file names are served from that file, so a Win9x game finds what
   its installer wrote under `HKLM\Software\<publisher>` without an installer,
@@ -33,6 +49,10 @@ versions follow [SemVer](https://semver.org/).
   first frame ended in an unresolved ITAIL.
 
 ### Fixed
+- native32: a callback's edx never reached its native caller (cb_tramp used
+  edx for the purge), so a 64-bit result came back with its high half lost.
+- disasm32: `drop_mid_instruction_entries` walks each body once instead of
+  two or three times a round; a catalog-only run keeps small operand copies.
 - native32 DirectDraw (built-in `DirectDrawCreate`/`Ex` shims, patched in
   ddraw's vtables and re-applied on every `QueryInterface`, because Windows'
   own DirectDraw compatibility shims hook `CreateSurface` again there):
