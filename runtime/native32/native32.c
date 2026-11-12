@@ -608,18 +608,28 @@ recomp_func_t recomp_lookup(uint32_t va) {
  * (0x008DD8B0). Through native_bridge it read 0 for each. So these calls get
  * the whole register file, on the guest's stack, the way the original call
  * instruction would have left it. */
+/* gen_bridge calls in flight with the TEB's stack bounds widened (cb_tramp). */
+static volatile LONG g_teb_widened;
+
 #define MAX_GEN 64
-static struct { uint32_t lo, hi; } g_gen[MAX_GEN];
+static struct { uint32_t lo, hi; int x87; } g_gen[MAX_GEN];
 static volatile LONG g_gen_n;
 
-int native32_is_generated(uint32_t va) {
+/* 1: generated (MMX registers carried), 2: an x87 range, 0: neither. */
+static int gen_kind(uint32_t va) {
     LONG n = g_gen_n < MAX_GEN ? g_gen_n : MAX_GEN;
     for (LONG i = 0; i < n; i++)
-        if (va >= g_gen[i].lo && va < g_gen[i].hi) return 1;
+        if (va >= g_gen[i].lo && va < g_gen[i].hi) return g_gen[i].x87 ? 2 : 1;
     return 0;
 }
 
-void native32_add_generated(uint32_t lo, uint32_t size) {
+int native32_is_generated(uint32_t va) { return gen_kind(va) != 0; }
+
+static void add_generated(uint32_t lo, uint32_t size, int x87);
+void native32_add_generated(uint32_t lo, uint32_t size) { add_generated(lo, size, 0); }
+void native32_add_guest_abi(uint32_t lo, uint32_t size) { add_generated(lo, size, 1); }
+
+static void add_generated(uint32_t lo, uint32_t size, int x87) {
     if (!size || (native32_is_generated(lo) && native32_is_generated(lo + size - 1))) return;
     LONG i = InterlockedIncrement(&g_gen_n) - 1;
     if (i >= MAX_GEN) {
@@ -628,17 +638,21 @@ void native32_add_generated(uint32_t lo, uint32_t size) {
         return;
     }
     g_gen[i].hi = lo + size;
+    g_gen[i].x87 = x87;
     g_gen[i].lo = lo;
     if (getenv("NATIVE32_LOG_THREADS") || native32_trace_native)
         fprintf(stderr, "[native32] generated code at 0x%08X+0x%X runs natively\n", lo, size);
 }
 
-/* Field offsets are used by the asm below: fn, in[8], mm, out[8]. */
+/* Field offsets are used by the asm below: fn, in[8], mm, out[8], sw[2]. */
 typedef struct {
     uint32_t fn;
     uint32_t in[8];     /* eax ecx edx ebx esp ebp esi edi; esp already past the dummy ret */
-    uint32_t mm;        /* &g_mm */
+    uint32_t mm;        /* &g_mm, or 0 for an x87 range (native32_add_guest_abi) */
     uint32_t out[8];
+    uint32_t sw[2];     /* x87 range: the status word before the call and after it */
+    uint32_t lim[2];    /* x87 range: the TEB's StackBase and StackLimit, put back after */
+    uint32_t fl;        /* EFLAGS as the callee left them */
 } gen_ctx_t;
 
 /* Entered by `call` on the guest's stack with edi = the context: loads the
@@ -665,7 +679,32 @@ static void gen_bridge(void) {
     c.fn = g_native_target;
     c.in[0] = g_eax; c.in[1] = g_ecx; c.in[2] = g_edx; c.in[3] = g_ebx;
     c.in[4] = g_esp + 4; c.in[5] = g_ebp; c.in[6] = g_esi; c.in[7] = g_edi;
-    c.mm = (uint32_t)(uintptr_t)g_mm;
+    /* An x87 range is a compiled runtime (CA-Visual Objects' CAVORT20) that
+     * computes on the real x87 and returns doubles in st(0), like any C
+     * function: loading the MMX registers set every x87 tag valid, so its
+     * first fld overflowed the stack and VO's FLOAT conversion raised
+     * NUMERIC OVERFLOW on -1.#I. Its MMX state is not carried, and an st(0)
+     * result is moved onto the lifted FPU stack, as native_bridge does. */
+    int x87 = gen_kind(c.fn) == 2;
+    double r_st = 0;
+    /* Its exception handling runs on the guest stack too: a compiled runtime
+     * calls Windows, and Windows' own __try frames (RPC inside the print
+     * spooler raising 0x6BA, Retail Plus Lite's startup) are then on the
+     * guest stack, outside the TEB's StackBase..StackLimit, and the
+     * dispatcher calls such a chain invalid and ends the process. So for the
+     * call the TEB's bounds cover the guest stack as well. cb_tramp tells
+     * the guest stack apart by the guest TIB, not by these. */
+    NT_TIB* tib = (NT_TIB*)NtCurrentTeb();
+    c.lim[0] = (uint32_t)(uintptr_t)tib->StackBase;
+    c.lim[1] = (uint32_t)(uintptr_t)tib->StackLimit;
+    int widened = x87 && g_fs_base;
+    if (widened) {
+        uint32_t gb = MEM32(g_fs_base + 4), gl = MEM32(g_fs_base + 8);
+        g_teb_widened++;
+        if (gb > c.lim[0]) tib->StackBase = (PVOID)(uintptr_t)gb;
+        if (gl && gl < c.lim[1]) tib->StackLimit = (PVOID)(uintptr_t)gl;
+    }
+    c.mm = x87 ? 0 : (uint32_t)(uintptr_t)g_mm;
     if (native32_trace_native)
         fprintf(stderr, "[native] generated code @%08X from sub_%08X (esi %08X edi %08X ebp %08X)\n",
                 c.fn, g_cur_func, g_esi, g_edi, g_ebp);
@@ -685,6 +724,12 @@ static void gen_bridge(void) {
         mov  fs:[0x14], esp
         mov  edi, eax
         mov  eax, [edi + 36]
+        test eax, eax
+        jnz  load_mm
+        fnstsw ax
+        mov  [edi + 72], eax         ; x87 TOP before
+        jmp  gen_go
+    load_mm:
         movq mm0, qword ptr [eax]
         movq mm1, qword ptr [eax + 8]
         movq mm2, qword ptr [eax + 16]
@@ -693,11 +738,14 @@ static void gen_bridge(void) {
         movq mm5, qword ptr [eax + 40]
         movq mm6, qword ptr [eax + 48]
         movq mm7, qword ptr [eax + 56]
+    gen_go:
         mov  esp, [edi + 20]         ; the guest's stack
         call gen_enter
         push eax
         mov  eax, fs:[0x14]
         mov  eax, [eax + 4]          ; the context
+        pushfd                       ; nothing above wrote the flags
+        pop  dword ptr [eax + 88]
         mov  [eax + 44], ecx
         mov  [eax + 48], edx
         mov  [eax + 52], ebx
@@ -708,6 +756,14 @@ static void gen_bridge(void) {
         mov  [eax + 40], ecx
         mov  [eax + 56], esp
         mov  ecx, [eax + 36]
+        test ecx, ecx
+        jnz  save_mm
+        mov  ecx, eax
+        fxam                         ; C3..C0 classify st(0)
+        fnstsw ax
+        mov  [ecx + 76], eax         ; x87 TOP after
+        jmp  gen_done
+    save_mm:
         movq qword ptr [ecx], mm0
         movq qword ptr [ecx + 8], mm1
         movq qword ptr [ecx + 16], mm2
@@ -717,6 +773,7 @@ static void gen_bridge(void) {
         movq qword ptr [ecx + 48], mm6
         movq qword ptr [ecx + 56], mm7
         emms                         ; the host's x87 is usable again
+    gen_done:
         mov  esp, fs:[0x14]
         pop  dword ptr fs:[0x14]
         add  esp, 4
@@ -725,8 +782,27 @@ static void gen_bridge(void) {
         pop  ebp
         pop  edi
     }
+    tib->StackBase = (PVOID)(uintptr_t)c.lim[0];
+    tib->StackLimit = (PVOID)(uintptr_t)c.lim[1];
+    if (widened) g_teb_widened--;
+    /* A runtime helper can answer in the flags: VO's string compare _CPSE is
+     * `call _CPSE; jne ...`, and the lifted caller reads the flags back after
+     * the call (RECOMP_FLAGS_IN). Left stale, Retail Plus Lite's ".DBF"
+     * extension check failed and every inventory was "not a DBF file". */
+    if (x87) {
+        g_flag_k = FK_EFLAGS;
+        g_flag_a = c.fl;
+    }
+    if (x87) {
+        uint16_t sw0 = (uint16_t)c.sw[0], sw1 = (uint16_t)c.sw[1];
+        if ((((sw0 >> 11) - (sw1 >> 11)) & 7) == 1 && (sw1 & 0x4100) != 0x4100) {
+            __asm fstp r_st
+            fp_push_impl(g_st, &g_fp_top, r_st);
+        }
+    }
     g_eax = c.out[0]; g_ecx = c.out[1]; g_edx = c.out[2]; g_ebx = c.out[3];
     g_esp = c.out[4]; g_ebp = c.out[5]; g_esi = c.out[6]; g_edi = c.out[7];
+    if (native32_trace_native) fprintf(stderr, "[native]   -> eax %08X edx %08X esp %08X\n", g_eax, g_edx, g_esp);
     g_cur_import = saved_import;
 }
 
@@ -1263,9 +1339,19 @@ int native32_bind(uint32_t base, native32_shim_t* shims, int nshims) {
 /* ------------------------------------------------------- Windows -> guest */
 
 /* Runs a lifted function for a native caller. `sp` points at the native
- * caller's [ret][args...]. Returns eax in the low half and the bytes the
- * callee popped in the high half, for cb_tramp's variable `ret n`. */
-static uint64_t __cdecl cb_run(uint32_t va, uint32_t* sp, uint32_t ecx) {
+ * caller's [ret][args...]. Returns eax in the low half and edx in the high
+ * half (a 64-bit result), and the bytes the callee popped in *purge, for
+ * cb_tramp's variable `ret n`. edx used to carry the purge, so a callback's
+ * edx never reached its caller: CA-Visual Objects returns a USUAL in
+ * eax:edx (edx the type), and every method the runtime sent came back NIL
+ * (Retail Plus Lite: DATA TYPE ERROR, NIL =>LOGIC, at APP:START). */
+/* A callback from an x87 range (native32_add_guest_abi) takes the caller's
+ * registers with it, as a call does: CA-Visual Objects' runtime calls
+ * compiled code with values in eax/edx and the frame in ebp. The VEH stashes
+ * them here (cb_tramp has only ecx free); cb_run loads them. */
+static __declspec(thread) struct { int on; uint32_t r[6]; } t_cb_regs;
+
+static uint64_t __cdecl cb_run(uint32_t va, uint32_t* sp, uint32_t ecx, uint32_t* purge_out) {
     recomp_func_t f = IS_SHIM_VA(va) ? recomp_lookup_import(va) : recomp_lookup(va);
     if (native32_trace_callbacks)
         fprintf(stderr, "[callback] sub_%08X (%08X %08X %08X %08X)\n", va, sp[1], sp[2], sp[3], sp[4]);
@@ -1281,8 +1367,13 @@ static uint64_t __cdecl cb_run(uint32_t va, uint32_t* sp, uint32_t ecx) {
     PUSH32(g_esp, RECOMP_RETADDR);
     uint32_t before = g_esp;
     g_ecx = ecx;
+    if (t_cb_regs.on) {
+        t_cb_regs.on = 0;
+        g_eax = t_cb_regs.r[0]; g_edx = t_cb_regs.r[1]; g_ebx = t_cb_regs.r[2];
+        g_esi = t_cb_regs.r[3]; g_edi = t_cb_regs.r[4]; g_ebp = t_cb_regs.r[5];
+    }
     f();
-    uint32_t eax = g_eax, purge = g_esp - before - 4;
+    uint32_t eax = g_eax, edx = g_edx, purge = g_esp - before - 4;
     /* The other half of the st(0) transfer: a lifted function returning a
      * float leaves it on the LIFTED x87 stack, and the native caller is about
      * to fstp its own. */
@@ -1291,7 +1382,8 @@ static uint64_t __cdecl cb_run(uint32_t va, uint32_t* sp, uint32_t ecx) {
     regs_load(&saved);
     mach_leave();
     if (st_ret) __asm fld cb_st
-    return ((uint64_t)purge << 32) | eax;
+    *purge_out = purge;
+    return ((uint64_t)edx << 32) | eax;
 }
 
 /* Native code that is guest code run natively (gen_bridge: VCL's window
@@ -1306,6 +1398,21 @@ static uint64_t __cdecl cb_run(uint32_t va, uint32_t* sp, uint32_t ecx) {
 static __declspec(naked) void cb_tramp(void) {
     __asm {
         mov  edx, esp            ; [ret][args]
+        cmp  g_teb_widened, 0
+        je   teb_only
+        push eax
+        mov  eax, g_fs_base      ; on the guest TIB's stack: off it, whatever
+        test eax, eax            ; the TEB says (gen_bridge widens the TEB's
+        jz   by_teb              ; bounds over the guest stack for an x87
+        cmp  edx, [eax + 8]      ; range)
+        jb   by_teb
+        cmp  edx, [eax + 4]
+        jae  by_teb
+        pop  eax
+        jmp  off_stack
+    by_teb:
+        pop  eax
+    teb_only:
         cmp  esp, fs:[8]
         jb   off_stack
         cmp  esp, fs:[4]
@@ -1315,15 +1422,19 @@ static __declspec(naked) void cb_tramp(void) {
         sub  esp, 16
     on_stack:
         push edx                 ; the native caller's esp
+        sub  esp, 4              ; cb_run's purge goes here
+        push esp                 ; ...this address
         push ecx
         push edx
         push eax                 ; the guest VA, planted by the VEH
-        call cb_run
-        add  esp, 12
-        pop  esp                 ; back on the caller's stack
-        pop  ecx                 ; native return address
-        add  esp, edx            ; pop what the guest callee popped
-        jmp  ecx
+        call cb_run              ; eax:edx the result
+        add  esp, 16
+        pop  ecx                 ; the bytes the guest callee popped
+        pop  esp                 ; back on the caller's stack: [ret][args]
+        push dword ptr [esp]     ; the native return address moves up past
+        pop  dword ptr [esp + ecx] ; the popped arguments (pop's address is
+        add  esp, ecx            ; computed after esp moves back), and only
+        ret                      ; ecx is spent: eax and edx are the result
     }
 }
 
@@ -1402,6 +1513,12 @@ static LONG CALLBACK native32_veh(EXCEPTION_POINTERS* ep) {
     if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fetch &&
         (native32_in_guest(pc) || IS_SHIM_VA(pc))) {
         if (recomp_lookup(pc) || IS_SHIM_VA(pc)) {
+            CONTEXT* cx = ep->ContextRecord;
+            if (gen_kind(MEM32(cx->Esp)) == 2) {     /* called from an x87 range */
+                t_cb_regs.on = 1;
+                t_cb_regs.r[0] = cx->Eax; t_cb_regs.r[1] = cx->Edx; t_cb_regs.r[2] = cx->Ebx;
+                t_cb_regs.r[3] = cx->Esi; t_cb_regs.r[4] = cx->Edi; t_cb_regs.r[5] = cx->Ebp;
+            }
             ep->ContextRecord->Eax = pc;
             ep->ContextRecord->Eip = (DWORD)(uintptr_t)cb_tramp;
             return EXCEPTION_CONTINUE_EXECUTION;

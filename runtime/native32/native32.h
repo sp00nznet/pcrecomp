@@ -143,6 +143,12 @@ int native32_lift_in_native(const uint32_t* vas, int n);
  * (VirtualAlloc or VirtualProtect with an execute protection) is registered
  * by the built-in shims; a host can add a range itself. */
 void native32_add_generated(uint32_t lo, uint32_t size);
+/* The same entry (the guest's stack and whole integer register file) for
+ * compiled code that is not the C ABI but uses the x87 like C does: a
+ * language runtime whose helpers read the caller's frame through ebp and move
+ * esp (CA-Visual Objects' CAVORT20: _NCARG, __chkstk). The MMX registers are
+ * not carried, and a float returned in st(0) goes onto the lifted FPU stack. */
+void native32_add_guest_abi(uint32_t lo, uint32_t size);
 int native32_is_generated(uint32_t va);
 
 /* Code a Windows DLL builds in heap memory and jumps to: Direct3D's RGB
