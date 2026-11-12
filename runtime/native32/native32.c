@@ -1351,6 +1351,24 @@ int native32_bind(uint32_t base, native32_shim_t* shims, int nshims) {
  * them here (cb_tramp has only ecx free); cb_run loads them. */
 static __declspec(thread) struct { int on; uint32_t r[6]; } t_cb_regs;
 
+/* A callback is a boundary for guest C++ throws (eh32.c): one that no guest
+ * frame catches ends the callback, as Windows does with an exception that
+ * leaves a window procedure of a 32-bit program (WOW64 drops it at the
+ * kernel callback). Flash MX 2004 throws an int out of a WM_SIZE handler
+ * while its frame is built and runs on. cb_run sets one up per callback. */
+typedef struct cb_guard {
+    struct cb_guard* prev;
+    jmp_buf jb;
+    uint32_t chain;                 /* the guest's fs:[0] at entry */
+    struct recomp_ehframe* frames;  /* eh32's landing pads at entry */
+} cb_guard_t;
+static __declspec(thread) cb_guard_t* t_cb_guard;
+static struct recomp_ehframe* eh32_frames(void);
+
+/* The bytes a callback popped (its `ret n`), by address, for one that ends
+ * by a throw: the purge it had the last time it returned. */
+static struct { uint32_t va, purge; } cb_purge[1024];
+
 static uint64_t __cdecl cb_run(uint32_t va, uint32_t* sp, uint32_t ecx, uint32_t* purge_out) {
     recomp_func_t f = IS_SHIM_VA(va) ? recomp_lookup_import(va) : recomp_lookup(va);
     if (native32_trace_callbacks)
@@ -1372,8 +1390,24 @@ static uint64_t __cdecl cb_run(uint32_t va, uint32_t* sp, uint32_t ecx, uint32_t
         g_eax = t_cb_regs.r[0]; g_edx = t_cb_regs.r[1]; g_ebx = t_cb_regs.r[2];
         g_esi = t_cb_regs.r[3]; g_edi = t_cb_regs.r[4]; g_ebp = t_cb_regs.r[5];
     }
-    f();
-    uint32_t eax = g_eax, edx = g_edx, purge = g_esp - before - 4;
+    cb_guard_t guard;
+    guard.prev = t_cb_guard;
+    guard.chain = g_fs_base ? MEM32(g_fs_base) : 0;
+    guard.frames = eh32_frames();
+    t_cb_guard = &guard;
+    uint32_t eax, edx, purge, slot = (va >> 2) & 1023;
+    if (!setjmp(guard.jb)) {
+        f();
+        eax = g_eax, edx = g_edx, purge = g_esp - before - 4;
+        cb_purge[slot].va = va, cb_purge[slot].purge = purge;
+    } else {
+        /* ponytail: a callback never seen to return is assumed stdcall with
+         * four arguments (a window procedure); per-address `ret n` if not. */
+        eax = edx = 0;
+        purge = cb_purge[slot].va == va ? cb_purge[slot].purge : 16;
+        fprintf(stderr, "[eh32] callback sub_%08X ended by an uncaught throw: returns 0\n", va);
+    }
+    t_cb_guard = guard.prev;
     /* The other half of the st(0) transfer: a lifted function returning a
      * float leaves it on the LIFTED x87 stack, and the native caller is about
      * to fstp its own. */

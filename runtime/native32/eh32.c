@@ -292,13 +292,27 @@ int native32_cxx_raise(uint32_t n, uint32_t args) {
     uint32_t magic = MEM32(args), obj = MEM32(args + 4), info = MEM32(args + 8);
     if (magic != EH_MAGIC_VC6 && magic != EH_MAGIC_VC7 && magic != EH_MAGIC_VC8) return 0;
     if (eh_trace)
-        fprintf(stderr, "[eh32] raise %s 0x%08X from sub_%08X\n", info ? throw_type(info) : "(rethrow)",
-                obj, g_cur_func);
+        fprintf(stderr, "[eh32] raise %s 0x%08X (first word 0x%08X) from sub_%08X\n",
+                info ? throw_type(info) : "(rethrow)", obj, obj ? MEM32(obj) : 0, g_cur_func);
     if (!info) obj = t_cur_obj, info = t_cur_info;          /* `throw;` */
     if (info) dispatch(obj, info);
     if (eh_trace) fprintf(stderr, "[eh32] %s: no guest frame catches it\n", throw_type(info));
+    if (t_cb_guard) {
+        /* Inside a callback: unwind the guest frames it entered and end it
+         * (cb_run's guard). */
+        cb_guard_t* g = t_cb_guard;
+        for (uint32_t r = MEM32(g_fs_base); r && r != 0xFFFFFFFFu && r != g->chain; r = MEM32(r)) {
+            uint32_t f = funcinfo(MEM32(r + 4));
+            if (f) unwind_to(r, f, -1);
+        }
+        MEM32(g_fs_base) = g->chain;
+        t_frames = g->frames;
+        longjmp(g->jb, 1);
+    }
     return 0;
 }
 
+static struct recomp_ehframe* eh32_frames(void) { return t_frames; }
+
 /* Set once, before any guest code runs (native32_init). */
-static void eh32_init(void) { recomp_eh_jump_hook = recomp_eh_jump; }
+static void eh32_init(void) { recomp_eh_jump_hook = recomp_eh_jump; recomp_trap_hook = seh_trap; }

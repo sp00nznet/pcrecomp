@@ -2041,6 +2041,15 @@ class Lifter:
             # unreachable fallthrough would run the next block's code.
             lines.append(f"/* int3 breakpoint */ return; {comment}")
 
+        elif not self.dos and (m == 'int1' or (m == 'int' and insn.op_str not in ('3', '0x3'))):
+            # A software interrupt faults on NT: `int n` (n != 3) is a #GP,
+            # an access violation; `int1` (icebp) a single step. Protection
+            # code takes the __except block as "no debugger"; a no-op here was
+            # the debugger answer (Flash MX 2004's licensing then killed the
+            # process). RECOMP_TRAP offers the fault to the guest's handlers.
+            code = '0x80000004u' if m == 'int1' else '0xC0000005u'
+            lines.append(f"RECOMP_TRAP({code}, 0x{insn.address:08X}u); {comment}")
+
         elif m == 'cdq':
             lines.append(f"edx = ((int32_t)eax < 0) ? 0xFFFFFFFFu : 0; {comment}")
 
