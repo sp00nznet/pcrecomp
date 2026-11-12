@@ -115,6 +115,30 @@ def thunk_tables(data, code_start, min_run=16):
     return runs
 
 
+class _Mem:
+    __slots__ = ('base', 'index', 'scale', 'disp')
+
+    def __init__(self, m):
+        self.base, self.index, self.scale, self.disp = m.base, m.index, m.scale, m.disp
+
+
+class _LightOp:
+    """The part of a capstone operand this catalog reads: type, imm, reg, mem.
+
+    A capstone operand pins its instruction's whole cs_detail struct. A
+    catalog-only run (release_operands) keeps these instead, so a round's
+    instructions cost a few small objects each until the harvest. Retail Plus
+    Lite's PLUSLITE.EXE (3.7 MB of CA-Visual Objects code, 31k candidates in
+    the first round) went past 20 GB without it."""
+    __slots__ = ('type', 'imm', 'reg', 'mem')
+
+    def __init__(self, op):
+        self.type = op.type
+        self.imm = op.imm if op.type == X86_OP_IMM else 0
+        self.reg = op.reg if op.type == X86_OP_REG else 0
+        self.mem = _Mem(op.mem) if op.type == X86_OP_MEM else None
+
+
 @dataclass
 class Instruction:
     address: int
@@ -275,6 +299,7 @@ class Disassembler:
         # operand detail for every instruction it walks past is the whole cost
         # of running it, and it throws all of it away.
         self._probe_md = Cs(CS_ARCH_X86, CS_MODE_32)
+        self.light_operands = False   # find_functions(release_operands=True) sets it
 
         # Build VA -> file offset cache for code sections
         # adj = raw_offset - va_start, so file_offset = va + adj
@@ -480,7 +505,8 @@ class Disassembler:
                 mnemonic=insn.mnemonic,
                 op_str=insn.op_str,
                 bytes=bytes(insn.bytes),
-                operands=list(insn.operands) if insn.operands else [],
+                operands=([_LightOp(o) for o in insn.operands] if self.light_operands
+                          else list(insn.operands)) if insn.operands else [],
             )
 
     def jump_table_targets(self, insn, limit: int = 256) -> list:
@@ -799,6 +825,7 @@ class Disassembler:
 
         Returns dict of addr -> Function.
         """
+        self.light_operands = release_operands
         print(f"[*] Scanning for call targets in 0x{code_start:08X}-0x{code_end:08X}...")
         call_targets = self.find_branch_targets(code_start, code_end)
         print(f"[*] Found {len(call_targets)} potential call targets")
