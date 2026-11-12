@@ -6,6 +6,35 @@ versions follow [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- `tools/pe/vb6.py`: a Visual Basic 5/6 exe's VB header (`VB5!`): native code
+  or P-code, the native code range (the rest of a VB `.text` is data, which a
+  sweep takes for hundreds of functions), the event handlers and the event,
+  vtable and Declare stubs the runtime calls (seeds), each procedure's cleanup
+  blocks, and its `On Error` resume points (`error_resumes`: the handler
+  labels and the Resume Next point of every statement, from the procedure's
+  descriptor). Periodic Table 2002, the first VB6 program.
+- native32: `native32_vb6_runtime()` (`vb6rt.c`): a VB5/6 guest on the real
+  MSVBVM60/50. The runtime is a guest-ABI range (its helpers take ecx/edx,
+  `__vbaChkstk` moves esp and zeroes locals), calls into it run with the
+  guest's SEH chain on the real fs:[0] (VB finds its procedure there), and a
+  VB runtime error (`RaiseException(0xC000008F)` inside the runtime) is offered
+  to the native frames above the guest's and then to the guest's chain; the
+  runtime's resume helper is patched (by pattern) to longjmp into the lifted
+  procedure's landing pad. Opt-in: a host calls it after binding.
+- native32: x87 built-ins for MSVBVM60's Pentium-FDIV-safe helpers
+  (`_adj_fdiv_m16i/m32/m32i/m64`, the `fdivr` forms, `_adj_fprem/fprem1/
+  fptan/fpatan`): they work on st(0), which is the lifted stack.
+- native32: `native32_fs_mirror_lo/hi`, the range whose calls get the guest's
+  SEH chain on the real fs:[0] (vb6rt sets it); gen_bridge keeps what it will
+  put back on a thread-local stack, so a guest error handler that longjmps
+  past it restores the TEB (`gen_unwind`).
+- eh32: `recomp_eh_find(va, ebp)`, the landing pad that continues at `va`
+  (what `recomp_eh_jump` did inline).
+
+### Fixed
+- seh32's trace (`NATIVE32_TRACE_EH`) read a Delphi exception object from any
+  raise with two parameters, and faulted on VB's.
+
 - native32: `native32_add_guest_abi(lo, size)`: a compiled language runtime
   that is not the C ABI (CA-Visual Objects' `CAVORT20` and friends: helpers
   read the caller's frame through ebp, `__chkstk` moves esp, results come in

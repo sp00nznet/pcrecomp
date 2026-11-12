@@ -81,3 +81,28 @@ UNARY(CItanh, tanh(x))
 BINARY(CIpow, pow(x, y))
 BINARY(CIfmod, fmod(x, y))
 BINARY(CIatan2, atan2(x, y))
+
+/* Visual Basic's Pentium-FDIV-safe helpers (MSVBVM60 exports, "Pentium FDIV
+ * safe" is on by default in a VB native build): the same x87 operation the
+ * compiler would have inlined, on the lifted stack. The m* forms take their
+ * memory operand pushed by value and pop it (ret 4 / ret 8); the register
+ * forms take none. fprem/fprem1 leave the whole reduction done in one step.
+ * ponytail: _adj_fdiv_r (operands picked by a code in eax) is not here; add
+ * it when a title calls it (it then shows as a native call on the real FPU). */
+#define ADJ_M(name, T, nbytes, expr)                                          \
+    void native32_shim_##name(void) {                                         \
+        double m = (double)*(T*)(uintptr_t)(g_esp + 4), x = X87_POP();        \
+        X87_PUSH(expr); g_esp += 4 + (nbytes); }
+ADJ_M(adj_fdiv_m64, double, 8, x / m)
+ADJ_M(adj_fdiv_m32, float, 4, x / m)
+ADJ_M(adj_fdiv_m16i, int16_t, 4, x / m)
+ADJ_M(adj_fdiv_m32i, int32_t, 4, x / m)
+ADJ_M(adj_fdivr_m64, double, 8, m / x)
+ADJ_M(adj_fdivr_m32, float, 4, m / x)
+ADJ_M(adj_fdivr_m16i, int16_t, 4, m / x)
+ADJ_M(adj_fdivr_m32i, int32_t, 4, m / x)
+
+void native32_shim_adj_fprem(void) { g_st[0] = fmod(g_st[0], g_st[1]); g_esp += 4; }
+void native32_shim_adj_fprem1(void) { g_st[0] = remainder(g_st[0], g_st[1]); g_esp += 4; }
+void native32_shim_adj_fptan(void) { g_st[0] = tan(g_st[0]); X87_PUSH(1.0); g_esp += 4; }
+void native32_shim_adj_fpatan(void) { double x = X87_POP(); g_st[0] = atan2(g_st[0], x); g_esp += 4; }

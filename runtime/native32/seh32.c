@@ -109,7 +109,7 @@ static int seh_dispatch(uint32_t code, uint32_t flags, uint32_t n, uint32_t args
                 code, g_cur_func, reg, g_esp, MEM32(g_fs_base + 8), MEM32(g_fs_base + 4));
         /* Delphi's: [0] the raising address, [1] the object: its class name
          * (a ShortString at VMT-44) and its message (an AnsiString at +4). */
-        uint32_t obj = n >= 2 && args ? MEM32(args + 4) : 0, vmt = obj ? MEM32(obj) : 0;
+        uint32_t obj = code == 0x0EEDFADEu && n >= 2 && args ? MEM32(args + 4) : 0, vmt = obj ? MEM32(obj) : 0;
         if (code == 0x0EEDFADEu && vmt > 0x10000u) {
             const uint8_t* cn = (const uint8_t*)(uintptr_t)MEM32(vmt - 44);
             const char* msg = (const char*)(uintptr_t)MEM32(obj + 4);
