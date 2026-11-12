@@ -512,9 +512,14 @@ def _jump_table(ins, code, code_start, lo, hi, limit=1024):
     # jmp through the same table reads the same dword (CRT memcpy's backward
     # copy: Hover! 0x00440489, SimCity 2000 0x0048ECB1), so the test is where
     # the entry points, not which jmp is reading.
+    #
+    # How far down: a signed char index reaches -128. Borland's hand-written
+    # preprocessor lexer does `movsx eax, byte [class + c]; jg ...; jmp cs:[eax*4
+    # + table]` with 35 arms below the base; a 64-byte cap kept 16 of them and
+    # the rest ran as unresolved ITAILs forever (BCC 5.5 bcc32, 0x0048E222).
     table_end = at + code_start          # where the upward scan stopped
     at = base - 4
-    while at >= 0 and base - at <= 64:
+    while at >= 0 and base - at <= 128 * 4:
         t = int.from_bytes(code[at:at + 4], 'little')
         if not lo <= t < hi or at + code_start <= t < table_end:
             break
@@ -897,6 +902,14 @@ def _selftest():
     assert got == {0x1000, 0x1010, 0x1012}, sorted(map(hex, got))
     insns, _ = linear_disassemble_function(md, code, 0x1000, 0x1000, 0x1013, reached=got)
     assert [i.address for i in insns] == [0x1000, 0x1010, 0x1012], [hex(i.address) for i in insns]
+
+    # A table indexed by a negative signed char, 20 arms deep below its base
+    # (Borland's lexer, BCC 5.5): all 20 must be found, not the first 16.
+    #   1000 dd 1058..106B (20 arms) / 1050 jmp [eax*4+104C] / 1057 nop...
+    code = (b''.join((0x1058 + i).to_bytes(4, 'little') for i in range(20))
+            + bytes([0xFF, 0x24, 0x85, 0x4C, 0x10, 0x00, 0x00]) + bytes([0x90]) * 0x20)
+    jmp = next(md.disasm(code[0x50:0x57], 0x1050))
+    assert sorted(_jump_table(jmp, code, 0x1000, 0x1050, 0x1077)) == [0x1058 + i for i in range(20)]
 
     # A biased table: slot 0 is never used and holds garbage (memmove).
     #   1000 jmp [eax*4+1007] / 1007 dd garbage, 1010 / 1010 ret

@@ -5,6 +5,13 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- generate `_jump_table`: the scan below a table's base reaches 128 entries
+  (a signed char index), not 16. A table indexed by `movsx eax, byte [...]`
+  with more than 16 arms below its base lost the rest, and each lost arm ran
+  as an unresolved ITAIL, forever. Borland C++ 5.5's preprocessor lexer
+  (`jmp cs:[eax*4 + table]`, 35 arms below), the first Borland-built program.
+
 ### Added
 - native32: `native32_add_guest_abi(lo, size)`: a compiled language runtime
   that is not the C ABI (CA-Visual Objects' `CAVORT20` and friends: helpers
