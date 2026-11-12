@@ -236,6 +236,9 @@ PURGE = {
     ('MMSYSTEM', 'SNDPLAYSOUND'): 6, ('MMSYSTEM', 'TIMEGETDEVCAPS'): 6,
     ('MMSYSTEM', 'TIMEGETTIME'): 0, ('MMSYSTEM', 'MCISENDSTRING'): 12,
     ('GDI', 'SETTEXTJUSTIFICATION'): 6,
+    # Johnny Castaway (SCRANTIC.SCR, 1992).
+    ('GDI', 'SETPIXEL'): 10, ('GDI', 'CREATEBITMAPINDIRECT'): 4,
+    ('GDI', 'CREATEDIBPATTERNBRUSH'): 4,
     # ---- TOOLHELP ----
     ('TOOLHELP', 'GLOBALENTRYHANDLE'): 6, ('TOOLHELP', 'TIMERCOUNT'): 4,
     # ---- WIN87EM ---- (FP emulator hook; not a PASCAL call, no arg purge)

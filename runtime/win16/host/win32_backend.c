@@ -32,6 +32,10 @@ static inline uint32_t b_a32(CPU *cpu, int off) {
 }
 static inline void b_ret(CPU *cpu, int purge) { cpu->sp += 4 + purge; }
 static void b_asciiz(CPU *cpu, uint16_t seg, uint16_t off, char *out, int max);
+/* screensaver.c */
+void recomp_scr_dc(HWND h, HDC dc);
+int  recomp_scr_filter(HWND h, UINT msg);
+int  recomp_scr_owns(HWND h);
 /* RECOMP_INPUT's pointer: once a scripted click has happened, GetCursorPos and
    the mouse-button key states answer from here, for games that poll the mouse
    instead of reading their messages. Host screen coordinates. */
@@ -80,7 +84,7 @@ extern HDC  wing_draw_begin(CPU *, uint16_t, const RECT *);
 extern void wing_draw_end(CPU *, uint16_t, const RECT *);
 
 /* GDI objects (bitmaps so far) get their own guest handle space. */
-#define MAXGDI 256
+#define MAXGDI 0x4000   /* Johnny Castaway keeps a mask bitmap per sprite frame: 256 ran out */
 static HGDIOBJ g_gdi[MAXGDI];
 static int g_ngdi = 1;
 /* A host HGDIOBJ is the object's identity, so the same one must always map to
@@ -243,7 +247,11 @@ static void tproc_set(HWND h, uint16_t id, uint16_t seg, uint16_t off) {
     g_tproc[i].h = h; g_tproc[i].id = id; g_tproc[i].seg = seg; g_tproc[i].off = off;
 }
 
+/* Made by DialogBoxParam or CreateDialogParam (they tag it). */
+static int is_dialog(HWND h) { return GetPropA(h, "recomp.dlg") != NULL; }
+
 static LRESULT CALLBACK host_wndproc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (recomp_scr_filter(hWnd, msg)) return DefWindowProc(hWnd, msg, wParam, lParam);
     if (msg == WM_TIMER) {
         int i = tproc_find(hWnd, (uint16_t)wParam);
         if (i >= 0) {   /* TIMERPROC(hwnd, WM_TIMER, id, dwTime): same PASCAL frame as a WNDPROC */
@@ -291,6 +299,8 @@ static LRESULT CALLBACK host_wndproc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
                     hWnd == g_main_hwnd ? "(main)" :
                     hWnd == g_screen_hwnd ? "(overlay child)" : "(other)");
     }
+    /* A dialog has no guest backdrop to show: let its class brush fill it. */
+    if (msg == WM_ERASEBKGND && is_dialog(hWnd)) return DefWindowProc(hWnd, msg, wParam, lParam);
     if (msg == WM_ERASEBKGND) return 1;
     /* RECOMP_LOG_CMD: every WM_COMMAND the engine dispatches to itself, with the
        command id. A menu item that does nothing either sends no command or
@@ -354,6 +364,23 @@ static LRESULT CALLBACK host_wndproc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
         return gr;
     }
     return DefWindowProc(hWnd, msg, wParam, lParam);
+}
+
+/* The class for a window made before the guest registered any: a screen
+ * saver's configure dialog (/c) is its first and only window. The name never
+ * was registered, so CreateWindow failed and the dialog closed at once. */
+static const char *fallback_class(void) {
+    static int done;
+    if (!done++) {
+        WNDCLASSA wc; memset(&wc, 0, sizeof wc);
+        wc.lpfnWndProc   = host_wndproc;
+        wc.hInstance     = GetModuleHandle(NULL);
+        wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = "RecompGuestCls0";
+        RegisterClassA(&wc);
+    }
+    return "RecompGuestCls0";
 }
 
 /* ===== USER: window class + creation ===== */
@@ -421,7 +448,7 @@ void USER_CREATEWINDOW(CPU *cpu) {
     if (tseg) b_asciiz(cpu, tseg, toff, title, sizeof title);
 
     GuestClass *c = cname[0] ? cls_find(cname) : NULL;
-    const char *hostcls = c ? c->name : (g_ncls ? g_cls[0].name : "RecompGuestCls0");
+    const char *hostcls = c ? c->name : (g_ncls ? g_cls[0].name : fallback_class());
 
     /* CW_USEDEFAULT is 0x8000 in Win16 and a different value in Win32. */
     if ((uint16_t)x == 0x8000) x = CW_USEDEFAULT;
@@ -486,6 +513,9 @@ void USER_CREATEWINDOW(CPU *cpu) {
     if (hw && !g_screen_hwnd && !recomp_game.real_windows
         && (as_child || ((style & WS_POPUP) && !(style & WS_CHILD))))
         g_screen_hwnd = hw;
+    /* A screen saver's window takes the monitor or the preview box, after the
+       frame sizing above (screensaver.c). */
+    { extern void recomp_scr_window(HWND, uint32_t); recomp_scr_window(hw, style); }
     if (gh) {
         g_hwnd_proc_seg[gh] = c ? c->seg : g_wndproc_seg;
         g_hwnd_proc_off[gh] = c ? c->off : g_wndproc_off;
@@ -749,6 +779,7 @@ void GDI_CREATEBITMAP(CPU *cpu) {
         bits = b_flat(cpu, bs, bo, (uint32_t)(((w * (int)bpp + 15) / 16) * 2) * (uint32_t)h * planes);
     HBITMAP bm = (w > 0 && h > 0) ? CreateBitmap(w, h, planes, bpp, bits) : NULL;
     cpu->ax = bm ? put_hgdi(bm) : 0;
+    if (getenv("RECOMP_LOG_BMBITS")) fprintf(stderr, "[bmbits] CreateBitmap %dx%d %u planes %u bpp -> %04X\n", w, h, planes, bpp, cpu->ax);
     b_ret(cpu, 12);
 }
 
@@ -767,6 +798,7 @@ void GDI_CREATECOMPATIBLEBITMAP(CPU *cpu) {    /* (hdc@4, w@2, h@0) */
     int w = (int16_t)b_a16(cpu, 2), h = (int16_t)b_a16(cpu, 0);
     HBITMAP bm = dc ? CreateCompatibleBitmap(dc, w, h) : NULL;
     cpu->ax = bm ? put_hgdi(bm) : 0;
+    if (getenv("RECOMP_LOG_BMBITS")) fprintf(stderr, "[bmbits] CreateCompatibleBitmap %dx%d -> %04X\n", w, h, cpu->ax);
     b_ret(cpu, 6);
 }
 
@@ -1447,6 +1479,7 @@ void USER_GETDC(CPU *cpu) {
         if (alt) h = alt;
     }
     HDC dc = GetDC(h);
+    recomp_scr_dc(h, dc);
     cpu->ax = dc ? put_hdc(dc) : 0;
     b_ret(cpu, 2);
 }
@@ -1704,7 +1737,7 @@ static void create_dialog_common(CPU *cpu, int purge, uint32_t param) {
     uint16_t poff = b_a16(cpu, 4 - k), pseg = b_a16(cpu, 6 - k);
     if (!pseg) { cpu->ax = 0; b_ret(cpu, purge); return; }
 
-    const char *hostcls = g_ncls ? g_cls[0].name : "RecompGuestCls0";
+    const char *hostcls = g_ncls ? g_cls[0].name : fallback_class();
     HWND h = CreateWindowExA(0, hostcls, "Catz", WS_OVERLAPPEDWINDOW,
                              CW_USEDEFAULT, CW_USEDEFAULT, 470, 370,
                              NULL, NULL, GetModuleHandle(NULL), NULL);
@@ -1720,6 +1753,7 @@ static void create_dialog_common(CPU *cpu, int purge, uint32_t param) {
             SetWindowPos(h, NULL, 0, 0, want.right - want.left,
                          want.bottom - want.top, SWP_NOMOVE | SWP_NOZORDER);
         }
+        SetPropA(h, "recomp.dlg", (HANDLE)1);
         gh = put_hwnd(h);
         if (gh) { g_hwnd_proc_seg[gh] = pseg; g_hwnd_proc_off[gh] = poff; }
         /* Honour the template's WS_VISIBLE rather than forcing the window up:
@@ -1758,7 +1792,7 @@ void USER_DIALOGBOXPARAM(CPU *cpu) {
     if (parent) GetClientRect(parent, &rc);
     if (rc.right - rc.left < 16 || rc.bottom - rc.top < 16) { rc.right = 470; rc.bottom = 370; }
 
-    const char *hostcls = g_ncls ? g_cls[0].name : "RecompGuestCls0";
+    const char *hostcls = g_ncls ? g_cls[0].name : fallback_class();
     HWND h = CreateWindowExA(0, hostcls, "Catz", WS_OVERLAPPEDWINDOW,
                              CW_USEDEFAULT, CW_USEDEFAULT,
                              rc.right - rc.left, rc.bottom - rc.top,
@@ -1775,6 +1809,7 @@ void USER_DIALOGBOXPARAM(CPU *cpu) {
                          SWP_NOMOVE | SWP_NOZORDER);
         }
     }
+    if (h) SetPropA(h, "recomp.dlg", (HANDLE)1);
     uint16_t gh = h ? put_hwnd(h) : 0;
     if (gh) { g_hwnd_proc_seg[gh] = pseg; g_hwnd_proc_off[gh] = poff; }
     g_dlg_hwnd[d] = h;
@@ -1912,6 +1947,7 @@ void USER_BEGINPAINT(CPU *cpu) {
     uint16_t poff = b_a16(cpu, 0), pseg = b_a16(cpu, 2); /* lpPaint@0/2 */
     PAINTSTRUCT ps;
     HDC dc = h ? BeginPaint(h, &ps) : NULL;
+    if (dc) { recomp_scr_dc(h, dc); DPtoLP(dc, (POINT *)&ps.rcPaint, 2); }
     uint16_t gdc = dc ? put_hdc(dc) : 0;
     if (pseg) {
         const int16_t f[8] = {
@@ -2297,6 +2333,7 @@ void USER_SETWINDOWPOS(CPU *cpu) {
     int cx = (int16_t)b_a16(cpu, 4), cy = (int16_t)b_a16(cpu, 2);
     UINT fl = b_a16(cpu, 0);
     if (h && is_top_level(h)) fl |= SWP_NOMOVE | (runtime_sized(h) ? SWP_NOSIZE : 0);
+    if (recomp_scr_owns(h)) fl |= SWP_NOMOVE | SWP_NOSIZE;   /* sized to the monitor or preview */
     if (getenv("RECOMP_LOG_WINPOS"))
         fprintf(stderr, "[winpos] SetWindowPos(guest %u %s%s, %d,%d %dx%d, flags %04X)\n",
                 b_a16(cpu, 12), h && is_top_level(h) ? "top" : "child",
@@ -2611,6 +2648,10 @@ void USER_ISDIALOGMESSAGE(CPU *cpu) { cpu->ax = 0; b_ret(cpu, 6); }  /* not a di
 static void dlg_check_set(uint16_t hdlg, uint16_t id, int state) {
     DlgText *t = dlgtxt(hdlg, id, 1);
     if (t) { t->text[0] = (char)('0' + state); t->text[1] = 0; }
+    /* The control dlg_build made, if any, shows it (Johnny Castaway's
+       configure dialog came up with every box unticked). */
+    HWND d = get_hwnd(hdlg), c = d ? GetDlgItem(d, id) : NULL;
+    if (c) SendMessageA(c, BM_SETCHECK, state ? BST_CHECKED : BST_UNCHECKED, 0);
 }
 void USER_CHECKDLGBUTTON(CPU *cpu) {        /* (hDlg@4, nIDButton@2, uCheck@0) */
     dlg_check_set(b_a16(cpu, 4), b_a16(cpu, 2), b_a16(cpu, 0) ? 1 : 0);
@@ -2624,6 +2665,9 @@ void USER_CHECKRADIOBUTTON(CPU *cpu) {      /* (hDlg@6, first@4, last@2, check@0
 void USER_ISDLGBUTTONCHECKED(CPU *cpu) {    /* (hDlg@2, nIDButton@0) */
     DlgText *t = dlgtxt(b_a16(cpu, 2), b_a16(cpu, 0), 0);
     cpu->ax = (uint16_t)(t && t->text[0] == '1');
+    /* A real control answers for itself: the person may have clicked it. */
+    HWND d = get_hwnd(b_a16(cpu, 2)), c = d ? GetDlgItem(d, b_a16(cpu, 0)) : NULL;
+    if (c) cpu->ax = (uint16_t)(SendMessageA(c, BM_GETCHECK, 0, 0) == BST_CHECKED);
     b_ret(cpu, 4);
 }
 void USER_SETDLGITEMINT(CPU *cpu) {         /* (hDlg@6, nID@4, uValue@2, bSigned@0) */
@@ -2772,6 +2816,13 @@ void GDI_CREATEDIBITMAP(CPU *cpu) {
     HDC screen = dc ? dc : GetDC(NULL);
     HBITMAP hb = hdr ? CreateDIBitmap(screen, &hdr->bmiHeader, bits ? CBM_INIT : 0, bits, bmi, usage) : NULL;
     if (!dc) ReleaseDC(NULL, screen);
+    if (getenv("RECOMP_LOG_BMBITS") && bmi) {
+        fprintf(stderr, "[bmbits] CreateDIBitmap %ldx%ld %ubpp usage %u init %lu:", bmi->bmiHeader.biWidth,
+                bmi->bmiHeader.biHeight, bmi->bmiHeader.biBitCount, usage, (unsigned long)init);
+        for (int i = 0; i < 16; i++) fprintf(stderr, " %02X%02X%02X", bmi->bmiColors[i].rgbRed,
+                                             bmi->bmiColors[i].rgbGreen, bmi->bmiColors[i].rgbBlue);
+        fputc(10, stderr);
+    }
     free(hdr); free(bmi);
     cpu->ax = put_hgdi(hb);
     b_ret(cpu, 20);
@@ -3119,4 +3170,115 @@ static DWORD WINAPI sim_input_thread(LPVOID arg) {
 void win16_sim_input_start(void) {
     const char *s = getenv("RECOMP_INPUT");
     if (s && *s) CreateThread(NULL, 0, sim_input_thread, (LPVOID)s, 0, NULL);
+}
+
+/* ---- GDI/USER calls first needed by Johnny Castaway (SCRANTIC.SCR, 1992) ---- */
+void GDI_SETROP2(CPU *cpu) {                  /* (hdc@2, mode@0) -> previous */
+    HDC dc = get_hdc(b_a16(cpu, 2));
+    cpu->ax = dc ? (uint16_t)SetROP2(dc, (int16_t)b_a16(cpu, 0)) : 0;
+    b_ret(cpu, 4);
+}
+void GDI_GETPIXEL(CPU *cpu) {                 /* (hdc@4, x@2, y@0) -> COLORREF */
+    HDC dc = get_hdc(b_a16(cpu, 4));
+    COLORREF c = dc ? GetPixel(dc, (int16_t)b_a16(cpu, 2), (int16_t)b_a16(cpu, 0)) : CLR_INVALID;
+    cpu->ax = (uint16_t)c; cpu->dx = (uint16_t)(c >> 16);
+    b_ret(cpu, 6);
+}
+void GDI_SETPIXEL(CPU *cpu) {                 /* (hdc@8, x@6, y@4, COLORREF@0) */
+    HDC dc = get_hdc(b_a16(cpu, 8));
+    COLORREF c = dc ? SetPixel(dc, (int16_t)b_a16(cpu, 6), (int16_t)b_a16(cpu, 4),
+                               (COLORREF)recomp_guest_color(b_a32(cpu, 0))) : CLR_INVALID;
+    cpu->ax = (uint16_t)c; cpu->dx = (uint16_t)(c >> 16);
+    b_ret(cpu, 10);
+}
+/* CreateBrushIndirect(LOGBRUSH16 far *: style, COLORREF, hatch). */
+void GDI_CREATEBRUSHINDIRECT(CPU *cpu) {
+    uint16_t o = b_a16(cpu, 0), s = b_a16(cpu, 2);
+    LOGBRUSH lb = { mem_read16(cpu, s, o),
+                    (COLORREF)recomp_guest_color(mem_read16(cpu, s, (uint16_t)(o + 2)) |
+                                                 ((uint32_t)mem_read16(cpu, s, (uint16_t)(o + 4)) << 16)),
+                    (int16_t)mem_read16(cpu, s, (uint16_t)(o + 6)) };
+    uint16_t hatch = mem_read16(cpu, s, (uint16_t)(o + 6));
+    if (lb.lbStyle == BS_PATTERN) lb.lbHatch = (ULONG_PTR)get_hgdi(hatch);   /* a guest HBITMAP */
+    if (getenv("RECOMP_LOG_BMBITS")) fprintf(stderr, "[bmbits] CreateBrushIndirect style %u hatch %04X\n", lb.lbStyle, hatch);
+    if (lb.lbStyle == BS_DIBPATTERN) {                                      /* a guest HGLOBAL */
+        const uint8_t *p = b_flat(cpu, hatch, 0, 40);
+        cpu->ax = p ? put_hgdi(CreateDIBPatternBrushPt(p, (UINT)lb.lbColor & 0xFFFF)) : 0;
+        b_ret(cpu, 4);
+        return;
+    }
+    cpu->ax = put_hgdi(CreateBrushIndirect(&lb));
+    b_ret(cpu, 4);
+}
+/* CreateBitmapIndirect(BITMAP16 far *: type, w, h, widthBytes, planes:8, bpp:8, bits far). */
+void GDI_CREATEBITMAPINDIRECT(CPU *cpu) {
+    uint16_t o = b_a16(cpu, 0), s = b_a16(cpu, 2);
+    int w = (int16_t)mem_read16(cpu, s, (uint16_t)(o + 2)), h = (int16_t)mem_read16(cpu, s, (uint16_t)(o + 4));
+    int wb = mem_read16(cpu, s, (uint16_t)(o + 6));
+    UINT planes = mem_read8(cpu, s, (uint16_t)(o + 8)), bpp = mem_read8(cpu, s, (uint16_t)(o + 9));
+    uint16_t bo = mem_read16(cpu, s, (uint16_t)(o + 10)), bs = mem_read16(cpu, s, (uint16_t)(o + 12));
+    const void *bits = (bs && w > 0 && h > 0) ? b_flat(cpu, bs, bo, (uint32_t)wb * h * planes) : NULL;
+    HBITMAP bm = (w > 0 && h > 0) ? CreateBitmap(w, h, planes, bpp, bits) : NULL;
+    cpu->ax = bm ? put_hgdi(bm) : 0;
+    b_ret(cpu, 4);
+}
+/* CreateDIBPatternBrush(hPackedDIB@2, wUsage@0): a global block holding a
+ * BITMAPINFO and its bits; Win32's CreateDIBPatternBrushPt reads the same layout. */
+void GDI_CREATEDIBPATTERNBRUSH(CPU *cpu) {
+    uint16_t sel = b_a16(cpu, 2);
+    const uint8_t *p = b_flat(cpu, sel, 0, 40);
+    cpu->ax = p ? put_hgdi(CreateDIBPatternBrushPt(p, b_a16(cpu, 0))) : 0;
+    b_ret(cpu, 4);
+}
+/* Get/SetBitmapBits(hbm@8, cb@4/6, lpBits@0/2): device-dependent bits. Win16
+ * and Win32 agree on the layout (rows padded to a WORD) at the same depth. */
+static void bitmap_bits(CPU *cpu, int set) {
+    HBITMAP bm = (HBITMAP)get_hgdi(b_a16(cpu, 8));
+    uint32_t cb = b_a32(cpu, 4);
+    uint8_t *p = b_flat(cpu, b_a16(cpu, 2), b_a16(cpu, 0), cb);
+    LONG n = (bm && p) ? (set ? SetBitmapBits(bm, cb, p) : GetBitmapBits(bm, (LONG)cb, p)) : 0;
+    if (getenv("RECOMP_LOG_BMBITS")) { BITMAP o = {0}; GetObject(bm, sizeof o, &o);
+        fprintf(stderr, "[bmbits] %s %04X cb=%lu -> %ld (%ldx%ld %ubpp)\n", set ? "set" : "get",
+                b_a16(cpu, 8), (unsigned long)cb, (long)n, o.bmWidth, o.bmHeight, o.bmBitsPixel); }
+    cpu->ax = (uint16_t)n; cpu->dx = (uint16_t)((uint32_t)n >> 16);
+    b_ret(cpu, 10);
+}
+void GDI_GETBITMAPBITS(CPU *cpu) { bitmap_bits(cpu, 0); }
+void GDI_SETBITMAPBITS(CPU *cpu) { bitmap_bits(cpu, 1); }
+void USER_DRAWFOCUSRECT(CPU *cpu) {           /* (hdc@4, lpRect@0/2) */
+    HDC dc = get_hdc(b_a16(cpu, 4)); RECT r;
+    b_rect_read(cpu, b_a16(cpu, 2), b_a16(cpu, 0), &r);
+    if (dc) DrawFocusRect(dc, &r);
+    b_ret(cpu, 6);
+}
+void USER_GETACTIVEWINDOW(CPU *cpu) { cpu->ax = hwnd_guest(GetActiveWindow()); b_ret(cpu, 0); }
+void USER_LSTRCMPI(CPU *cpu) {                /* (lpsz1@4/6, lpsz2@0/2) */
+    char a[512], b[512];
+    b_asciiz(cpu, b_a16(cpu, 6), b_a16(cpu, 4), a, sizeof a);
+    b_asciiz(cpu, b_a16(cpu, 2), b_a16(cpu, 0), b, sizeof b);
+    cpu->ax = (uint16_t)lstrcmpiA(a, b);
+    b_ret(cpu, 8);
+}
+
+/* GDI_STRETCHBLT's non-WinG half, like recomp_gdi_bitblt: StretchBlt(hdcDest@22,
+ * x@20, y@18, w@16, h@14, hdcSrc@12, xs@10, ys@8, ws@6, hs@4, rop@0/2). Johnny
+ * Castaway draws every sprite and the island with it, between memory DCs and
+ * onto the window, with mask ROPs that the WinG stretch path ignored. */
+int recomp_gdi_stretchblt(CPU *cpu) {
+    uint16_t gd = b_a16(cpu, 22), gs = b_a16(cpu, 12);
+    HDC src = gs ? get_hdc(gs) : NULL;
+    if ((gs && !src) || wing_is_dc(gs)) return 0;
+    int x = (int16_t)b_a16(cpu, 20), y = (int16_t)b_a16(cpu, 18);
+    int w = (int16_t)b_a16(cpu, 16), h = (int16_t)b_a16(cpu, 14);
+    RECT r = { x, y, x + w, y + h }, used = r;
+    int wing = 0;
+    HDC dst = draw_dc(cpu, gd, r, &used, &wing);
+    if (dst) SetStretchBltMode(dst, COLORONCOLOR);
+    cpu->ax = (uint16_t)(dst ? StretchBlt(dst, x, y, w, h, src,
+                                          (int16_t)b_a16(cpu, 10), (int16_t)b_a16(cpu, 8),
+                                          (int16_t)b_a16(cpu, 6), (int16_t)b_a16(cpu, 4),
+                                          b_a32(cpu, 0)) : 0);
+    if (dst && wing) wing_draw_end(cpu, gd, &used);
+    b_ret(cpu, 24);
+    return 1;
 }

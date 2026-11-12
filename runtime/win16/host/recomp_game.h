@@ -105,6 +105,12 @@ typedef struct {
      * pointers by 8 -- lift it with ne_link.py --selector-step 8 to match.
      * Bermuda Syndrome: 8. */
     int selector_step;
+
+    /* GetTickCount/GetCurrentTime/timeGetTime answer the real clock. 0: the
+     * synthetic one (16 ms per call), which keeps calibration waits short. A
+     * game paced by polling the clock (Johnny Castaway's scene scheduler) needs
+     * the real one, or it runs in fast-forward. */
+    int real_clock;
 } RecompGame;
 
 struct CPU;
