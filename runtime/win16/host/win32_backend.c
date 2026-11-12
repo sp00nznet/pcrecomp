@@ -530,7 +530,30 @@ void USER_DEFWINDOWPROC(CPU *cpu) {
     WPARAM   wp   = b_a16(cpu, 4);
     LPARAM   lp   = (LPARAM)(int32_t)b_a32(cpu, 0);
     HWND     h    = get_hwnd(gh);
-    LRESULT  r    = h ? DefWindowProc(h, msg, wp, lp) : 0;
+    LRESULT  r    = 0;
+    /* lParam is a 16:16 guest pointer for these; handing it to the host's
+       DefWindowProc as a flat one faulted inside user32 (CivNet's leader-name
+       edit box). Text is copied across; the other pointer messages get Win16's
+       defaults without touching the structure. */
+    uint16_t lo = (uint16_t)lp, ls = (uint16_t)((uint32_t)lp >> 16);
+    if (!h) ;
+    else if (msg == WM_SETTEXT) {
+        char buf[256] = "";
+        if (ls) b_asciiz(cpu, ls, lo, buf, sizeof buf);
+        r = DefWindowProcA(h, msg, 0, (LPARAM)buf);
+    } else if (msg == WM_GETTEXT) {
+        char buf[256] = "";
+        int n = (int)DefWindowProcA(h, WM_GETTEXT, sizeof buf, (LPARAM)buf), nmax = (int)wp;
+        if (n >= nmax) n = nmax > 0 ? nmax - 1 : 0;
+        for (int i = 0; i < n && ls; i++) mem_write8(cpu, ls, (uint16_t)(lo + i), (uint8_t)buf[i]);
+        if (nmax > 0 && ls) mem_write8(cpu, ls, (uint16_t)(lo + n), 0);
+        r = n;
+    } else if (msg == WM_NCCREATE) r = 1;
+    else if (msg == WM_CREATE || msg == WM_NCCALCSIZE || msg == WM_GETMINMAXINFO
+          || msg == WM_WINDOWPOSCHANGING || msg == WM_WINDOWPOSCHANGED
+          || msg == WM_DRAWITEM || msg == WM_MEASUREITEM || msg == WM_COMPAREITEM
+          || msg == WM_DELETEITEM) r = 0;
+    else r = DefWindowProc(h, msg, wp, lp);
     cpu->ax = (uint16_t)(r & 0xFFFF);
     cpu->dx = (uint16_t)((uint32_t)r >> 16);
     b_ret(cpu, 10);
