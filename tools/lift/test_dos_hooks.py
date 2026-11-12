@@ -41,7 +41,15 @@ def main():
         (b"\xf4", "recomp_hlt()"),
         (b"\xcf", "esp += 12; return;"),
         (b"\xc3", "RECOMP_RET_JUMP(_rt)"),                  # push x; ret is a jump
-        (b"\xff\x18", "PUSH32(esp, _seg_cs); RECOMP_ICALL(MEM32("),  # call far [eax]
+        (b"\xff\x18", "PUSH32(esp, _seg_cs);"),            # call far [eax]
+        (b"\xff\x18", "RECOMP_ICALL(CS_BASE + MEM32("),    # ... at the selector's base (a loaded driver)
+        (b"\x2e\x8b\xad\x73\x28\x00\x00", "CS_BASE + ("),  # mov ebp, cs:[ebp+0x2873]
+        # pushf/popf, both widths; under DOS the word carries the host's IF.
+        (b"\x66\x9c", "PUSH16(esp, "),
+        (b"\x66\x9c", "recomp_get_if()"),
+        (b"\x9c", "PUSH32(esp, "),
+        (b"\x66\x9d", "POP16_VAL(esp)"),
+        (b"\x9d", "recomp_set_if(_fl & 0x200u)"),
         (b"\xcb", "esp += 8; return;"),                     # retf
         (b"\xca\x04\x00", "esp += 12; return;"),            # retf 4
         # Segment loads keep the host's base in step; es: reads through it.

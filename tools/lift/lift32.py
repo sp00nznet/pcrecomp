@@ -443,6 +443,8 @@ class Lifter:
         # through edi, which holds while the program keeps es == ds for them.
         if seg == X86_REG_ES and self.dos:
             return f"ES_BASE + ({addr})"
+        if seg == X86_REG_CS and self.dos:
+            return f"CS_BASE + ({addr})"
         return addr
 
     def _fmt_mem_read(self, mem, size: int) -> str:
@@ -901,16 +903,26 @@ class Lifter:
         elif m in ('popad', 'popal'):      # Capstone spells POPAD as 'popal' in 32-bit
             lines.append(f"POPAD(); {comment}")
 
-        elif m == 'pushfd':
+        elif m in ('pushfd', 'pushf'):
             # Pushing a constant 0 was observable: the CRT's CPU detection
             # toggles a bit in the saved EFLAGS and reads it back to decide
             # whether CPUID exists, and a word that never changes answers
             # every such probe the same wrong way. The lazy tuple holds
             # everything the arithmetic flags derive from, so hand it over.
-            lines.append(f"PUSH32(esp, recomp_eflags(_flag_k, _flag_a, _flag_b, _cf, _df)); {comment}")
+            # pushf (16-bit, 66 9C) pushes a word. Under DOS the word carries
+            # IF too: `pushf; pop ax; cli ... push ax; popf` is how a DOS
+            # program saves and restores interrupts, and IF is the host's.
+            fl = "recomp_eflags(_flag_k, _flag_a, _flag_b, _cf, _df)"
+            if self.dos:
+                fl = f"(({fl} & ~0x200u) | recomp_get_if())"
+            push = 'PUSH16' if m == 'pushf' else 'PUSH32'
+            lines.append(f"{push}(esp, {fl}); {comment}")
 
-        elif m == 'popfd':
-            lines.append(f"{{ uint32_t _fl = POP32_VAL(esp); {comment}")
+        elif m in ('popfd', 'popf'):
+            pop = 'POP16_VAL' if m == 'popf' else 'POP32_VAL'
+            lines.append(f"{{ uint32_t _fl = {pop}(esp); {comment}")
+            if self.dos:
+                lines.append("  recomp_set_if(_fl & 0x200u);")
             lines.append(f"  _flag_k = FK_EFLAGS; _flag_a = _fl; _flag_b = 0;")
             lines.append(f"  _cf = _fl & 1u; _df = (_fl & 0x400u) ? -1 : 1; }}")
             # The restored word, not whatever instruction last set the flags,
@@ -1521,8 +1533,13 @@ class Lifter:
                     # call m16:32: CS goes on the stack under the return
                     # address, and the callee's retf takes both off. A DOS
                     # extender's timer and driver callbacks are called this way.
+                    # The selector's base counts: a driver the program loaded
+                    # at run time runs with cs on its buffer, and its offsets
+                    # (and cs: tables) are from there. 0 for the program's own.
                     addr = self._fmt_mem_addr(ops[0].mem)
-                    lines.append(f"PUSH32(esp, _seg_cs); RECOMP_ICALL(MEM32({addr})); {comment}")
+                    lines.append(f"{{ uint32_t _ocs = CS_BASE; PUSH32(esp, _seg_cs); {comment}")
+                    lines.append(f"  CS_BASE = recomp_sel_base(MEM16(({addr}) + 4));")
+                    lines.append(f"  RECOMP_ICALL(CS_BASE + MEM32({addr})); CS_BASE = _ocs; }}")
                 elif ops and ops[0].type == X86_OP_MEM:
                     addr = self._fmt_mem_addr(ops[0].mem)
                     lines.append(f"RECOMP_ICALL(MEM32({addr})); {comment}")
