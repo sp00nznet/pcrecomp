@@ -300,6 +300,12 @@ class Disassembler:
         # of running it, and it throws all of it away.
         self._probe_md = Cs(CS_ARCH_X86, CS_MODE_32)
         self.light_operands = False   # find_functions(release_operands=True) sets it
+        # --tail-jumps: a `jmp` to one of these is a tail call, not more of the
+        # body. CA-Visual Objects links thousands of class-init stubs that each
+        # end `jmp <the previous stub>`; followed, every stub's body is the
+        # whole chain before it (O(n^2): Retail Plus Lite's PLUSLITE.EXE went
+        # past 16 GB and an hour). Off by default: it changes catalogs.
+        self.tail_starts = frozenset()
 
         # Build VA -> file offset cache for code sections
         # adj = raw_offset - va_start, so file_offset = va + adj
@@ -574,6 +580,8 @@ class Disassembler:
 
                 if insn.is_uncond_jump:
                     target = insn.get_branch_target()
+                    if target and target != start_va and target in self.tail_starts:
+                        break    # a tail call to another start (--tail-jumps)
                     if target and self.is_code_address(target):
                         if abs(target - start_va) < 0x100000:
                             block_leaders.add(target)
@@ -808,7 +816,8 @@ class Disassembler:
         return found
 
     def find_functions(self, code_start: int, code_end: int, iat_map: dict = None,
-                       seeds=(), release_operands: bool = False) -> dict:
+                       seeds=(), release_operands: bool = False,
+                       tail_jumps: bool = False) -> dict:
         """
         Find all functions in the code section.
         Uses call target analysis + common prologue patterns.
@@ -849,6 +858,8 @@ class Disassembler:
         # Filter to code range
         all_targets = {t for t in all_targets if code_start <= t < code_end}
         print(f"[*] Total unique function candidates: {len(all_targets)}")
+        if tail_jumps:
+            self.tail_starts = frozenset(all_targets)
 
         # Disassemble each function. Then iterate to a fixpoint, following
         # unconditional-jmp and call targets that land on code not yet covered by
@@ -1340,6 +1351,23 @@ def drop_mid_instruction_entries(read_va, functions, code_start, code_end,
                 if not advanced:
                     break
 
+    # A body's walk depends only on its address and the image, and every round
+    # walks every body two or three times: kept here as (address, size) arrays.
+    # Retail Plus Lite (39k entries, CA-Visual Objects code full of long
+    # forward jumps) spent over half an hour here without it.
+    import array
+    walked = {}
+
+    def body(addr):
+        r = walked.get(addr)
+        if r is None:
+            va, sz = array.array('I'), array.array('B')
+            for ins in body_instructions(addr):
+                va.append(ins.address)
+                sz.append(ins.size)
+            r = walked[addr] = (va, sz)
+        return zip(*r)
+
     static_keep = set(keep)
     for _ in range(max_rounds):
         # A call is evidence only while the body making it is still an entry:
@@ -1349,15 +1377,15 @@ def drop_mid_instruction_entries(read_va, functions, code_start, code_end,
         evict = {a for a in set(weak) & set(functions)
                  if a not in keep and functions[a] > 0 and any(
                      k in keep and k in functions
-                     for ins in body_instructions(a)
-                     for k in range(ins.address + 1, ins.address + ins.size))}
+                     for iva, isz in body(a)
+                     for k in range(iva + 1, iva + isz))}
         def interior_of(skip):
             marks = bytearray(max(0, code_end - code_start))
             for addr in functions:
                 if functions[addr] <= 0 or addr in skip:
                     continue
-                for ins in body_instructions(addr):
-                    for k in range(ins.address + 1, ins.address + ins.size):
+                for iva, isz in body(addr):
+                    for k in range(iva + 1, iva + isz):
                         if code_start <= k < code_end:
                             marks[k - code_start] = 1
             return marks
@@ -1968,6 +1996,10 @@ def main(argv=None):
                                       "analysis is recomputed from the exe regardless")
     ap.add_argument("--full", action="store_true",
                     help="Include per-instruction detail in the JSON (large output)")
+    ap.add_argument("--tail-jumps", action="store_true",
+                    help="A jmp to another function candidate is a tail call, not "
+                         "part of the body (CA-Visual Objects' chained class-init "
+                         "stubs; quadratic without it)")
     ap.add_argument("--min-size", type=int, default=0,
                     help="Drop recovered functions smaller than N bytes from the catalog")
     ap.add_argument("--seed-functions", metavar="FILE",
@@ -2037,7 +2069,8 @@ def main(argv=None):
     # afford to let the operand lists go -- which is where the memory went on a
     # multi-megabyte image.
     functions = dis.find_functions(info.code_start, info.code_end, iat,
-                                   seeds=seeds, release_operands=True)
+                                   seeds=seeds, release_operands=True,
+                                   tail_jumps=args.tail_jumps)
 
     funcs = [f for f in functions.values() if f.size >= args.min_size]
     funcs.sort(key=lambda x: x.address)
