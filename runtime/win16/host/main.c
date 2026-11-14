@@ -387,6 +387,17 @@ int main(int argc, char *argv[])
     if (getenv("RECOMP_WATCH_DS")) g_watch_ds = 1;
     if (getenv("RECOMP_STUB_HITS")) atexit(stub_report);
     /* A screen saver's switches (/s, /p <hwnd>, /c) come first; screensaver.c. */
+    /* --record FILE / --replay FILE / --keys f120:enter,...: frame-keyed input
+       for the game's host (runtime/replay), handed over as RECOMP_* variables. */
+    while (argc > 2 && (!strcmp(argv[1], "--record") || !strcmp(argv[1], "--replay") || !strcmp(argv[1], "--keys"))) {
+        static char env[3][1024];
+        char full[512];
+        int k = argv[1][2] == 'k' ? 2 : argv[1][4] == 'c' ? 0 : 1;
+        snprintf(env[k], sizeof env[k], "%s=%s", k == 2 ? "RECOMP_FKEYS" : k ? "RECOMP_REPLAY" : "RECOMP_RECORD",
+                 k == 2 ? argv[2] : (GetFullPathNameA(argv[2], sizeof full, full, NULL), full));
+        _putenv(env[k]);
+        argv[2] = argv[0]; argv += 2; argc -= 2;
+    }
     extern int recomp_scr_args(int, char **);
     int first = recomp_scr_args(argc, argv);
     const char *img = (first < argc) ? argv[first] : RECOMP_IMAGE_PATH;

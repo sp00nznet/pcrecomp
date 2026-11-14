@@ -7,6 +7,10 @@ versions follow [SemVer](https://semver.org/).
 
 ### Added
 
+- `runtime/replay/`: input record and replay keyed to the game's own frames
+  or timer ticks, not wall time (`--record`, `--replay`, `--keys f<frame>:...`),
+  with screenshot/hash checkpoints; Win16 hosts take the flags in `main.c`.
+  After Exhume's runtime/replay (MIT). Pilots: Jazz Jackrabbit, KISS.
 - lift32: a test that `jcxz` (67 E3) leaves the function as `jecxz` does
   (`tools/lift/test_loop_exits.py`; #191, by [@pete-jorgensen](https://github.com/pete-jorgensen)).
 - `tools/pe/vb6.py`: a Visual Basic 5/6 exe's VB header (`VB5!`): native code

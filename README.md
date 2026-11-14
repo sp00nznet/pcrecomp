@@ -419,6 +419,27 @@ python tools/lift/difftest.py --pe game.exe --gen new/gen --old old/gen --change
 cc -Iruntime/recomp16 runtime/recomp16/cpu_selftest.c -o selftest && ./selftest
 ```
 
+### "My scripted test run is flaky"
+
+Keys sent at wall-clock seconds land early or late as the machine's load
+changes. `runtime/replay/` keys them to the game's own progress instead: the
+host counts frames as it already does (presents, flips, timer ticks), logs
+each input it delivers as `FRAME EVENT` under `--record FILE`, and under
+`--replay FILE` delivers each at the same frame, with `shot FILE` checkpoints
+(a screenshot and an FNV hash) and `end`. `--keys f120:enter,...` is the same
+with frame times. A host whose game reads a wall clock also makes time
+virtual under replay (Jazz Jackrabbit: the PIT advances by lifted work, not
+by the clock), which makes replays bit-identical.
+
+```bash
+cc -DREPLAY_SELFTEST runtime/replay/replay.c -o replay_selftest && ./replay_selftest
+```
+
+Win16 hosts take `--record`/`--replay`/`--keys` before the image argument
+(`runtime/win16/host/main.c` hands them over as `RECOMP_RECORD`,
+`RECOMP_REPLAY`, `RECOMP_FKEYS`). Pilots: Jazz Jackrabbit and KISS Psycho
+Circus, each with a recording in `tests/` and the recipe in `docs/testing.md`.
+
 ### "Did the disassembler find the real functions?"
 
 ```bash
@@ -714,10 +735,12 @@ Built on other people's tools, and on published reverse-engineering work:
   the headless scripts in `tools/ghidra/` and `tools/ida/`; function boundaries
   and decompilation.
 - **[Exhume](https://github.com/abedegno/exhume)** (MIT, abedegno) — the
-  method of `lift/difftest.py --pe`: a single routine's original bytes in
-  Unicorn against its C, on seeded random and edge-case inputs, a fault on
-  both sides counting as agreement and memory below the final stack pointer
-  left out (Exhume's `tools/fuzzasm.py`). Reimplemented here, no code copied.
+  methods of `lift/difftest.py --pe` (a single routine's original bytes in
+  Unicorn against its C, on seeded random and edge-case inputs; Exhume's
+  `tools/fuzzasm.py`) and of `runtime/replay/` (input recorded at the
+  program's own clock, replayed at the same point, compared at named
+  checkpoints; its `docs/port.md`, "Verifying a port"). Reimplemented here,
+  no code copied.
 - **Kostya Shishkov** and **Alyssa Milburn** — their published work on the
   FVF/IFS fractal codec family underpins `tools/formats/ftcdecode/`.
 
