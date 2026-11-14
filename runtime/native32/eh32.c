@@ -105,6 +105,16 @@ static recomp_ehframe_t* eh_frame_at(uint32_t ebp) {
     return NULL;
 }
 
+/* The frame whose body continues at `va` with guest ebp `ebp`, or NULL. */
+recomp_ehframe_t* recomp_eh_find(uint32_t va, uint32_t ebp) {
+    for (recomp_ehframe_t* f = t_frames; f; f = f->prev) {
+        if (!f->resume_at || f->entry_esp != ebp + f->off) continue;
+        for (const uint32_t* r = f->resume_at; *r; r++)
+            if (*r == va) return f;
+    }
+    return NULL;
+}
+
 static int eh_trace = -1;
 
 /* recomp_eh_jump_hook: a guest handler continuing at `va` with the frame's
@@ -113,15 +123,11 @@ static int eh_trace = -1;
 static int recomp_eh_jump(uint32_t va) {
     if (eh_trace > 0 || seh_trace > 0)
         fprintf(stderr, "[eh32] miss at 0x%08X with ebp 0x%08X: is it a handler's continuation?\n", va, g_ebp);
-    for (recomp_ehframe_t* f = t_frames; f; f = f->prev) {
-        if (!f->resume_at || f->entry_esp != g_ebp + f->off) continue;
-        for (const uint32_t* r = f->resume_at; *r; r++)
-            if (*r == va) {
-                if (eh_trace > 0)
-                    fprintf(stderr, "[eh32] continue at 0x%08X in sub_%08X (ebp 0x%08X)\n", va, f->func, g_ebp);
-                recomp_eh_resume(f, va);
-            }
-    }
+    recomp_ehframe_t* f = recomp_eh_find(va, g_ebp);
+    if (!f) return 0;
+    if (eh_trace > 0)
+        fprintf(stderr, "[eh32] continue at 0x%08X in sub_%08X (ebp 0x%08X)\n", va, f->func, g_ebp);
+    recomp_eh_resume(f, va);
     return 0;
 }
 

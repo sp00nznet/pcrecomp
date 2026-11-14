@@ -179,6 +179,11 @@ int native32_headless(void);
  * needs a landing pad (generate.py eh_resume). */
 void native32_seh_continue(uint32_t va);
 extern int native32_guest_seh;   /* 1: RaiseException goes to the guest chain */
+/* A Visual Basic 5/6 guest on the real MSVBVM60/50 (vb6rt.c): the runtime is
+ * entered with the guest's registers and stack, and its runtime errors go to
+ * the guest's On Error handling. Call after native32_bind. 1 if set up. */
+int native32_vb6_runtime(void);
+extern uint32_t native32_fs_mirror_lo, native32_fs_mirror_hi;   /* vb6rt.c sets them */
 
 /* The guest's frames as it presents them: cb gets the surface blitted to the
  * primary (a windowed game) or the primary after a Flip, and its interface

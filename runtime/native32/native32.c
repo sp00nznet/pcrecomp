@@ -33,6 +33,8 @@ uint32_t  g_icall_trace[ICALL_TRACE_SIZE], g_icall_from[ICALL_TRACE_SIZE];
 uint32_t  g_icall_trace_idx, g_icall_count;
 
 int native32_trace_native, native32_trace_callbacks;
+/* Calls into [lo, hi) run with the guest's SEH chain on the real fs:[0] (vb6rt.c). */
+uint32_t native32_fs_mirror_lo, native32_fs_mirror_hi;
 
 typedef struct {
     uint32_t eax, ecx, edx, esp, ebx, esi, edi, ebp, fs, cur;
@@ -672,6 +674,12 @@ static __declspec(naked) void gen_enter(void) {
     }
 }
 
+/* The state each gen_bridge in flight on this thread will put back. */
+#define MAX_GEN_NEST 64
+typedef struct { uint32_t gesp, lim0, lim1, fs_host, anchor; int widened; } gen_saved_t;
+static __declspec(thread) gen_saved_t t_gen[MAX_GEN_NEST];
+static __declspec(thread) int t_gen_n;
+
 static void gen_bridge(void) {
     gen_ctx_t c;
     gen_ctx_t* cp = &c;
@@ -704,6 +712,21 @@ static void gen_bridge(void) {
         if (gb > c.lim[0]) tib->StackBase = (PVOID)(uintptr_t)gb;
         if (gl && gl < c.lim[1]) tib->StackLimit = (PVOID)(uintptr_t)gl;
     }
+    /* vb6rt.c: the runtime finds its procedure's frame through fs:[0]. */
+    int fs_mirror = c.fn - native32_fs_mirror_lo < native32_fs_mirror_hi - native32_fs_mirror_lo;
+    uint32_t fs_host = 0;
+    if (fs_mirror) {
+        fs_host = __readfsdword(0);
+        __writefsdword(0, MEM32(g_fs_base));
+    }
+    /* What the epilogue below puts back, for a guest error handler that
+     * longjmps past it (vb6rt.c gen_unwind). */
+    if (t_gen_n < MAX_GEN_NEST) {
+        gen_saved_t* g = &t_gen[t_gen_n];
+        g->gesp = g_esp; g->lim0 = c.lim[0]; g->lim1 = c.lim[1]; g->widened = widened;
+        g->fs_host = fs_mirror ? fs_host : __readfsdword(0); g->anchor = __readfsdword(0x14);
+    }
+    t_gen_n++;
     c.mm = x87 ? 0 : (uint32_t)(uintptr_t)g_mm;
     if (native32_trace_native)
         fprintf(stderr, "[native] generated code @%08X from sub_%08X (esi %08X edi %08X ebp %08X)\n",
@@ -785,6 +808,11 @@ static void gen_bridge(void) {
     tib->StackBase = (PVOID)(uintptr_t)c.lim[0];
     tib->StackLimit = (PVOID)(uintptr_t)c.lim[1];
     if (widened) g_teb_widened--;
+    if (fs_mirror) {
+        MEM32(g_fs_base) = __readfsdword(0);
+        __writefsdword(0, fs_host);
+    }
+    t_gen_n--;
     /* A runtime helper can answer in the flags: VO's string compare _CPSE is
      * `call _CPSE; jne ...`, and the lifted caller reads the flags back after
      * the call (RECOMP_FLAGS_IN). Left stale, Retail Plus Lite's ".DBF"
@@ -960,6 +988,9 @@ static void shim_VirtualQuery(void) {
 /* With native32_guest_seh, any other code goes to the guest's own SEH chain
  * first (seh32.c), and is raised for real only if no guest frame takes it. */
 #include "seh32.c"
+
+/* Visual Basic 5/6 on the real MSVBVM60 (vb6rt.c). */
+#include "vb6rt.c"
 
 /* A C++ throw from a statically linked CRT goes to eh32's dispatch first
  * (native32_cxx_raise returns only if nothing in the guest catches it). */
@@ -1228,6 +1259,9 @@ X87CRT(ftol) X87CRT(CIsqrt) X87CRT(CIsin) X87CRT(CIcos) X87CRT(CItan) X87CRT(CIa
 X87CRT(CIacos) X87CRT(CIatan) X87CRT(CIexp) X87CRT(CIlog) X87CRT(CIlog10) X87CRT(CIsinh)
 X87CRT(CIcosh) X87CRT(CItanh) X87CRT(CIpow) X87CRT(CIfmod) X87CRT(CIatan2)
 X87CRT(controlfp) X87CRT(control87)
+X87CRT(adj_fdiv_m64) X87CRT(adj_fdiv_m32) X87CRT(adj_fdiv_m16i) X87CRT(adj_fdiv_m32i)
+X87CRT(adj_fdivr_m64) X87CRT(adj_fdivr_m32) X87CRT(adj_fdivr_m16i) X87CRT(adj_fdivr_m32i)
+X87CRT(adj_fprem) X87CRT(adj_fprem1) X87CRT(adj_fptan) X87CRT(adj_fpatan)
 
 /* native32_set_codepage: the guest's ANSI code page (codepage.c). */
 #include "codepage.c"
@@ -1258,6 +1292,12 @@ static native32_shim_t g_builtin[] = {
     { "_CItanh", native32_shim_CItanh }, { "_CIpow", native32_shim_CIpow },
     { "_CIfmod", native32_shim_CIfmod }, { "_CIatan2", native32_shim_CIatan2 },
     { "_controlfp", native32_shim_controlfp }, { "_control87", native32_shim_control87 },
+    { "_adj_fdiv_m64", native32_shim_adj_fdiv_m64 }, { "_adj_fdiv_m32", native32_shim_adj_fdiv_m32 },
+    { "_adj_fdiv_m16i", native32_shim_adj_fdiv_m16i }, { "_adj_fdiv_m32i", native32_shim_adj_fdiv_m32i },
+    { "_adj_fdivr_m64", native32_shim_adj_fdivr_m64 }, { "_adj_fdivr_m32", native32_shim_adj_fdivr_m32 },
+    { "_adj_fdivr_m16i", native32_shim_adj_fdivr_m16i }, { "_adj_fdivr_m32i", native32_shim_adj_fdivr_m32i },
+    { "_adj_fprem", native32_shim_adj_fprem }, { "_adj_fprem1", native32_shim_adj_fprem1 },
+    { "_adj_fptan", native32_shim_adj_fptan }, { "_adj_fpatan", native32_shim_adj_fpatan },
 };
 
 int native32_bind(uint32_t base, native32_shim_t* shims, int nshims) {
