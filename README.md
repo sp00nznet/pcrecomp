@@ -129,7 +129,7 @@ or IDA, whatever the architecture.
 | `translator.py` | `python -m tools`: the default 32-bit pipeline, analyse -> disassemble -> lift -> split into files |
 | `generate.py` | Fast 32-bit generation: one linear sweep, split on known boundaries |
 | `generate64.py` | Whole-PE x86-64 driver: chunked TUs, declarations, dispatch table, import map. It also finishes the catalog (below) |
-| `difftest.py` | Lifted C vs Unicorn for x86-32, every register, flag and byte compared |
+| `difftest.py` | Lifted C vs Unicorn for x86-32, every register, flag and byte compared; `--pe` does it a whole function at a time on a game's own code |
 | `difftest16.py` | The same for x86-16, on raw bytes or a real NE segment (`--ne`) |
 | `difftest64.py` | Lifted C vs the **host CPU** running the original bytes (`difftest64.asm`): registers, memory operands, `lock` atomics |
 
@@ -406,6 +406,14 @@ python tools/disasm/analyze.py GAME.EXE -symbols work/symbols.toml
 # every register, flag and byte of memory. Needs unicorn + a C compiler.
 python tools/lift/difftest.py -v
 
+# The same for a game's own functions: each one's original bytes in Unicorn
+# against its lifted body, every callee and import stubbed (a call stops both
+# sides and compares there), on seeded random and edge-case inputs. --old and
+# --changed test every function whose body changed between two lifts.
+python tools/lift/difftest.py --self-check
+python tools/lift/difftest.py --pe game.exe --gen src/recomp/gen 0x00486794
+python tools/lift/difftest.py --pe game.exe --gen new/gen --old old/gen --changed     -D RECOMP_LOCAL_REGS --cases 200 --seed 1
+
 # The 16-bit CPU model's hand-written flag logic (BCD, ADC/SBB carry-in),
 # against values taken from hardware
 cc -Iruntime/recomp16 runtime/recomp16/cpu_selftest.c -o selftest && ./selftest
@@ -618,6 +626,8 @@ python tools/ne/ne_decode.py GAME.EXE --ida-json code_map.json
 - `lief` - advanced binary analysis. Optional.
 - `unicorn` - the reference x86 that `lift/difftest.py` and `difftest16.py`
   check the lifted C against. Only needed to run the differential tests.
+  Unicorn is GPL-2: it is a test-time dependency only, installed with pip,
+  never vendored, linked or shipped in any runtime here.
   `difftest64.py` needs no emulator: the reference is the host CPU, built with
   MSVC x64 (`ml64` + `cl`).
 
@@ -703,6 +713,11 @@ Built on other people's tools, and on published reverse-engineering work:
 - **[Ghidra](https://ghidra-sre.org/)** (Apache-2.0) and **IDA Pro** — hosts for
   the headless scripts in `tools/ghidra/` and `tools/ida/`; function boundaries
   and decompilation.
+- **[Exhume](https://github.com/abedegno/exhume)** (MIT, abedegno) — the
+  method of `lift/difftest.py --pe`: a single routine's original bytes in
+  Unicorn against its C, on seeded random and edge-case inputs, a fault on
+  both sides counting as agreement and memory below the final stack pointer
+  left out (Exhume's `tools/fuzzasm.py`). Reimplemented here, no code copied.
 - **Kostya Shishkov** and **Alyssa Milburn** — their published work on the
   FVF/IFS fractal codec family underpins `tools/formats/ftcdecode/`.
 

@@ -22,7 +22,21 @@ hardware EFLAGS tests the whole model, not one condition at a time.
     python tools/lift/difftest.py -k shift   # only cases matching a substring
     python tools/lift/difftest.py --keep     # leave the generated C behind
 
+Whole functions of a game, the original bytes against the project's gen:
+
+    python tools/lift/difftest.py --self-check
+    python tools/lift/difftest.py --pe GAME.EXE --gen GEN 0x00486794 [...]
+    python tools/lift/difftest.py --pe GAME.EXE --gen NEW --old OLD --changed
+        [--cases 100] [--seed N] [-D RECOMP_LOCAL_REGS ...]
+
+Every callee and import is a stub: a call or jump out of the function stops
+both machines, and the state is compared there. The method is Exhume's
+tools/fuzzasm.py (github.com/abedegno/exhume, MIT, abedegno), reimplemented.
+Exits 1 when the (new) gen differs from the CPU anywhere.
+
 Needs: unicorn, capstone (pip), and a C compiler (gcc/clang/cc, or $RECOMP_CC).
+Unicorn is GPL-2, so it is a test-time dependency only: never vendor it or link
+it into a runtime.
 """
 
 import argparse
@@ -1099,12 +1113,523 @@ def diff(case, lifted, real):
     return out
 
 
+# ---------------------------------------------------------------- whole functions
+#
+# The cases above are instructions written by hand. This half tests a game's
+# own functions: the original bytes in Unicorn, the lifted body from the
+# project's gen in a small C harness, from the same seeded registers and memory.
+# The method is Exhume's tools/fuzzasm.py (github.com/abedegno/exhume, MIT,
+# (c) abedegno): seeded random inputs with edge values first, a fault on both
+# sides counts as agreement, memory below the final stack pointer is not
+# compared. No code of theirs is copied here.
+#
+# A call or jump out of the function stops both sides there: every callee and
+# import is a stub, so a difference is this function's own. The state compared
+# at the stop is the eight registers, CF ZF SF OF, the x87 depth and values,
+# and every changed byte of the image, a scratch heap and the stack.
+
+FN_SCRATCH, FN_STACK, FN_TRAMP, FN_LEN = 0x10000000, 0x20000000, 0x30000000, 0x10000
+FN_ESP = FN_STACK + 0x8000
+FN_TEB = FN_SCRATCH + 0xF000          # fs:[0] and friends read here
+FN_RET = FN_TRAMP + 0xF00             # the caller's return address: reaching it is `ret`
+FN_FLAGS = (('CF', 0), ('ZF', 6), ('SF', 7), ('OF', 11))   # ponytail: PF/AF/DF not compared
+FN_EDGE = (0, 1, 0xFFFFFFFF, 0x7FFFFFFF, 0x80000000)
+FN_CASE = struct.Struct('<8IIdI')     # regs, x87 depth, st0, skip
+
+
+def pe_image(path):
+    """(image base, the image as the loader maps it) for a PE, stdlib only."""
+    d = open(path, 'rb').read()
+    pe = struct.unpack_from('<I', d, 0x3C)[0]
+    nsec, optsz = struct.unpack_from('<H', d, pe + 6)[0], struct.unpack_from('<H', d, pe + 20)[0]
+    opt = pe + 24
+    base, size, hdrs = (struct.unpack_from('<I', d, opt + o)[0] for o in (28, 56, 60))
+    img = bytearray((size + 0xFFF) & ~0xFFF)
+    img[:hdrs] = d[:hdrs]
+    for i in range(nsec):
+        vsz, va, rsz, raw = struct.unpack_from('<IIII', d, opt + optsz + 40 * i + 8)
+        n = min(rsz, vsz or rsz)
+        img[va:va + n] = d[raw:raw + n]
+    return base, bytes(img)
+
+
+def gen_bodies(gen):
+    """{va: C source} of every lifted body in a gen directory."""
+    import glob, re
+    out = {}
+    for f in sorted(glob.glob(os.path.join(gen, 'recomp_*.c'))):
+        for m in re.finditer(r'^void sub_([0-9A-F]{8})\(void\) \{\n.*?^\}\n',
+                             open(f).read(), re.M | re.S):
+            out[int(m.group(1), 16)] = m.group(0)
+    return out
+
+
+def norm_body(b):
+    """A body with generate.py's _st[i] -> _ST(i) rename undone, for --changed."""
+    import re
+    b = re.sub(r'(?<![\w])_st\[(\d+)\]', r'_ST(\1)', b)
+    return re.sub(r'(?<![\w])g_st_i64\[(\d+)\]', r'_STI(\1)', b)
+
+
+def fn_word(rng):
+    """A dword a game would hold: a pointer into the scratch heap, a float, a
+    small or edge integer, or noise."""
+    r = rng.random()
+    if r < .4:
+        return (FN_SCRATCH + rng.randrange(0x100, 0xE000)) & ~3
+    if r < .6:
+        return struct.unpack('<I', struct.pack('<f', rng.uniform(-100, 100)))[0]
+    if r < .8:
+        return rng.choice(FN_EDGE + (2, 0x3F800000))
+    return rng.getrandbits(32)
+
+
+def fn_cases(seed, n):
+    """n inputs from one seed: the first few with every register and stack
+    argument at an edge value, the rest random."""
+    import random
+    rng = random.Random(seed)
+    out = []
+    for i in range(n):
+        pick = (lambda: FN_EDGE[i]) if i < len(FN_EDGE) else (lambda: fn_word(rng))
+        regs = [pick() for _ in range(8)]
+        regs[4] = FN_ESP
+        heap = struct.pack('<%dI' % (FN_LEN // 4), *(fn_word(rng) for _ in range(FN_LEN // 4)))
+        stack = bytearray(struct.pack('<%dI' % (FN_LEN // 4), *(fn_word(rng) for _ in range(FN_LEN // 4))))
+        args = struct.pack('<16I', *(pick() for _ in range(16)))
+        stack[FN_ESP - FN_STACK:FN_ESP - FN_STACK + 4 + len(args)] = struct.pack('<I', FN_RET) + args
+        out.append({'regs': regs, 'depth': rng.randrange(2), 'st0': rng.uniform(-100, 100),
+                    'heap': heap, 'stack': bytes(stack)})
+    return out
+
+
+def body_insns(body):
+    import re
+    return {int(a, 16) for a in re.findall(r'/\* 0x([0-9A-F]{8}): ', body)}
+
+
+def page_diff(base, before, after):
+    out = {}
+    for p in range(0, len(after), 0x1000):
+        if before[p:p + 0x1000] != after[p:p + 0x1000]:
+            out.update({base + p + i: after[p + i] for i in range(min(0x1000, len(after) - p))
+                        if before[p + i] != after[p + i]})
+    return out
+
+
+def uc_function(base, img, va, insns, c):
+    """The original bytes from case c, to the first exit from `insns`."""
+    from unicorn import UcError, UC_HOOK_CODE, UC_HOOK_BLOCK, UC_HOOK_INTR
+    mu = Uc(UC_ARCH_X86, UC_MODE_32)
+    mu.mem_map(base, len(img))
+    mu.mem_write(base, img)
+    for a in (FN_SCRATCH, FN_STACK, FN_TRAMP):
+        mu.mem_map(a, FN_LEN)
+    mu.mem_write(FN_SCRATCH, c['heap'])
+    mu.mem_write(FN_STACK, c['stack'])
+    # fs is a GDT descriptor in 32-bit Unicorn (FS_BASE is ignored there), and
+    # with a GDT loaded ss/ds/es need a flat one too or the first push faults
+    gdt = FN_TRAMP + 0xE000
+    teb = 0xFFF | ((FN_TEB & 0xFFFFFF) << 16) | (0xF3 << 40) | (0x4 << 52) | ((FN_TEB >> 24) << 56)
+    flat = 0xFFFF | (0x93 << 40) | (0xF << 48) | (0xC << 52)
+    mu.mem_write(gdt + 8, struct.pack('<QQ', teb, flat))
+    mu.reg_write(X.UC_X86_REG_GDTR, (0, gdt, 0x18, 0))
+    mu.reg_write(X.UC_X86_REG_FS, 0x0B)
+    for seg in (X.UC_X86_REG_SS, X.UC_X86_REG_DS, X.UC_X86_REG_ES):
+        mu.reg_write(seg, 0x10)
+    # the x87 from code, since Unicorn's ST accessors cannot write a value
+    mu.mem_write(FN_TRAMP + 0x800, struct.pack('<Hxxxxxxd', FPU_CONTROL_WORD, c['st0']))
+    pro = bytes.fromhex('dbe3d92d') + struct.pack('<I', FN_TRAMP + 0x800)
+    if c['depth']:
+        pro += bytes.fromhex('dd05') + struct.pack('<I', FN_TRAMP + 0x808)
+    mu.mem_write(FN_TRAMP, pro)
+    mu.emu_start(FN_TRAMP, FN_TRAMP + len(pro))
+    for name, v in zip(REGS, c['regs']):
+        mu.reg_write(UC_REGS[name], v)
+    mu.reg_write(X.UC_X86_REG_EFLAGS, EFLAGS_START)
+
+    stop = []
+    def leave(uc, addr, size, ud):
+        if addr not in insns:
+            stop.append(addr)
+            uc.emu_stop()
+    def intr(uc, n, ud):
+        stop.append('int %d' % n)
+        uc.emu_stop()
+    lo, hi = min(insns), max(insns)
+    hooks = [mu.hook_add(UC_HOOK_CODE, leave, None, 0, lo - 1),
+             mu.hook_add(UC_HOOK_CODE, leave, None, hi + 1, 0xFFFFFFFF),
+             mu.hook_add(UC_HOOK_BLOCK, leave, None, lo, hi),   # a gap inside the range
+             mu.hook_add(UC_HOOK_INTR, intr)]
+    before = [bytes(mu.mem_read(a, n)) for a, n in ((base, len(img)), (FN_SCRATCH, FN_LEN), (FN_STACK, FN_LEN))]
+    try:
+        mu.emu_start(va, FN_RET, count=5_000_000)
+    except UcError:
+        return {'stop': 'fault'}
+    if not stop:
+        stop.append(FN_RET if mu.reg_read(X.UC_X86_REG_EIP) == FN_RET else 'hang')
+    out = {'stop': stop[0], 'regs': {n: mu.reg_read(UC_REGS[n]) for n in REGS},
+           'eflags': mu.reg_read(X.UC_X86_REG_EFLAGS), 'depth': fpu_depth(mu), 'mem': {}}
+    for (a, n), b in zip(((base, len(img)), (FN_SCRATCH, FN_LEN), (FN_STACK, FN_LEN)), before):
+        out['mem'].update(page_diff(a, b, bytes(mu.mem_read(a, n))))
+    for h in hooks:
+        mu.hook_del(h)
+    epi = b''.join(bytes.fromhex('dd1d') + struct.pack('<I', FN_TRAMP + 0x900 + 8 * i)
+                   for i in range(out['depth']))
+    if epi:
+        mu.mem_write(FN_TRAMP + 0x100, epi)
+        mu.emu_start(FN_TRAMP + 0x100, FN_TRAMP + 0x100 + len(epi))
+    out['st'] = list(struct.unpack('<%dd' % out['depth'], mu.mem_read(FN_TRAMP + 0x900, 8 * out['depth'])))
+    return out
+
+
+FN_BODY_C = r'''/* generated by tools/lift/difftest.py --pe: the lifted body under test */
+#define RECOMP_GENERATED_CODE
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include "recomp_types.h"
+%(funcs_h)s
+uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi, g_ebp;
+double   g_st[8];
+int      g_fp_top;
+uint16_t g_fpu_cw = 0x027F;
+uint16_t g_seg_cs, g_seg_ds, g_seg_es, g_seg_fs, g_seg_gs, g_seg_ss;
+uint32_t g_fs_base = 0x%(teb)08Xu, g_gs_base, g_es_base, g_cs_base, g_cur_func;
+uint64_t g_mm[8];
+xmm_t    g_xmm[8];
+uint32_t g_mxcsr = 0x1F80;
+ptrdiff_t g_mem_base;
+uint32_t g_icall_trace[ICALL_TRACE_SIZE], g_icall_from[ICALL_TRACE_SIZE], g_icall_trace_idx, g_icall_count;
+void recomp_dump_trace(const char *why) { (void)why; }
+void recomp_not_lifted(uint32_t va) { void dt_stop(uint32_t); dt_stop(va); }
+%(decls)s
+%(body)s
+void dt_stop(uint32_t va);
+static uint32_t dt_target;
+static void dt_icall(void) { dt_stop(dt_target); }
+recomp_func_t recomp_lookup_manual(uint32_t va) { (void)va; return 0; }
+recomp_func_t recomp_lookup(uint32_t va) { dt_target = va; return dt_icall; }
+recomp_func_t recomp_lookup_import(uint32_t va) { dt_target = va; return dt_icall; }
+void dt_run(void) { %(name)s(); }
+uint32_t dt_eflags(void) { return recomp_eflags(g_flag_k, g_flag_a, g_flag_b, g_flag_cf, 1); }
+'''
+
+FN_MAIN_C = r'''/* generated by tools/lift/difftest.py --pe: the harness, stubs and memory */
+#include <setjmp.h>
+#include <signal.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+static unsigned char *reserve(void) { return VirtualAlloc(0, 1ull << 32, MEM_RESERVE, PAGE_NOACCESS); }
+static void commit(unsigned char *p, size_t n) { VirtualAlloc(p, n, MEM_COMMIT, PAGE_READWRITE); }
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+static unsigned char *reserve(void) { return mmap(0, 1ull << 32, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0); }
+static void commit(unsigned char *p, size_t n) { mprotect(p, n, PROT_READ | PROT_WRITE); }
+#endif
+
+extern uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi, g_ebp;
+extern double g_st[8];
+extern int g_fp_top;
+extern ptrdiff_t g_mem_base;
+void dt_run(void);
+uint32_t dt_eflags(void);
+
+static jmp_buf jb;
+static unsigned char *mem;
+static struct { uint32_t va, n; unsigned char *ref; } reg[3] = {
+    { 0x%(base)08Xu, 0x%(imglen)Xu }, { 0x%(heap)08Xu, 0x%(len)Xu }, { 0x%(stack)08Xu, 0x%(len)Xu } };
+
+static void report(uint32_t stop) {
+    int i, k;
+    printf("S %%08X\nR %%08X %%08X %%08X %%08X %%08X %%08X %%08X %%08X\nF %%08X\nT %%d\n", stop,
+           g_eax, g_ecx, g_edx, g_ebx, g_esp, g_ebp, g_esi, g_edi, dt_eflags(), g_fp_top);
+    for (k = 0; k < g_fp_top && k < 8; k++) printf("V %%.17g\n", g_st[k]);
+    for (i = 0; i < 3; i++) {
+        unsigned char *p = mem + reg[i].va;
+        uint32_t o;
+        for (o = 0; o < reg[i].n; o += 4096)
+            if (memcmp(p + o, reg[i].ref + o, 4096)) {
+                uint32_t j;
+                for (j = o; j < o + 4096; j++)
+                    if (p[j] != reg[i].ref[j]) printf("M %%08X %%02X\n", reg[i].va + j, p[j]);
+            }
+    }
+    printf("E\n");
+    fflush(stdout);
+}
+void dt_stop(uint32_t va) { report(va); longjmp(jb, 1); }
+static void fault(int sig) { printf("S fault\nE\n"); fflush(stdout); _exit(3); }
+
+%(stubs)s
+
+static unsigned char *slurp(const char *path, long *n) {
+    FILE *f = fopen(path, "rb"); unsigned char *b;
+    fseek(f, 0, SEEK_END); *n = ftell(f); fseek(f, 0, SEEK_SET);
+    b = malloc(*n); fread(b, 1, *n, f); fclose(f); return b;
+}
+
+int main(int argc, char **argv) {
+    long n, i, ncase;
+    unsigned char *img = slurp(argv[1], &n), *cases = slurp(argv[2], &n);
+    long first = atol(argv[3]), csize = %(hdr)d + 2 * 0x%(len)Xu;
+    mem = reserve();
+    g_mem_base = (ptrdiff_t)mem;
+    for (i = 0; i < 3; i++) { commit(mem + reg[i].va, reg[i].n); reg[i].ref = malloc(reg[i].n); }
+    memcpy(reg[0].ref, img, reg[0].n);
+    signal(SIGSEGV, fault); signal(SIGFPE, fault); signal(SIGILL, fault);
+    ncase = n / csize;
+    for (i = first; i < ncase; i++) {
+        unsigned char *c = cases + i * csize;
+        uint32_t r[8], depth, skip; double st0;
+        memcpy(r, c, 32); memcpy(&depth, c + 32, 4); memcpy(&st0, c + 36, 8); memcpy(&skip, c + 44, 4);
+        printf("C %%ld\n", i);
+        if (skip) { printf("S skip\nE\n"); fflush(stdout); continue; }
+        memcpy(reg[1].ref, c + %(hdr)d, 0x%(len)Xu);
+        memcpy(reg[2].ref, c + %(hdr)d + 0x%(len)Xu, 0x%(len)Xu);
+        for (int k = 0; k < 3; k++) memcpy(mem + reg[k].va, reg[k].ref, reg[k].n);
+        g_eax = r[0]; g_ecx = r[1]; g_edx = r[2]; g_ebx = r[3];
+        g_esp = r[4]; g_ebp = r[5]; g_esi = r[6]; g_edi = r[7];
+        memset(g_st, 0, sizeof g_st); g_st[0] = st0; g_fp_top = (int)depth;
+        if (!setjmp(jb)) { dt_run(); report(0x%(ret)08Xu); }
+    }
+    return 0;
+}
+'''
+
+
+def build_harness(body, name, workdir, defines, funcs_h, base, imglen):
+    """Compile one lifted body into a harness executable, stubbing every
+    function it calls. Undefined symbols the gen's header did not declare get
+    a stub too, found from the linker's complaint."""
+    import re
+    rt = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'runtime', 'recomp32'))
+    callees = sorted(set(re.findall(r'\bsub_[0-9A-F]{8}\b', body)) - {name})
+    extra, err = [], ''
+    body_c, main_c = os.path.join(workdir, 'fn.c'), os.path.join(workdir, 'main.c')
+    exe = os.path.join(workdir, 'fn.exe')
+    with open(body_c, 'w') as f:
+        f.write(FN_BODY_C % {'funcs_h': '#include "%s"' % funcs_h.replace('\\', '/') if funcs_h else '',
+                             'teb': FN_TEB, 'decls': ''.join('void %s(void);\n' % c for c in callees),
+                             'body': body, 'name': name})
+    for _ in range(4):
+        stubs = ''.join('void %s(void) { dt_stop(0x%su); }\n' % (c, c[4:]) for c in callees)
+        stubs += ''.join('void %s(void) { dt_stop(0xFFFFFFFFu); }\n' % e for e in extra)
+        with open(main_c, 'w') as f:
+            f.write(FN_MAIN_C % dict(stubs=stubs, base=base, imglen=imglen,
+                                     heap=FN_SCRATCH, stack=FN_STACK, len=FN_LEN, ret=FN_RET,
+                                     hdr=FN_CASE.size))
+        for cc in compilers():
+            r = subprocess.run([cc, '-O1', '-w', '-I', rt] + ['-D' + d for d in defines]
+                               + [body_c, main_c, '-o', exe, '-lm'], capture_output=True, text=True)
+            if r.returncode == 0:
+                return exe
+            missing = set(re.findall(r"undefined reference to `(\w+)'", r.stderr)) - set(extra)
+            if missing:
+                extra += sorted(missing)
+                break
+            err = r.stdout + r.stderr
+        else:
+            raise SystemExit(f'{name}: harness does not build:\n{err[-3000:]}')
+    raise SystemExit(f'{name}: harness does not link')
+
+
+def run_harness(exe, workdir, img, cases, skips):
+    """Every case through the lifted body; a fault or hang ends a run and
+    the next run starts after it."""
+    imgf, casef = os.path.join(workdir, 'image.bin'), os.path.join(workdir, 'cases.bin')
+    with open(imgf, 'wb') as f:
+        f.write(img)
+    with open(casef, 'wb') as f:
+        for c, skip in zip(cases, skips):
+            f.write(FN_CASE.pack(*c['regs'], c['depth'], c['st0'], skip) + c['heap'] + c['stack'])
+    out, first = {}, 0
+    while first < len(cases):
+        try:
+            text = subprocess.run([exe, imgf, casef, str(first)], capture_output=True, text=True,
+                                  timeout=30).stdout
+        except subprocess.TimeoutExpired as e:
+            text = (e.stdout or b'').decode() if isinstance(e.stdout, bytes) else (e.stdout or '')
+            text += '\nS hang\nE\n'
+        cur = None
+        for line in text.splitlines():
+            p = line.split()
+            if not p:
+                continue
+            if p[0] == 'C':
+                cur = int(p[1]); out[cur] = {'regs': {}, 'mem': {}, 'st': [], 'depth': 0, 'eflags': 0}
+            elif cur is None:
+                continue
+            elif p[0] == 'S':
+                out[cur]['stop'] = int(p[1], 16) if p[1] not in ('fault', 'hang', 'skip') else p[1]
+            elif p[0] == 'R':
+                out[cur]['regs'] = {n: int(v, 16) for n, v in zip(REGS, p[1:])}
+            elif p[0] == 'F':
+                out[cur]['eflags'] = int(p[1], 16)
+            elif p[0] == 'T':
+                out[cur]['depth'] = int(p[1])
+            elif p[0] == 'V':
+                out[cur]['st'].append(float(p[1]))
+            elif p[0] == 'M':
+                out[cur]['mem'][int(p[1], 16)] = int(p[2], 16)
+        first = (cur if cur is not None else first) + 1
+    return out
+
+
+def near(a, b, rel):
+    import math
+    return a == b or (math.isfinite(a) and math.isfinite(b) and abs(a - b) <= rel * max(abs(a), abs(b)))
+
+
+def fn_diff(lifted, real):
+    """What two runs of one function disagree on. A fault on both sides, or a
+    case Unicorn could not finish, is agreement."""
+    if real['stop'] in ('fault', 'hang') or lifted['stop'] == 'skip':
+        return [] if lifted['stop'] in (real['stop'], 'skip') else [('stop', lifted['stop'], real['stop'])]
+    st = lambda s: s if isinstance(s, str) else ('ret' if s == FN_RET else f'{s:08X}')
+    if lifted['stop'] != real['stop']:
+        return [('stop', st(lifted['stop']), st(real['stop']))]
+    out = [(n, f"{lifted['regs'][n]:08X}", f"{real['regs'][n]:08X}")
+           for n in REGS if lifted['regs'][n] != real['regs'][n]]
+    out += [(n, str(lifted['eflags'] >> b & 1), str(real['eflags'] >> b & 1))
+            for n, b in FN_FLAGS if (lifted['eflags'] ^ real['eflags']) >> b & 1]
+    if lifted['depth'] != real['depth']:
+        out.append(('x87 depth', str(lifted['depth']), str(real['depth'])))
+    # ponytail: libm against the x87's own sin/cos/log disagree in the last bits;
+    # a value within 1e-12 (st) or 1e-6 (a float in memory), or 1e-25 of it, is the same value.
+    out += [(f'st({i})', repr(a), repr(b)) for i, (a, b) in enumerate(zip(lifted['st'], real['st']))
+            if not near(a, b, 1e-12)]
+    esp = real['regs']['esp']
+    keep = lambda a: not (FN_STACK <= a < esp or (real['stop'] != FN_RET and esp <= a < esp + 4))
+    words = sorted({a & ~3 for a in set(lifted['mem']) | set(real['mem']) if keep(a)})
+    for w in words:
+        got = [lifted['mem'].get(w + i) for i in range(4)]
+        want = [real['mem'].get(w + i) for i in range(4)]
+        if got == want:
+            continue
+        if None not in got and None not in want:
+            fa, fb = (struct.unpack('<f', bytes(x))[0] for x in (got, want))
+            if near(fa, fb, 1e-6):
+                continue
+        hexs = lambda v: ''.join('--' if b is None else f'{b:02X}' for b in v)
+        out.append((f'[{w:08X}]', hexs(got), hexs(want)))
+    return out
+
+
+def test_function(base, img, va, body, cases, workdir, defines, funcs_h, show=3):
+    """(cases that differ, cases run) for one lifted body; prints each difference."""
+    name = 'sub_%08X' % va
+    insns = body_insns(body)
+    real = [uc_function(base, img, va, insns, c) for c in cases]
+    exe = build_harness(body, name, workdir, defines, funcs_h, base, len(img))
+    got = run_harness(exe, workdir, img, cases, [r['stop'] in ('fault', 'hang') for r in real])
+    bad = 0
+    for i, (c, r) in enumerate(zip(cases, real)):
+        fields = fn_diff(got.get(i, {'stop': 'missing'}), r)
+        if not fields:
+            continue
+        bad += 1
+        if bad <= show:
+            print(f'FAIL {name} case {i}: ' + ' '.join(f'{n}={v:08X}' for n, v in zip(REGS, c['regs']))
+                  + f" x87 depth {c['depth']} st0 {c['st0']!r}")
+            print('       args ' + ' '.join('%08X' % w for w in struct.unpack_from(
+                '<8I', c['stack'], FN_ESP - FN_STACK + 4)))
+            for n, a, b in fields[:12]:
+                print(f'       {n:>10}  lifted {a:>10}   cpu {b:>10}')
+    return bad, len(cases)
+
+
+def self_check():
+    """A hand-made function through the whole pipe: its lift must match the
+    CPU, and the same lift with fsincos's two results swapped back (the bug
+    #165 fixed) must not."""
+    from tools.lift.generate import linear_disassemble_function, lift_function_linear
+    base, va = 0x00400000, 0x00401000
+    code = bytes.fromhex(
+        '55 8BEC 8B4508 03450C D9450C D9FB D95D10 D95D14 85C0 7E05'.replace(' ', ''))
+    call_at = va + len(code)
+    code += b'\xE8' + struct.pack('<i', 0x00402000 - (call_at + 5)) + bytes.fromhex('5DC3')
+    img = bytearray(0x3000)
+    img[va - base:va - base + len(code)] = code
+    md = Cs(CS_ARCH_X86, CS_MODE_32)
+    md.detail = True
+    insns, leaders = linear_disassemble_function(md, bytes(img[0x1000:0x2000]), va, va, va + len(code))
+    body = lift_function_linear(Lifter(precise_carry=True), 'sub_00401000', insns, leaders, va)
+    assert 'sin(_a)' in body, body
+    cases = fn_cases(1, 40)
+    workdir = tempfile.mkdtemp(prefix='difftest-fn-')
+    try:
+        bad, n = test_function(base, bytes(img), va, body, cases, workdir, ["RECOMP_LOCAL_REGS"], None)
+        assert bad == 0, f'the correct lift differs from the CPU on {bad}/{n} cases'
+        swapped = body.replace('sin(_a)', 'SWAP').replace('cos(_a)', 'sin(_a)').replace('SWAP', 'cos(_a)')
+        bad, n = test_function(base, bytes(img), va, swapped, cases, workdir, ['RECOMP_LOCAL_REGS'], None, show=0)
+        assert bad > 0, 'a body with sin and cos swapped went unnoticed'
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    print(f'self-check ok: the lift matches on {n} cases, the swapped one differs on {bad}')
+    return 0
+
+
+def fn_main(args):
+    import random
+    if args.self_check:
+        return self_check()
+    base, img = pe_image(args.pe)
+    new = gen_bodies(args.gen)
+    old = gen_bodies(args.old) if args.old else {}
+    vas = [int(v, 16) for v in args.va]
+    if args.changed:
+        vas += [v for v in sorted(set(old) & set(new)) if norm_body(old[v]) != norm_body(new[v])]
+    if not vas:
+        raise SystemExit('no functions: give VAs or --old DIR --changed')
+    seed = args.seed if args.seed is not None else random.randrange(1 << 32)
+    print(f'seed {seed}  ({args.cases} cases a function; --seed {seed} repeats them)')
+    cases = fn_cases(seed, args.cases)
+    funcs_h = lambda g: os.path.abspath(os.path.join(g, 'recomp_funcs.h')) \
+        if os.path.exists(os.path.join(g, 'recomp_funcs.h')) else None
+    failed = 0
+    for va in vas:
+        for label, gen, bodies in (('old', args.old, old), ('new', args.gen, new)):
+            if va not in bodies:
+                continue
+            workdir = tempfile.mkdtemp(prefix='difftest-fn-')
+            try:
+                bad, n = test_function(base, img, va, bodies[va], cases, workdir,
+                                       args.define or ['RECOMP_LOCAL_REGS'], funcs_h(gen))
+            finally:
+                shutil.rmtree(workdir, ignore_errors=True)
+            print(f"{'ok  ' if not bad else 'DIFF'} sub_{va:08X} {label if old else ''} "
+                  f'{n - bad}/{n} cases match')
+            failed += bool(bad) and label == 'new'
+    return 1 if failed else 0
+
+
 def main():
     ap = argparse.ArgumentParser(description='differential test: lifted C vs Unicorn')
     ap.add_argument('-k', '--filter', help='only cases whose name contains this')
     ap.add_argument('--keep', action='store_true', help='keep the generated C')
     ap.add_argument('-v', '--verbose', action='store_true', help='show passing cases')
+    fn = ap.add_argument_group('whole functions of a game (the method of Exhume)')
+    fn.add_argument('--pe', help='the original executable')
+    fn.add_argument('--gen', help='its lifted gen directory (recomp_*.c)')
+    fn.add_argument('--old', help='another gen of the same PE, tested alongside')
+    fn.add_argument('--changed', action='store_true',
+                    help='test every function whose body differs between --old and --gen')
+    fn.add_argument('va', nargs='*', help='function VAs (hex)')
+    fn.add_argument('--cases', type=int, default=100, help='inputs a function (default 100)')
+    fn.add_argument('--seed', type=int, help='repeat a run')
+    fn.add_argument('-D', dest='define', action='append',
+                    help='a define the project builds its gen with (default RECOMP_LOCAL_REGS)')
+    fn.add_argument('--self-check', action='store_true', help='the function mode on a hand-made function')
     args = ap.parse_args()
+    if args.pe or args.self_check:
+        return fn_main(args)
 
     cases = [c for c in CASES if not args.filter or args.filter in c.name]
     if not cases:
