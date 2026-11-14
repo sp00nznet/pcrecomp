@@ -234,6 +234,14 @@ versions follow [SemVer](https://semver.org/).
   wait as signalled (Windows keeps the object alive for the wait) instead of
   failing it. Operation Flashpoint closes an event its watchdog thread waits
   on when it exits. A handle already invalid on the first poll still fails (#169, by [@neurocontrarian](https://github.com/neurocontrarian)).
+- native32 code page: the A functions that hand back paths answer in the
+  guest code page too (`GetModuleFileNameA`, `GetCurrentDirectoryA`,
+  `SetCurrentDirectoryA`, `GetWindowsDirectoryA`, `GetSystemDirectoryA`,
+  `GetTempPathA`, `GetFullPathNameA`). Before, a 932 guest read its paths in
+  932 but was given them in the system code page, so a folder with a
+  non-ASCII name could not be opened; one the guest code page cannot spell
+  comes back as its 8.3 short name. `native32_selftest` checks a folder with
+  a Japanese name.
 - native32 / lift: MSVC exception frames, generically. `tools/lift/eh32.py`
   `frame()` finds every prologue that installs an MSVC frame and says where
   its handlers continue and which ebp they use: C++ frames with

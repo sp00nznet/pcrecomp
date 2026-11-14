@@ -330,6 +330,27 @@ int main(void) {
         CHECK(one.cx > 0 && two.cx == 2 * one.cx);
         DeleteDC(dc);
         DeleteObject(f);
+        /* A folder named U+65E5 U+672C: the paths Windows hands back are in 932 too. */
+        {
+            WCHAR tmp[MAX_PATH], dir[MAX_PATH], old[MAX_PATH];
+            char got[MAX_PATH * 2], full[MAX_PATH * 2], *part = NULL;
+            GetTempPathW(MAX_PATH, tmp);
+            _snwprintf(dir, MAX_PATH, L"%s\x65E5\x672C%lu", tmp, GetCurrentProcessId());
+            GetCurrentDirectoryW(MAX_PATH, old);
+            CHECK(CreateDirectoryW(dir, NULL) && SetCurrentDirectoryW(dir));
+            uint32_t gcd = codepage_func("GetCurrentDirectoryA"), gfp = codepage_func("GetFullPathNameA");
+            uint32_t c[2] = { sizeof got, (uint32_t)(uintptr_t)got };
+            uint32_t n = call((void*)(uintptr_t)gcd, 2, c, &after);
+            CHECK(n == strlen(got) && strstr(got, "\x93\xfa\x96\x7b") != NULL);
+            uint32_t d[4] = { (uint32_t)(uintptr_t)"a.txt", sizeof full, (uint32_t)(uintptr_t)full,
+                              (uint32_t)(uintptr_t)&part };
+            n = call((void*)(uintptr_t)gfp, 4, d, &after);
+            CHECK(n == strlen(full) && part && !strcmp(part, "a.txt") && !strncmp(full, got, strlen(got)));
+            c[0] = 4;   /* too small: the size needed, NUL included */
+            CHECK(call((void*)(uintptr_t)gcd, 2, c, &after) == strlen(got) + 1);
+            SetCurrentDirectoryW(old);
+            RemoveDirectoryW(dir);
+        }
         native32_set_codepage(0);
     }
 
