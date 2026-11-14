@@ -1132,6 +1132,21 @@ static inline void fp_st80(uint8_t* p, double v) {
     memcpy(p, &m, 8); memcpy(p + 8, &se, 2);
 }
 
+/* Packed BCD (fbld/fbstp tbyte): 18 digits, two per byte from the low end,
+ * the sign in bit 7 of byte 9. CodeWarrior's strtod (__dec2num) loads its
+ * digit string this way; lifted as nothing, every atof returned 0 and Tribes 2
+ * read each "1" in its prefs as false. */
+static inline int64_t fp_bcd_ld(const uint8_t* p) {
+    int64_t v = 0;
+    for (int i = 8; i >= 0; i--) v = v * 100 + (p[i] >> 4) * 10 + (p[i] & 15);
+    return (p[9] & 0x80) ? -v : v;
+}
+static inline void fp_bcd_st(uint8_t* p, int64_t v) {
+    uint64_t u = v < 0 ? (uint64_t)-v : (uint64_t)v;
+    for (int i = 0; i < 9; i++) { p[i] = (uint8_t)(u % 10 | (u / 10 % 10) << 4); u /= 100; }
+    p[9] = v < 0 ? 0x80 : 0;
+}
+
 /* ============================================================
  * CPUID stub
  * ============================================================ */
