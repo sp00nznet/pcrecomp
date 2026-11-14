@@ -311,6 +311,7 @@ class Lifter:
         self.call_pop = call_pop or set()
         self._patched_imm = None
         self._patched_disp = None   # (placeholder, expr) for a patched disp32
+        self._live_branch = None    # expr for a call/jmp whose rel32 is patched
         self._labels = None        # block starts of the function being lifted
         self._jump_targets = None  # arms its switch tables dispatch to
         self._flag_state = None  # (setter_mnemonic, operands_str)
@@ -777,7 +778,7 @@ class Lifter:
         # the shipped placeholder bytes say which operand they belong to. Both
         # occur in Gunman's sw.dll span generator.
         site = insn.address + insn.size - 4
-        self._patched_imm = self._patched_disp = None
+        self._patched_imm = self._patched_disp = self._live_branch = None
         if site in self.patch_sites:
             ph = int.from_bytes(bytes(insn.bytes[-4:]), 'little')
             expr = f"MEM32(0x{site:08X}u)"
@@ -786,6 +787,20 @@ class Lifter:
                 self._patched_imm = expr
             elif any(o.type == X86_OP_MEM and (o.mem.disp & 0xFFFFFFFF) == ph for o in ops_):
                 self._patched_disp = (ph, expr)
+            # A rel32 call or jmp whose displacement is rewritten: the target is
+            # read at run time (an XWA hook points one into its own DLL).
+            if insn.bytes[0] in (0xE8, 0xE9) and insn.size == 5:
+                self._live_branch = f"(0x{insn.address + 5:08X}u + MEM32(0x{site:08X}u))"
+        # The same for a dword that is not the instruction's last: a disp32
+        # followed by an imm8 (`cmp byte ptr [ebx+0xb07aee], 0`), or an imm32
+        # with something after it. capstone gives each operand's offset.
+        if not (self._patched_imm or self._patched_disp or self._live_branch) and self.patch_sites:
+            if getattr(insn, 'disp_size', 0) == 4 and insn.address + insn.disp_offset in self.patch_sites:
+                at = insn.address + insn.disp_offset
+                ph = int.from_bytes(bytes(insn.bytes[insn.disp_offset:insn.disp_offset + 4]), 'little')
+                self._patched_disp = (ph, f"MEM32(0x{at:08X}u)")
+            elif getattr(insn, 'imm_size', 0) == 4 and insn.address + insn.imm_offset in self.patch_sites:
+                self._patched_imm = f"MEM32(0x{insn.address + insn.imm_offset:08X}u)"
         m = insn.mnemonic
         # Capstone reports `lock inc dword ptr [x]` with mnemonic 'lock inc' (or
         # plain 'lock' + op_str); the operands are decoded either way. Single-
@@ -1492,6 +1507,11 @@ class Lifter:
             lines.append(f"PUSH32(esp, 0x{insn.address + insn.size:08X}u); RECOMP_FLAGS_OUT();"
                          f" RECOMP_ITAIL(0x{target:08X}u); return; {comment}")
 
+        elif m == 'call' and self._live_branch:
+            lines.append(f"RECOMP_ICALL({self._live_branch}); {comment} /* live target */")
+            lines.append("RECOMP_FLAGS_IN();")
+            self._flag_state = None
+
         elif m == 'call':
             target = insn.get_branch_target()
             if target:
@@ -1552,6 +1572,9 @@ class Lifter:
                 lines.append(f"RECOMP_FLAGS_OUT(); esp += {8 + n}; return; /* far return */ {comment}")
             else:
                 lines.append(f"return; /* far return */ {comment}")
+
+        elif m == 'jmp' and self._live_branch:
+            lines.extend(self._computed_jump(self._live_branch, comment + ' /* live target */'))
 
         elif m == 'jmp':
             target = insn.get_branch_target()
