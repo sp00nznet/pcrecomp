@@ -12,6 +12,8 @@
 #include "image_loader.h"
 #include "recomp_trace.h"
 
+static const char* export_name(HMODULE h, unsigned ord);
+
 #if !defined(_MSC_VER) || !defined(_M_IX86)
 #error "native32 is MSVC x86 only: the bridge and the callback trampoline are inline asm"
 #endif
@@ -1355,6 +1357,14 @@ int native32_bind(uint32_t base, native32_shim_t* shims, int nshims) {
                     shimmed++;
                 }
             if (!va && !guest && !by_ord && (va = codepage_func(nm)) != 0) shimmed++;
+            /* A redirect by name covers an import by ordinal of that name too:
+             * WSOCK32's connect is #4 to Napster, and a loopback guard that
+             * missed it would let the program out (net32.c). */
+            if (!va && !guest && by_ord) {
+                if (!h) h = LoadLibraryA(dll);
+                const char* en = h ? export_name(h, *ilt & 0xFFFF) : NULL;
+                if (en && (va = codepage_func(en)) != 0) shimmed++;
+            }
             if (!va) {
                 if (!guest && !h) h = LoadLibraryA(dll);
                 va = guest ? native32_export(guest, nm)
@@ -1568,6 +1578,48 @@ static __declspec(naked) void lin_tramp(void) {
 
 static int g_heap_code;
 
+/* ATL's window thunks. ATL 3 (VC6) and 7 build each window's WndProc as 13
+ * bytes of code on the heap, `mov dword ptr [esp+4], this; jmp WindowProc`
+ * (or `mov ecx, this; jmp`), and hand that to Windows. The heap is not
+ * executable here: native32 turns DEP on, and a /NXCOMPAT host does not get
+ * Windows' own ATL thunk emulation. So the fetch faults, and this does what
+ * the thunk would have: store `this`, then jump, which lands on lifted code
+ * (another fetch fault, the callback trampoline) or on a native module.
+ * Napster 2.0's browser pane (AtlAxWin) is one. */
+/* The name a loaded DLL exports ordinal `ord` under, or NULL. */
+static const char* export_name(HMODULE h, unsigned ord) {
+    const uint8_t* b = (const uint8_t*)h;
+    const IMAGE_NT_HEADERS32* nt = (const IMAGE_NT_HEADERS32*)(b + ((const IMAGE_DOS_HEADER*)b)->e_lfanew);
+    const IMAGE_DATA_DIRECTORY* dd = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dd->VirtualAddress) return NULL;
+    const IMAGE_EXPORT_DIRECTORY* e = (const IMAGE_EXPORT_DIRECTORY*)(b + dd->VirtualAddress);
+    const uint32_t* names = (const uint32_t*)(b + e->AddressOfNames);
+    const uint16_t* ords = (const uint16_t*)(b + e->AddressOfNameOrdinals);
+    for (uint32_t i = 0; i < e->NumberOfNames; i++)
+        if (ords[i] + e->Base == ord) return (const char*)(b + names[i]);
+    return NULL;
+}
+
+static int atl_thunk(CONTEXT* c, uint32_t pc) {
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery((void*)(uintptr_t)pc, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT ||
+        !(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY)) ||
+        (uint32_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize - pc < 13)
+        return 0;
+    const uint8_t* p = (const uint8_t*)(uintptr_t)pc;
+    if (p[0] == 0xC7 && p[1] == 0x44 && p[2] == 0x24 && p[3] == 0x04 && p[8] == 0xE9) {
+        *(uint32_t*)(uintptr_t)(c->Esp + 4) = *(const uint32_t*)(p + 4);
+        c->Eip = pc + 13 + *(const int32_t*)(p + 9);
+        return 1;
+    }
+    if (p[0] == 0xB9 && p[5] == 0xE9) {
+        c->Ecx = *(const uint32_t*)(p + 1);
+        c->Eip = pc + 10 + *(const int32_t*)(p + 6);
+        return 1;
+    }
+    return 0;
+}
+
 static LONG CALLBACK native32_veh(EXCEPTION_POINTERS* ep) {
     EXCEPTION_RECORD* er = ep->ExceptionRecord;
     uint32_t pc = (uint32_t)(uintptr_t)er->ExceptionAddress;
@@ -1599,6 +1651,8 @@ static LONG CALLBACK native32_veh(EXCEPTION_POINTERS* ep) {
         }
         fprintf(stderr, "[callback] Windows called guest 0x%08X, which is not lifted\n", pc);
     }
+    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fetch && atl_thunk(ep->ContextRecord, pc))
+        return EXCEPTION_CONTINUE_EXECUTION;
     /* native32_allow_heap_code: Windows' own code run from the heap. */
     MEMORY_BASIC_INFORMATION mbi;
     DWORD old;
@@ -1676,7 +1730,10 @@ void native32_init(void) {
 }
 
 void native32_call_guest(uint32_t va, int nargs, const uint32_t* args) {
+    /* A module set native (native32_set_native) runs its entry point, a
+     * DllMain or the EXE's entry, through the bridge like any call into it. */
     recomp_func_t f = recomp_lookup(va);
+    if (!f && native_module_at(va)) f = recomp_lookup_import(va);
     if (!f) { fprintf(stderr, "[native32] no lifted function at 0x%08X\n", va); exit(3); }
     mach_enter();
     for (int i = nargs - 1; i >= 0; i--) PUSH32(g_esp, args[i]);

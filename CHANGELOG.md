@@ -149,6 +149,91 @@ versions follow [SemVer](https://semver.org/).
 - drive32: `lift_image` lifts every code section. It read only `.text`'s raw
   bytes, so functions in a second code section (Sim Theme Park's `cseg`)
   decoded as zeros.
+- native32: `native32_net_loopback_only()` (`net32.c`) keeps a lifted network
+  program on this machine: `connect` and `sendto` only to 127/8, `bind` of
+  `INADDR_ANY` becomes 127.0.0.1, `gethostbyname` answers only localhost
+  names; each refusal is a `[net] refused` line. For old clients and servers
+  run against a local test server (Napster 2.0).
+- native32: `native32_registry_sandbox(name)` (`reg32.c`) gives the guest its
+  own HKLM and HKCU under `HKCU\Software\pcrecomp\sandbox\<name>`: its Reg*A
+  imports write there and read there first, then the real registry
+  read-only. Two instances of one program run side by side as two users,
+  and HKLM is never written. Windows' own code in the process is unaffected.
+- native32: ATL 3/7 window thunks (`mov [esp+4], this; jmp` or `mov ecx,
+  this; jmp`, built on the heap) are emulated in the VEH. DEP is on and a
+  `/NXCOMPAT` host gets no ATL thunk emulation from Windows, so any ATL
+  window (`AtlAxWin`, an embedded browser) faulted on its first message.
+- `tools/assets/extract_vise.py`: MindVision Installer VISE (Windows), read
+  without running it: raw deflate through 16-bit big-endian words, the stub's
+  records and the install file table; a record is written only when its
+  stream inflates to its stated size. `--selftest`.
+- native32: `modules32.c`, the loader's part for a program made of several
+  lifted modules. It maps each rebased module at its base, binds them all with
+  one shim array, runs each DLL's `DllMain` after the guest modules it imports,
+  and answers `LoadLibrary{A,W,ExA}`, `FreeLibrary`, `GetProcAddress`,
+  `GetModuleHandle{A,W}` and `GetModuleFileName{A,W}` for guest modules from the
+  table. Every multi-module host carried its own copy (gunman, ut99, kf, tw,
+  shogo...). Opt-in: a host that does not call `native32_modules_map` is
+  unchanged. First user: Sambar Server (plug-in DLLs loaded from its config).
+- `tools/pe/rebase.py`: give every module its own base before disassembly
+  (applies the HIGHLOW relocations to a copy), keeping a module's linked base
+  when it is free and otherwise the lowest free 1 MB slot above it; writes the
+  layout as JSON for the host. Extracted from gunman's and ut99's copies.
+- `tools/lift/drive32.py`: `lift_image()`, the per-module lift loop the
+  project drivers each carried: find_splits, C++ catch resume points, targets
+  outside the catalog in rounds, and alias stubs. An entry whose code another
+  body already lifts is a stub into that body's local dispatch
+  (`generate.alias_stub`) instead of a copy of the rest of the body, and only
+  when the host body really has the case. On Sambar Server it took the C from
+  ~220 MB to 105 MB; one 20 KB function with ~50 aliases had been an 84 MB
+  file that MSVC could not finish in an hour. A body whose indirect jumps are
+  all jump tables labels only the tables' arms (`indirect_targets`), not every
+  instruction: that function's local switch went from 8,018 cases to 155, and
+  the whole Sambar build from over an hour at `/O2` to 3 minutes.
+- `tools/assets/extract_nsis.py`: extract the NSIS 2.0 betas (2002-2006,
+  24-byte script entries) that 7-Zip lists as `NSIS-2 BadCmd=` with 0 files,
+  without running the installer.
+
+### Fixed
+- modules32: a DLL that is not a guest module is looked for in the guest's
+  own folder first (the one `GetModuleFileName` reports), as Windows would
+  for the guest, then by the normal search. Windows' "application folder" is
+  the host's build folder. Napster loads its file-type plug-ins by bare name
+  (`LoadLibrary("VMP3.NVM")`) and found them only through the current
+  directory. A native load that fails is now one `[load] ... not found` line.
+- native32: a host redirect by name (`native32_redirect`) now also covers an
+  import by ordinal of that name, looked up in the DLL's export table.
+  Napster imports all of WSOCK32 by ordinal (`#4` is `connect`).
+- native32: `native32_call_guest` enters a module set native
+  (`native32_set_native`) through the bridge, so its `DllMain` and the EXE's
+  entry point run. It exited with "no lifted function" before, which made a
+  whole program impossible to run on its original code under its host.
+- win32hle: DirectDraw 4's texture cache is rebuilt when `SetSurfaceDesc`
+  changes a surface's size, a render target lets go of its attached z-buffer
+  when it is freed, and each surface has its own uniqueness value;
+  `SetColorKey` and `SetSurfaceDesc` flush queued Direct3D drawing first.
+  `ddraw_selftest.c` covers them. (#158, by [@cpressland](https://github.com/cpressland))
+- win32hle: a font's `lfWidth` stretches or squeezes its text:
+  `GetTextExtentPoint32A`, `GetTextMetricsA` and `TextOutA` scale it to the
+  requested average character width. Theme Park World's ride signs no longer
+  loop forever while being fitted. (#160, by [@cpressland](https://github.com/cpressland))
+- win32hle: DirectSound's play cursor moves on between mixes by the time
+  since the last one, as a sound card's does, so a game streaming by the
+  cursor no longer writes a lap ahead (Theme Park World's movie audio).
+  (#164, by [@cpressland](https://github.com/cpressland))
+- lift32: `loop`, `loope`, `loopne`, `jecxz` and `jcxz` leave the function the
+  way `jmp` and `jcc` do. A taken branch to an address that is not a block of
+  the function being lifted was a `goto` to a label that does not exist, and the
+  generated file did not compile; it now dispatches with `RECOMP_ITAIL` and
+  returns. `tools/lift/test_loop_exits.py` (#166, by [@pete-jorgensen](https://github.com/pete-jorgensen)).
+- win32hle: `VirtualFree(MEM_RELEASE)` fails with `ERROR_INVALID_PARAMETER`,
+  as on Windows, unless it names a whole reservation by its base with size 0.
+  It released the whole reservation instead: Operation Flashpoint calls it on
+  blocks inside its own memory pool and lost the pool (#169, by [@neurocontrarian](https://github.com/neurocontrarian)).
+- win32hle: a handle closed by another thread while a wait is on it wakes the
+  wait as signalled (Windows keeps the object alive for the wait) instead of
+  failing it. Operation Flashpoint closes an event its watchdog thread waits
+  on when it exits. A handle already invalid on the first poll still fails (#169, by [@neurocontrarian](https://github.com/neurocontrarian)).
 - native32 / lift: MSVC exception frames, generically. `tools/lift/eh32.py`
   `frame()` finds every prologue that installs an MSVC frame and says where
   its handlers continue and which ebp they use: C++ frames with
@@ -255,6 +340,8 @@ versions follow [SemVer](https://semver.org/).
   wait as signalled (Windows keeps the object alive for the wait) instead of
   failing it. Operation Flashpoint closes an event its watchdog thread waits
   on when it exits. A handle already invalid on the first poll still fails (#169, by [@neurocontrarian](https://github.com/neurocontrarian)).
+
+### Fixed
 - native32: a callback from guest code that runs natively on the guest stack
   (gen_bridge: VCL's window procedure thunks jump to `StdWndProc`) ran its
   host frames and the lifted function's guest frames through the same memory.

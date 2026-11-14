@@ -61,6 +61,18 @@ void native32_redirect(const char* name, void* fn);
  * missing or names none (reg32.c). */
 int native32_registry(const char* file);
 
+/* Keep the guest's network on this machine (net32.c): connect and sendto
+ * only to 127/8, bind INADDR_ANY as 127.0.0.1, gethostbyname answers only
+ * localhost names. For old network programs run only against a local
+ * server. Call before native32_bind. */
+void native32_net_loopback_only(void);
+
+/* Give the guest its own HKLM and HKCU (regbox32.c), under
+ * HKCU\Software\pcrecomp\sandbox\<name>: its Reg*A imports write there and
+ * read there first, then the real registry read-only. Two instances with two
+ * names keep apart. Call before native32_bind; 0 if the key can't be made. */
+int native32_registry_sandbox(const char* name);
+
 /* Call once, before anything else. */
 void native32_init(void);
 

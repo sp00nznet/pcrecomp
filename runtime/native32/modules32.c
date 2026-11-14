@@ -119,22 +119,47 @@ static uint32_t load(native32_module_t* m, uint32_t native) {
     if (!m) return native;
     return native32_attach(m->base) ? m->base : 0;
 }
+/* A DLL that is not a guest module loads natively, but searched for the way
+ * Windows would for the guest: its own folder first (the one GetModuleFileName
+ * reports), not the host's. Windows looks in the folder of the process's EXE,
+ * which here is the host's build folder. Napster's file-type plug-ins
+ * (LoadLibrary("VMP3.NVM"), next to napster.exe) were not found, and every
+ * file it was asked to share was rejected. */
+static HMODULE load_native(const char* nm, DWORD flags) {
+    if (!strpbrk(nm, "\\/:") && g_dir[0]) {
+        char path[MAX_PATH];
+        _snprintf(path, MAX_PATH - 1, "%s\\%s", g_dir, nm);
+        path[MAX_PATH - 1] = 0;
+        if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) {
+            HMODULE h = LoadLibraryExA(path, NULL, flags | LOAD_WITH_ALTERED_SEARCH_PATH);
+            if (h) return h;
+        }
+    }
+    HMODULE h = LoadLibraryExA(nm, NULL, flags);
+    if (!h) fprintf(stderr, "[load] %s: not found (error %lu)\n", nm, GetLastError());
+    else if (native32_trace_native) fprintf(stderr, "[load] %s: native\n", nm);
+    return h;
+}
 static void shim_LoadLibraryA(void) {
     const char* nm = (const char*)(uintptr_t)ARG(0);
     native32_module_t* m = native32_module_by_name(nm);
-    g_eax = m ? load(m, 0) : (uint32_t)(uintptr_t)LoadLibraryA(nm);
+    g_eax = m ? load(m, 0) : (uint32_t)(uintptr_t)load_native(nm, 0);
     g_esp += 8;
 }
 static void shim_LoadLibraryW(void) {
     const WCHAR* nm = (const WCHAR*)(uintptr_t)ARG(0);
     native32_module_t* m = by_name_w(nm);
-    g_eax = m ? load(m, 0) : (uint32_t)(uintptr_t)LoadLibraryW(nm);
+    char a[MAX_PATH];
+    if (!m && WideCharToMultiByte(CP_ACP, 0, nm, -1, a, sizeof a, NULL, NULL))
+        g_eax = (uint32_t)(uintptr_t)load_native(a, 0);
+    else
+        g_eax = m ? load(m, 0) : (uint32_t)(uintptr_t)LoadLibraryW(nm);
     g_esp += 8;
 }
 static void shim_LoadLibraryExA(void) {
     const char* nm = (const char*)(uintptr_t)ARG(0);
     native32_module_t* m = native32_module_by_name(nm);
-    g_eax = m ? load(m, 0) : (uint32_t)(uintptr_t)LoadLibraryExA(nm, NULL, ARG(2));
+    g_eax = m ? load(m, 0) : (uint32_t)(uintptr_t)load_native(nm, ARG(2));
     g_esp += 16;
 }
 static void shim_FreeLibrary(void) {
