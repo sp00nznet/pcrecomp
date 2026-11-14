@@ -521,6 +521,28 @@ versions follow [SemVer](https://semver.org/).
   UNC paths and Windows quota semantics remain unsupported. Lexical `..` in a
   mapped-drive path stops at the drive's root. (#146, by
   [@yeager](https://github.com/yeager))
+- 16-bit DOS, for Wing Commander (sp00nznet/wingcommander-recomp): code a
+  real-mode program unpacks into its heap at run time, lifted ahead of time.
+  `runtime/recomp16/codeblob.h` has the host capture 64 KB at the segment of
+  any call or jump into bytes that are not the load image's
+  (`work/<game>/blobs/SSSS.bin`) and, once lifted, maps a live segment to its
+  lifted copy by the entry's first 24 bytes; `tools/lift/codeblob16.py` gives
+  each capture a virtual code segment above 1 MB, turns the misses in it into
+  its entries, and emits the tables, with `SEG_<virt>` bound to the live
+  segment so `cs:` operands follow the copy. Wing Commander's Origin `.DRV`
+  drivers (LZW-packed, far-called through a word table) are the first users.
+- `tools/drm/vroomm.py`: Borland VROOMM overlays (the `FBOV` block) made
+  resident for a static lift: each overlay gets a fixed home in upper memory,
+  its fixups become relocations and its `INT 3Fh` entries far jumps. From the
+  Mario Is Missing recomp's lifter, where it lived per game; Wing Commander
+  (40 overlays, 867 entries) is the second user. Self-check:
+  `python tools/drm/vroomm.py`.
+
+### Fixed
+- decode16: the Borland 8087 emulator's `CD 3C xx` segment override reads
+  xx's top bits as 0 DS, 1 CS, 2 SS, 3 ES (it had CS, SS, ES, DS). The
+  emulator's FJ?RQQ fixups step the ESC byte by 40h in that order; Mario Is
+  Missing's 54 overrides are all 3 and all follow `pop es`/`les`.
 - NE: a native code map, so no Win16 lift needs IDA. `tools/ne/ne_codemap.py`
   finds code by recursive descent from CS:IP and the entry table (branches,
   near/far calls, jump tables including MSC's sparse switch), then
