@@ -1244,6 +1244,7 @@ void GDI_STRETCHBLT(CPU *cpu) {
     WING_WINGSTRETCHBLT(cpu);            /* pops 4 + 20, i.e. our 4 + 24 total */
 }
 
+volatile int recomp_snap_req;   /* RECOMP_DUMP_BLIT=snapN: set to dump every surface at the next blit */
 void WING_WINGSTRETCHBLT(CPU *cpu) {
     int hSrc  = (int16_t)a16(cpu, 0),  wSrc  = (int16_t)a16(cpu, 2);
     int ySrc  = (int16_t)a16(cpu, 4),  xSrc  = (int16_t)a16(cpu, 6);
@@ -1251,6 +1252,12 @@ void WING_WINGSTRETCHBLT(CPU *cpu) {
     int yDest = (int16_t)a16(cpu, 14), xDest = (int16_t)a16(cpu, 16);
     uint16_t hdcDest = a16(cpu, 18);
     uint16_t hdcSrc  = a16(cpu, 8);
+    {   /* RECOMP_RING_ON_BLIT=WxH[:k]: the guest call ring at the k-th blit of that size. */
+        static int left = -2; static int rw, rh;
+        if (left == -2) { const char *e = getenv("RECOMP_RING_ON_BLIT"); left = -1;
+            if (e && sscanf(e, "%dx%d", &rw, &rh) == 2) { const char *c = strchr(e, ':'); left = c ? atoi(c + 1) : 0; } }
+        if (left >= 0 && wDest == rw && hDest == rh && left-- == 0) { void dump_fn_ring(int); dump_fn_ring(1000); }
+    }
 
     extern HDC recomp_real_hdc(uint16_t);
 
@@ -1353,11 +1360,13 @@ void WING_WINGSTRETCHBLT(CPU *cpu) {
         if (snap) {
             static int fired = 0;
             int at = atoi(want + 4);
+            if (recomp_snap_req) { recomp_snap_req = 0; fired = 0; seen = at; }   /* a host asked for one now */
             if (!fired && seen++ >= at) {
                 fired = 1;
                 for (int q = 0; q < g_nwing && q < (int)(sizeof g_wing / sizeof g_wing[0]); q++) {
                     uint32_t st = (((uint32_t)g_wing[q].w * g_wing[q].bpp + 31) / 32) * 4;
                     uint32_t nb = st * (uint32_t)g_wing[q].h;
+                    if (!g_wing[q].sel || seg_off(cpu, g_wing[q].sel, 0) + nb > cpu->mem_size) continue;   /* freed */
                     unsigned nz = 0; unsigned char seenv[256]; unsigned distinct = 0;
                     memset(seenv, 0, sizeof seenv);
                     const uint8_t *pp = cpu->mem + seg_off(cpu, g_wing[q].sel, 0);
@@ -2812,7 +2821,8 @@ void KERNEL_OPENFILE(CPU *cpu) {
         if (f) fclose(f);
         cpu->ax = f ? 1 : 0xFFFF;
     } else {
-        cpu->ax = lopen_host(name, (style & 3) ? "r+b" : "rb");
+        /* OF_CREATE (0x1000) makes or truncates it: CivNet's autosave. */
+        cpu->ax = lopen_host(name, (style & 0x1000) ? "w+b" : (style & 3) ? "r+b" : "rb");
     }
     /* OFSTRUCT: cBytes, fFixedDisk, nErrCode, reserved[4], szPathName[128] */
     if (bseg) {
@@ -2878,8 +2888,12 @@ void KERNEL__HREAD(CPU *cpu) {
     ret(cpu, 10);
 }
 
-void KERNEL__LWRITE(CPU *cpu) {             /* read-only bring-up: report success */
-    uint16_t n = a16(cpu, 0);
+void KERNEL__LWRITE(CPU *cpu) {             /* _lwrite(hFile, lpBuffer, wBytes) */
+    uint16_t n = a16(cpu, 0), boff = a16(cpu, 2), bseg = a16(cpu, 4);
+    FILE *f = lfile(a16(cpu, 6));
+    if (f) { uint16_t i = 0;
+        for (; i < n; i++) if (fputc(mem_read8(cpu, bseg, (uint16_t)(boff + i)), f) < 0) break;
+        n = i; }
     cpu->ax = n;
     ret(cpu, 8);
 }
