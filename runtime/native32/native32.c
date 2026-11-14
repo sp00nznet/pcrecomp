@@ -1671,7 +1671,7 @@ void native32_allow_heap_code(void) { g_heap_code = 1; }
 
 int native32_require_color_depth(int bpp) {
     char layer[512] = "";
-    const char* want = bpp == 16 ? "16BITCOLOR" : bpp == 8 ? "256COLOR" : NULL;
+    const char* want = bpp == 16 ? "DWM8And16BitMitigation 16BITCOLOR" : bpp == 8 ? "256COLOR" : NULL;
     STARTUPINFOA si = { sizeof si };
     PROCESS_INFORMATION pi;
     DWORD rc = 1;
@@ -1682,6 +1682,7 @@ int native32_require_color_depth(int bpp) {
     strcat_s(layer, sizeof layer, want);
     SetEnvironmentVariableA("__COMPAT_LAYER", layer);
     fprintf(stderr, "[native32] relaunching under __COMPAT_LAYER=%s for %d-bit DirectDraw modes\n", layer, bpp);
+    fflush(stderr);   /* the parent then waits in WaitForSingleObject; killed there, an unflushed line is lost */
     if (!CreateProcessA(NULL, GetCommandLineA(), NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
         fprintf(stderr, "[native32] relaunch failed (%lu); running at the desktop's depth\n", GetLastError());
         return -1;
