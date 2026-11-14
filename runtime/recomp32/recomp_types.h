@@ -1307,6 +1307,14 @@ static inline recomp_func_t recomp_resolve(uint32_t va) {
     g_cur_func = _caller;  /* the callee RECOMP_ENTER clobbered it */ \
 } while(0)
 
+/* An indirect call or jump to an address that is no function entry may be a
+ * guest exception handler continuing inside a body further up the host stack
+ * (RECOMP_EH_FRAME). The hook longjmps there if a frame owns both the address
+ * and the guest's ebp, and returns 0 otherwise. native32 sets it (eh32.c). */
+RECOMP_WEAK int (*recomp_eh_jump_hook)(uint32_t va);
+#define RECOMP_EH_MISS(va_) (recomp_eh_jump_hook && \
+    (RECOMP_FLAGS_OUT(), RECOMP_REGS_OUT(), recomp_eh_jump_hook(va_)))
+
 /* Indirect call through dispatch */
 #define RECOMP_ICALL(target_va) do { \
     uint32_t _va = (uint32_t)(target_va); \
@@ -1325,6 +1333,7 @@ static inline recomp_func_t recomp_resolve(uint32_t va) {
          * `esp += 4` here shifted the caller's stack by one slot per miss. \
          * (Nocturne's CRT init runner lost its saved registers that way and \
          * skipped ~90 static constructors after its first unlifted entry.) */ \
+        if (!RECOMP_EH_MISS(_va)) \
         fprintf(stderr, "ICALL: unresolved VA 0x%08X from 0x%08X\n", _va, g_cur_func); \
         eax = 0; \
     } \
@@ -1361,7 +1370,7 @@ static __attribute__((noinline, cold, unused)) void recomp_itail_miss(uint32_t v
     if (_fn) { RECOMP_FLAGS_OUT(); RECOMP_REGS_OUT(); RECOMP_TAIL_CALL(_fn); } \
     else if (_va == RECOMP_RETADDR) { /* setjmp and friends return by jumping \
         to the saved return address; that is a return, not a missing target. */ } \
-    else recomp_itail_miss(_va); \
+    else if (!RECOMP_EH_MISS(_va)) recomp_itail_miss(_va); \
 } while(0)
 
 /* `push target; ret` (Lifter dos=True): a jump to a computed address. Its own
@@ -1402,6 +1411,12 @@ typedef struct recomp_ehframe {
     uint32_t entry_esp;
     uint32_t resume;
     uint32_t func;      /* the lifted function that owns the frame */
+    /* An MSVC EH frame's own (RECOMP_EH_FRAME): where its handlers put ebp,
+     * relative to entry_esp (entry_esp - off), and the addresses inside the
+     * body that a handler may continue at with that ebp (0-terminated).
+     * NULL for a plain setjmp landing pad. */
+    uint32_t off;
+    const uint32_t* resume_at;
 } recomp_ehframe_t;
 void recomp_eh_push(recomp_ehframe_t* f);
 void recomp_eh_pop(recomp_ehframe_t* f);
@@ -1410,10 +1425,19 @@ void recomp_eh_pop(recomp_ehframe_t* f);
  * registers already set. Never returns. */
 recomp_ehframe_t* recomp_eh_owner(uint32_t esp);
 void recomp_eh_resume(recomp_ehframe_t* f, uint32_t resume);
-#define RECOMP_EH_ENTER()                                                     \
+#define RECOMP_EH_ENTER() RECOMP_EH_FRAME(4u, NULL)
+/* A body that installs an MSVC exception frame (__try or C++ try): `off` and
+ * `list` as in recomp_ehframe_t (tools/lift/eh32.py works them out). A guest
+ * handler that continues inside the body -- _except_handler3 calling an
+ * __except block, __CxxFrameHandler's jump to a catch's continuation -- is an
+ * indirect call or jump to an address that has no dispatch entry; the miss
+ * goes to recomp_eh_jump_hook, which longjmps here. */
+#define RECOMP_EH_FRAME(off_, list_)                                          \
     recomp_ehframe_t _ehf;                                                    \
     _ehf.entry_esp = g_esp;                                                   \
     _ehf.func = g_cur_func;                                                   \
+    _ehf.off = (off_);                                                        \
+    _ehf.resume_at = (list_);                                                 \
     recomp_eh_push(&_ehf);                                                    \
     if (setjmp(_ehf.jb)) { RECOMP_REGS_IN(); _flag_k = FK_NONE; RECOMP_X87_CLEAR(); \
                            _itail_tgt = _ehf.resume; goto _ljump; }

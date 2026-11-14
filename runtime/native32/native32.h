@@ -39,6 +39,28 @@
  * DLL compared without regard to case. */
 typedef struct { const char* name; recomp_func_t fn; uint32_t va; } native32_shim_t;
 
+/* Run the guest in another ANSI code page than the system's (932 for a
+ * Japanese title on a Western Windows): CP_ACP in MultiByteToWideChar and the
+ * A functions that take text read the guest's strings in it (codepage.c).
+ * Call before native32_bind. 0 (the default) leaves the system's. */
+void native32_set_codepage(unsigned cp);
+
+/* Bind every import of this name, and every GetProcAddress for it, to a
+ * native function of the host's (same signature, called by the bridge like
+ * the real one). For DLLs the guest loads itself, which a shim by import
+ * name never sees. Call before native32_bind; up to 32. */
+void native32_redirect(const char* name, void* fn);
+
+/* Serve the registry subtrees a .reg file names (regedit 4: [HKEY_...\path]
+ * sections, "name"="text", dword:, hex:) from that file instead of the real
+ * registry: the guest's RegOpenKey/RegCreateKey/RegQueryValueEx/RegSetValueEx
+ * (A, Ex) on keys inside them read and write a copy, saved back to the file
+ * on every change. A Win9x game finds what its installer wrote there, and
+ * nothing needs administrator rights. Call before native32_bind (it uses
+ * native32_redirect). Returns the number of subtrees, 0 if the file is
+ * missing or names none (reg32.c). */
+int native32_registry(const char* file);
+
 /* Call once, before anything else. */
 void native32_init(void);
 
@@ -55,6 +77,19 @@ void native32_init(void);
  * The host's /STACK must be small (256 KB) so the child's first stack fits
  * below base: run the lifted code on a thread with a large stack. */
 int native32_hold_image(const char* path, uint32_t base);
+
+/* Give this process a 16-bit (or 8-bit) DirectDraw. On a 32-bit desktop
+ * DirectDraw enumerates and sets only 32-bit modes, so a game that wants
+ * 640x480x16 fails at startup. Windows' "reduced color mode" compatibility
+ * layer (__COMPAT_LAYER=16BITCOLOR / 256COLOR) emulates them, but it is read
+ * at process start: so this runs the host again with it set, waits, and
+ * returns the child's exit code for main() to return. Returns -1 when no
+ * relaunch happened (already the child, bpp not 8/16, or CreateProcess
+ * failed): carry on. The child is marked by PCRECOMP_COLOR_CHILD, since
+ * Windows strips __COMPAT_LAYER from the environment the child sees; without
+ * that marker the child would relaunch itself forever. Call it before
+ * native32_init(), and only on the path that runs the game. */
+int native32_require_color_depth(int bpp);
 
 /* Map a PE at its preferred base (image_loader.c) and make its executable
  * sections non-executable, so every entry comes through the dispatch table or
@@ -108,7 +143,59 @@ int native32_lift_in_native(const uint32_t* vas, int n);
  * (VirtualAlloc or VirtualProtect with an execute protection) is registered
  * by the built-in shims; a host can add a range itself. */
 void native32_add_generated(uint32_t lo, uint32_t size);
+/* The same entry (the guest's stack and whole integer register file) for
+ * compiled code that is not the C ABI but uses the x87 like C does: a
+ * language runtime whose helpers read the caller's frame through ebp and move
+ * esp (CA-Visual Objects' CAVORT20: _NCARG, __chkstk). The MMX registers are
+ * not carried, and a float returned in st(0) goes onto the lifted FPU stack. */
+void native32_add_guest_abi(uint32_t lo, uint32_t size);
 int native32_is_generated(uint32_t va);
+
+/* Code a Windows DLL builds in heap memory and jumps to: Direct3D's RGB
+ * software rasteriser (d3dim/d3dim700) compiles its span loops into
+ * HeapAlloc'd memory. A 1998 process could run that; this host is /NXCOMPAT
+ * (the callback trampoline needs DEP), so the fetch faults. After this call,
+ * an execute fault in committed private read-write memory outside the guest
+ * makes that region executable and retries. Off by default: a wild jump into
+ * the heap then still faults where it happened. Shogo, Unreal Tournament
+ * (Galaxy's mixers) and KISS Psycho Circus need it. */
+void native32_allow_heap_code(void);
+
+/* Run this process again on a desktop of its own that is never shown, and
+ * wait for it: windows, DirectDraw and Direct3D work there (software
+ * rendering), but nothing reaches the user's screens, over RDP or not. Call
+ * first thing in main(); it returns the child's exit code, or -1 in the child
+ * (and on failure), which then carries on. SendInput and the foreground
+ * window still belong to the user's desktop: a harness that drives the game
+ * must post messages to its window instead, or it types into the user's
+ * session. The child finds NATIVE32_HEADLESS set in its environment. */
+int native32_headless(void);
+/* Guest SEH (seh32.c): a guest exception is dispatched over the guest's own
+ * fs:[0] chain, and RtlUnwind unwinds it. A handler that takes an exception
+ * continues in its frame's function by a jump the lift cannot follow into a
+ * body further up the host stack; the host patches that jump (Delphi's
+ * _HandleAnyException `jmp ebx`) into this, which resumes at va inside the
+ * function that registered the frame RtlUnwind last stopped at. That function
+ * needs a landing pad (generate.py eh_resume). */
+void native32_seh_continue(uint32_t va);
+extern int native32_guest_seh;   /* 1: RaiseException goes to the guest chain */
+
+/* The guest's frames as it presents them: cb gets the surface blitted to the
+ * primary (a windowed game) or the primary after a Flip, and its interface
+ * version (1, 4 or 7: the DDSURFACEDESC Lock wants). For screenshots and
+ * recordings under native32_headless, where a GDI copy of the window is
+ * black. Runs on the guest's thread, inside its present. */
+void native32_on_present(void (*cb)(void* surface, int version));
+
+/* Synthetic DirectInput (dinput32.c): every system mouse and keyboard the
+ * guest creates reads its state from these calls instead of the hardware, so
+ * a harness can drive a game that polls DirectInput. On by default under
+ * native32_headless, where real devices cannot be acquired; dx/dy/dz add up
+ * until the next GetDeviceState; b is the button (0 left), dik a DIK_ code. */
+void native32_input_synthetic(int on);
+void native32_input_mouse(int dx, int dy, int dz);
+void native32_input_button(int b, int down);
+void native32_input_key(int dik, int down);
 
 /* Diagnostics: set before running. */
 extern int native32_trace_native;     /* one line per native call */
@@ -119,5 +206,21 @@ int native32_in_guest(uint32_t va);
 
 /* Print the last indirect calls, newest first. */
 void native32_dump_icalls(int n);
+
+/* ---- modules32.c: the loader's part for several lifted modules ----------
+ * Map each (rebased, tools/pe/rebase.py) module from map_dir at its base;
+ * GetModuleFileName reports report_dir\<name>. Bind all of them with the
+ * host's shims plus LoadLibrary{A,W,ExA}, FreeLibrary, GetProcAddress,
+ * GetModuleHandle{A,W} and GetModuleFileName{A,W} over the table (a host
+ * shim of the same name wins). A guest DLL is attached (DllMain, after the
+ * guest modules it imports) when something loads it; attach_imports does
+ * that for everything a module imports, before entering it. */
+typedef struct { const char* name; uint32_t base; int attached; } native32_module_t;
+int native32_modules_map(const char* map_dir, const char* report_dir, native32_module_t* m, int n);
+int native32_modules_bind(const native32_shim_t* host, int nhost);   /* unresolved count */
+int native32_attach(uint32_t base);
+int native32_attach_imports(uint32_t base);
+native32_module_t* native32_module_by_name(const char* path);
+native32_module_t* native32_module_by_base(uint32_t base);
 
 #endif

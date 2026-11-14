@@ -59,6 +59,7 @@ pcrecomp/
     compat/        Win32 -> SDL2 mapping (the original annotated import census;
                    win32hle is the implemented successor)
   templates/       Starter CMakeLists and .gitignore for a new project
+  cmake/           pcrecomp_gen.cmake: adds the generated C to a target, unoptimised
   docs/            Pipeline, philosophy, the hybrid boundary, publishing
 ```
 
@@ -165,9 +166,9 @@ or IDA, whatever the architecture.
 | `drm/steamstub.py` | Remove SteamStub 2.0 and 2.x (x86) statically: header, payload and the embedded `steamdrm.dll` are decoded in Python, then `.text` is decrypted (AES, or 2.0's running XOR) and the OEP restored. No Steam, nothing run |
 | `drm/unlzexe.py` | Undo LZEXE 0.90/0.91 on a DOS MZ executable -- decoded directly, nothing is run; `test_unlzexe.py` packs a file to check it |
 | `drm/emu_unpack.py` | Unpack a compressed PE32 (PECompact 2.x, and Valve's Steam2 wrapper built on it) by running its stub under Unicorn to the OEP, then rebuild the import table. Headless: nothing is launched |
-| `assets/extract_wise.py`, `isextract.py`, `is3extract.py`, `extract_cab.sh`, `pk3_inspect.py`, `bin2iso.js` | Wise and InstallShield (3, 5, 6+) installers, CABs, PK3/ZIP, BIN/CUE -> ISO |
+| `assets/extract_wise.py`, `extract_clickteam.py`, `isextract.py`, `is3extract.py`, `extract_cab.sh`, `pk3_inspect.py`, `bin2iso.js` | Wise, Clickteam Install Maker and InstallShield (3, 5, 6+) installers, CABs, PK3/ZIP, BIN/CUE -> ISO |
 | `assets/iso_peek.py` | Read an ISO's directory, locally or **over HTTP range requests**, and pull one file out without downloading the image |
-| `formats/` | FIF/FTC fractal image, M20/MVB, SPAM, DAT and string-table decoders (C) |
+| `formats/` | FIF/FTC fractal image, M20/MVB, SPAM, DAT and string-table decoders (C); LithTech REZ archives (`lithrez`, Python) |
 | `audit_repo.py` | Game material or lifted output tracked in a repo, in HEAD or in history; see [docs/PUBLISHING.md](docs/PUBLISHING.md) |
 
 ### What the 64-bit path does that the 32-bit one never needed
@@ -648,7 +649,11 @@ pip install capstone pefile lief unicorn cryptography
    against a linker map, a PDB or IDA. Lifting a catalog you have not scored
    means finding its gaps at runtime, 30,000 calls deep, instead of now.
 5. Drop in the appropriate `runtime/` files
-6. Build with CMake, fix, repeat
+6. Build with CMake, fix, repeat. Add the generated C with
+   `include(${PCRECOMP}/cmake/pcrecomp_gen.cmake)` and
+   `pcrecomp_gen_sources(<target>)`: it compiles `src/recomp/gen` at /Od (-O0),
+   minutes instead of half an hour, while the runtime stays optimised.
+   `-DPCRECOMP_GEN_OPT=ON` optimises it too.
 7. Before going public, run `audit_repo.py` and read
    [docs/PUBLISHING.md](docs/PUBLISHING.md). Lifted output never goes in git.
 

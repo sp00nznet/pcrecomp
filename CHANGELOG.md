@@ -43,6 +43,155 @@ versions follow [SemVer](https://semver.org/).
   relative mode while the mouse is held (`hle_input_relative_hook`,
   `hle_input_motion`). The keys that let the mouse go are named for each
   platform (Ctrl+Cmd, Ctrl+Win, Ctrl+Super).
+- generate `_jump_table`: the scan below a table's base reaches 128 entries
+  (a signed char index), not 16. A table indexed by `movsx eax, byte [...]`
+  with more than 16 arms below its base lost the rest, and each lost arm ran
+  as an unresolved ITAIL, forever. Borland C++ 5.5's preprocessor lexer
+  (`jmp cs:[eax*4 + table]`, 35 arms below), the first Borland-built program.
+
+### Added
+- native32: `native32_add_guest_abi(lo, size)`: a compiled language runtime
+  that is not the C ABI (CA-Visual Objects' `CAVORT20` and friends: helpers
+  read the caller's frame through ebp, `__chkstk` moves esp, results come in
+  eax:edx and in the flags) is entered on the guest stack with the guest's
+  registers, like generated code, but with the x87 left alone (an st(0) result
+  goes onto the lifted FPU stack), EFLAGS returned to the lifted caller, the
+  TEB's stack bounds covering the guest stack (so Windows' own `__try` frames
+  there are valid), and callbacks from it given the caller's registers.
+  Retail Plus Lite, the first VO program.
+- `tools/assets/extract_clickteam.py`: Clickteam Install Maker installers,
+  unpacked without running them.
+- disasm32 `--tail-jumps`: a jmp to another candidate is a tail call. VO's
+  chained class-init stubs made the catalog quadratic (hours, 16+ GB).
+- generate `true_extent(far=...)`: forward branch targets past the extent,
+  for a driver to make dispatchable (VO's `je <shared failure tail>`).
+
+- native32: `native32_registry(file)` (`reg32.c`): the registry subtrees a
+  regedit 4 file names are served from that file, so a Win9x game finds what
+  its installer wrote under `HKLM\Software\<publisher>` without an installer,
+  administrator rights or the VirtualStore. Writes are saved back to the file.
+  Keys above a subtree are followed, for games that open the path a step at a
+  time. Opt-in; everything else goes to the real registry (Sim Theme Park).
+- native32: synthetic DirectInput (`dinput32.c`, `native32_input_mouse`,
+  `_button`, `_key`, `_synthetic`). Every system mouse and keyboard the guest
+  creates reads its state from the host instead of the hardware, and devices
+  waiting on `SetEventNotification` are signalled. On by default under
+  `native32_headless`, where real devices can never be acquired (the private
+  desktop is never in the foreground), so a harness can now drive games that
+  poll DirectInput (KISS Psycho Circus's roadmap item).
+- native32: `native32_on_present(cb)`: the surface a game blits to its
+  primary (or the primary after a Flip), for screenshots and recordings under
+  `native32_headless`, where a GDI copy of the window is black.
+- native32: `PCRECOMP_MUTE=1` sets the process's audio session to volume 0
+  in `native32_init` (DirectSound, waveOut and mixer DLLs share it), for
+  silent test runs; `PCRECOMP_MUTE=0` restores it, since Windows remembers
+  a program's session volume.
+- disasm32: aligned runs of code pointers inside code sections that no
+  decoded instruction covers are function seeds too. Sim Theme Park's
+  hand-written software renderer (`cseg`) keeps its span routines in such a
+  table and reaches them by `jmp [table + eax*4]`; 8 of 9 were missing, the
+  first frame ended in an unresolved ITAIL.
+
+### Fixed
+- native32: a callback's edx never reached its native caller (cb_tramp used
+  edx for the purge), so a 64-bit result came back with its high half lost.
+- disasm32: `drop_mid_instruction_entries` walks each body once instead of
+  two or three times a round; a catalog-only run keeps small operand copies.
+- native32 DirectDraw (built-in `DirectDrawCreate`/`Ex` shims, patched in
+  ddraw's vtables and re-applied on every `QueryInterface`, because Windows'
+  own DirectDraw compatibility shims hook `CreateSurface` again there):
+  `GetDeviceIdentifier(DDGDI_GETHOSTIDENTIFIER)` answers `DDERR_NOTFOUND` on
+  Windows 10/11 and fails outright on a private desktop; a failed host query
+  is asked again without the flag, then answered with a vendorless identifier.
+  A surface asked for in video memory where there is no HAL (`DDERR_NOHAL`,
+  the headless desktop) is made again in system memory.
+- native32: `GetForegroundWindow` under `native32_headless` answers the
+  process's own top-level window instead of NULL. DirectSound's
+  `SetCooperativeLevel(NULL)` failed with `E_INVALIDARG`, and Sim Theme Park
+  then used the DirectSound object it had released.
+- drive32: `lift_image` lifts every code section. It read only `.text`'s raw
+  bytes, so functions in a second code section (Sim Theme Park's `cseg`)
+  decoded as zeros.
+- native32 / lift: MSVC exception frames, generically. `tools/lift/eh32.py`
+  `frame()` finds every prologue that installs an MSVC frame and says where
+  its handlers continue and which ebp they use: C++ frames with
+  `push ebp; mov ebp, esp` (ebp = entry esp - 4) and frame-pointer-omitted
+  ones (ebp = entry esp; VC6 /O2 builds most C++ frames that way, 488 of 489
+  in Galactic Battlegrounds, and eh32 used to skip them all), and
+  `__try/__except` frames (`_except_handler3`, scope table, ebp = record +
+  16). `generate.lift_function_linear(eh_off=)` gives such a body a
+  `RECOMP_EH_FRAME(off, list)` landing pad; `true_extent(seeds=)` keeps an
+  `__except` block, which only the scope table reaches, inside its body.
+  An indirect call or jump that misses the dispatch table now asks
+  `recomp_eh_jump_hook` (native32 sets it) before reporting an unresolved
+  target: `_except_handler3` calling an `__except` block, or a guest
+  `__CxxFrameHandler`'s jump to a catch's continuation, longjmps back into
+  the lifted body that owns that ebp and address. With `native32_guest_seh`
+  set, `__try/__except` therefore runs end to end as guest code (seh32.c's
+  note that MSVC frames were not followed no longer applies).
+- native32: a guest with the CRT linked in statically has no
+  `_CxxThrowException` import; its `RaiseException(0xE06D7363)` now goes to
+  eh32's catch dispatch first (`native32_cxx_raise`), on by default: before,
+  that throw went to the host's SEH and ended the process.
+- native32: VirtualQuery on a lifted module reports MEM_IMAGE at the module's
+  base. VC8+ CRTs (`_ValidateEH3RN`) skip a `__try` whose scope table is not
+  in an image, so every `__except` was passed over.
+- `tools/lift/msvceh_probe/run.cmd`: MSVC exception handling end to end. It
+  compiles a probe (C++ catch, nested, rethrow, `__except`, `__finally`) with
+  MSVC, catalogs, lifts and builds it on native32, and runs it: 5/5.
+- native32_selftest: the jump hook (taken for a listed address with the
+  frame's ebp, refused otherwise). eh32.py selftest: FPO and `__try` frames.
+
+### Changed
+- eh32's catch dispatch matches a landing pad by the frame's own ebp offset
+  (`recomp_ehframe_t.off`), not by assuming `push ebp; mov ebp, esp`.
+  `RECOMP_EH_ENTER()` is `RECOMP_EH_FRAME(4, NULL)`, so existing lifts (and
+  setjmp landing pads) behave as before.
+- native32: `modules32.c`, the loader's part for a program made of several
+  lifted modules. It maps each rebased module at its base, binds them all with
+  one shim array, runs each DLL's `DllMain` after the guest modules it imports,
+  and answers `LoadLibrary{A,W,ExA}`, `FreeLibrary`, `GetProcAddress`,
+  `GetModuleHandle{A,W}` and `GetModuleFileName{A,W}` for guest modules from the
+  table. Every multi-module host carried its own copy (gunman, ut99, kf, tw,
+  shogo...). Opt-in: a host that does not call `native32_modules_map` is
+  unchanged. First user: Sambar Server (plug-in DLLs loaded from its config).
+- `tools/pe/rebase.py`: give every module its own base before disassembly
+  (applies the HIGHLOW relocations to a copy), keeping a module's linked base
+  when it is free and otherwise the lowest free 1 MB slot above it; writes the
+  layout as JSON for the host. Extracted from gunman's and ut99's copies.
+- `tools/lift/drive32.py`: `lift_image()`, the per-module lift loop the
+  project drivers each carried: find_splits, C++ catch resume points, targets
+  outside the catalog in rounds, and alias stubs. An entry whose code another
+  body already lifts is a stub into that body's local dispatch
+  (`generate.alias_stub`) instead of a copy of the rest of the body, and only
+  when the host body really has the case. On Sambar Server it took the C from
+  ~220 MB to 105 MB; one 20 KB function with ~50 aliases had been an 84 MB
+  file that MSVC could not finish in an hour. A body whose indirect jumps are
+  all jump tables labels only the tables' arms (`indirect_targets`), not every
+  instruction: that function's local switch went from 8,018 cases to 155, and
+  the whole Sambar build from over an hour at `/O2` to 3 minutes.
+- `tools/assets/extract_nsis.py`: extract the NSIS 2.0 betas (2002-2006,
+  24-byte script entries) that 7-Zip lists as `NSIS-2 BadCmd=` with 0 files,
+  without running the installer.
+
+### Fixed
+- recomp32 loader: when the image's range is already reserved, it commits
+  into the reservation only if that starts at the image base and covers the
+  whole image, and otherwise says who holds it. It used to commit into any
+  reservation, so an image based where the process had already put a heap
+  segment "mapped", and lost its tail when the heap released that segment:
+  KISS Psycho Circus (based at `0x01CA0000`) read its own IAT from freed
+  memory a minute in.
+- native32: the built-in `DirectInputCreateA`/`W` shims wrap
+  `IDirectInput::EnumDevices`. Enumerating every device type walks the
+  "other" HID devices too, and on Windows 11 with some vendor-defined HID
+  collections that walk corrupts the process heap inside `dinput.dll` (a
+  plain C program dies the same way). An all-types request now enumerates
+  mice, keyboards and joysticks and leaves the "other" class out.
+- native32: `DirectInputCreateA`/`W`/`Ex` and `DirectInput8Create` are built-in
+  shims that swap a guest `HINSTANCE` for the host's: DirectInput refuses a
+  module Windows did not load (`E_INVALIDARG`), and Shogo's engine quit on it
+  before its first frame (KotOR and Messiah had each patched it in their host).
 - win32hle: DirectDraw 4's texture cache is rebuilt when `SetSurfaceDesc`
   changes a surface's size, a render target lets go of its attached z-buffer
   when it is freed, and each surface has its own uniqueness value;
@@ -69,6 +218,14 @@ versions follow [SemVer](https://semver.org/).
   wait as signalled (Windows keeps the object alive for the wait) instead of
   failing it. Operation Flashpoint closes an event its watchdog thread waits
   on when it exits. A handle already invalid on the first poll still fails (#169, by [@neurocontrarian](https://github.com/neurocontrarian)).
+- native32: a callback from guest code that runs natively on the guest stack
+  (gen_bridge: VCL's window procedure thunks jump to `StdWndProc`) ran its
+  host frames and the lifted function's guest frames through the same memory.
+  The trampoline now moves to the host stack below gen_bridge's anchor, and
+  the guest stack below the native caller's arguments.
+- lift32: `fninit` resets the x87 control word to 0x037F. It lifted to
+  nothing, so the FPU probe (`fninit; fnstcw; and 0x103F; cmp 0x3F`) read the
+  runtime's own control word (Borland's 0x1332) and reported no FPU.
 - lift32: `fsincos` left the sine in ST(0) and the cosine in ST(1); it is
   the other way round. MechCommander 2's camera builds its view direction
   with it, and the swapped pair laid the 35-degree camera almost flat on the
@@ -84,6 +241,15 @@ versions follow [SemVer](https://semver.org/).
 - win32hle screen: `hle_screen_poll_hook`, called on the window's thread at
   each pump, for a host to poll what SDL sends no events for (a game
   controller it turns into the mouse and keys), and `hle_screen_relative`.
+- native32: `native32_headless()` runs the host again on a private desktop
+  that is never shown: windows, DirectDraw and Direct3D work there, nothing
+  reaches the user's screens, over RDP or not (REPO_RULES section 10).
+- native32: `native32_allow_heap_code()`, the opt-in for Windows' own code
+  run from heap memory (Direct3D's RGB rasteriser), which Shogo and the
+  Unreal Tournament recomp each had in their host.
+- formats: `lithrez/lithrez.py`, LithTech's REZ archives ("RezMgr Version 1",
+  LithTech 1.0 through 2.x): list and extract, `--selftest`. From the Shogo
+  recomp; KISS Psycho Circus reads the same format.
 - win32hle: DirectInput 3 and 5 (`dinput.c`): the system mouse (relative or
   absolute axes, three buttons) and keyboard (DIK codes), immediate and
   buffered, read from the same input state as the window messages; arriving
@@ -151,6 +317,33 @@ versions follow [SemVer](https://semver.org/).
   where it runs at a constant rate (scaled to ns by `hle_tsc_calibrate`, which
   a host calls at start), CLOCK_MONOTONIC otherwise. Operation Flashpoint's
   performance log is built on it (#173, by [@neurocontrarian](https://github.com/neurocontrarian)).
+- native32: `native32_set_codepage(cp)` runs the guest in its own ANSI code
+  page, whatever the system's: `CP_ACP` in `MultiByteToWideChar` /
+  `WideCharToMultiByte`, `GetACP`, `IsDBCSLeadByte`, and the A functions that
+  take text (files, window text, fonts, `TextOutA`, `ExtTextOutA`,
+  `GetTextExtentPoint32A`, `GetGlyphOutlineA`, `EnumFonts*A`, ...) read the
+  guest's strings in it and call the W functions (`codepage.c`). A Japanese
+  title's Shift-JIS (932) on a Western-locale Windows, with no locale change.
+  Off by default; the selftest checks it.
+- native32: `native32_redirect(name, fn)` binds an import, and every
+  `GetProcAddress` for it, to a host function: for DLLs the guest loads
+  itself (a host that wants to see each `DrawDibDraw` the guest presents).
+  With a code page set, `DefWindowProcA` keeps an A window's text in the
+  guest's code page too (`WM_NCCREATE`, `WM_SETTEXT`, `WM_GETTEXT`), so a
+  Shift-JIS caption shows in the title bar.
+- native32: static TLS for guest modules. A module with a TLS directory gets
+  its index, and every guest thread's TIB a copy of the template at
+  `fs:[2Ch]`: Borland's RTL reads its threadvars there from its first
+  instruction.
+- native32: guest SEH (`seh32.c`, opt-in with `native32_guest_seh`).
+  `RaiseException` walks the guest's own `fs:[0]` chain and calls its
+  handlers as guest code; `RtlUnwind` unwinds it; `native32_seh_continue(va)`
+  resumes in the function whose frame took the exception (through its
+  RECOMP_EH_ENTER landing pad), for a host to patch into the runtime's jump
+  to the except block. Borland's runtimes raise every exception this way.
+- lift32: with `computed_ret`, `jmp reg` holding the dummy return address is
+  a return: the `pop edx; ...; jmp edx` hand-made return of Delphi's
+  `_DoneExcept`.
 - pe: `pdb2_ref.py` reads a Visual C++ 5/6 PDB (MSF 2.00, `_ST` symbol
   records), which llvm-pdbutil and `pdb_ref.py` cannot, into the same
   reference JSON, plus a `--seed-functions` list for disasm32. No external
