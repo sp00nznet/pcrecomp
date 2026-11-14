@@ -30,5 +30,8 @@ extern const d3d_gpu_t *hle_d3d_gpu;
 
 /* Metal (d3d_metal.m, macOS): 0 and in use, or -1 with no Metal device. */
 int hle_d3d_metal_enable(void);
+/* Vulkan (d3d_vulkan.c, Linux): 0 and in use, or -1 with no Vulkan 1.3 GPU
+ * (or built without Vulkan's headers). */
+int hle_d3d_vulkan_enable(void);
 
 #endif

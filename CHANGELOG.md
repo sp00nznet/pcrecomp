@@ -366,6 +366,15 @@ versions follow [SemVer](https://semver.org/).
   shadowed.
 
 ### Added
+- win32hle: Direct3D on the GPU through Vulkan (Linux), `d3d_vulkan.c`, the
+  renderer `d3d_gpu.h` describes, made as `d3d_metal.m` is: the same shading
+  (`vulkan/d3d.frag` is `d3d_raster.c`'s `shade()`), surfaces packed and
+  unpacked in their own formats by compute shaders, blits on the GPU, and a
+  flip's frame read back for the presenter without the game waiting. Vulkan
+  1.3 (dynamic rendering), headless, the loader opened at run time;
+  `hle_d3d_vulkan_enable` returns -1 (software rendering) without it, or when
+  built without Vulkan's headers. SPIR-V from `vulkan/spv.sh`. Theme Park
+  World's menu on a Steam Deck: 60 frames a second, from 10-15 in software.
 - win32hle: Direct3D on the GPU through Metal (macOS), `d3d_metal.m`, behind
   the `d3d_gpu.h` seam (`hle_d3d_metal_enable`; NULL keeps `d3d_raster.c`):
   the same triangles and state, shaded as `d3d_raster.c` shades, surfaces

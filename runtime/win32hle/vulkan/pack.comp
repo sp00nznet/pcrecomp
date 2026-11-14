@@ -1,0 +1,31 @@
+#version 450
+// A colour image into a surface's pixels, in its own format (d3d_metal.m's
+// pack): each channel's shift and width; bpp 16 or 32; rows `pitch` bytes
+// apart. One invocation a 32-bit word of the buffer, so two 16-bit pixels
+// never share a word between invocations.
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, rgba8) uniform readonly image2D t;
+layout(set = 0, binding = 1) buffer B { uint w[]; } buf;
+layout(push_constant) uniform PK { uvec4 dim; uvec4 sh; uvec4 bits; uint words; uint row; } k;   // dim: w, h, pitch, bpp
+uint pix(uint x, uint y) {
+    vec4 c = imageLoad(t, ivec2(x, y));
+    uint v = 0u;
+    for (int i = 0; i < 4; i++)
+        if (k.bits[i] != 0u) v |= uint(clamp(c[i], 0.0, 1.0) * float((1u << k.bits[i]) - 1u) + 0.5) << k.sh[i];
+    return v;
+}
+void main() {
+    uint i = gl_GlobalInvocationID.y * k.row + gl_GlobalInvocationID.x;
+    if (i >= k.words) return;
+    uint b = i * 4u, v = 0u;
+    if (k.dim.w == 32u) {
+        uint y = b / k.dim.z, x = (b % k.dim.z) / 4u;
+        if (y < k.dim.y && x < k.dim.x) v = pix(x, y);
+    } else {
+        for (uint h = 0u; h < 2u; h++) {
+            uint bb = b + h * 2u, y = bb / k.dim.z, x = (bb % k.dim.z) / 2u;
+            if (y < k.dim.y && x < k.dim.x) v |= (pix(x, y) & 0xFFFFu) << (16u * h);
+        }
+    }
+    buf.w[i] = v;
+}
