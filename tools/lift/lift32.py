@@ -1991,7 +1991,7 @@ class Lifter:
 
         elif m == 'fptan':
             # tan into ST(0), then push 1.0 -- the 8087 leaves a ratio behind.
-            lines.append(f"_st[0] = tan(_st[0]); fp_push(1.0); _fpu_cmp = 1; {comment}")
+            lines.append(f"if (fabs(_st[0]) >= 9223372036854775808.0 && !isinf(_st[0])) _fpu_cmp = 0x10400; else {{ _st[0] = tan(_st[0]); fp_push(1.0); _fpu_cmp = 1; }} {comment}")
 
         elif m == 'fpatan':
             lines.append(f"{{ double _x = fp_pop(); _st[0] = atan2(_st[0], _x); }} {comment}")
@@ -2043,16 +2043,20 @@ class Lifter:
         # argument). The CRT tests it -- `fsin; fnstsw ax; sahf; jp reduce` --
         # and a C2 left over from its own fxam sent every call down the
         # reduction path. _fpu_cmp = 1 is the status word with C2 clear.
+        # Past 2^63 the x87 does not reduce at all: it sets C2 and leaves the
+        # stack as it was (difftest --pe found the lift pushing anyway, so the
+        # stack came out one deeper). 0x10400 is the raw status word, C2 set. A NaN
+        # or infinity is not out of range: it gives a NaN, pushed as usual.
         elif m == 'fsin':
-            lines.append(f"_st[0] = sin(_st[0]); _fpu_cmp = 1; {comment}")
+            lines.append(f"if (fabs(_st[0]) >= 9223372036854775808.0 && !isinf(_st[0])) _fpu_cmp = 0x10400; else {{ _st[0] = sin(_st[0]); _fpu_cmp = 1; }} {comment}")
 
         elif m == 'fcos':
-            lines.append(f"_st[0] = cos(_st[0]); _fpu_cmp = 1; {comment}")
+            lines.append(f"if (fabs(_st[0]) >= 9223372036854775808.0 && !isinf(_st[0])) _fpu_cmp = 0x10400; else {{ _st[0] = cos(_st[0]); _fpu_cmp = 1; }} {comment}")
 
         elif m == 'fsincos':
             # The sine replaces ST(0), then the cosine is pushed: ST(0)=cos,
             # ST(1)=sin. Swapped, MechCommander 2's camera tilt came out wrong.
-            lines.append(f"{{ double _a = _st[0]; _st[0] = sin(_a); fp_push(cos(_a)); }} _fpu_cmp = 1; {comment}")
+            lines.append(f"{{ double _a = _st[0]; if (fabs(_a) >= 9223372036854775808.0 && !isinf(_a)) _fpu_cmp = 0x10400; else {{ _st[0] = sin(_a); fp_push(cos(_a)); _fpu_cmp = 1; }} }} {comment}")
 
         elif m == 'frndint':
             # Round by the control word, like fist. `(double)(int)x` always

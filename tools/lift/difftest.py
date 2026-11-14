@@ -675,6 +675,13 @@ CASES = [
     # fstp qword [edi]; fstp qword [edi+8] (MechCommander 2's camera)
     Case('fsincos', bytes.fromhex('dd06' 'd9fb' 'dd1f' 'dd5f08'),
          mem={SCRATCH: struct.pack('<d', 0.6108652) + bytes(24)}),
+    # Past 2^63 the trig ops leave ST(0) alone and set C2 (Crazy Taxi's
+    # rotation builders, found by --pe): fld qword [esi]; fsincos / fsin;
+    # fstp qword [edi] -- the argument comes back, and the stack is empty.
+    Case('fsincos.huge', bytes.fromhex('dd06' 'd9fb' 'dd1f'),
+         mem={SCRATCH: struct.pack('<d', 1e19) + bytes(24)}),
+    Case('fsin.huge', bytes.fromhex('dd06' 'd9fe' 'dd1f'),
+         mem={SCRATCH: struct.pack('<d', -1e19) + bytes(24)}),
     # Quake's span stepper: the fraction adds carry into the texel address.
     # add edx,eax; sbb ecx,ecx; add ebx,ebp; adc esi,[edi+ecx*4+4]
     Case('span.carry', bytes.fromhex('01c2' '19c9' '01eb' '13748f04'),
