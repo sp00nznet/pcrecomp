@@ -683,6 +683,14 @@ CASES = [
     # fstp qword [edi] -- the argument comes back, and the stack is empty.
     Case('fsincos.huge', bytes.fromhex('dd06' 'd9fb' 'dd1f'),
          mem={SCRATCH: struct.pack('<d', 1e19) + bytes(24)}),
+    # A zero divisor: inf, and 0/0 the indefinite NaN. fld qword [esi];
+    # fld qword [esi+8]; fdivp / fdivrp; fstp qword [edi]
+    Case('fdivp.zero', bytes.fromhex('dd06' 'dd4608' 'def9' 'dd1f'),
+         mem={SCRATCH: struct.pack('<dd', 3.0, 0.0) + bytes(16)}),
+    Case('fdivp.zero-zero', bytes.fromhex('dd06' 'dd4608' 'def9' 'dd1f'),
+         mem={SCRATCH: struct.pack('<dd', 0.0, 0.0) + bytes(16)}),
+    Case('fdivrp.zero', bytes.fromhex('dd06' 'dd4608' 'def1' 'dd1f'),
+         mem={SCRATCH: struct.pack('<dd', 0.0, -2.0) + bytes(16)}),
     Case('fsin.huge', bytes.fromhex('dd06' 'd9fe' 'dd1f'),
          mem={SCRATCH: struct.pack('<d', -1e19) + bytes(24)}),
     # Quake's span stepper: the fraction adds carry into the texel address.

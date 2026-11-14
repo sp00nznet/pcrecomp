@@ -1739,7 +1739,10 @@ class Lifter:
 
         elif m == 'fdivp':
             d = self._fpu_popdst(ops)
-            lines.append(f"{{ double _v = fp_pop(); {d} = _v == 0.0 ? {d} : {d} / _v; }} {comment}")
+            # A zero divisor gives the IEEE answer, as on the masked x87 (inf,
+            # or NaN for 0/0) -- not the dividend, which this used to keep, and
+            # only here and in fdivrp (difftest --pe, Crazy Taxi's 0x431244).
+            lines.append(f"{{ double _v = fp_pop(); {d} = {d} / _v; }} {comment}")
 
         elif m == 'fdivr':
             if ops:
@@ -1747,7 +1750,7 @@ class Lifter:
 
         elif m == 'fdivrp':
             d = self._fpu_popdst(ops)
-            lines.append(f"{{ double _v = fp_pop(); {d} = {d} == 0.0 ? _v : _v / {d}; }} {comment}")
+            lines.append(f"{{ double _v = fp_pop(); {d} = _v / {d}; }} {comment}")
 
         elif m == 'fchs':
             lines.append(f"_st[0] = -_st[0]; {comment}")
