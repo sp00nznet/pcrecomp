@@ -57,12 +57,35 @@ python tools/ne/mapsym.py GAME.SYM          # seg:off name
 `mapsym.read()` returns `(seg, offset, name)` with NE segment numbers, ready
 to feed `ne_link --seeds`. SimAnt's relift is a worked example.
 
-## Improving accuracy with an external code map
+## The code map: native by default, IDA optional
 
-Linear sweep desyncs on data-in-code. If you have IDA (or any tool that can
-classify code vs. data), export a code map with `tools/ida/ida_export.py` and
-feed it in -- `ne_decode` will decode at exactly the verified instruction
-heads and treat exported function entries as authoritative:
+Linear sweep desyncs on data-in-code, so `ne_decode` (and `ne_link`) decode
+only at the instruction heads of a code map. With none given they build one
+with `ne_codemap.py`: recursive descent from the header CS:IP and the entry
+table, through branches, near and far calls and jump tables, then
+speculative seeds -- far-pointer, offset and selector+offset relocation
+targets, MSC/Borland prologues, and the bytes behind each return -- each kept
+only if everything it reaches decodes cleanly. It writes the same JSON as
+`ida_export.py`:
+
+```bash
+python tools/ne/ne_codemap.py GAME.EXE code_map.json
+python tools/disasm/score_recovery.py --ne --reference ida.json --candidate code_map.json
+python tools/ne/test_ne_codemap.py      # scores every IDA export on this machine, SKIP without
+```
+
+Against IDA's exports, instruction heads agree to 98.5-100% both ways on
+Bermuda Syndrome, CivNet (three modules), Space Bucks and Jazz Jackrabbit
+(and Catz, Dogz, Oddballz); most of the remainder is IDA splitting `fwait` from
+its x87 op, or IDA decoding a string as code. All four lift and run to the
+same point without IDA as with it. `PCRECOMP_NE_SWEEP=1` brings back the old
+linear sweep for comparison.
+
+The Win16 ordinal names (`win16_imports.json`) come from Wine's `.spec` files
+the same way: `python tools/ne/wine_spec_to_json.py -o tools/ne/win16_imports.json`.
+
+An exported map still wins when given -- from IDA, or any tool that
+classifies code vs. data:
 
 ```bash
 # inside IDA:  py -3 tools/ida/ida_export.py GAME.EXE code_map.json

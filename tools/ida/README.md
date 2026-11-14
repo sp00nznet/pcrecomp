@@ -22,6 +22,10 @@ segments before exporting (for NE, IDA index `i` is NE segment `i + 1`).
 
 ## ida_export.py
 
+Optional for NE: `tools/ne/ne_codemap.py` builds the same map natively and
+is the default; this export is the oracle `tools/ne/test_ne_codemap.py`
+scores it against.
+
 Exports a **code map** -- per CODE segment: function entry offsets, every
 instruction-head offset, and merged code ranges -- as JSON. Feed it to a
 disassembler so it decodes only at verified instruction boundaries instead of

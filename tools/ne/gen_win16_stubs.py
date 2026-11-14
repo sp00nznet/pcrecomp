@@ -238,7 +238,13 @@ def main():
     # int_handler is declared above for every target; a runtime that has no
     # INT support of its own still has to link, and an unhandled INT should
     # say which one rather than fail at link time.
-    if 'int_handler' not in have:
+    # The Win16 host's win16_int_default answers what any Win16 program asks
+    # (INT 1Ah ticks); a game with INT needs of its own (Jazz, CivNet) defines
+    # int_handler itself, and then nothing is generated.
+    if 'int_handler' not in have and 'win16_int_default' in have:
+        c.append('void win16_int_default(CPU *cpu, int vec);')
+        c.append('void int_handler(CPU *cpu, int int_num) { win16_int_default(cpu, int_num); }')
+    elif 'int_handler' not in have:
         c.append('void int_handler(CPU *cpu, int int_num) { (void)cpu; '
                  'fprintf(stderr, "[int] unhandled INT 0x%02X\\n", int_num); }')
     for vec in ('10', '16'):

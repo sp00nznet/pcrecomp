@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+const char *recomp_installed_dir(const char *built);   /* win16_impl.c */
 #ifndef RECOMP_GAME_DIR
 #define RECOMP_GAME_DIR "game"
 #endif
@@ -125,11 +126,11 @@ static Mod *register_mod(const char *base, uint16_t hinst, const char *file) {
     if (file) {                         /* absolute host path, or relative to the game */
         int abs = file[0] == '/' || file[0] == '\\' || (file[0] && file[1] == ':');
         if (abs) snprintf(path, sizeof path, "%s", file);
-        else     snprintf(path, sizeof path, "%s/%s", RECOMP_GAME_DIR, file);
+        else     snprintf(path, sizeof path, "%s/%s", recomp_installed_dir(RECOMP_GAME_DIR), file);
         f = fopen(path, "rb");
     }
     for (unsigned k = 0; !f && !file && k < sizeof EXTS / sizeof EXTS[0]; k++) {
-        snprintf(path, sizeof path, "%s/%s.%s", RECOMP_GAME_DIR, base, EXTS[k]);
+        snprintf(path, sizeof path, "%s/%s.%s", recomp_installed_dir(RECOMP_GAME_DIR), base, EXTS[k]);
         f = fopen(path, "rb");
     }
     if (!f) { fprintf(stderr, "[ne] cannot open %s\n", base); return NULL; }

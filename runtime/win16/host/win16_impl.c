@@ -78,10 +78,7 @@ static uint16_t galloc(CPU *cpu, uint32_t bytes) {
                came next, and Space Bucks' file reader (_lread in 32 KB steps
                through a huge pointer) wrote its fourth chunk of credit4.lbm
                into an unrelated block below the stack. */
-            for (uint32_t off = 0x10000u; off < need; off += 0x10000u) {
-                if (cpu->next_sel == 0) break;
-                cpu->sel_base[cpu->next_sel++] = base + off;
-            }
+            cpu_tile_selectors(cpu, s, base, need);
             /* Blocks off the free list still hold the previous tenant's bytes.
                Real KERNEL grows the heap with fresh (zero) pages, and this
                engine leans on that: XApt's on-screen rect at +0xE8 is read by
@@ -152,8 +149,8 @@ void KERNEL_GLOBALREALLOC(CPU *cpu) {
     } else {                                /* grow: new block, copy, free old */
         uint16_t nsel = galloc(cpu, bytes);
         if (nsel && hMem) {
-            for (uint32_t i = 0; i < old; i++)
-                mem_write8(cpu, nsel, (uint16_t)i, mem_read8(cpu, hMem, (uint16_t)i));
+            /* Flat: a 16-bit offset wrapped a block over 64 KB onto itself. */
+            memmove(cpu->mem + cpu->sel_base[nsel], cpu->mem + cpu->sel_base[hMem], old);
             gfree(cpu, hMem);
         }
         cpu->ax = nsel;
@@ -194,6 +191,7 @@ void KERNEL_LOCKSEGMENT(CPU *cpu) {
     cpu->ax = s == 0xFFFF ? cpu->ds : s;
     ret(cpu, 2);
 }
+void KERNEL_UNLOCKSEGMENT(CPU *cpu) { cpu->ax = 0; ret(cpu, 2); }
 
 void KERNEL_GLOBALSIZE(CPU *cpu) {          /* -> DWORD size in DX:AX */
     uint16_t hMem = a16(cpu, 0);
@@ -841,10 +839,30 @@ void GDI_SETDIBITSTODEVICE(CPU *cpu) {
                               xsrc, ysrc, start, nscans,
                               cpu->mem + seg_off(cpu, bits, bito),
                               (const BITMAPINFO *)bi,
-                              usage == 1 ? DIB_PAL_COLORS : DIB_RGB_COLORS);
-    IMPL_LOG("[win16] SetDIBitsToDevice %dx%d at (%d,%d) -> %d\\n", wid, hgt, xdst, ydst, r);
+                              DIB_RGB_COLORS);   /* the table was resolved above */
+    if (getenv("RECOMP_LOG_DIB")) { static int k; if (k++ < 60)
+        fprintf(stderr, "[dib] SetDIBitsToDevice hdc=%u %dx%d at (%d,%d) src(%d,%d) scans %u+%u bpp=%d usage=%u -> %d\n",
+                ghdc, wid, hgt, xdst, ydst, xsrc, ysrc, start, nscans, h->biBitCount, usage, r); }
     cpu->ax = (uint16_t)r;
     ret(cpu, 28);
+}
+
+/* A DIB_PAL_COLORS BITMAPINFO's index table, resolved through the realized
+ * palette into a host BITMAPINFO with an RGB table (free() it). Drawn to a
+ * true-colour host DC, DIB_PAL_COLORS indexes a palette that DC never had and
+ * comes out in the wrong colours. Bermuda Syndrome blits every scene this way. */
+BITMAPINFO *recomp_pal_colors_bmi(const BITMAPINFO *in) {
+    const BITMAPINFOHEADER *h = &in->bmiHeader;
+    unsigned n = h->biBitCount <= 8 ? (h->biClrUsed ? h->biClrUsed : 1u << h->biBitCount) : 0;
+    if (n > 256) n = 256;
+    BITMAPINFO *bi = calloc(1, sizeof(BITMAPINFOHEADER) + 256 * 4);
+    if (!bi) return NULL;
+    bi->bmiHeader = *h;
+    bi->bmiHeader.biClrUsed = n;
+    const uint16_t *idx = (const uint16_t *)((const uint8_t *)in + sizeof(BITMAPINFOHEADER));
+    for (unsigned c = 0; c < n; c++)
+        memcpy(&bi->bmiColors[c], g_active_pal + (idx[c] & 0xFF) * 4, 4);
+    return bi;
 }
 
 uint16_t recomp_guest_scratch(CPU *cpu, uint32_t bytes) {
@@ -1209,10 +1227,12 @@ static void wing_colors(CPU *cpu, int set) {
 void WING_WINGSETDIBCOLORTABLE(CPU *cpu) { wing_colors(cpu, 1); }
 void WING_WINGGETDIBCOLORTABLE(CPU *cpu) { wing_colors(cpu, 0); }
 
+int recomp_gdi_stretchblt(CPU *cpu);   /* win32_backend.c */
 void GDI_STRETCHBLT(CPU *cpu) {
     if (getenv("RECOMP_LOG_ROP")) { static int n; if (n++ < 40)
         fprintf(stderr, "[rop] StretchBlt rop=%08lX\n",
                 (unsigned long)a32(cpu, 0)); }
+    if (recomp_gdi_stretchblt(cpu)) return;
     uint16_t a[10];
     a[9] = a16(cpu, 22); a[8] = a16(cpu, 20); a[7] = a16(cpu, 18);   /* hdcDest x y */
     a[6] = a16(cpu, 16); a[5] = a16(cpu, 14);                        /* wDest hDest */
@@ -1671,6 +1691,108 @@ void KERNEL_LOCALINIT(CPU *cpu) {
     ret(cpu, 6);
 }
 
+/* LocalAlloc/LocalReAlloc/LocalFree/LocalSize: the local heap of the caller's
+ * DGROUP (DS). It is the NE header's heap+stack tail of the auto data segment
+ * gen_image.py sized (the stack itself runs from 0xFFFE, past it). Blocks are
+ * fixed: the handle is the near offset, which is what LMEM_FIXED returns and
+ * what a moveable block's LocalLock would give anyway. Bookkeeping is on the
+ * host side so a guest overrun cannot corrupt the heap's own links.
+ * ponytail: first-fit over a flat table of 1024 blocks per heap; a real
+ * arena when a game outgrows it. */
+#define LH_MAX 1024
+typedef struct { uint16_t ds, lo, hi, n; uint16_t off[LH_MAX], size[LH_MAX]; } LocalHeap;
+static LocalHeap g_lheap[4];
+static LocalHeap *lheap(CPU *cpu) {
+    for (int i = 0; i < 4; i++) if (g_lheap[i].ds == cpu->ds) return &g_lheap[i];
+    for (int i = 0; i < RECOMP_NUM_MODULES; i++) {
+        const RecompModule *m = &RECOMP_MODULES[i];
+        if (!m->dgroup || recomp_dgroup_of_seg(m->dgroup) != cpu->ds) continue;
+        for (int k = 0; k < 4; k++) if (!g_lheap[k].ds) {
+            LocalHeap *h = &g_lheap[k];
+            /* The segment after DGROUP starts where it ends; the last one
+               ends at the guard region. */
+            uint32_t end = m->dgroup < RECOMP_NUM_SEG ? SEG_SEGMENT_BASE[m->dgroup + 1] : RECOMP_GUARD_BASE;
+            uint32_t total = end - SEG_SEGMENT_BASE[m->dgroup];
+            uint32_t want = (uint32_t)m->heap + m->stack;
+            h->ds = cpu->ds;
+            h->hi = (uint16_t)(total > 0xFFF0 ? 0xFFF0 : total);
+            h->lo = (uint16_t)((total > want ? total - want : 0x100) + 15) & 0xFFF0;
+            IMPL_LOG("[win16] local heap ds=%04X %04X-%04X\n", h->ds, h->lo, h->hi);
+            return h;
+        }
+    }
+    return NULL;
+}
+static uint16_t lh_alloc(CPU *cpu, LocalHeap *h, uint16_t bytes, int zero) {
+    uint16_t need = (uint16_t)((bytes ? bytes : 1) + 3) & ~3u, at = h->lo;
+    if (h->n >= LH_MAX) return 0;
+    int i = 0;
+    for (; i < h->n; i++) {                       /* table is sorted by offset */
+        if ((uint32_t)at + need <= h->off[i]) break;
+        at = (uint16_t)(h->off[i] + ((h->size[i] + 3) & ~3u));
+    }
+    if ((uint32_t)at + need > h->hi) return 0;
+    memmove(&h->off[i + 1], &h->off[i], (h->n - i) * sizeof h->off[0]);
+    memmove(&h->size[i + 1], &h->size[i], (h->n - i) * sizeof h->size[0]);
+    h->off[i] = at; h->size[i] = bytes ? bytes : 1; h->n++;
+    if (zero) for (uint16_t k = 0; k < need; k++) mem_write8(cpu, h->ds, (uint16_t)(at + k), 0);
+    return at;
+}
+static int lh_find(LocalHeap *h, uint16_t off) {
+    for (int i = 0; i < h->n; i++) if (h->off[i] == off) return i;
+    return -1;
+}
+static void lh_free(LocalHeap *h, int i) {
+    memmove(&h->off[i], &h->off[i + 1], (h->n - i - 1) * sizeof h->off[0]);
+    memmove(&h->size[i], &h->size[i + 1], (h->n - i - 1) * sizeof h->size[0]);
+    h->n--;
+}
+void KERNEL_LOCALALLOC(CPU *cpu) {          /* (wFlags@2, wBytes@0) -> near handle */
+    uint16_t bytes = a16(cpu, 0), flags = a16(cpu, 2);
+    LocalHeap *h = lheap(cpu);
+    cpu->ax = h ? lh_alloc(cpu, h, bytes, flags & 0x40) : 0;
+    IMPL_LOG("[win16] LocalAlloc(%04X, %u) -> %04X\n", flags, bytes, cpu->ax);
+    ret(cpu, 4);
+}
+void KERNEL_LOCALFREE(CPU *cpu) {           /* (hMem@0) -> 0 on success */
+    LocalHeap *h = lheap(cpu); uint16_t m = a16(cpu, 0);
+    int i = h ? lh_find(h, m) : -1;
+    if (i >= 0) lh_free(h, i);
+    cpu->ax = i >= 0 ? 0 : m;
+    ret(cpu, 2);
+}
+void KERNEL_LOCALSIZE(CPU *cpu) {
+    LocalHeap *h = lheap(cpu); int i = h ? lh_find(h, a16(cpu, 0)) : -1;
+    cpu->ax = i >= 0 ? h->size[i] : 0;
+    ret(cpu, 2);
+}
+void KERNEL_LOCALREALLOC(CPU *cpu) {        /* (hMem@4, wBytes@2, wFlags@0) */
+    uint16_t flags = a16(cpu, 0), bytes = a16(cpu, 2), m = a16(cpu, 4);
+    LocalHeap *h = lheap(cpu); int i = h ? lh_find(h, m) : -1;
+    cpu->ax = 0;
+    if (i >= 0) {
+        uint16_t old = h->size[i];
+        lh_free(h, i);
+        uint16_t n = lh_alloc(cpu, h, bytes, 0);
+        if (!n) n = lh_alloc(cpu, h, old, 0);    /* failed: keep the old block */
+        else {
+            uint16_t keep = old < bytes ? old : bytes;
+            if (n != m) {
+                if (n < m) for (uint16_t k = 0; k < keep; k++)
+                    mem_write8(cpu, h->ds, (uint16_t)(n + k), mem_read8(cpu, h->ds, (uint16_t)(m + k)));
+                else for (int k = keep - 1; k >= 0; k--)
+                    mem_write8(cpu, h->ds, (uint16_t)(n + k), mem_read8(cpu, h->ds, (uint16_t)(m + k)));
+            }
+            if ((flags & 0x40) && bytes > old)
+                for (uint16_t k = old; k < bytes; k++) mem_write8(cpu, h->ds, (uint16_t)(n + k), 0);
+            cpu->ax = n;
+        }
+    }
+    ret(cpu, 6);
+}
+void KERNEL_LOCALLOCK(CPU *cpu)   { cpu->ax = a16(cpu, 0); ret(cpu, 2); }
+void KERNEL_LOCALUNLOCK(CPU *cpu) { cpu->ax = 0; ret(cpu, 2); }
+
 /* ===== KERNEL: task startup =====
  * InitTask is called once at the very start of a Win16 EXE (Borland C0, MS C
  * crt0). It returns the startup register block the runtime needs; a stub
@@ -1679,15 +1801,23 @@ void KERNEL_LOCALINIT(CPU *cpu) {
  * gives up on a carry, so anything near 0xFFFF makes it exit 255. */
 void KERNEL_INITTASK(CPU *cpu) {
     uint16_t hinst = RECOMP_AUTO_DATA_SEG;   /* fake hInstance == WAD DGROUP sel */
-    /* Empty command line in the (fake) PSP at DGROUP:0080: length byte 0, CR. */
-    mem_write8(cpu, hinst, 0x80, 0);
-    mem_write8(cpu, hinst, 0x81, 0x0D);
+    /* The command line in the (fake) PSP at DGROUP:0080: length byte, text, CR.
+       Empty, except for a screen saver's switch (screensaver.c). */
+    extern char recomp_guest_cmdline[];
+    uint8_t len = (uint8_t)strlen(recomp_guest_cmdline);
+    mem_write8(cpu, hinst, 0x80, len);
+    for (uint8_t i = 0; i < len; i++) mem_write8(cpu, hinst, (uint16_t)(0x81 + i), (uint8_t)recomp_guest_cmdline[i]);
+    mem_write8(cpu, hinst, (uint16_t)(0x81 + len), len ? 0 : 0x0D);   /* lpCmdLine is a C string */
+    if (len) mem_write8(cpu, hinst, (uint16_t)(0x82 + len), 0x0D);
     cpu->ax = 1;                 /* success (nonzero) */
     cpu->cx = RECOMP_MODULES[RECOMP_NUM_MODULES - 1].stack;   /* the host's, last in load order */
     cpu->dx = 1;                 /* nCmdShow = SW_SHOWNORMAL */
     cpu->si = 0;                 /* hPrevInstance = none */
     cpu->di = hinst;             /* hInstance */
-    cpu->es = hinst; cpu->bx = 0x0080;   /* ES:BX -> command line */
+    /* ES:BX -> command line: the text at 0x81, as Windows hands it to WinMain.
+       Kept at the (empty) length byte when there is none, as every game
+       before the first screen saver was brought up with. */
+    cpu->es = hinst; cpu->bx = len ? 0x0081 : 0x0080;
     cpu->bp = 0;
     ret(cpu, 0);
 }
@@ -1769,6 +1899,7 @@ void USER_ENUMTASKWINDOWS(CPU *cpu) {
  * always advancing so the engine's calibration waits terminate. */
 uint32_t recomp_tick_ms(void) {
     static uint32_t t = 0;
+    if (recomp_game.real_clock) return GetTickCount();
     t += 16;
     return t;
 }
@@ -1778,6 +1909,8 @@ void USER_GETTICKCOUNT(CPU *cpu) {          /* DX:AX ms, monotonic so waits end 
     cpu->ax = (uint16_t)t; cpu->dx = (uint16_t)(t >> 16);
     ret(cpu, 0);
 }
+
+void USER_GETCURRENTTIME(CPU *cpu) { USER_GETTICKCOUNT(cpu); }   /* the same clock, Win 1.x name */
 
 void USER_MESSAGEBEEP(CPU *cpu) { cpu->ax = 1; ret(cpu, 2); }
 
@@ -1981,17 +2114,54 @@ void CTL3DV2_CTL3DAUTOSUBCLASS(CPU *cpu)   { cpu->ax = 1; ret(cpu, 2); }
 #ifndef RECOMP_DATA_DIR
 #define RECOMP_DATA_DIR "game"
 #endif
+/* An installed copy (a .scr copied to another machine, say) cannot use the
+ * absolute directories baked in at build time: a "game" folder next to the
+ * executable wins over them when it exists. */
+const char *recomp_installed_dir(const char *built) {
+    static char dir[MAX_PATH]; static int state;      /* 0 unknown, 1 found, 2 none */
+    if (!state) {
+        DWORD n = GetModuleFileNameA(NULL, dir, sizeof dir - 8);
+        char *slash = n ? strrchr(dir, '\\') : NULL;
+        state = 2;
+        if (slash) {
+            strcpy(slash + 1, "game");
+            DWORD a = GetFileAttributesA(dir);
+            if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) state = 1;
+        }
+    }
+    return state == 1 ? dir : built;
+}
+#define DATA_DIR recomp_installed_dir(RECOMP_DATA_DIR)
 static FILE *g_dosfiles[64];          /* DOS handle h (>=5) -> host FILE* (slot h-5) */
 
 /* Map a guest DOS path to a host path under RECOMP_DATA_DIR. */
 static int map_guest_path(const char *g, char *host, int hostsz) {
     if (!g[0]) return 0;
-    char low[192]; int i = 0;
+    /* A relative path is relative to the guest's current directory, which is
+     * the install directory: Bermuda Syndrome runs from BERMUDA\SCN and opens
+     * "_01.SCN" bare and its art as "..\MENU\MENU1.WGP". Make it absolute
+     * (folding "..") before the tail match below, or a bare name is looked for
+     * only in the data root. */
+    char abs[256];
+    if (g[1] != ':' && g[0] != '\\' && g[0] != '/' && recomp_game.guest_dir) {
+        snprintf(abs, sizeof abs, "%s\\%s", recomp_game.guest_dir, g);
+        for (char *q = abs; *q; q++) if (*q == '/') *q = '\\';
+        char *d;
+        while ((d = strstr(abs, "\\..\\")) || ((d = strstr(abs, "\\..")) && !d[3])) {
+            char *up = d;
+            while (up > abs && up[-1] != '\\') up--;   /* start of the parent */
+            if (up == abs || up[-1] != '\\') break;    /* nothing to fold */
+            memmove(up - 1, d + 3, strlen(d + 3) + 1);
+        }
+        for (char *q = abs; (q = strstr(q, "\\.\\")); ) memmove(q, q + 2, strlen(q + 2) + 1);
+        g = abs;
+    }
+    char low[256]; int i = 0;
     for (; g[i]; i++) low[i] = (g[i] >= 'A' && g[i] <= 'Z') ? (char)(g[i] + 32) : g[i];
     low[i] = 0;
     char *p = recomp_game.path_anchor ? strstr(low, recomp_game.path_anchor) : NULL;
     if (p) {
-        snprintf(host, hostsz, "%s/%s", RECOMP_DATA_DIR, g + (p - low));
+        snprintf(host, hostsz, "%s/%s", DATA_DIR, g + (p - low));
     } else {
         /* Everything else the engine opens by absolute guest path, and the guest
          * drive and directory are whatever the original install used. Matching on
@@ -2007,7 +2177,7 @@ static int map_guest_path(const char *g, char *host, int hostsz) {
         int found = 0;
         for (int k = 0; k < nseg && !found; k++) {
             char cand[256];
-            snprintf(cand, sizeof cand, "%s/%s", RECOMP_DATA_DIR, seg[k]);
+            snprintf(cand, sizeof cand, "%s/%s", DATA_DIR, seg[k]);
             for (char *q = cand; *q; q++) if (*q == '\\') *q = '/';
             /* GetFileAttributes, not fopen: a directory has to resolve too,
                or FindFirst on "C:\GAME\EGGZ\*.*" lists the install root. */
@@ -2017,7 +2187,7 @@ static int map_guest_path(const char *g, char *host, int hostsz) {
         if (!found) {                    /* report the leaf, as before */
             const char *leaf = seg[nseg - 1];
             if (!*leaf) return 0;
-            snprintf(host, hostsz, "%s/%s", RECOMP_DATA_DIR, leaf);
+            snprintf(host, hostsz, "%s/%s", DATA_DIR, leaf);
         }
     }
     for (char *q = host; *q; q++) if (*q == '\\') *q = '/';
@@ -2040,6 +2210,9 @@ void MMSYSTEM_SNDPLAYSOUND(CPU *cpu) {
     uint16_t off = a16(cpu, 2), seg = a16(cpu, 4);
     int ok = 0;
     static char *mem_snd;                   /* the SND_MEMORY copy now playing */
+    /* PCRECOMP_MUTE (test runs), and a screen saver's preview box: "played". */
+    extern int recomp_scr_mode;
+    if (getenv("PCRECOMP_MUTE") || recomp_scr_mode == 'p') { cpu->ax = 1; ret(cpu, 6); return; }
     if (!seg && !off) {
         PlaySoundA(NULL, NULL, 0);          /* NULL name: stop what is playing */
         ok = 1;
@@ -2152,6 +2325,27 @@ static int find_step(CPU *cpu, int slot, WIN32_FIND_DATAA *fd, uint8_t want, int
  * under Borland's RTM) needs more of DOS than a Windows program does: it
  * answers first, and returns 0 for what it leaves to the cases below. */
 __attribute__((weak)) int recomp_game_int21(CPU *cpu) { (void)cpu; return 0; }
+
+/* Software interrupts a Win16 program issues itself besides INT 21h. MSVC's
+ * startup seeds from INT 1Ah AH=0 (BIOS ticks since midnight, 18.2/s); the
+ * rest are logged once each. Not int_handler itself: a game that answers
+ * interrupts of its own (Jazz, CivNet) defines that, and a MinGW static
+ * library will not resolve a weak one. gen_win16_stubs emits an int_handler
+ * that calls this when the game has none. */
+void win16_int_default(CPU *cpu, int vec) {
+    if (vec == 0x1A && cpu->ah == 0) {
+        SYSTEMTIME t; GetLocalTime(&t);
+        uint32_t ms = ((t.wHour * 60u + t.wMinute) * 60u + t.wSecond) * 1000u + t.wMilliseconds;
+        uint32_t ticks = (uint32_t)((uint64_t)ms * 1193180 / 65536 / 1000);
+        cpu->cx = (uint16_t)(ticks >> 16); cpu->dx = (uint16_t)ticks; cpu->al = 0;
+        return;
+    }
+    static uint32_t told[8];
+    if (!(told[vec >> 5] & (1u << (vec & 31)))) {
+        told[vec >> 5] |= 1u << (vec & 31);
+        fprintf(stderr, "[int] unhandled INT 0x%02X AX=%04X\n", vec, cpu->ax);
+    }
+}
 
 void dos_int21(CPU *cpu) {
     if (recomp_game_int21(cpu)) return;
@@ -2273,7 +2467,7 @@ void dos_int21(CPU *cpu) {
         if (dir[0] && map_guest_path(dir, hostdir, sizeof hostdir))
             snprintf(host, sizeof host, "%s/%s", hostdir, leaf);
         else
-            snprintf(host, sizeof host, "%s/%s", RECOMP_DATA_DIR, leaf);
+            snprintf(host, sizeof host, "%s/%s", DATA_DIR, leaf);
         int slot = 0;
         for (; slot < 16 && g_find[slot]; slot++) {}
         if (slot == 16) { FindClose(g_find[0]); g_find[0] = NULL; slot = 0; }  /* oldest goes */
@@ -2336,7 +2530,7 @@ void dos_int21(CPU *cpu) {
 static void ini_host_path(const char *guest, char *out, int outsz) {
     const char *leaf = guest;
     for (const char *q = guest; *q; q++) if (*q == '\\' || *q == '/') leaf = q + 1;
-    snprintf(out, outsz, "%s/%s", RECOMP_DATA_DIR, leaf);
+    snprintf(out, outsz, "%s/%s", DATA_DIR, leaf);
 }
 
 /* Resolve which host INI actually answers (app,key); empty guest name searches
@@ -2356,7 +2550,7 @@ static int ini_resolve(const char *guest, const char *app, const char *key,
         const char *f = i < 0 ? RECOMP_WIN_INI : recomp_game.ini_fallbacks[i];
         if (!f) break;
         if (strchr(f, '/'))  snprintf(out, outsz, "%s", f);          /* already a host path */
-        else                 snprintf(out, outsz, "%s/%s", RECOMP_DATA_DIR, f);
+        else                 snprintf(out, outsz, "%s/%s", DATA_DIR, f);
         char probe[8];
         if (GetPrivateProfileStringA(app, key, "\1", probe, sizeof probe, out) &&
             probe[0] != '\1')
@@ -2455,7 +2649,7 @@ void KERNEL_GETPRIVATEPROFILESTRING(CPU *cpu) {
     if (!n && recomp_game.serial_key && !strcmp(key, recomp_game.serial_key)) {
         static int said = 0;
         if (!said++ && recomp_game.serial_help)
-            fprintf(stderr, recomp_game.serial_help, RECOMP_DATA_DIR);
+            fprintf(stderr, recomp_game.serial_help, DATA_DIR);
     }
 
     fprintf(stderr, "[ini] GetPrivateProfileString(%s, [%s] %s, def=\"%s\") -> \"%s\"\n",
@@ -2866,7 +3060,7 @@ void KERNEL_WRITEPROFILESTRING(CPU *cpu) { /* (lpAppName@8/10, lpKeyName@4/6, lp
     read_asciiz(cpu, a16(cpu, 10), a16(cpu, 8), app, sizeof app);
     if (kseg) read_asciiz(cpu, kseg, a16(cpu, 4), key, sizeof key);
     if (vseg) read_asciiz(cpu, vseg, a16(cpu, 0), val, sizeof val);
-    snprintf(host, sizeof host, "%s/%s", RECOMP_DATA_DIR, RECOMP_WIN_INI);
+    snprintf(host, sizeof host, "%s/%s", DATA_DIR, RECOMP_WIN_INI);
     cpu->ax = (uint16_t)!!WritePrivateProfileStringA(app, kseg ? key : NULL,
                                                      vseg ? val : NULL, host);
     ret(cpu, 12);

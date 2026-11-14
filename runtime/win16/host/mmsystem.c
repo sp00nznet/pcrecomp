@@ -19,6 +19,7 @@
 #include "runtime_api.h"
 #include "recomp_game.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <windows.h>
 #include <mmsystem.h>
@@ -216,6 +217,44 @@ void MMSYSTEM_TIMEGETDEVCAPS(CPU *cpu);   /* win32_backend.c */
 
 /* The calls above, imported rather than looked up. */
 void MMSYSTEM_MCISENDCOMMAND(CPU *cpu) { mci_send(cpu); }
+
+/* mciSendString(lpstrCommand@8, lpstrReturn@4, uReturnLength@2, hwndCallback@0).
+ * Forwarded to Win32 MCI after two rewrites: the word after "open" is a guest
+ * path, and the number after "parent" or "handle" is a guest HWND. Bermuda
+ * Syndrome plays its intro this way ("open ..\data\intro.avi alias movie style
+ * child parent %d", then "play movie notify") and waits for MM_MCINOTIFY. */
+void MMSYSTEM_MCISENDSTRING(CPU *cpu) {
+    char in[512], out[768] = "", ret_buf[256] = "";
+    rd_str(cpu, a32(cpu, 8), in, sizeof in);
+    uint32_t rp = a32(cpu, 4);
+    UINT rlen = a16(cpu, 2);
+    HWND cb = recomp_real_hwnd(a16(cpu, 0));
+    char prev[64] = "";
+    for (char *t = strtok(in, " "); t; t = strtok(NULL, " ")) {
+        char tok[400];
+        snprintf(tok, sizeof tok, "%s", t);
+        if (!_stricmp(prev, "open") && strchr(t, '.')) {
+            char host[320];
+            if (recomp_map_guest_path(t, host, sizeof host)) snprintf(tok, sizeof tok, "\"%s\"", host);
+        } else if (!_stricmp(prev, "parent") || !_stricmp(prev, "handle")) {
+            snprintf(tok, sizeof tok, "%llu", (unsigned long long)(uintptr_t)recomp_real_hwnd((uint16_t)atoi(t)));
+        }
+        if (*out) strncat(out, " ", sizeof out - strlen(out) - 1);
+        strncat(out, tok, sizeof out - strlen(out) - 1);
+        snprintf(prev, sizeof prev, "%s", t);
+    }
+    MCIERROR e = mciSendStringA(out, ret_buf, sizeof ret_buf, cb);
+    for (UINT i = 0; rp && i < rlen; i++) {
+        mem_write8(cpu, (uint16_t)(rp >> 16), (uint16_t)(rp + i), (uint8_t)ret_buf[i]);
+        if (!ret_buf[i]) break;
+    }
+    if (e || getenv("RECOMP_LOG_MCI")) {
+        char msg[128] = "";
+        if (e) mciGetErrorStringA(e, msg, sizeof msg);
+        fprintf(stderr, "[mci] \"%s\" -> %lu %s\n", out, (unsigned long)e, msg);
+    }
+    ret32(cpu, e, 12);
+}
 
 static const struct { const char *name; void (*fn)(CPU *); } g_mm[] = {
     { "timeSetEvent",           MMSYSTEM_TIMESETEVENT },

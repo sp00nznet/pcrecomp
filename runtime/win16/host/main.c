@@ -386,7 +386,21 @@ int main(int argc, char *argv[])
     if (getenv("RECOMP_FN_COUNT")) { g_fncount = 1; atexit(fnc_report); }
     if (getenv("RECOMP_WATCH_DS")) g_watch_ds = 1;
     if (getenv("RECOMP_STUB_HITS")) atexit(stub_report);
-    const char *img = (argc > 1) ? argv[1] : RECOMP_IMAGE_PATH;
+    /* A screen saver's switches (/s, /p <hwnd>, /c) come first; screensaver.c. */
+    extern int recomp_scr_args(int, char **);
+    int first = recomp_scr_args(argc, argv);
+    const char *img = (first < argc) ? argv[first] : RECOMP_IMAGE_PATH;
+    /* Installed (a screen saver copied anywhere), the image sits next to the
+       executable, and wins over the build tree's path compiled in. */
+    static char beside[MAX_PATH];
+    if (first >= argc) {
+        DWORD n = GetModuleFileNameA(NULL, beside, MAX_PATH - 16);
+        char *slash = n ? strrchr(beside, 92) : NULL;   /* the last backslash */
+        if (slash) {
+            strcpy(slash + 1, "mem_image.bin");
+            if (GetFileAttributesA(beside) != INVALID_FILE_ATTRIBUTES) img = beside;
+        }
+    }
 
     /* Unbuffered: the engine dies by crash/abort often enough that a lost
      * stdout buffer hides exactly the lines that say where it got to. */
@@ -401,6 +415,7 @@ int main(int argc, char *argv[])
 
     CPU cpu;
     cpu_init(&cpu);
+    if (recomp_game.selector_step > 1) cpu.sel_step = (uint16_t)recomp_game.selector_step;
     g_cpu = &cpu;
 
     /* Flat image + a heap for dynamically allocated selectors (past the image).
@@ -450,11 +465,11 @@ int main(int argc, char *argv[])
         printf("%s init returned (ax=%04X)\n", m->name, cpu.ax);
     }
 
-#ifdef RECOMP_WATCHDOG
-    CreateThread(NULL, 0, watchdog_thread, NULL, 0, NULL);
-#else
-    (void)watchdog_thread;
+#ifndef RECOMP_WATCHDOG
+    if (getenv("RECOMP_WATCHDOG_SECS"))     /* a run can ask for it without a rebuild */
 #endif
+    CreateThread(NULL, 0, watchdog_thread, NULL, 0, NULL);
+    { extern void win16_sim_input_start(void); win16_sim_input_start(); }
 
     /* 2) The host EXE's startup (Borland C0 -> InitTask -> WinMain): window and
      *    message loop, calling into the DLLs through the cross-module calls the
