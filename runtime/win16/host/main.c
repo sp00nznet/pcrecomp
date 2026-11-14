@@ -575,9 +575,17 @@ const RecompModule *recomp_module_of_hinst(uint16_t hinst)
  * dropped, so the caller resumes; on Catz that was enough to run the whole game
  * while the last misses were chased down. RECOMP_DISPATCH_STRICT=1 aborts
  * instead, which is what you want while bringing a new title up. */
+/* A program that builds or loads machine code at run time (compiled sprites,
+ * say) calls into memory nothing was lifted from. A project can run such code
+ * itself -- an interpreter for the few instructions it uses -- by defining this;
+ * 1 = handled, the call's frame already popped. */
+__attribute__((weak)) int recomp_dispatch_miss_hook(CPU *cpu, uint16_t seg, uint16_t off, int far_call)
+{ (void)cpu; (void)seg; (void)off; (void)far_call; return 0; }
+
 static void dispatch_miss(CPU *cpu, uint16_t seg, uint16_t off, int far_call)
 {
     static int told, strict = -1;
+    if (recomp_dispatch_miss_hook(cpu, seg, off, far_call)) return;
     if (strict < 0) strict = getenv("RECOMP_DISPATCH_STRICT") != NULL;
     if (told++ < 32 || strict)
         fprintf(stderr, "[dispatch] %s MISS seg=%u off=%04X\n", far_call ? "far" : "near", seg, off);
