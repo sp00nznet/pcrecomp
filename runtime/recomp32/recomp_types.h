@@ -276,8 +276,16 @@ static inline void MEMSET16(void* dst, uint16_t val, uint32_t count) {
  * buffer, and Red Alert 2's Tesla bolt starts its three strands that way.
  * memmove would copy as if through a temporary, so it serves every other
  * case and only that one walks element by element. */
+#ifdef RECOMP_DOS32_VGA
+/* runtime/dos32's Mode X: a VGA-to-VGA copy in write mode 1 goes through the
+ * latches, all four planes at once. 1 = handled. Projects opt in. */
+int recomp_vga_movs(uint32_t edi, uint32_t esi, uint32_t n, uint32_t esz, int df);
+#endif
 static inline void recomp_rep_movs(uint32_t edi, uint32_t esi, uint32_t n, uint32_t esz, int df) {
     uint32_t b = n * esz;
+#ifdef RECOMP_DOS32_VGA
+    if (edi - 0xA0000u < 0x10000u && recomp_vga_movs(edi, esi, n, esz, df)) return;
+#endif
     if (df > 0 ? edi - esi >= b : esi - edi >= b) {
         if (df > 0) memmove((void*)ADDR(edi), (void*)ADDR(esi), b);
         else memmove((void*)ADDR(edi - b + esz), (void*)ADDR(esi - b + esz), b);

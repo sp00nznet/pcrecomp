@@ -586,7 +586,7 @@ void dos32_vesa_custom(int w, int h) { vesa_modes[4].w = (uint16_t)w; vesa_modes
 static void set_mode(int mode, int clear) {
     EnterCriticalSection(&video_lock);
     vmode = mode; vbank = 0; vesa_lfb = 0;
-    if (mode == 0x13) { vw = 320; vh = 200; vpitch = 320; }
+    if (mode == 0x13) { vw = 320; vh = 200; vpitch = 320; seq[2] = 15; seq[4] = 0x0E; crtc[0x0C] = crtc[0x0D] = 0; crtc[0x13] = 40; gc[5] = 0x40; }
     else if (mode < 0x100) { vw = 80; vh = 25; vpitch = 80; }
     else {
         for (int i = 0; i < NVESA; i++)
@@ -611,6 +611,52 @@ static void set_bank(uint32_t bank) {
     LeaveCriticalSection(&video_lock);
 }
 
+/* Mode X (unchained 256-colour VGA). Video memory is four 64 KB planes, kept
+ * in vram. Lifted code reaches A0000 as plain memory, so the window holds one
+ * plane, xw, at a time: when the Map Mask or the Read Map changes, the bytes
+ * the program changed in the window go to every plane the mask selects, and
+ * the window is refilled from the plane now in front (the lowest one written,
+ * or the one read). Write mode 1 copies (the latches) come in through
+ * recomp_vga_movs. A byte written with its old value under a multi-plane mask
+ * reaches only plane xw: a known ceiling, rare in practice. */
+static int xw;                                     /* the plane in the window */
+#define MODEX (vmode == 0x13 && !(seq[4] & 8))
+#define PLANE(p) (vram + (uint32_t)(p) * 0x10000u)
+
+static void modex_flush(void) {
+    uint8_t* win = LIN(0xA0000);
+    uint8_t* base = PLANE(xw);
+    int m = seq[2] & 15;
+    if (m == 1 << xw) { memcpy(base, win, 0x10000); return; }   /* the usual case */
+    for (uint32_t i = 0; i < 0x10000; i += 8) {
+        if (*(uint64_t*)(win + i) == *(uint64_t*)(base + i)) continue;
+        for (uint32_t j = i; j < i + 8; j++)
+            if (win[j] != base[j])
+                for (int p = 0; p < 4; p++) if (m >> p & 1) PLANE(p)[j] = win[j];
+    }
+    memcpy(win, base, 0x10000);
+}
+
+static void modex_show(int plane) {
+    modex_flush();
+    xw = plane & 3;
+    memcpy(LIN(0xA0000), PLANE(xw), 0x10000);
+}
+
+static int lowest(int m) { for (int p = 0; p < 4; p++) if (m >> p & 1) return p; return xw; }
+
+int recomp_vga_movs(uint32_t edi, uint32_t esi, uint32_t n, uint32_t esz, int df) {
+    if (!MODEX || (gc[5] & 3) != 1 || esi - 0xA0000u >= 0x10000u) return 0;
+    modex_flush();      /* the planes are now current; copy on them */
+    int m = seq[2] & 15;
+    uint32_t b = n * esz, d = edi - 0xA0000u, s = esi - 0xA0000u;
+    if (df < 0) { d = d - b + esz; s = s - b + esz; }
+    for (int p = 0; p < 4; p++)
+        if (m >> p & 1) for (uint32_t i = 0; i < b; i++) PLANE(p)[(d + i) & 0xFFFF] = PLANE(p)[(s + i) & 0xFFFF];
+    memcpy(LIN(0xA0000), PLANE(xw), 0x10000);
+    return 1;
+}
+
 int dos32_frame(uint32_t* out, int maxw, int maxh, int* w, int* h) {
     if (vmode < 0x13) return 0;
     uint32_t pal[256];
@@ -620,11 +666,21 @@ int dos32_frame(uint32_t* out, int maxw, int maxh, int* w, int* h) {
     }
     int fw = vw < maxw ? vw : maxw, fh = vh < maxh ? vh : maxh;
     EnterCriticalSection(&video_lock);
+    int modex = MODEX;
+    uint32_t start = (uint32_t)crtc[0x0C] << 8 | crtc[0x0D], xpitch = crtc[0x13] * 2u;
     for (int y = 0; y < fh; y++) {
         uint32_t off = (uint32_t)y * vpitch;
         for (int x = 0; x < fw; x++, off++) {
             uint8_t p;
-            if (vmode == 0x13) p = R8(0xA0000 + off);
+            if (modex) {
+                /* what the program last wrote: the window for plane xw, and
+                 * for the other masked planes where it differs from xw's copy */
+                uint32_t a = (start + (uint32_t)y * xpitch + (x >> 2)) & 0xFFFF;
+                int pl = x & 3;
+                uint8_t wv = R8(0xA0000 + a);
+                p = (pl == xw || ((seq[2] >> pl & 1) && wv != PLANE(xw)[a])) ? wv : PLANE(pl)[a];
+            }
+            else if (vmode == 0x13) p = R8(0xA0000 + off);
             else if (vesa_lfb) p = R8(LFB_VA + off);
             else p = (off >> 16) == vbank ? R8(0xA0000 + (off & 0xFFFF)) : vram[off];
             out[y * fw + x] = pal[p];
@@ -1337,11 +1393,18 @@ static void out8(uint32_t port, uint8_t v) {
     case 0x3C8: dac_w = v; dac_c = 0; return;
     case 0x3C9: dac[dac_w][dac_c] = v & 63; if (++dac_c == 3) { dac_c = 0; dac_w = (dac_w + 1) & 255; } return;
     case 0x3C4: seq_idx = v; return;
-    case 0x3C5: seq[seq_idx & 7] = v;
-        if ((seq_idx & 7) == 4 && !(v & 8) && vmode == 0x13) once("unchained VGA (mode X)", v, 0);
+    case 0x3C5:
+        if ((seq_idx & 7) == 2 && MODEX) { modex_flush(); seq[2] = v; modex_show(lowest(v & 15)); return; }
+        if ((seq_idx & 7) == 4 && vmode == 0x13 && ((seq[4] ^ v) & 8)) {
+            if (!(v & 8)) { memset(vram, 0, 0x40000); xw = 0; memset(LIN(0xA0000), 0, 0x10000); }
+            LOG("dos32: VGA %s\n", v & 8 ? "chained" : "unchained (mode X)");
+        }
+        seq[seq_idx & 7] = v;
         return;
     case 0x3CE: gc_idx = v; return;
-    case 0x3CF: gc[gc_idx & 15] = v; return;
+    case 0x3CF:
+        if ((gc_idx & 15) == 4 && MODEX && (v & 3) != xw) { gc[4] = v; modex_show(v & 3); return; }
+        gc[gc_idx & 15] = v; return;
     case 0x3D4: crtc_idx = v; return;
     case 0x3D5: crtc[crtc_idx & 31] = v; return;
     case 0x3C0: case 0x3C2: case 0x3B4: case 0x3B5: return;
