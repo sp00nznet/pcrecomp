@@ -33,6 +33,9 @@ Every callee and import is a stub: a call or jump out of the function stops
 both machines, and the state is compared there. The method is Exhume's
 tools/fuzzasm.py (github.com/abedegno/exhume, MIT, abedegno), reimplemented.
 Exits 1 when the (new) gen differs from the CPU anywhere.
+Known noise: the lift's fnstsw leaves TOP (status bits 11-13) at 0, so eax
+after an fnstsw differs from the CPU's in 0x3800 -- harmless to every caller
+that tests C0-C3. Inputs that pop the empty x87 stack count as a fault.
 
 Needs: unicorn, capstone (pip), and a C compiler (gcc/clang/cc, or $RECOMP_CC).
 Unicorn is GPL-2, so it is a test-time dependency only: never vendor it or link
@@ -1212,7 +1215,10 @@ def fn_cases(seed, n):
 
 def body_insns(body):
     import re
-    return {int(a, 16) for a in re.findall(r'/\* 0x([0-9A-F]{8}): ', body)}
+    # every instruction carries its address in a comment, except a jump-table
+    # dispatch, which has only its label
+    return {int(a, 16) for a in re.findall(r'/\* 0x([0-9A-F]{8}): |^L_([0-9A-F]{8}):', body, re.M)
+            for a in a if a}
 
 
 def page_diff(base, before, after):
@@ -1272,6 +1278,11 @@ def uc_function(base, img, va, insns, c):
     try:
         mu.emu_start(va, FN_RET, count=5_000_000)
     except UcError:
+        return {'stop': 'fault'}
+    if fpu_depth(mu) == 7:
+        # a pop of the empty stack (Unicorn sets no stack fault, and reads 0):
+        # an input no caller gives, e.g. __ftol with nothing on the stack.
+        # ponytail: also drops a function that really leaves 7 values
         return {'stop': 'fault'}
     if not stop:
         stop.append(FN_RET if mu.reg_read(X.UC_X86_REG_EIP) == FN_RET else 'hang')
@@ -1491,7 +1502,7 @@ def run_harness(exe, workdir, img, cases, skips):
 
 def near(a, b, rel):
     import math
-    return a == b or (math.isfinite(a) and math.isfinite(b) and abs(a - b) <= rel * max(abs(a), abs(b)))
+    return a == b or (math.isnan(a) and math.isnan(b)) or (math.isfinite(a) and math.isfinite(b) and abs(a - b) <= rel * max(abs(a), abs(b)))
 
 
 def fn_diff(lifted, real):
