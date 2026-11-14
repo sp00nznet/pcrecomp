@@ -2668,12 +2668,26 @@ void USER_WINHELP(CPU *cpu)         { cpu->ax = 1; b_ret(cpu, 12); }  /* no help
    lives in the same store as their text, so it round-trips. */
 void USER_ISDIALOGMESSAGE(CPU *cpu) { cpu->ax = 0; b_ret(cpu, 6); }  /* not a dialog message */
 
+/* The real check box or radio button dlg_build made for (hdlg, id), if any.
+   Anything else at that id (a game's own control class, a push button)
+   knows nothing of BM_GETCHECK, so the store stays the answer for it. */
+static HWND dlg_check_ctl(uint16_t hdlg, uint16_t id) {
+    HWND d = get_hwnd(hdlg), c = d ? GetDlgItem(d, id) : NULL;
+    char cls[16] = "";
+    if (!c || !GetClassNameA(c, cls, sizeof cls) || _stricmp(cls, "Button")) return NULL;
+    switch (GetWindowLongA(c, GWL_STYLE) & 0xF) {
+    case BS_CHECKBOX: case BS_AUTOCHECKBOX: case BS_3STATE: case BS_AUTO3STATE:
+    case BS_RADIOBUTTON: case BS_AUTORADIOBUTTON: return c;
+    }
+    return NULL;
+}
+
 static void dlg_check_set(uint16_t hdlg, uint16_t id, int state) {
     DlgText *t = dlgtxt(hdlg, id, 1);
     if (t) { t->text[0] = (char)('0' + state); t->text[1] = 0; }
     /* The control dlg_build made, if any, shows it (Johnny Castaway's
        configure dialog came up with every box unticked). */
-    HWND d = get_hwnd(hdlg), c = d ? GetDlgItem(d, id) : NULL;
+    HWND c = dlg_check_ctl(hdlg, id);
     if (c) SendMessageA(c, BM_SETCHECK, state ? BST_CHECKED : BST_UNCHECKED, 0);
 }
 void USER_CHECKDLGBUTTON(CPU *cpu) {        /* (hDlg@4, nIDButton@2, uCheck@0) */
@@ -2689,7 +2703,7 @@ void USER_ISDLGBUTTONCHECKED(CPU *cpu) {    /* (hDlg@2, nIDButton@0) */
     DlgText *t = dlgtxt(b_a16(cpu, 2), b_a16(cpu, 0), 0);
     cpu->ax = (uint16_t)(t && t->text[0] == '1');
     /* A real control answers for itself: the person may have clicked it. */
-    HWND d = get_hwnd(b_a16(cpu, 2)), c = d ? GetDlgItem(d, b_a16(cpu, 0)) : NULL;
+    HWND c = dlg_check_ctl(b_a16(cpu, 2), b_a16(cpu, 0));
     if (c) cpu->ax = (uint16_t)(SendMessageA(c, BM_GETCHECK, 0, 0) == BST_CHECKED);
     b_ret(cpu, 4);
 }
