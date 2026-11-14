@@ -1700,17 +1700,72 @@ static void eh32_init(void);
  * and every mixer DLL in the process share; set before the guest makes a
  * sound, so test runs are silent without touching the game's audio code. */
 #include <mmsystem.h>
+#define COBJMACROS
+#include <mmdeviceapi.h>
+#include <audiopolicy.h>
 #pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "ole32.lib")
+/* The session's mute flag, apart from its volume: a guest's own
+ * waveOutSetVolume or legacy mixerSetControlDetails (on Vista+ both set this
+ * process's session volume) cannot undo it. Run on a thread of its own so the
+ * guest's main thread keeps whatever COM apartment it asks for later. */
+static DWORD WINAPI session_mute(LPVOID on) {
+    IMMDeviceEnumerator* en = NULL; IMMDevice* dev = NULL;
+    IAudioSessionManager* sm = NULL; ISimpleAudioVolume* sv = NULL;
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    static const GUID clsid = {0xBCDE0395, 0xE52F, 0x467C, {0x8E,0x3D,0xC4,0x57,0x92,0x91,0x69,0x2E}};
+    static const GUID iid_en = {0xA95664D2, 0x9614, 0x4F35, {0xA7,0x46,0xDE,0x8D,0xB6,0x36,0x17,0xE6}};
+    static const GUID iid_sm = {0xBFA971F1, 0x4D5E, 0x40BB, {0x93,0x5E,0x96,0x70,0x39,0xBF,0xBE,0xE4}};
+    BOOL ok = FALSE;
+    if (SUCCEEDED(CoCreateInstance(&clsid, NULL, CLSCTX_ALL, &iid_en, (void**)&en))
+        && SUCCEEDED(IMMDeviceEnumerator_GetDefaultAudioEndpoint(en, eRender, eConsole, &dev))
+        && SUCCEEDED(IMMDevice_Activate(dev, &iid_sm, CLSCTX_ALL, NULL, (void**)&sm))
+        && SUCCEEDED(IAudioSessionManager_GetSimpleAudioVolume(sm, NULL, FALSE, &sv)))
+        ok = SUCCEEDED(ISimpleAudioVolume_SetMute(sv, on ? TRUE : FALSE, NULL));
+    if (sv) ISimpleAudioVolume_Release(sv);
+    if (sm) IAudioSessionManager_Release(sm);
+    if (dev) IMMDevice_Release(dev);
+    if (en) IMMDeviceEnumerator_Release(en);
+    if (SUCCEEDED(hr)) CoUninitialize();
+    return ok;
+}
+/* MessageBeep and Beep sound through Windows' System Sounds session, not this
+ * process's, so the session mute misses them: patch both, in this process
+ * only, to return TRUE silently (both stdcall). Covers native modules too. */
+static void silence_export(const char* dll, const char* name, uint8_t argbytes) {
+    uint8_t* p = (uint8_t*)GetProcAddress(GetModuleHandleA(dll), name);
+    uint8_t stub[8] = { 0xB8, 1, 0, 0, 0, 0xC2, argbytes, 0 };   /* mov eax,1; ret n */
+    DWORD old;
+    if (p && VirtualProtect(p, sizeof stub, PAGE_EXECUTE_READWRITE, &old)) {
+        memcpy(p, stub, sizeof stub);
+        VirtualProtect(p, sizeof stub, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), p, sizeof stub);
+    }
+}
+static int session_mute_sync(int on) {
+    HANDLE t = CreateThread(NULL, 0, session_mute, (LPVOID)(intptr_t)on, 0, NULL);
+    DWORD ok = 0;
+    if (t) { WaitForSingleObject(t, 5000); GetExitCodeThread(t, &ok); CloseHandle(t); }
+    return ok == 1;
+}
 static void native32_mute(void) {
     char v[8] = "";
     GetEnvironmentVariableA("PCRECOMP_MUTE", v, sizeof v);
     if (v[0] && v[0] != '0') {
+        int ok;
         waveOutSetVolume(NULL, 0);
-        fprintf(stderr, "[native32] PCRECOMP_MUTE: audio session muted\n");
+        ok = session_mute_sync(1);
+        LoadLibraryA("user32.dll");
+        silence_export("user32.dll", "MessageBeep", 4);
+        silence_export("kernel32.dll", "Beep", 8);
+        fprintf(stderr, "[native32] PCRECOMP_MUTE: audio session muted%s, MessageBeep/Beep silenced\n",
+                ok ? "" : " (volume only: session mute flag failed)");
     } else if (v[0] == '0') {
-        /* Windows remembers an app's session volume, so a muted test run
-         * would leave the next real one silent: PCRECOMP_MUTE=0 undoes it. */
+        /* Windows remembers an app's session volume and mute, so a muted
+         * test run would leave the next real one silent: PCRECOMP_MUTE=0
+         * undoes both. */
         waveOutSetVolume(NULL, 0xFFFFFFFFu);
+        session_mute_sync(0);
     }
 }
 
