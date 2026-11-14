@@ -227,8 +227,12 @@ extern uint32_t g_gs_base;
  * hlt and segment loads (tools/lift/lift32.py _lift_dos). A DOS host such as
  * runtime/dos32 defines them; nothing else references them. Under DOS/4GW es
  * is a real selector (the PSP, the environment), so es: overrides get a base. */
-extern uint32_t g_es_base;
+extern uint32_t g_es_base, g_cs_base;
 #define ES_BASE  g_es_base
+/* cs: overrides: 0 for the program, the module's base while a far call runs
+ * code a program loaded at run time (a driver addressing its own tables). */
+#define CS_BASE  g_cs_base
+uint32_t recomp_sel_base(uint32_t selector);
 void     recomp_int(int n);
 uint8_t  recomp_in8(uint32_t port);
 uint16_t recomp_in16(uint32_t port);
@@ -240,6 +244,8 @@ void     recomp_ins(uint32_t port, uint32_t va, int size, uint32_t count, int di
 void     recomp_outs(uint32_t port, uint32_t va, int size, uint32_t count, int dir);
 void     recomp_cli(void);
 void     recomp_sti(void);
+uint32_t recomp_get_if(void);          /* 0x200 when interrupts are on (pushf) */
+void     recomp_set_if(uint32_t on);   /* popf */
 void     recomp_hlt(void);
 void     recomp_set_seg(int sreg, uint32_t selector);
 

@@ -95,6 +95,14 @@ versions follow [SemVer](https://semver.org/).
 - generate `true_extent(far=...)`: forward branch targets past the extent,
   for a driver to make dispatchable (VO's `je <shared failure tail>`).
 
+- dos32: code a program loads from files at run time (Sierra's SCI drivers),
+  lifted ahead of time at a base of its own and listed in `cfg.modules`. A
+  DOS read that fills a buffer with one module's bytes records where it lives,
+  and calls into it go to the lifted copy (docs/DOS32.md, "Code loaded at run
+  time"). Lifter, `dos=True`: a far call goes to the selector's base plus the
+  offset, and `cs:` overrides read through `CS_BASE`. For Gabriel Knight.
+- lift32: `pushf`/`popf` (16-bit); under `dos=True` both widths carry IF from
+  the host, so `push ax; popf` turns interrupts back on.
 - native32: `native32_registry(file)` (`reg32.c`): the registry subtrees a
   regedit 4 file names are served from that file, so a Win9x game finds what
   its installer wrote under `HKLM\Software\<publisher>` without an installer,

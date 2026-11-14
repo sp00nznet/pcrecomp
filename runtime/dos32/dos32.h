@@ -21,6 +21,11 @@
 extern "C" {
 #endif
 
+/* Code a program loads from a file at run time (a driver), lifted ahead of
+ * time with its offset 0 at vbase. size/bytes are the file's. */
+#define DOS32_MAX_MODULES 16
+typedef struct { uint32_t vbase, size; const uint8_t* bytes; } dos32_module;
+
 typedef struct {
     const char* root;      /* host folder that is drive C: */
     const char* overlay;   /* optional: a folder laid over root for files opened
@@ -36,6 +41,8 @@ typedef struct {
      * that links more than one lifted program; NULL = recomp_dispatch_table */
     const void* dispatch;  /* const recomp_dispatch_entry_t* */
     uint32_t dispatch_count;
+    const dos32_module* modules;   /* optional, see dos32_module */
+    int module_count;
 } dos32_config;
 
 /* Map guest memory, load the image, and run the program to its exit on the
