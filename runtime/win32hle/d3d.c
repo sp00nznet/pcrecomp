@@ -19,6 +19,7 @@
 #include "win32hle.h"
 #include "ddraw_int.h"
 #include "d3d_raster.h"
+#include "d3d_gpu.h"
 
 #define D3D_OK              0u
 #define DDERR_INVALIDPARAMS 0x80070057u
@@ -31,6 +32,16 @@ static int trace(void) { if (g_trace < 0) g_trace = getenv("HLE_D3DTRACE") != NU
 
 static uint32_t g_vt_d3d, g_vt_dev, g_vt_vp, g_vt_tex, g_vt_mat, g_vt_vb, g_vt_light;
 static uint32_t g_d3d;                                   /* the one IDirect3D3 */
+
+/* The renderer: a GPU's (d3d_gpu.h), else the software rasteriser. */
+const d3d_gpu_t *hle_d3d_gpu;
+static void flush(void) { if (hle_d3d_gpu) hle_d3d_gpu->sync(); else d3d_raster_flush(); }
+static void tri(const rstate_t *st, const rvert_t *a, const rvert_t *b, const rvert_t *c) {
+    if (hle_d3d_gpu) hle_d3d_gpu->triangle(st, a, b, c); else d3d_raster_submit_triangle(st, a, b, c);
+}
+static void line(const rstate_t *st, const rvert_t *a, const rvert_t *b) {
+    if (hle_d3d_gpu) hle_d3d_gpu->line(st, a, b); else d3d_raster_submit_line(st, a, b);
+}
 
 /* ---- the device ---- */
 #define NRS 256
@@ -187,7 +198,7 @@ static void d3_CreateDevice(void) {                      /* (this, guid, surface
     if (t && !t->zbuf) d->rs[7] = 0;
     uint32_t o = new_obj(g_vt_dev, hle_va(d));
     d->self = o;
-    hle_dd_access_hook = d3d_raster_flush;              /* DirectDraw touching any surface: draw what is queued first */
+    if (!hle_d3d_gpu) hle_dd_access_hook = d3d_raster_flush;   /* DirectDraw touching any surface: draw what is queued first */
     T("CreateDevice on 0x%08X (%dx%d, z-buffer %s) -> 0x%08X\n", A32(2), t ? t->w : 0, t ? t->h : 0,
       t && t->zbuf ? "yes" : "no", o);
     fprintf(stderr, "[d3d] CreateDevice %dx%d%s\n", t ? t->w : 0, t ? t->h : 0, t && t->zbuf ? " with a z-buffer" : "");
@@ -285,7 +296,7 @@ static void tx_QueryInterface(void) {                    /* the texture, or the 
 static void tx_GetHandle(void) { if (A32(2)) MEM32(A32(2)) = A32(0); RET(D3D_OK, 3); }   /* the handle is the object */
 static void tx_PaletteChanged(void) { RET(D3D_OK, 3); }
 static void tx_Load(void) {                              /* (this, source texture): copy its pixels, every level */
-    d3d_raster_flush();
+    flush();
     surf_t *d = hle_dd_surf(TEX(A32(0))->surface), *s = A32(1) ? hle_dd_surf(TEX(A32(1))->surface) : NULL;
     for (; d && s; d = d->mip, s = s->mip) {
         int rows = d->h < s->h ? d->h : s->h, bytes = (d->w < s->w ? d->w : s->w) * (d->bpp / 8);
@@ -364,7 +375,7 @@ static void vp_SetBackground(void) { VP(A32(0))->background = A32(1); RET(D3D_OK
 static void vp_GetBackground(void) { if (A32(1)) MEM32(A32(1)) = VP(A32(0))->background; if (A32(2)) MEM32(A32(2)) = 1; RET(D3D_OK, 3); }
 static void vp_GetBackgroundDepth(void) { if (A32(1)) MEM32(A32(1)) = 0; if (A32(2)) MEM32(A32(2)) = 0; RET(D3D_OK, 3); }
 static void clear(vp_t *v, uint32_t nrects, uint32_t rects, uint32_t flags, uint32_t argb, float z) {
-    d3d_raster_flush();
+    if (!hle_d3d_gpu) flush();
     d3ddev_t *d = v->device ? DEV(v->device) : NULL;
     surf_t *t = d ? hle_dd_surf(d->target) : NULL;
     if (!t) return;
@@ -376,6 +387,10 @@ static void clear(vp_t *v, uint32_t nrects, uint32_t rects, uint32_t flags, uint
         if (tp < 0) tp = 0;
         if (r > t->w) r = t->w;
         if (b > t->h) b = t->h;
+        if (hle_d3d_gpu) {
+            if (l < r && tp < b) hle_d3d_gpu->clear(t, l, tp, r, b, flags & 3, argb, z);
+            continue;
+        }
         if (flags & 1) {                                 /* D3DCLEAR_TARGET */
             uint32_t c = d3d_pack(t, (float)((argb >> 16) & 0xFF) / 255.f, (float)((argb >> 8) & 0xFF) / 255.f,
                                   (float)(argb & 0xFF) / 255.f, (float)(argb >> 24) / 255.f);
@@ -392,7 +407,7 @@ static void clear(vp_t *v, uint32_t nrects, uint32_t rects, uint32_t flags, uint
                 for (int x = l; x < r && x < zb->w; x++) ((uint16_t *)(zb->px + (size_t)y * (size_t)zb->pitch))[x] = zv;
         }
     }
-    hle_dd_mark(t);
+    if (!hle_d3d_gpu) hle_dd_mark(t);
 }
 static void vp_Clear(void) {                             /* (this, count, rects, flags): the background material */
     vp_t *v = VP(A32(0));
@@ -454,7 +469,7 @@ static void dv_BeginScene(void) { DEV(A32(0))->scene = 1; RET(D3D_OK, 1); }
 static void dv_EndScene(void) {
     d3ddev_t *d = DEV(A32(0));
     d->scene = 0;
-    d3d_raster_flush();
+    if (hle_d3d_gpu) hle_d3d_gpu->end_scene(hle_dd_surf(d->target)); else d3d_raster_flush();
     static int fps = -1;
     static uint32_t t0, frames, tris0;
     if (fps < 0) fps = getenv("HLE_D3DFPS") != NULL;
@@ -469,7 +484,7 @@ static void dv_EndScene(void) {
         }
     }
     surf_t *t = hle_dd_surf(d->target);
-    if (t) hle_dd_mark(t);
+    if (t && !hle_d3d_gpu) hle_dd_mark(t);
     RET(D3D_OK, 1);
 }
 static void dv_GetDirect3D(void) { MEM32(A32(1)) = g_d3d; MEM32(g_d3d + 4)++; RET(D3D_OK, 2); }
@@ -482,7 +497,7 @@ static void dv_GetCurrentViewport(void) {
 }
 static void dv_SetRenderTarget(void) {
     d3ddev_t *d = DEV(A32(0));
-    d3d_raster_flush();
+    flush();
     if (A32(1)) MEM32(A32(1) + 4)++;
     d->target = A32(1);
     RET(D3D_OK, 3);
@@ -652,32 +667,32 @@ static void draw(d3ddev_t *d, uint32_t type, uint32_t fvf, const uint8_t *verts,
     switch (type) {
     case 4:
         for (uint32_t i = 0; i + 2 < n; i += 3)
-            if (V(i, &a) && V(i + 1, &b) && V(i + 2, &c)) d3d_raster_submit_triangle(&st, &a, &b, &c), d->tris++;
+            if (V(i, &a) && V(i + 1, &b) && V(i + 2, &c)) tri(&st, &a, &b, &c), d->tris++;
         break;
     case 5:
         for (uint32_t i = 0; i + 2 < n; i++)
             if (V(i, &a) && V(i + 1, &b) && V(i + 2, &c)) {
-                if (i & 1) d3d_raster_submit_triangle(&st, &b, &a, &c); else d3d_raster_submit_triangle(&st, &a, &b, &c);
+                if (i & 1) tri(&st, &b, &a, &c); else tri(&st, &a, &b, &c);
                 d->tris++;
             }
         break;
     case 6:
         if (n >= 3 && V(0, &a))
             for (uint32_t i = 1; i + 1 < n; i++)
-                if (V(i, &b) && V(i + 1, &c)) d3d_raster_submit_triangle(&st, &a, &b, &c), d->tris++;
+                if (V(i, &b) && V(i + 1, &c)) tri(&st, &a, &b, &c), d->tris++;
         break;
     case 2:
-        for (uint32_t i = 0; i + 1 < n; i += 2) if (V(i, &a) && V(i + 1, &b)) d3d_raster_submit_line(&st, &a, &b);
+        for (uint32_t i = 0; i + 1 < n; i += 2) if (V(i, &a) && V(i + 1, &b)) line(&st, &a, &b);
         break;
     case 3:
-        for (uint32_t i = 0; i + 1 < n; i++) if (V(i, &a) && V(i + 1, &b)) d3d_raster_submit_line(&st, &a, &b);
+        for (uint32_t i = 0; i + 1 < n; i++) if (V(i, &a) && V(i + 1, &b)) line(&st, &a, &b);
         break;
     case 1:
-        for (uint32_t i = 0; i < n; i++) if (V(i, &a)) d3d_raster_submit_line(&st, &a, &a);
+        for (uint32_t i = 0; i < n; i++) if (V(i, &a)) line(&st, &a, &a);
         break;
     }
 #undef V
-    hle_dd_mark(st.target);
+    if (!hle_d3d_gpu) hle_dd_mark(st.target);
 }
 static void dv_DrawPrimitive(void) {                     /* (this, type, fvf, verts, count, flags) */
     draw(DEV(A32(0)), A32(1), A32(2), (const uint8_t *)APTR(3), A32(4), NULL, 0);
