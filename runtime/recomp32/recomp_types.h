@@ -1315,6 +1315,17 @@ RECOMP_WEAK int (*recomp_eh_jump_hook)(uint32_t va);
 #define RECOMP_EH_MISS(va_) (recomp_eh_jump_hook && \
     (RECOMP_FLAGS_OUT(), RECOMP_REGS_OUT(), recomp_eh_jump_hook(va_)))
 
+/* A software interrupt in Win32 code (`int 1`, `int 0x68`, `int1`): on NT it
+ * faults, and protection code relies on that, wrapping one in __try and
+ * taking the __except block as "no debugger" (a debugger would swallow it).
+ * Lifted as a no-op it looked like a debugger. The hook offers the fault to
+ * the guest's own SEH chain (seh32.c), whose handler normally unwinds and
+ * jumps into the __except block, so it does not return; it returns if no
+ * guest frame took it, or one asked to continue. native32 sets it. */
+RECOMP_WEAK void (*recomp_trap_hook)(uint32_t code, uint32_t va);
+#define RECOMP_TRAP(code_, va_) do { if (recomp_trap_hook) { \
+    RECOMP_FLAGS_OUT(); RECOMP_REGS_OUT(); recomp_trap_hook(code_, va_); RECOMP_REGS_IN(); } } while (0)
+
 /* Indirect call through dispatch */
 #define RECOMP_ICALL(target_va) do { \
     uint32_t _va = (uint32_t)(target_va); \

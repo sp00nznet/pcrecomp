@@ -43,6 +43,8 @@ int native32_guest_seh;
 
 /* The registration the last RtlUnwind stopped at, for native32_seh_continue. */
 static __declspec(thread) uint32_t t_unwind_target;
+/* The faulting instruction of a trap being dispatched (seh_trap), for the record. */
+static __declspec(thread) uint32_t t_trap_va;
 static int seh_trace = -1;
 
 /* A guest handler: cdecl, four arguments. Every register but eax is kept. */
@@ -86,12 +88,14 @@ static uint32_t seh_records(uint32_t code, uint32_t flags, uint32_t n, uint32_t 
     memset(er, 0, sizeof *er + sizeof *c);
     er->ExceptionCode = code;
     er->ExceptionFlags = flags;
+    er->ExceptionAddress = (PVOID)(uintptr_t)t_trap_va;
     er->NumberParameters = n > EXCEPTION_MAXIMUM_PARAMETERS ? EXCEPTION_MAXIMUM_PARAMETERS : n;
     for (DWORD i = 0; args && i < er->NumberParameters; i++)
         er->ExceptionInformation[i] = MEM32(args + 4 * i);
     c->ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL;
     c->Eax = g_eax, c->Ecx = g_ecx, c->Edx = g_edx, c->Ebx = g_ebx;
     c->Esi = g_esi, c->Edi = g_edi, c->Ebp = g_ebp, c->Esp = g_esp;
+    c->Eip = t_trap_va;
     *ctx = (uint32_t)(uintptr_t)c;
     return (uint32_t)(uintptr_t)er;
 }
@@ -130,6 +134,21 @@ static int seh_dispatch(uint32_t code, uint32_t flags, uint32_t n, uint32_t args
     g_esp = esp;
     if (seh_trace) fprintf(stderr, "[seh32] 0x%08X: no guest frame took it\n", code);
     return 0;
+}
+
+/* recomp_trap_hook: a software interrupt in lifted code faults as it would on
+ * NT, and the guest's handlers get the fault (recomp_types.h, RECOMP_TRAP).
+ * ExceptionAddress is the instruction. */
+static void seh_trap(uint32_t code, uint32_t va) {
+    if (seh_trace < 0) seh_trace = getenv("NATIVE32_TRACE_EH") != NULL;
+    if (seh_trace) fprintf(stderr, "[seh32] trap 0x%08X at 0x%08X\n", code, va);
+    if (!native32_guest_seh) return;
+    /* No ExceptionInformation: a software interrupt carries none, and the
+     * anti-debug filters only test the code. (seh_records reads args as a
+     * guest address, so a host pointer here would fault the host.) */
+    t_trap_va = va;
+    seh_dispatch(code, 0, 0, 0);
+    t_trap_va = 0;
 }
 
 /* RtlUnwind(TargetFrame, TargetIp, ExceptionRecord, ReturnValue), stdcall.
