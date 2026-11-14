@@ -1432,7 +1432,14 @@ static uint64_t __cdecl cb_run(uint32_t va, uint32_t* sp, uint32_t ecx, uint32_t
         g_esp = (at - 64) & ~15u;
     g_esp -= BRIDGE_SLOTS * 4;
     memcpy((void*)(uintptr_t)g_esp, sp + 1, BRIDGE_SLOTS * 4);
+#ifdef NATIVE32_CB_RETADDR
+    /* The native caller's return address, not the dummy: code that reads the
+     * caller's frame through the stack finds what it would natively (XWA's
+     * hooks read a lifted function's frame by offset, the return slot too). */
+    PUSH32(g_esp, sp[0]);
+#else
     PUSH32(g_esp, RECOMP_RETADDR);
+#endif
     uint32_t before = g_esp;
     g_ecx = ecx;
     if (t_cb_regs.on) {
