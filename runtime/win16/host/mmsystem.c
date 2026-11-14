@@ -65,6 +65,37 @@ static void wave_open(CPU *cpu)    { cpu->ax = MMSYSERR_ALLOCATED; ret(cpu, 22);
 static void wave_hdr(CPU *cpu)     { cpu->ax = MMSYSERR_INVALHANDLE; ret(cpu, 8); }  /* (hwo, lpHdr, cb) */
 static void wave_h(CPU *cpu)       { cpu->ax = MMSYSERR_INVALHANDLE; ret(cpu, 2); }  /* (hwo) */
 
+/* PCRECOMP_MUTE: MCI is the one Win16 audio path that reaches a real device
+ * (the MIDI sequencer plays through the GS synth, which the per-app mixer
+ * cannot mute). A muted PLAY on a sound-only device (sequencer, CD audio,
+ * wave) is not sent; with MCI_NOTIFY the guest is told it finished, so a game
+ * waiting for the end goes on. Video devices still play, with their audio
+ * switched off first. Returns 1 when the PLAY was swallowed. */
+static int mci_muted_play(UINT dev, DWORD fl, DWORD_PTR cb)
+{
+    if (!getenv("PCRECOMP_MUTE")) return 0;
+    MCI_GETDEVCAPS_PARMS dc = { 0, 0, MCI_GETDEVCAPS_DEVICE_TYPE };
+    DWORD type = mciSendCommandA(dev, MCI_GETDEVCAPS, MCI_GETDEVCAPS_ITEM, (DWORD_PTR)&dc) ? 0 : dc.dwReturn;
+    if (type == MCI_DEVTYPE_SEQUENCER) {
+        /* Played to no MIDI port: silent, but it still takes the song's
+           length and notifies at its end, which a title screen may wait for. */
+        MCI_SEQ_SET_PARMS sq = { 0 };
+        sq.dwPort = MCI_SEQ_NONE;
+        MCIERROR e = mciSendCommandA(dev, MCI_SET, MCI_SEQ_SET_PORT, (DWORD_PTR)&sq);
+        fprintf(stderr, "[mci] muted: sequencer %u to no port -> %lu\n", dev, (unsigned long)e);
+        if (!e) return 0;
+    }
+    if (type == MCI_DEVTYPE_SEQUENCER || type == MCI_DEVTYPE_CD_AUDIO || type == MCI_DEVTYPE_WAVEFORM_AUDIO) {
+        fprintf(stderr, "[mci] muted: play on device %u (type %lu) not sent\n", dev, (unsigned long)type);
+        if ((fl & MCI_NOTIFY) && cb) PostMessageA((HWND)cb, MM_MCINOTIFY, MCI_NOTIFY_SUCCESSFUL, dev);
+        return 1;
+    }
+    MCI_SET_PARMS sp = { 0 };             /* dwAudio = MCI_SET_AUDIO_ALL */
+    MCIERROR e = mciSendCommandA(dev, MCI_SET, MCI_SET_AUDIO | MCI_SET_OFF, (DWORD_PTR)&sp);
+    fprintf(stderr, "[mci] muted: device %u (type %lu) audio off -> %lu\n", dev, (unsigned long)type, (unsigned long)e);
+    return 0;
+}
+
 /* mciSendCommand(wDeviceID@10, wMessage@8, dwParam1@4, dwParam2@0) -> DWORD.
  * The Win16 parameter blocks are a DWORD callback (low word: the HWND to
  * notify) followed by fields that are DWORDs here but pointer-sized on Win64,
@@ -100,7 +131,7 @@ static void mci_send(CPU *cpu) {
     }
     case MCI_PLAY: {
         MCI_PLAY_PARMS p = { cb, rd32(cpu, ps, (uint16_t)(po + 4)), rd32(cpu, ps, (uint16_t)(po + 8)) };
-        e = mciSendCommandA(dev, msg, fl, (DWORD_PTR)&p);
+        e = mci_muted_play(dev, fl, cb) ? 0 : mciSendCommandA(dev, msg, fl, (DWORD_PTR)&p);
         break;
     }
     case MCI_SEEK: {
@@ -243,7 +274,13 @@ void MMSYSTEM_MCISENDSTRING(CPU *cpu) {
         strncat(out, tok, sizeof out - strlen(out) - 1);
         snprintf(prev, sizeof prev, "%s", t);
     }
-    MCIERROR e = mciSendStringA(out, ret_buf, sizeof ret_buf, cb);
+    MCIERROR e = 0;
+    char verb[16] = "", name[128] = "";
+    sscanf(out, "%15s %127s", verb, name);
+    if (!_stricmp(verb, "play") && mci_muted_play(mciGetDeviceIDA(name), strstr(out, " notify") ? MCI_NOTIFY : 0, (DWORD_PTR)cb))
+        ;   /* swallowed; the notify is already posted */
+    else
+        e = mciSendStringA(out, ret_buf, sizeof ret_buf, cb);
     for (UINT i = 0; rp && i < rlen; i++) {
         mem_write8(cpu, (uint16_t)(rp >> 16), (uint16_t)(rp + i), (uint8_t)ret_buf[i]);
         if (!ret_buf[i]) break;
