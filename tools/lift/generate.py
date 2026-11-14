@@ -16,9 +16,14 @@ import json
 # never been the paths -- so it did not import at all, and every project forked
 # it instead of using it.
 _TOOLS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Compared normalised: a driver that already put tools/pe on the path as
+# `G:/x/pcrecomp/tools\pe` or `..\pcrecomp\tools\pe` would otherwise get a
+# second copy at the front, ahead of its own tools/, and pe/rebase.py shadowed
+# the project's tools/rebase.py (Kiss and Shogo: `cannot import name 'MODULES'`).
+_have = {os.path.normcase(os.path.abspath(p)) for p in sys.path}
 for _d in ('pe', 'lift', 'disasm'):
     _p = os.path.join(_TOOLS, _d)
-    if _p not in sys.path:
+    if os.path.normcase(_p) not in _have:
         sys.path.insert(0, _p)
 
 import lift32
