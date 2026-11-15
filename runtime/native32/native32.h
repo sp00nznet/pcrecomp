@@ -254,38 +254,38 @@ native32_module_t* native32_module_by_base(uint32_t base);
  * NtXxx export stubs (mov eax, N; ...; int 2Eh; ret 4*argc), so the table
  * needs no symbols; a backend maps each service by NAME to the host (on
  * Windows: the host ntdll's export of that name, with per-service fixups).
- *   native32_nt_syscalls(ntdll_base)      -- after native32_map, before running
- *   native32_nt_process(...)              -- an NT 5 PEB + process parameters,
- *                                            the guest's NLS tables and heap
- * NATIVE32_SYSCALLS=1 traces every call. */
+ *
+ *   native32_modules_map(...)        every guest module, NOT bound: the
+ *                                    guest's own loader snaps the imports
+ *   native32_nt_syscalls(ntdll)
+ *   native32_nt_boot(...)            the kernel's part of process creation,
+ *                                    then the guest ntdll's LdrInitializeThunk
+ *                                    (heap, NLS, loader lists, imports, DllMains)
+ *   native32_call_guest(entry)
+ *
+ * The kernel's part: a PEB and process parameters, the NLS tables, image
+ * sections (a lifted module's view is its mapping; a host DLL is a proxy
+ * image of its exports; anything else is refused, and so is process
+ * creation: no original binary runs natively), \KnownDlls hidden, and csrss
+ * over its LPC port (csr32.c). NATIVE32_SYSCALLS=1 traces every call. */
 extern uint32_t native32_guest_peb;
 int native32_nt_syscalls(uint32_t ntdll_base);
 typedef uint32_t (*native32_syscall_fn)(uint32_t* args);
 void native32_nt_override(const char* name, native32_syscall_fn fn);
 uint32_t native32_nt_forward(const char* name, uint32_t* args);
-/* csr32.c: csrss for the guest. Put both in the host's shim array (they
- * replace the guest ntdll's CsrClient* exports); api handlers get the
- * message's data (msg + 0x28) and the capture buffer and return the status. */
-extern native32_shim_t native32_csr_shims[2];
-typedef uint32_t (*native32_csr_api_fn)(uint32_t data, uint32_t capture);
-void native32_csr_api(uint32_t number, native32_csr_api_fn fn);
-/* A guest function (no arguments) native32_nt_process runs before it makes
- * the heap: the loader's own unexported init steps. Up to 8. */
-void native32_nt_preinit(uint32_t va);
+/* dll_path: the loader's search path (the guest modules' directory first,
+ * then the host's system directory for proxies). csd: the service pack, as
+ * PEB's OSCSDVersion (0x0400 for SP4). Returns 0 on failure. */
+int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, const wchar_t* cmdline,
+                     const wchar_t* dll_path, const char* nls_dir, uint16_t csd);
 /* A named section the guest opens that a server process of its own OS would
  * have created (csrss's \NLS\NlsSection* for kernel32): NtOpenSection on
  * that name returns a read-only section of the file. */
 void native32_nt_section_file(const wchar_t* name, const wchar_t* file);
-/* Register a mapped module in the guest PEB's loader lists (call after
- * native32_nt_process, the EXE first): GetModuleHandle, GetModuleFileName
- * and GetProcAddress in a lifted kernel32 walk them. */
-void native32_nt_module(uint32_t base, const wchar_t* path);
-/* The guest ntdll's loader hash table (32 LIST_ENTRY heads) and its
- * LdrpInsertMemoryTableEntry(entry): unexported, so the host names them.
- * With them native32_nt_module inserts the way ntdll does, and LdrGetDllHandle
- * finds the module. Call before native32_nt_module. */
-void native32_nt_loader(uint32_t hash_table, uint32_t insert_fn);
-uint32_t native32_nt_process(uint32_t ntdll, uint32_t image_base, const wchar_t* image_path,
-                             const wchar_t* cmdline, const char* nls_dir);
+/* csr32.c: csrss for the guest, at its LPC port. A handler for an api
+ * ((server << 16) | api) gets the message's data (msg + 0x28) and capture
+ * buffer and returns the status; unanswered apis are logged and succeed. */
+typedef uint32_t (*native32_csr_api_fn)(uint32_t data, uint32_t capture);
+void native32_csr_api(uint32_t number, native32_csr_api_fn fn);
 
 #endif

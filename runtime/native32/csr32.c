@@ -1,20 +1,21 @@
 /*
- * csr32: csrss, for a lifted NT 5 userland (syscall32.c).
+ * csr32: csrss, for a lifted NT userland (syscall32.c).
  *
  * On Windows NT the Win32 subsystem server, csrss.exe, is another process:
- * kernel32 connects to it at start (CsrClientConnectToServer) and asks it for
- * consoles, process and thread bookkeeping, and more (CsrClientCallServer, an
- * LPC message). The host's own csrss speaks its own, newer protocol, so the
- * guest ntdll's two CsrClient* exports are replaced here (as
- * "ntdll.dll!CsrClient..." shims, which win over a guest module's export):
+ * ntdll connects to its LPC port, \Windows\ApiPort, and kernel32 asks it for
+ * consoles, process and thread bookkeeping and more, one LPC message each.
+ * The host's own csrss speaks its own, newer protocol, so the guest's port is
+ * answered here, at the system calls (NtSecureConnectPort,
+ * NtRequestWaitReplyPort): the guest's ntdll runs its own CSR client code.
  *
- *   connect  answers every server DLL; for basesrv (1) it fills in what
- *            basesrv maps into each process, BASE_STATIC_SERVER_DATA, and
- *            points Peb->ReadOnlyStaticServerData at it.
- *   call     api numbers are (server << 16) | api; unknown ones are logged
- *            and succeed with a zero reply, which most callers take.
+ *   connect  maps the client's port memory, gives the connect info what
+ *            basesrv publishes (BASE_STATIC_SERVER_DATA in the static server
+ *            data's slot 1), and a port handle of ours;
+ *   call     api numbers are (server << 16) | api: csrsrv 0 ClientConnect
+ *            (consrv: the host's console), basesrv 26 NlsGetUserInfo; others
+ *            are logged and succeed with an empty reply.
  *
- * Layouts are NT 5.0's, from the offsets the lifted kernel32 reads.
+ * Layouts are NT 5.0's, from the offsets the lifted ntdll and kernel32 read.
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -23,7 +24,6 @@
 #include <string.h>
 #include "native32.h"
 
-#define ARG(n) MEM32(g_esp + 4 + 4 * (n))
 extern uint32_t g_cur_func;
 
 static void ustr(uint8_t* at, const wchar_t* s) {
@@ -53,35 +53,42 @@ static uint32_t base_static_server_data(void) {
     ustr(d + 0x00, win);
     ustr(d + 0x08, sys);
     ustr(d + 0x10, obj);
-    *(uint16_t*)(d + 0x18) = 5;           /* 5.0.2195 Service Pack 4 */
-    *(uint16_t*)(d + 0x1A) = 0;
-    *(uint16_t*)(d + 0x1C) = 2195;
-    *(uint16_t*)(d + 0x1E) = 0x0400;
-    wcscpy((wchar_t*)(d + 0x22), L"Service Pack 4");
+    *(uint16_t*)(d + 0x18) = (uint16_t)MEM32(native32_guest_peb + 0xA4);   /* the PEB's OS version */
+    *(uint16_t*)(d + 0x1A) = (uint16_t)MEM32(native32_guest_peb + 0xA8);
+    *(uint16_t*)(d + 0x1C) = MEM16(native32_guest_peb + 0xAC);
+    *(uint16_t*)(d + 0x1E) = MEM16(native32_guest_peb + 0xAE);
+    if (MEM16(native32_guest_peb + 0xAE) >> 8)
+        _snwprintf((wchar_t*)(d + 0x22), 127, L"Service Pack %u", MEM16(native32_guest_peb + 0xAE) >> 8);
     qsi(0, d + 0x124, 0x2C, NULL);        /* SystemBasicInformation */
     qsi(3, d + 0x150, 0x20, NULL);        /* SystemTimeOfDayInformation */
+    /* Before build 2195 (2163, a release candidate) kernel32 reads the user's
+     * NLS settings from an NLS_USER_INFO inside this data, at 0x184;
+     * UserLocaleId is its +0x1860. 2195 asks basesrv instead (api 26). */
+    if (MEM16(native32_guest_peb + 0xAC) < 2195) MEM32((uint32_t)(uintptr_t)d + 0x184 + 0x1860) = GetUserDefaultLCID();
     return (uint32_t)(uintptr_t)d;
 }
 
-/* CsrClientConnectToServer(ObjectDirectory, ServerDllIndex, CallbackInfo,
- *                          ConnectionInformation, ConnectionInformationLength,
- *                          CalledFromServer) */
-static void csr_connect(void) {
+
+/* ---- the api handlers ---------------------------------------------------- */
+static native32_csr_api_fn g_api[8][1024];
+
+void native32_csr_api(uint32_t number, native32_csr_api_fn fn) {
+    if ((number >> 16) < 8 && (number & 0xFFFF) < 1024) g_api[number >> 16][number & 0xFFFF] = fn;
+}
+
+/* csrsrv 0, ClientConnect { ServerDllIndex; ConnectionInformation*; Length }:
+ * ntdll's CsrClientConnectToServer, once per server DLL. consrv (2) fills
+ * CONSOLE_INFO at the start of its connect info: the console is the host's,
+ * with its real std handles (a lifted kernel32 sends ReadFile/WriteFile on
+ * them down to NtReadFile/NtWriteFile), a pseudo console handle for the
+ * console api, and the two init events ConDllInitialize waits on, the first
+ * ("succeeded") signaled. */
+static uint32_t client_connect(uint32_t data, uint32_t capture) {
+    uint32_t index = MEM32(data), ci = MEM32(data + 4);
+    (void)capture;
     if (getenv("NATIVE32_SYSCALLS"))
-        fprintf(stderr, "[csr] connect %ls server %u info %08X len %u\n", (wchar_t*)(uintptr_t)ARG(0), ARG(1),
-                ARG(3), ARG(4) ? MEM32(ARG(4)) : 0);
-    if (!MEM32(native32_guest_peb + 0x54)) {
-        uint32_t* srv = (uint32_t*)calloc(16, 4);   /* one slot per server DLL */
-        srv[1] = base_static_server_data();
-        MEM32(native32_guest_peb + 0x54) = (uint32_t)(uintptr_t)srv;
-    }
-    if (ARG(1) == 2 && ARG(3)) {
-        /* consrv: CONSOLE_INFO at the start of the connect info. The console
-         * is the host's: its real std handles (a lifted kernel32 sends
-         * ReadFile/WriteFile on them down to NtReadFile/NtWriteFile), a
-         * pseudo console handle for the CSR console api, and the init events
-         * ConDllInitialize waits on, the first ("succeeded") signaled. */
-        uint32_t ci = ARG(3);
+        fprintf(stderr, "[csr] client connect, server %u, info %08X len %u\n", index, ci, MEM32(data + 8));
+    if (index == 2 && ci) {
         MEM32(ci + 0x00) = 0x0C0Eu;
         MEM32(ci + 0x04) = (uint32_t)(uintptr_t)CreateEventA(NULL, TRUE, FALSE, NULL);
         MEM32(ci + 0x08) = (uint32_t)(uintptr_t)GetStdHandle(STD_INPUT_HANDLE);
@@ -90,18 +97,7 @@ static void csr_connect(void) {
         MEM32(ci + 0x14) = (uint32_t)(uintptr_t)CreateEventA(NULL, TRUE, TRUE, NULL);
         MEM32(ci + 0x18) = (uint32_t)(uintptr_t)CreateEventA(NULL, TRUE, FALSE, NULL);
     }
-    if (ARG(5)) *(uint8_t*)(uintptr_t)ARG(5) = 0;
-    g_eax = 0;
-    g_esp += 4 + 4 * 6;
-}
-
-/* CsrClientCallServer(ApiMessage, CaptureBuffer, ApiNumber, ArgLength):
- * CSR_API_MSG is a PORT_MESSAGE (0x18) + CaptureBuffer, ApiNumber,
- * ReturnValue (0x20), Reserved, then the api's own data (0x28). */
-static native32_csr_api_fn g_api[8][1024];
-
-void native32_csr_api(uint32_t number, native32_csr_api_fn fn) {
-    if ((number >> 16) < 8 && (number & 0xFFFF) < 1024) g_api[number >> 16][number & 0xFFFF] = fn;
+    return 0;
 }
 
 /* basesrv 26 (NT 5.0), NlsGetUserInfo { NLS_USER_INFO* info; ULONG length }:
@@ -119,20 +115,106 @@ static uint32_t nls_get_user_info(uint32_t data, uint32_t capture) {
     return 0;
 }
 
-static void csr_call(void) {
-    uint32_t m = ARG(0), api = ARG(2), r = 0;
-    native32_csr_api_fn fn = (api >> 16) < 8 && (api & 0xFFFF) < 1024 ? g_api[api >> 16][api & 0xFFFF] : NULL;
-    if (!fn && api == 0x1001A) fn = nls_get_user_info;
-    MEM32(m + 0x1C) = api;
-    if (fn) r = fn(m + 0x28, ARG(1));
-    else fprintf(stderr, "[csr] api %u:%u (len %u) not answered, from sub_%08X\n", api >> 16, api & 0xFFFF,
-                 ARG(3), g_cur_func);
-    MEM32(m + 0x20) = r;
-    g_eax = r;
-    g_esp += 4 + 4 * 4;
+/* ---- the port ------------------------------------------------------------ */
+static HANDLE g_port;     /* the guest's handle to \Windows\ApiPort: an event of ours */
+
+/* NtSecureConnectPort(Port*, Name, Qos, ClientView, Sid, ServerView, MaxLen*, Info, InfoLen*)
+ * and NtConnectPort (the same without Sid). The client's port memory view is
+ * mapped here, at the same address on "both sides" (no remote delta); the
+ * connect info (NT 5: CSR_API_CONNECTINFO) names the shared section, the
+ * static server data array (basesrv's slot 1) and the shared heap, which
+ * ntdll copies into the PEB. */
+static uint32_t lpc_connect(uint32_t* a, int secure) {
+    uint32_t name = a[1], cv = a[3], sv = a[secure ? 5 : 4], len = a[secure ? 6 : 5];
+    uint32_t info = a[secure ? 7 : 6];
+    int n = name ? MEM16(name) / 2 : 0;
+    const wchar_t* s = name ? (const wchar_t*)(uintptr_t)MEM32(name + 4) : L"";
+    if (n < 8 || _wcsnicmp(s + n - 8, L"\\ApiPort", 8))
+        return native32_nt_forward(secure ? "NtSecureConnectPort" : "NtConnectPort", a);
+    if (cv && MEM32(cv + 4)) {
+        void* v = MapViewOfFile((HANDLE)(uintptr_t)MEM32(cv + 4), FILE_MAP_ALL_ACCESS, 0, MEM32(cv + 8), MEM32(cv + 12));
+        if (!v) return 0xC0000017u;                       /* STATUS_NO_MEMORY */
+        MEM32(cv + 16) = MEM32(cv + 20) = (uint32_t)(uintptr_t)v;
+        if (sv) MEM32(sv + 4) = MEM32(cv + 12), MEM32(sv + 8) = (uint32_t)(uintptr_t)v;
+    }
+    if (info) {
+        static uint32_t srv[16];
+        static uint8_t* shared;
+        if (!shared) shared = (uint8_t*)VirtualAlloc(NULL, 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!srv[1]) srv[1] = base_static_server_data();
+        MEM32(info + 0x08) = GetCurrentProcessId();
+        MEM32(info + 0x0C) = (uint32_t)(uintptr_t)shared;   /* SharedSectionBase */
+        MEM32(info + 0x10) = (uint32_t)(uintptr_t)srv;      /* SharedStaticServerData */
+        MEM32(info + 0x14) = (uint32_t)(uintptr_t)shared;   /* SharedSectionHeap */
+    }
+    if (len) MEM32(len) = 0x148;
+    if (!g_port) g_port = CreateEventA(NULL, FALSE, FALSE, NULL);
+    MEM32(a[0]) = (uint32_t)(uintptr_t)g_port;
+    if (getenv("NATIVE32_SYSCALLS")) fprintf(stderr, "[csr] connected to %.*ls\n", n, s);
+    return 0;
 }
 
-native32_shim_t native32_csr_shims[2] = {
-    { "ntdll.dll!CsrClientConnectToServer", csr_connect },
-    { "ntdll.dll!CsrClientCallServer", csr_call },
-};
+static uint32_t ovr_secure_connect(uint32_t* a) { return lpc_connect(a, 1); }
+static uint32_t ovr_connect(uint32_t* a) { return lpc_connect(a, 0); }
+
+static int is_port(uint32_t h) { return g_port && (HANDLE)(uintptr_t)h == g_port; }
+
+/* NtRequestWaitReplyPort(Port, Request, Reply): one CSR_API_MSG, a
+ * PORT_MESSAGE (0x18) + CaptureBuffer, ApiNumber, ReturnValue (0x20),
+ * Reserved, then the api's data (0x28). */
+static uint32_t ovr_request_wait_reply(uint32_t* a) {
+    if (!is_port(a[0])) return native32_nt_forward("NtRequestWaitReplyPort", a);
+    uint32_t m = a[1], api = MEM32(m + 0x1C), r = 0;
+    native32_csr_api_fn fn = (api >> 16) < 8 && (api & 0xFFFF) < 1024 ? g_api[api >> 16][api & 0xFFFF] : NULL;
+    if (fn) r = fn(m + 0x28, MEM32(m + 0x18));
+    else {
+        /* An empty reply, not the request's stack bytes: build 2163's
+         * GetConsoleOutputCP read its code page from here, got garbage, and
+         * every WideCharToMultiByte cmd wrote failed. 0 is CP_ACP. */
+        uint16_t total = MEM16(m + 2);
+        if (total > 0x28 && total < 0x1000) memset((void*)(uintptr_t)(m + 0x28), 0, total - 0x28);
+        if (getenv("NATIVE32_SYSCALLS"))
+            fprintf(stderr, "[csr] api %u:%u not answered, from sub_%08X\n", api >> 16, api & 0xFFFF, g_cur_func);
+    }
+    MEM32(m + 0x20) = r;
+    if (a[2] && a[2] != m) memcpy((void*)(uintptr_t)a[2], (void*)(uintptr_t)m, MEM16(m) + 0x18);
+    return 0;
+}
+
+static uint32_t ovr_request_port(uint32_t* a) {
+    return is_port(a[0]) ? 0 : native32_nt_forward("NtRequestPort", a);
+}
+
+static uint32_t ovr_terminate_port(uint32_t* a) {
+    return is_port(a[0]) ? 0 : native32_nt_forward("NtRegisterThreadTerminatePort", a);
+}
+
+/* Named objects csrss creates at its start, which the guest only opens:
+ * build 2163's kernel32 opens \Sessions\N\NlsCacheMutant and fails its
+ * DllMain without it. A process of our own needs no sharing, so the open
+ * returns a new unnamed one. NtOpenMutant(Handle*, Access, ObjectAttributes) */
+static uint32_t ovr_open_mutant(uint32_t* a) {
+    uint32_t r = native32_nt_forward("NtOpenMutant", a), us = a[2] ? MEM32(a[2] + 8) : 0;
+    int n = us ? MEM16(us) / 2 : 0;
+    const wchar_t* s = us ? (const wchar_t*)(uintptr_t)MEM32(us + 4) : L"";
+    if (r == 0xC0000034u && n >= 14 && !_wcsnicmp(s + n - 14, L"NlsCacheMutant", 14)) {
+        static HANDLE m;
+        if (!m) m = CreateMutexW(NULL, FALSE, NULL);
+        HANDLE d;
+        if (!DuplicateHandle(GetCurrentProcess(), m, GetCurrentProcess(), &d, 0, FALSE, DUPLICATE_SAME_ACCESS)) return r;
+        MEM32(a[0]) = (uint32_t)(uintptr_t)d;
+        return 0;
+    }
+    return r;
+}
+
+void csr32_install(void) {
+    native32_nt_override("NtOpenMutant", ovr_open_mutant);
+    native32_csr_api(0x00000, client_connect);
+    if (!g_api[1][26]) native32_csr_api(0x1001A, nls_get_user_info);
+    native32_nt_override("NtSecureConnectPort", ovr_secure_connect);
+    native32_nt_override("NtConnectPort", ovr_connect);
+    native32_nt_override("NtRequestWaitReplyPort", ovr_request_wait_reply);
+    native32_nt_override("NtRequestPort", ovr_request_port);
+    native32_nt_override("NtRegisterThreadTerminatePort", ovr_terminate_port);
+}

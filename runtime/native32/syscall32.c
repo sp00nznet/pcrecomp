@@ -133,8 +133,16 @@ void recomp_syscall(int vector) {
     }
     if (g_trace) {
         fprintf(stderr, "[syscall] %-32s(", g_svc[svc].name);
-        for (int i = 0; i < g_svc[svc].argc && i < 6; i++) fprintf(stderr, i ? " %08X" : "%08X", args[i]);
-        fprintf(stderr, ") -> %08X  from sub_%08X\n", r, g_cur_func);
+        for (int i = 0; i < g_svc[svc].argc && i < 10; i++) fprintf(stderr, i ? " %08X" : "%08X", args[i]);
+        fprintf(stderr, ") -> %08X  from sub_%08X", r, g_cur_func);
+        /* The object's name, for an Open/Create whose third argument is
+         * OBJECT_ATTRIBUTES (Length 0x18) */
+        if (g_svc[svc].argc >= 3 && args[2] > 0x10000 && !IsBadReadPtr((void*)(uintptr_t)args[2], 0x18) &&
+            MEM32(args[2]) == 0x18 && MEM32(args[2] + 8) && !IsBadReadPtr((void*)(uintptr_t)MEM32(args[2] + 8), 8)) {
+            uint32_t us = MEM32(args[2] + 8);
+            fprintf(stderr, "  %.*ls", MEM16(us) / 2, (wchar_t*)(uintptr_t)MEM32(us + 4));
+        }
+        fprintf(stderr, "\n");
     }
     g_eax = r;
 }
@@ -188,7 +196,268 @@ static uint32_t ovr_open_section(uint32_t* a) {
     return r;
 }
 
-/* ---- process start: what the kernel and LdrpInitializeProcess did ------- */
+
+/* ---- images: the kernel's half of the guest's own loader ---------------
+ * The guest ntdll loads DLLs itself (LdrpMapDll): it opens the file, makes an
+ * image section (NtCreateSection, SEC_IMAGE) and maps a view of it. Here:
+ *   - a guest module the host already mapped (modules32's table, by file
+ *     name): the view is that mapping, so its lifted code is what runs;
+ *   - a host DLL (in the host's system directory): a proxy image, a PE
+ *     header and export directory whose exports are the host DLL's functions
+ *     (GetProcAddress, forwarders and API sets resolved by the host), with
+ *     no entry point and no imports: the guest's loader snaps them like any
+ *     DLL's and the lifted callers reach the host functions by the bridge;
+ *   - anything else is refused: an image that is neither lifted nor the
+ *     host's never runs (the guard: no original Windows 2000 binary is ever
+ *     started natively). Process creation is refused the same way. */
+#define MAX_IMAGES 64
+static struct { HANDLE h; uint32_t base, size; } g_img[MAX_IMAGES];
+static int g_nimg;
+
+static int img_by_handle(uint32_t h) {
+    for (int i = g_nimg - 1; i >= 0; i--)        /* newest first: handle values are reused */
+        if (g_img[i].h && (uint32_t)(uintptr_t)g_img[i].h == h) return i;
+    return -1;
+}
+
+static uint32_t image_size(uint32_t base) {
+    IMAGE_NT_HEADERS32* nt = (IMAGE_NT_HEADERS32*)(uintptr_t)(base + MEM32(base + 0x3C));
+    return nt->OptionalHeader.SizeOfImage;
+}
+
+/* The guard's other half: a host DLL can start processes itself (cmd.exe
+ * fell back to shell32's ShellExecuteEx when its own CreateProcess was
+ * refused, and the host ran the program). Through a proxy, these exports are
+ * refusals with the same signatures. */
+static BOOL WINAPI deny_cp10(void* a, void* b, void* c, void* d, BOOL e, DWORD f, void* g, void* h, void* i, void* j) {
+    (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g; (void)h; (void)i; (void)j;
+    fprintf(stderr, "[guard] host CreateProcess from the guest: refused\n");
+    SetLastError(ERROR_ACCESS_DENIED);
+    return FALSE;
+}
+static BOOL WINAPI deny_cp11(void* t, void* a, void* b, void* c, void* d, BOOL e, DWORD f, void* g, void* h, void* i, void* j) {
+    (void)t;
+    return deny_cp10(a, b, c, d, e, f, g, h, i, j);
+}
+static BOOL WINAPI deny_cp9(void* t, DWORD l, void* a, void* b, DWORD f, void* g, void* h, void* i, void* j) {
+    (void)t; (void)l; (void)a; (void)b; (void)f; (void)g; (void)h; (void)i; (void)j;
+    return deny_cp10(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+}
+static BOOL WINAPI deny_sex(void* info) {
+    (void)info;
+    fprintf(stderr, "[guard] host ShellExecuteEx from the guest: refused\n");
+    SetLastError(ERROR_ACCESS_DENIED);
+    return FALSE;
+}
+static void* WINAPI deny_se(void* a, void* b, void* c, void* d, void* e, int f) {
+    (void)a; (void)b; (void)c; (void)d; (void)e; (void)f;
+    fprintf(stderr, "[guard] host ShellExecute from the guest: refused\n");
+    return (void*)(uintptr_t)5;                                   /* SE_ERR_ACCESSDENIED */
+}
+static UINT WINAPI deny_winexec(const char* a, UINT b) {
+    (void)a; (void)b;
+    fprintf(stderr, "[guard] host WinExec from the guest: refused\n");
+    return 0;
+}
+static const struct { const char* name; void* fn; } g_deny[] = {
+    { "CreateProcessA", deny_cp10 }, { "CreateProcessW", deny_cp10 },
+    { "CreateProcessAsUserA", deny_cp11 }, { "CreateProcessAsUserW", deny_cp11 },
+    { "CreateProcessWithLogonW", deny_cp11 }, { "CreateProcessWithTokenW", deny_cp9 },
+    { "ShellExecuteExA", deny_sex }, { "ShellExecuteExW", deny_sex },
+    { "ShellExecuteA", deny_se }, { "ShellExecuteW", deny_se }, { "WinExec", deny_winexec },
+};
+
+static void* denied(const char* name) {
+    for (int i = 0; i < (int)(sizeof g_deny / sizeof g_deny[0]); i++)
+        if (!strcmp(g_deny[i].name, name)) return g_deny[i].fn;
+    return NULL;
+}
+
+/* A PE image in memory whose export table is a host DLL's, by ordinal and
+ * name; each export's RVA is (host function - proxy base), modulo 2^32. */
+static uint32_t proxy_image(const wchar_t* path) {
+    HMODULE h = LoadLibraryW(path);
+    if (!h) return 0;
+    uint8_t* hb = (uint8_t*)h;
+    IMAGE_NT_HEADERS* hnt = (IMAGE_NT_HEADERS*)(hb + ((IMAGE_DOS_HEADER*)hb)->e_lfanew);
+    IMAGE_DATA_DIRECTORY hd = hnt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!hd.VirtualAddress) return 0;
+    IMAGE_EXPORT_DIRECTORY* he = (IMAGE_EXPORT_DIRECTORY*)(hb + hd.VirtualAddress);
+    uint32_t nf = he->NumberOfFunctions, nn = he->NumberOfNames, strs = 0;
+    uint32_t* hnames = (uint32_t*)(hb + he->AddressOfNames);
+    uint16_t* hords = (uint16_t*)(hb + he->AddressOfNameOrdinals);
+    for (uint32_t i = 0; i < nn; i++) strs += (uint32_t)strlen((char*)hb + hnames[i]) + 1;
+    uint32_t dir = 0x1000, funcs = dir + 40, names = funcs + 4 * nf, ords = names + 4 * nn, pool = ords + 2 * nn;
+    uint32_t size = (pool + strs + 64 + 0xFFF) & ~0xFFFu;
+    uint8_t* p = (uint8_t*)VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    uint32_t base = (uint32_t)(uintptr_t)p;
+    IMAGE_NT_HEADERS32* nt = (IMAGE_NT_HEADERS32*)(p + 0x40);
+    ((IMAGE_DOS_HEADER*)p)->e_magic = IMAGE_DOS_SIGNATURE;
+    ((IMAGE_DOS_HEADER*)p)->e_lfanew = 0x40;
+    nt->Signature = IMAGE_NT_SIGNATURE;
+    nt->FileHeader.Machine = IMAGE_FILE_MACHINE_I386;
+    nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER32);
+    nt->FileHeader.Characteristics = IMAGE_FILE_DLL | IMAGE_FILE_32BIT_MACHINE | IMAGE_FILE_EXECUTABLE_IMAGE;
+    nt->FileHeader.TimeDateStamp = hnt->FileHeader.TimeDateStamp;
+    nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR32_MAGIC;
+    nt->OptionalHeader.ImageBase = base;
+    nt->OptionalHeader.SectionAlignment = 0x1000;
+    nt->OptionalHeader.FileAlignment = 0x200;
+    nt->OptionalHeader.MajorOperatingSystemVersion = 4;
+    nt->OptionalHeader.MajorSubsystemVersion = 4;
+    nt->OptionalHeader.SizeOfImage = size;
+    nt->OptionalHeader.SizeOfHeaders = 0x1000;
+    nt->OptionalHeader.Subsystem = IMAGE_SUBSYSTEM_WINDOWS_GUI;
+    nt->OptionalHeader.NumberOfRvaAndSizes = 16;
+    nt->OptionalHeader.DataDirectory[0].VirtualAddress = dir;
+    nt->OptionalHeader.DataDirectory[0].Size = pool + strs - dir;
+    IMAGE_EXPORT_DIRECTORY* e = (IMAGE_EXPORT_DIRECTORY*)(p + dir);
+    e->Base = he->Base;
+    e->NumberOfFunctions = nf;
+    e->NumberOfNames = nn;
+    e->AddressOfFunctions = funcs;
+    e->AddressOfNames = names;
+    e->AddressOfNameOrdinals = ords;
+    for (uint32_t i = 0; i < nf; i++) {
+        FARPROC f = GetProcAddress(h, (LPCSTR)(uintptr_t)(he->Base + i));
+        ((uint32_t*)(p + funcs))[i] = f ? (uint32_t)(uintptr_t)f - base : 0;
+    }
+    for (uint32_t i = 0; i < nn; i++) {
+        const char* s = (const char*)hb + hnames[i];
+        strcpy((char*)p + pool, s);
+        ((uint32_t*)(p + names))[i] = pool;
+        ((uint16_t*)(p + ords))[i] = hords[i];
+        if (denied(s)) ((uint32_t*)(p + funcs))[hords[i]] = (uint32_t)(uintptr_t)denied(s) - base;
+        pool += (uint32_t)strlen(s) + 1;
+    }
+    e->Name = pool;
+    WideCharToMultiByte(CP_ACP, 0, wcsrchr(path, L'\\') ? wcsrchr(path, L'\\') + 1 : path, -1,
+                        (char*)p + pool, 60, NULL, NULL);
+    return base;
+}
+
+static int under(const wchar_t* path, const wchar_t* dir) {
+    size_t n = wcslen(dir);
+    return !_wcsnicmp(path, dir, n) && (path[n] == L'\\' || !path[n]);
+}
+
+/* NtCreateSection(Handle*, Access, ObjectAttributes, MaximumSize*, Protect, Attributes, File) */
+static uint32_t ovr_create_section(uint32_t* a) {
+    if (!(a[5] & 0x01000000u) || !a[6] || g_nimg >= MAX_IMAGES)   /* SEC_IMAGE */
+        return native32_nt_forward("NtCreateSection", a);
+    wchar_t raw[MAX_PATH + 8], sys[MAX_PATH], win[MAX_PATH];
+    char name[MAX_PATH];
+    if (!GetFinalPathNameByHandleW((HANDLE)(uintptr_t)a[6], raw, MAX_PATH, 0)) return 0xC0000008u;
+    const wchar_t* path = !wcsncmp(raw, L"\\\\?\\", 4) ? raw + 4 : raw;
+    WideCharToMultiByte(CP_ACP, 0, path, -1, name, MAX_PATH, NULL, NULL);
+    uint32_t base = native32_module(name), size;
+    GetSystemDirectoryW(sys, MAX_PATH);
+    GetWindowsDirectoryW(win, MAX_PATH);
+    {
+        /* The guard: a program image is either lifted or not run. A host DLL
+         * is served as a proxy; a host or original EXE never is. */
+        size_t n = wcslen(path);
+        int exe = n > 4 && (!_wcsicmp(path + n - 4, L".exe") || !_wcsicmp(path + n - 4, L".com") ||
+                            !_wcsicmp(path + n - 4, L".scr"));
+        if (exe && !base) {
+            fprintf(stderr, "[guard] %ls: a program that is not lifted: not run\n", path);
+            return 0xC0000022u;                                              /* STATUS_ACCESS_DENIED */
+        }
+    }
+    if (base) size = image_size(base);
+    else if (under(path, sys) || under(path, win)) {
+        if (!(base = proxy_image(path))) return 0xC000007Bu;                 /* STATUS_INVALID_IMAGE_FORMAT */
+        size = image_size(base);
+        fprintf(stderr, "[nt] %ls: the host's, through a proxy image at 0x%08X\n", path, base);
+    } else {
+        fprintf(stderr, "[guard] %ls is neither lifted nor the host's: not mapped\n", path);
+        return 0xC0000022u;                                                  /* STATUS_ACCESS_DENIED */
+    }
+    g_img[g_nimg].h = CreateEventA(NULL, FALSE, FALSE, NULL);
+    g_img[g_nimg].base = base;
+    g_img[g_nimg].size = size;
+    MEM32(a[0]) = (uint32_t)(uintptr_t)g_img[g_nimg++].h;
+    return 0;
+}
+
+/* NtMapViewOfSection(Section, Process, Base*, ZeroBits, Commit, Offset*, ViewSize*, ...) */
+static uint32_t ovr_map_view(uint32_t* a) {
+    int i = img_by_handle(a[0]);
+    if (i < 0) return native32_nt_forward("NtMapViewOfSection", a);
+    MEM32(a[2]) = g_img[i].base;
+    MEM32(a[6]) = g_img[i].size;
+    return 0;
+}
+
+/* NtClose on an image section handle: the loader closes it right after
+ * mapping, and the host hands the same value to the next object. */
+static uint32_t ovr_close(uint32_t* a) {
+    int i = img_by_handle(a[0]);
+    if (i >= 0) g_img[i].h = NULL;
+    return native32_nt_forward("NtClose", a);
+}
+
+/* NtUnmapViewOfSection(Process, Base): a guest image or proxy stays mapped. */
+static uint32_t ovr_unmap_view(uint32_t* a) {
+    for (int i = 0; i < g_nimg; i++)
+        if (g_img[i].base == a[1]) return 0;
+    return native32_nt_forward("NtUnmapViewOfSection", a);
+}
+
+/* NtQuerySection(Section, Class, Buffer, Length, ReturnLength*) for an image:
+ * SectionImageInformation (1) from its headers. */
+static uint32_t ovr_query_section(uint32_t* a) {
+    int i = img_by_handle(a[0]);
+    if (i < 0) return native32_nt_forward("NtQuerySection", a);
+    if (a[1] != 1 || a[3] < 0x30) return 0xC0000003u;                         /* STATUS_INVALID_INFO_CLASS */
+    IMAGE_NT_HEADERS32* nt = (IMAGE_NT_HEADERS32*)(uintptr_t)(g_img[i].base + MEM32(g_img[i].base + 0x3C));
+    uint8_t* o = (uint8_t*)(uintptr_t)a[2];
+    memset(o, 0, 0x30);
+    *(uint32_t*)(o + 0x00) = nt->OptionalHeader.AddressOfEntryPoint ? g_img[i].base + nt->OptionalHeader.AddressOfEntryPoint : 0;
+    *(uint32_t*)(o + 0x08) = nt->OptionalHeader.SizeOfStackReserve;
+    *(uint32_t*)(o + 0x0C) = nt->OptionalHeader.SizeOfStackCommit;
+    *(uint32_t*)(o + 0x10) = nt->OptionalHeader.Subsystem;
+    *(uint16_t*)(o + 0x14) = nt->OptionalHeader.MinorSubsystemVersion;
+    *(uint16_t*)(o + 0x16) = nt->OptionalHeader.MajorSubsystemVersion;
+    *(uint16_t*)(o + 0x1C) = nt->FileHeader.Characteristics;
+    *(uint16_t*)(o + 0x1E) = nt->OptionalHeader.DllCharacteristics;
+    *(uint16_t*)(o + 0x20) = nt->FileHeader.Machine;
+    o[0x22] = 1;
+    if (a[4]) MEM32(a[4]) = 0x30;
+    return 0;
+}
+
+/* \KnownDlls is the host's: its sections are the host's own system DLLs as
+ * images, which the guest must not map. Without it the loader searches the
+ * DLL path, which ends at the host system directory (proxies, above). */
+static uint32_t ovr_open_directory(uint32_t* a) {
+    int n;
+    const wchar_t* name = oa_name(a[2], &n);
+    if (n >= 10 && !_wcsnicmp(name, L"\\KnownDlls", 10)) return 0xC0000034u;     /* NAME_NOT_FOUND */
+    return native32_nt_forward("NtOpenDirectoryObject", a);
+}
+
+/* NtRaiseHardError(Status, NumberOfParameters, UnicodeStringMask, Parameters*,
+ * ResponseOption, Response*): the message box csrss would show, printed. */
+static uint32_t ovr_hard_error(uint32_t* a) {
+    fprintf(stderr, "[nt] hard error %08X", a[0]);
+    for (uint32_t i = 0; i < a[1] && i < 4 && a[3]; i++) {
+        uint32_t p = MEM32(a[3] + 4 * i);
+        if (a[2] & (1u << i)) fprintf(stderr, " \"%.*ls\"", MEM16(p) / 2, (wchar_t*)(uintptr_t)MEM32(p + 4));
+        else fprintf(stderr, " %08X", p);
+    }
+    fprintf(stderr, "\n");
+    if (a[5]) MEM32(a[5]) = 1;                        /* ResponseReturnToCaller */
+    return 0;
+}
+
+static uint32_t ovr_no_process(uint32_t* a) {
+    (void)a;
+    fprintf(stderr, "[guard] the guest tried to create a process: refused\n");
+    return 0xC0000022u;
+}
+
+/* ---- process start ------------------------------------------------------ */
 static void* load_file(const char* dir, const char* name) {
     char path[MAX_PATH];
     _snprintf(path, MAX_PATH - 1, "%s\\%s", dir, name);
@@ -213,38 +482,50 @@ static void ustr(uint8_t* at, const wchar_t* s, uint8_t** pool) {
     *pool += (n + 2 + 3) & ~3u;
 }
 
-static uint32_t guest(uint32_t ntdll, const char* fn, int n, const uint32_t* a) {
-    uint32_t va = native32_export(ntdll, fn);
-    if (!va) { fprintf(stderr, "[nt] ntdll has no %s\n", fn); return 0; }
-    native32_call_guest(va, n, a);
-    return g_eax;
+/* The OS version from the guest ntdll's VS_FIXEDFILEINFO: 5.0.2195 for
+ * Windows 2000 whatever its service pack. */
+static void ntdll_version(uint32_t ntdll, uint32_t* major, uint32_t* minor, uint32_t* build) {
+    uint32_t size = image_size(ntdll);
+    *major = 5, *minor = 0, *build = 2195;
+    for (uint32_t p = ntdll; p + 52 < ntdll + size; p += 4)
+        if (MEM32(p) == 0xFEEF04BDu) {
+            *major = MEM32(p + 8) >> 16, *minor = MEM32(p + 8) & 0xFFFF, *build = MEM32(p + 12) >> 16;
+            return;
+        }
 }
 
-static uint32_t g_preinit[8];
-static int g_npreinit;
-void native32_nt_preinit(uint32_t va) { if (g_npreinit < 8) g_preinit[g_npreinit++] = va; }
+void csr32_install(void);   /* csr32.c */
 
-uint32_t native32_nt_process(uint32_t ntdll, uint32_t image_base, const wchar_t* image_path,
-                             const wchar_t* cmdline, const char* nls_dir) {
+/* What the kernel hands a new process, then the guest's own process start:
+ * ntdll's LdrInitializeThunk does what LdrpInitializeProcess does on NT
+ * (heap, NLS, loader lists, the EXE's imports, every DllMain), and returns. */
+int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, const wchar_t* cmdline,
+                     const wchar_t* dll_path, const char* nls_dir, uint16_t csd) {
     uint8_t* peb = (uint8_t*)VirtualAlloc(NULL, 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     uint8_t* pp = peb + 0x1000;                       /* RTL_USER_PROCESS_PARAMETERS */
     uint8_t* pool = peb + 0x2000;                     /* its strings */
-    uint32_t* heaps = (uint32_t*)(peb + 0x800);
-    uint8_t* lock = peb + 0x900;                      /* FastPebLock, LoaderLock (24 bytes each) */
-    wchar_t cur[MAX_PATH], sysdir[MAX_PATH];
+    wchar_t cur[MAX_PATH];
+    uint32_t major, minor, build;
+    IMAGE_NT_HEADERS32* ent = (IMAGE_NT_HEADERS32*)(uintptr_t)(exe + MEM32(exe + 0x3C));
     native32_guest_peb = (uint32_t)(uintptr_t)peb;
     native32_nt_override("NtQueryInformationProcess", ovr_query_process);
     native32_nt_override("NtOpenSection", ovr_open_section);
+    native32_nt_override("NtCreateSection", ovr_create_section);
+    native32_nt_override("NtMapViewOfSection", ovr_map_view);
+    native32_nt_override("NtUnmapViewOfSection", ovr_unmap_view);
+    native32_nt_override("NtClose", ovr_close);
+    native32_nt_override("NtQuerySection", ovr_query_section);
+    native32_nt_override("NtOpenDirectoryObject", ovr_open_directory);
+    native32_nt_override("NtRaiseHardError", ovr_hard_error);
+    native32_nt_override("NtCreateProcess", ovr_no_process);
+    native32_nt_override("NtCreateProcessEx", ovr_no_process);
+    csr32_install();
 
-    /* PEB, NT 5.0 offsets */
-    *(uint32_t*)(peb + 0x08) = image_base;
+    /* PEB: the fields the kernel sets (NT 5 offsets). Ldr, the heap, the
+     * locks and the TLS bitmap are the guest ntdll's to make. */
+    ntdll_version(ntdll, &major, &minor, &build);
+    *(uint32_t*)(peb + 0x08) = exe;
     *(uint32_t*)(peb + 0x10) = (uint32_t)(uintptr_t)pp;
-    *(uint32_t*)(peb + 0x1C) = (uint32_t)(uintptr_t)lock;
-    *(uint32_t*)(peb + 0x20) = native32_export(ntdll, "RtlEnterCriticalSection");
-    *(uint32_t*)(peb + 0x24) = native32_export(ntdll, "RtlLeaveCriticalSection");
-    *(uint32_t*)(peb + 0x40) = (uint32_t)(uintptr_t)(peb + 0x600);   /* TlsBitmap -> RTL_BITMAP */
-    *(uint32_t*)(peb + 0x600) = 64;
-    *(uint32_t*)(peb + 0x604) = (uint32_t)(uintptr_t)(peb + 0x44);
     SYSTEM_INFO si;
     GetSystemInfo(&si);
     *(uint32_t*)(peb + 0x64) = si.dwNumberOfProcessors;
@@ -253,29 +534,40 @@ uint32_t native32_nt_process(uint32_t ntdll, uint32_t image_base, const wchar_t*
     *(uint32_t*)(peb + 0x7C) = 0x2000;                                /* HeapSegmentCommit */
     *(uint32_t*)(peb + 0x80) = 0x10000;
     *(uint32_t*)(peb + 0x84) = 0x1000;
-    *(uint32_t*)(peb + 0x8C) = 16;                                    /* MaximumNumberOfHeaps */
-    *(uint32_t*)(peb + 0x90) = (uint32_t)(uintptr_t)heaps;
-    *(uint32_t*)(peb + 0xA0) = (uint32_t)(uintptr_t)(lock + 0x20);    /* LoaderLock */
-    *(uint32_t*)(peb + 0xA4) = 5;                                     /* Windows 2000: 5.0.2195 */
-    *(uint32_t*)(peb + 0xA8) = 0;
-    *(uint16_t*)(peb + 0xAC) = 2195;
-    *(uint16_t*)(peb + 0xAE) = 0x0400;                                /* SP4 */
+    *(uint32_t*)(peb + 0xA4) = major;
+    *(uint32_t*)(peb + 0xA8) = minor;
+    *(uint16_t*)(peb + 0xAC) = (uint16_t)build;
+    *(uint16_t*)(peb + 0xAE) = csd;
     *(uint32_t*)(peb + 0xB0) = 2;                                     /* VER_PLATFORM_WIN32_NT */
-    *(uint32_t*)(peb + 0xB4) = 3;                                     /* ImageSubsystem: console */
-    *(uint32_t*)(peb + 0xB8) = 4;
+    *(uint32_t*)(peb + 0xB4) = ent->OptionalHeader.Subsystem;
+    *(uint32_t*)(peb + 0xB8) = ent->OptionalHeader.MajorSubsystemVersion;
+    *(uint32_t*)(peb + 0xBC) = ent->OptionalHeader.MinorSubsystemVersion;
+    {
+        DWORD session = 0;
+        ProcessIdToSessionId(GetCurrentProcessId(), &session);
+        *(uint32_t*)(peb + 0x1D4) = session;
+    }
 
-    /* Process parameters, normalized (absolute pointers) */
+    /* Process parameters, normalized, with the current directory's handle
+     * open the way the creating process leaves it. */
     GetCurrentDirectoryW(MAX_PATH - 1, cur);
     if (cur[wcslen(cur) - 1] != L'\\') wcscat(cur, L"\\");
-    GetSystemDirectoryW(sysdir, MAX_PATH);
     *(uint32_t*)(pp + 0x00) = 0x1000;
     *(uint32_t*)(pp + 0x04) = 0x2A0;
     *(uint32_t*)(pp + 0x08) = 1;                                      /* RTL_USER_PROC_PARAMS_NORMALIZED */
     *(uint32_t*)(pp + 0x18) = (uint32_t)(uintptr_t)GetStdHandle(STD_INPUT_HANDLE);
     *(uint32_t*)(pp + 0x1C) = (uint32_t)(uintptr_t)GetStdHandle(STD_OUTPUT_HANDLE);
     *(uint32_t*)(pp + 0x20) = (uint32_t)(uintptr_t)GetStdHandle(STD_ERROR_HANDLE);
+    /* CurrentDirectory.DosPath: a MAX_PATH buffer, as RtlCreateProcessParameters
+     * makes it. RtlSetCurrentDirectory_U writes the new path into it in place;
+     * sized to the first path, every longer one (`cd work`) failed with
+     * ERROR_INVALID_NAME and `cd ..` worked. */
     ustr(pp + 0x24, cur, &pool);
-    ustr(pp + 0x30, sysdir, &pool);
+    *(uint16_t*)(pp + 0x26) = MAX_PATH * 2;
+    pool += MAX_PATH * 2;
+    *(uint32_t*)(pp + 0x2C) = (uint32_t)(uintptr_t)CreateFileW(cur, FILE_TRAVERSE | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    ustr(pp + 0x30, dll_path, &pool);
     ustr(pp + 0x38, image_path, &pool);
     ustr(pp + 0x40, cmdline, &pool);
     {
@@ -292,7 +584,7 @@ uint32_t native32_nt_process(uint32_t ntdll, uint32_t image_base, const wchar_t*
     ustr(pp + 0x80, L"", &pool);
     ustr(pp + 0x88, L"", &pool);
 
-    /* NLS: the guest's own code page and case tables */
+    /* The NLS tables the kernel maps into every process: the guest's own. */
     void* ansi = load_file(nls_dir, "c_1252.nls");
     void* oem = load_file(nls_dir, "c_437.nls");
     void* casetab = load_file(nls_dir, "l_intl.nls");
@@ -300,90 +592,22 @@ uint32_t native32_nt_process(uint32_t ntdll, uint32_t image_base, const wchar_t*
     *(uint32_t*)(peb + 0x58) = (uint32_t)(uintptr_t)ansi;
     *(uint32_t*)(peb + 0x5C) = (uint32_t)(uintptr_t)oem;
     *(uint32_t*)(peb + 0x60) = (uint32_t)(uintptr_t)casetab;
-    {
-        static uint8_t info[0x80];                                    /* NLSTABLEINFO */
-        uint32_t a[4] = { (uint32_t)(uintptr_t)ansi, (uint32_t)(uintptr_t)oem, (uint32_t)(uintptr_t)casetab,
-                          (uint32_t)(uintptr_t)info };
-        guest(ntdll, "RtlInitNlsTables", 4, a);
-        a[0] = (uint32_t)(uintptr_t)info;
-        guest(ntdll, "RtlResetRtlTranslations", 1, a);
-    }
-    /* LdrpInitializeProcess's own unexported steps before the heap, by
-     * address (the host finds them; NT 5.0: RtlpInitDeferedCriticalSection,
-     * which seeds the critical sections' debug-info pool). */
-    for (int i = 0; i < g_npreinit; i++) native32_call_guest(g_preinit[i], 0, NULL);
-    {
-        uint32_t a[6] = { 0x00000002u /* HEAP_GROWABLE */, 0, 0, 0, 0, 0 };
-        uint32_t h = guest(ntdll, "RtlCreateHeap", 6, a);
-        *(uint32_t*)(peb + 0x18) = h;
-        fprintf(stderr, "[nt] guest PEB %p, process heap %08X\n", peb, h);
-        if (!h) return 0;
-    }
-    /* after the heap: a critical section's debug info comes from it */
-    {
-        uint32_t a[1] = { (uint32_t)(uintptr_t)lock };
-        guest(ntdll, "RtlInitializeCriticalSection", 1, a);
-        a[0] = (uint32_t)(uintptr_t)(lock + 0x20);
-        guest(ntdll, "RtlInitializeCriticalSection", 1, a);
-    }
-    return (uint32_t)(uintptr_t)peb;
-}
 
-/* ---- loader data: the modules the host mapped, as ntdll's loader keeps them
- * PEB_LDR_DATA (NT 5): 0x0C InLoadOrder, 0x14 InMemoryOrder, 0x1C InInitializationOrder.
- * LDR_DATA_TABLE_ENTRY: links at 0x00/0x08/0x10, DllBase 0x18, EntryPoint
- * 0x1C, SizeOfImage 0x20, FullDllName 0x24, BaseDllName 0x2C, Flags 0x34,
- * LoadCount 0x38, HashLinks 0x3C, TimeDateStamp 0x44. */
-static void list_init(uint8_t* head) { MEM32((uint32_t)(uintptr_t)head) = MEM32((uint32_t)(uintptr_t)head + 4) = (uint32_t)(uintptr_t)head; }
-
-static void list_tail(uint8_t* head, uint8_t* e) {
-    uint32_t h = (uint32_t)(uintptr_t)head, x = (uint32_t)(uintptr_t)e, last = MEM32(h + 4);
-    MEM32(x) = h;
-    MEM32(x + 4) = last;
-    MEM32(last) = x;
-    MEM32(h + 4) = x;
-}
-
-static uint32_t g_insert_fn;
-void native32_nt_loader(uint32_t hash_table, uint32_t insert_fn) {
-    for (int i = 0; i < 32; i++) list_init((uint8_t*)(uintptr_t)(hash_table + 8 * i));
-    g_insert_fn = insert_fn;
-}
-
-void native32_nt_module(uint32_t base, const wchar_t* path) {
-    uint8_t* peb = (uint8_t*)(uintptr_t)native32_guest_peb;
-    uint8_t* ldr = (uint8_t*)(uintptr_t)MEM32(native32_guest_peb + 0x0C);
-    if (!ldr) {
-        ldr = (uint8_t*)calloc(1, 0x30);
-        *(uint32_t*)ldr = 0x28;
-        ldr[4] = 1;
-        list_init(ldr + 0x0C); list_init(ldr + 0x14); list_init(ldr + 0x1C);
-        *(uint32_t*)(peb + 0x0C) = (uint32_t)(uintptr_t)ldr;
-    }
-    uint8_t* b = (uint8_t*)(uintptr_t)base;
-    IMAGE_NT_HEADERS32* nt = (IMAGE_NT_HEADERS32*)(b + ((IMAGE_DOS_HEADER*)b)->e_lfanew);
-    int dll = (nt->FileHeader.Characteristics & IMAGE_FILE_DLL) != 0;
-    uint8_t* e = (uint8_t*)calloc(1, 0x50);
-    uint8_t* pool = (uint8_t*)calloc(1, (wcslen(path) + 1) * 2 + 8);
-    const wchar_t* name = wcsrchr(path, L'\\');
-    name = name ? name + 1 : path;
-    *(uint32_t*)(e + 0x18) = base;
-    *(uint32_t*)(e + 0x1C) = nt->OptionalHeader.AddressOfEntryPoint ? base + nt->OptionalHeader.AddressOfEntryPoint : 0;
-    *(uint32_t*)(e + 0x20) = nt->OptionalHeader.SizeOfImage;
-    ustr(e + 0x24, path, &pool);
-    *(uint16_t*)(e + 0x2C) = (uint16_t)(wcslen(name) * 2);           /* BaseDllName: the tail of FullDllName */
-    *(uint16_t*)(e + 0x2E) = (uint16_t)(wcslen(name) * 2 + 2);
-    *(uint32_t*)(e + 0x30) = *(uint32_t*)(e + 0x28) + (uint32_t)((name - path) * 2);
-    *(uint32_t*)(e + 0x34) = (dll ? 0x4u : 0) | 0x4000u | 0x80000u;   /* IMAGE_DLL, ENTRY_PROCESSED, PROCESS_ATTACH_CALLED */
-    *(uint16_t*)(e + 0x38) = 0xFFFF;                                  /* static: never unloaded */
-    list_init(e + 0x3C);
-    *(uint32_t*)(e + 0x44) = nt->FileHeader.TimeDateStamp;
-    if (g_insert_fn) {           /* the guest's own: hash table, load and memory order */
-        uint32_t a = (uint32_t)(uintptr_t)e;
-        native32_call_guest(g_insert_fn, 1, &a);
-    } else {
-        list_tail(ldr + 0x0C, e);
-        list_tail(ldr + 0x14, e + 0x08);
-    }
-    if (dll) list_tail(ldr + 0x1C, e + 0x10);
+    /* LdrInitializeThunk(NormalContext, SystemArgument1 = ntdll's base,
+     * SystemArgument2) with the thread's initial CONTEXT right after, as
+     * KiUserApcDispatcher calls it; NT 5 takes the context at esp + 0x10. */
+    uint32_t thunk = native32_export(ntdll, "LdrInitializeThunk");
+    if (!thunk) { fprintf(stderr, "[nt] ntdll has no LdrInitializeThunk\n"); return 0; }
+    uint32_t args[3 + 0x2CC / 4] = { 0, ntdll, 0 };
+    uint32_t* ctx = args + 3;
+    ctx[0] = 0x10007;                                                 /* CONTEXT_FULL */
+    ctx[0xB0 / 4] = exe + ent->OptionalHeader.AddressOfEntryPoint;    /* Eax: the image's entry */
+    ctx[0xB8 / 4] = exe + ent->OptionalHeader.AddressOfEntryPoint;    /* Eip */
+    mach_enter();
+    uint32_t sp = g_esp;
+    native32_call_guest(thunk, (int)(sizeof args / 4), args);
+    g_esp = sp;
+    mach_leave();
+    fprintf(stderr, "[nt] guest PEB %p, process heap %08X: the guest's loader is done\n", peb, MEM32(native32_guest_peb + 0x18));
+    return MEM32(native32_guest_peb + 0x18) != 0;
 }
