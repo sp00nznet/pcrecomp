@@ -60,7 +60,10 @@ static uint32_t base_static_server_data(void) {
     if (MEM16(native32_guest_peb + 0xAE) >> 8)
         _snwprintf((wchar_t*)(d + 0x22), 127, L"Service Pack %u", MEM16(native32_guest_peb + 0xAE) >> 8);
     qsi(0, d + 0x124, 0x2C, NULL);        /* SystemBasicInformation */
-    qsi(3, d + 0x150, 0x20, NULL);        /* SystemTimeOfDayInformation */
+    qsi(3, d + 0x150, 0x30, NULL);        /* SystemTimeOfDayInformation */
+    /* IniFileMapping (0x180, after a 0x30-byte time of day): basesrv's map of .ini sections to registry
+     * keys. Empty: the profile APIs (calc's GetProfileIntW) use the files. */
+    *(uint32_t*)(d + 0x180) = (uint32_t)(uintptr_t)calloc(1, 0x40);
     /* Before build 2195 (2163, a release candidate) kernel32 reads the user's
      * NLS settings from an NLS_USER_INFO inside this data, at 0x184;
      * UserLocaleId is its +0x1860. 2195 asks basesrv instead (api 26). */

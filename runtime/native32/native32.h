@@ -228,6 +228,12 @@ void native32_input_mouse(int dx, int dy, int dz);
 void native32_input_button(int b, int down);
 void native32_input_key(int dik, int down);
 
+/* A look at every Windows -> guest call (a window procedure, a hook, ...):
+ * in, at the guest stack's copy of its arguments before it runs; out, at
+ * them and its result after. A filter may change both. */
+extern void (*native32_cb_in)(uint32_t* args);
+extern void (*native32_cb_out)(uint32_t* args, uint32_t* eax);
+
 /* Diagnostics: set before running. */
 extern int native32_trace_native;     /* one line per native call */
 extern int native32_trace_callbacks;  /* one line per Windows -> guest call */
@@ -290,6 +296,8 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
  * services are logged and return 0; a host answers by name. */
 int native32_nt_win32k(const uint32_t* bases, int nbases, const char* names_file);
 void native32_nt_win32k_override(const char* name, native32_syscall_fn fn);
+/* Called before every win32k service, as win32k flushes GDI's TEB batch on entry. */
+extern void (*native32_win32k_pre)(void);
 /* A user-mode callback, as win32k makes one (KeUserModeCallback): the guest
  * ntdll's KiUserCallbackDispatcher runs KernelCallbackTable[api](in, len);
  * returns its status, and the NtCallbackReturn output. */

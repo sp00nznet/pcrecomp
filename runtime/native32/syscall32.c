@@ -282,7 +282,7 @@ static const struct { const char* name; void* fn; } g_deny[] = {
 /* Host functions a host puts in place of a proxied export (native32_nt_proxy_hook):
  * the same signature, usually calling the real one and noting its result
  * (w32kgdi.c registers the HDC host user32's BeginPaint returns). */
-#define MAX_HOOKS 32
+#define MAX_HOOKS 96
 static struct { const char* name; void* fn; } g_hook[MAX_HOOKS];
 static int g_nhook;
 void native32_nt_proxy_hook(const char* name, void* fn) {
@@ -527,8 +527,11 @@ void native32_nt_win32k_override(const char* name, native32_syscall_fn fn) {
     fprintf(stderr, "[win32k] no service named %s\n", name);
 }
 
+void (*native32_win32k_pre)(void);   /* before every win32k service (GDI's TEB batch) */
+
 static uint32_t win32k_call(uint32_t svc, uint32_t* args) {
     int i = (int)(svc - 0x1000);
+    if (native32_win32k_pre) native32_win32k_pre();
     if (i < 0 || i >= W32K_MAX) return 0xC000001Cu;                       /* STATUS_INVALID_SYSTEM_SERVICE */
     uint32_t r = g_w32k[i].fn ? g_w32k[i].fn(args) : 0;
     if (g_trace || (!g_w32k[i].fn && !g_w32k[i].seen)) {

@@ -1493,6 +1493,12 @@ static struct recomp_ehframe* eh32_frames(void);
  * by a throw: the purge it had the last time it returned. */
 static struct { uint32_t va, purge; } cb_purge[1024];
 
+/* native32_cb_in/out: a host's look at every Windows -> guest call, on the
+ * guest stack's copy of its arguments (in) and at its result (out): w32kgdi
+ * translates the GDI handles window messages carry. NULL by default. */
+void (*native32_cb_in)(uint32_t* args);
+void (*native32_cb_out)(uint32_t* args, uint32_t* eax);
+
 static uint64_t __cdecl cb_run(uint32_t va, uint32_t* sp, uint32_t ecx, uint32_t* purge_out) {
     recomp_func_t f = IS_SHIM_VA(va) ? recomp_lookup_import(va) : recomp_lookup(va);
     if (native32_trace_callbacks)
@@ -1520,9 +1526,12 @@ static uint64_t __cdecl cb_run(uint32_t va, uint32_t* sp, uint32_t ecx, uint32_t
     guard.frames = eh32_frames();
     t_cb_guard = &guard;
     uint32_t eax, edx, purge, slot = (va >> 2) & 1023;
+    uint32_t* cb_args = (uint32_t*)(uintptr_t)(before + 4);
+    if (native32_cb_in) native32_cb_in(cb_args);
     if (!setjmp(guard.jb)) {
         f();
         eax = g_eax, edx = g_edx, purge = g_esp - before - 4;
+        if (native32_cb_out) native32_cb_out(cb_args, &eax);
         cb_purge[slot].va = va, cb_purge[slot].purge = purge;
     } else {
         /* ponytail: a callback never seen to return is assumed stdcall with
