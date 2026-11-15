@@ -1151,6 +1151,37 @@ def eh_entries(read, code_start, code_end):
     return out
 
 
+def seh_entries(read, code_start, code_end):
+    """__try/__except/__finally code (_except_handler3) that only a scope
+    table names: entries to seed.
+
+    The frame prologue `push -1; push scopetable; push handler; mov eax,
+    fs:[0]` names a table of (enclosing level, filter, handler). Filters and
+    __finally blocks (filter 0) are called -- by the handler, by
+    _local_unwind2 -- and return, so each is an entry that runs on its
+    parent's ebp. An __except block is a resume point of its function (eh32),
+    not an entry. Windows 2000's RtlSetCurrentDirectory_U has a __finally
+    nothing else names; unseeded, `cd` in cmd.exe failed with an unresolved
+    indirect call.
+    """
+    text = read(code_start, code_end - code_start) or b""
+    def dword(va):
+        raw = read(va, 4)
+        return int.from_bytes(raw, "little") if raw and len(raw) == 4 else 0
+    out = set()
+    for m in re.finditer(rb"\x6A\xFF\x68(.{4})\x68(.{4})\x64\xA1\x00\x00\x00\x00", text, re.S):
+        table = int.from_bytes(m.group(1), "little")
+        for k in range(64):
+            enclosing, flt, handler = dword(table + 12 * k), dword(table + 12 * k + 4), dword(table + 12 * k + 8)
+            if not (enclosing == 0xFFFFFFFF or enclosing < k) or not code_start <= handler < code_end:
+                break
+            if flt and code_start <= flt < code_end:
+                out.add(flt)
+            elif not flt:
+                out.add(handler)
+    return out
+
+
 def interior_starts(functions, protected=frozenset(), weak=frozenset()):
     """Starts that are really labels inside another function's body.
 
@@ -2068,6 +2099,10 @@ def main(argv=None):
         print(f"[*] {len(doc)} seeds from {args.seed_functions}")
 
     dis = Disassembler(pe_data, info.image_base, info.sections)
+    seh = seh_entries(dis.read_bytes, info.code_start, info.code_end) - seeds
+    if seh:
+        print(f"[*] {len(seh)} SEH filters and __finally blocks seeded")
+    seeds |= seh
     # This CLI exports a catalog and never lifts, so it is the caller that can
     # afford to let the operand lists go -- which is where the memory went on a
     # multi-megabyte image.
