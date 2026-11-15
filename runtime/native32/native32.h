@@ -51,6 +51,11 @@ void native32_set_codepage(unsigned cp);
  * name never sees. Call before native32_bind; up to 32. */
 void native32_redirect(const char* name, void* fn);
 
+/* The guest's command line ("winmine.exe -x"), not the host's flags:
+ * GetCommandLineA/W and the host msvcrt's __getmainargs/__wgetmainargs
+ * answer it (cmdline32.c). Call before native32_bind; uses 4 redirects. */
+void native32_set_command_line(const char* line);
+
 /* Serve the registry subtrees a .reg file names (regedit 4: [HKEY_...\path]
  * sections, "name"="text", dword:, hex:) from that file instead of the real
  * registry: the guest's RegOpenKey/RegCreateKey/RegQueryValueEx/RegSetValueEx
@@ -109,7 +114,9 @@ int native32_require_color_depth(int bpp);
 uint32_t native32_map(const char* path, uint32_t base);
 
 /* Fill a mapped module's IAT the way the Windows loader would: shims first
- * (by name, or "<dll>#<ordinal>"), then LoadLibrary + GetProcAddress. Returns unresolved count. */
+ * (by name, or "<dll>#<ordinal>"), then LoadLibrary + GetProcAddress. A shim named
+ * "<dll>!<name>" ("NTDLL.DLL!CsrClientCallServer", DLL any case) also replaces
+ * that export of a GUEST module; a plain name never does. Returns unresolved count. */
 int native32_bind(uint32_t base, native32_shim_t* shims, int nshims);
 
 /* A mapped guest module by file name ("Golf.exe", or a path ending in one;
@@ -239,5 +246,46 @@ int native32_attach(uint32_t base);
 int native32_attach_imports(uint32_t base);
 native32_module_t* native32_module_by_name(const char* path);
 native32_module_t* native32_module_by_base(uint32_t base);
+
+/* ---- syscall32.c: a lifted Windows NT userland on the host's kernel ------
+ * The guest's own ntdll (and kernel32 ... on it) is lifted like any module;
+ * its system call gate (int 2Eh, lifted to recomp_syscall) is the only
+ * boundary. The service numbers are the guest ntdll's own, read from its
+ * NtXxx export stubs (mov eax, N; ...; int 2Eh; ret 4*argc), so the table
+ * needs no symbols; a backend maps each service by NAME to the host (on
+ * Windows: the host ntdll's export of that name, with per-service fixups).
+ *   native32_nt_syscalls(ntdll_base)      -- after native32_map, before running
+ *   native32_nt_process(...)              -- an NT 5 PEB + process parameters,
+ *                                            the guest's NLS tables and heap
+ * NATIVE32_SYSCALLS=1 traces every call. */
+extern uint32_t native32_guest_peb;
+int native32_nt_syscalls(uint32_t ntdll_base);
+typedef uint32_t (*native32_syscall_fn)(uint32_t* args);
+void native32_nt_override(const char* name, native32_syscall_fn fn);
+uint32_t native32_nt_forward(const char* name, uint32_t* args);
+/* csr32.c: csrss for the guest. Put both in the host's shim array (they
+ * replace the guest ntdll's CsrClient* exports); api handlers get the
+ * message's data (msg + 0x28) and the capture buffer and return the status. */
+extern native32_shim_t native32_csr_shims[2];
+typedef uint32_t (*native32_csr_api_fn)(uint32_t data, uint32_t capture);
+void native32_csr_api(uint32_t number, native32_csr_api_fn fn);
+/* A guest function (no arguments) native32_nt_process runs before it makes
+ * the heap: the loader's own unexported init steps. Up to 8. */
+void native32_nt_preinit(uint32_t va);
+/* A named section the guest opens that a server process of its own OS would
+ * have created (csrss's \NLS\NlsSection* for kernel32): NtOpenSection on
+ * that name returns a read-only section of the file. */
+void native32_nt_section_file(const wchar_t* name, const wchar_t* file);
+/* Register a mapped module in the guest PEB's loader lists (call after
+ * native32_nt_process, the EXE first): GetModuleHandle, GetModuleFileName
+ * and GetProcAddress in a lifted kernel32 walk them. */
+void native32_nt_module(uint32_t base, const wchar_t* path);
+/* The guest ntdll's loader hash table (32 LIST_ENTRY heads) and its
+ * LdrpInsertMemoryTableEntry(entry): unexported, so the host names them.
+ * With them native32_nt_module inserts the way ntdll does, and LdrGetDllHandle
+ * finds the module. Call before native32_nt_module. */
+void native32_nt_loader(uint32_t hash_table, uint32_t insert_fn);
+uint32_t native32_nt_process(uint32_t ntdll, uint32_t image_base, const wchar_t* image_path,
+                             const wchar_t* cmdline, const char* nls_dir);
 
 #endif

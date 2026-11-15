@@ -91,6 +91,7 @@ static int g_tls_n;
 /* A guest thread's TIB. Lifted code reads fs:[n] as MEM32(g_fs_base + n); the
  * real TEB stays the host's, so a guest SEH frame never lands on a chain
  * Windows walks. The PEB is the real one: code that reads fs:[30h] wants it. */
+uint32_t native32_guest_peb;   /* syscall32.c: a lifted ntdll's own PEB */
 static uint32_t make_tib(uint32_t lo, uint32_t hi) {
     uint32_t* t = (uint32_t*)VirtualAlloc(NULL, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     t[0] = 0xFFFFFFFFu;                          /* ExceptionList: end of chain */
@@ -99,6 +100,16 @@ static uint32_t make_tib(uint32_t lo, uint32_t hi) {
     t[0x18 / 4] = (uint32_t)(uintptr_t)t;        /* Self                        */
     t[0x24 / 4] = GetCurrentThreadId();
     t[0x30 / 4] = __readfsdword(0x30);
+    if (native32_guest_peb) {
+        /* A lifted NT userland (ntdll + kernel32) reads its own PEB and the
+         * TEB fields NT 5 has: ClientId, the static Unicode string the A
+         * functions convert into, the deallocation stack. */
+        t[0x30 / 4] = native32_guest_peb;
+        t[0x20 / 4] = GetCurrentProcessId();
+        t[0xBF8 / 4] = 0x020A0000u;                       /* Length 0, MaximumLength 0x20A */
+        t[0xBFC / 4] = (uint32_t)(uintptr_t)t + 0xC00;    /* -> StaticUnicodeBuffer */
+        t[0xE0C / 4] = lo;                                /* DeallocationStack */
+    }
     if (g_tls_n) {
         uint32_t* slots = (uint32_t*)calloc(MAX_TLS, 4);
         for (int i = 0; i < g_tls_n; i++) {
@@ -450,7 +461,24 @@ uint32_t native32_export(uint32_t base, const char* name) {
     else
         for (uint32_t i = 0; i < e->NumberOfNames; i++)
             if (!strcmp((const char*)(b + names[i]), name)) { idx = ords[i]; break; }
-    return idx < e->NumberOfFunctions && funcs[idx] ? base + funcs[idx] : 0;
+    if (idx >= e->NumberOfFunctions || !funcs[idx]) return 0;
+    /* A forwarder ("NTDLL.RtlAllocateHeap", "NTDLL.#12"): the RVA points into
+     * the export directory at that string. Followed to a guest module of that
+     * name, else to the host's DLL (Windows 2000's kernel32 HeapAlloc). */
+    if (funcs[idx] >= dd.VirtualAddress && funcs[idx] < dd.VirtualAddress + dd.Size) {
+        char dll[MAX_PATH];
+        const char* fwd = (const char*)(b + funcs[idx]);
+        const char* dot = strrchr(fwd, '.');
+        if (!dot || dot - fwd > MAX_PATH - 5) return 0;
+        _snprintf(dll, MAX_PATH - 1, "%.*s.dll", (int)(dot - fwd), fwd);
+        dll[MAX_PATH - 1] = 0;
+        const char* sym = dot[1] == '#' ? (const char*)(uintptr_t)strtoul(dot + 2, NULL, 10) : dot + 1;
+        uint32_t g = native32_module(dll);
+        if (g) return native32_export(g, sym);
+        HMODULE h = LoadLibraryA(dll);
+        return h ? (uint32_t)(uintptr_t)GetProcAddress(h, sym) : 0;
+    }
+    return base + funcs[idx];
 }
 
 /* ---------------------------------------------------------------- names */
@@ -1268,6 +1296,9 @@ X87CRT(adj_fprem) X87CRT(adj_fprem1) X87CRT(adj_fptan) X87CRT(adj_fpatan)
 /* native32_set_codepage: the guest's ANSI code page (codepage.c). */
 #include "codepage.c"
 
+/* native32_set_command_line: the guest's argv, not the host's flags. */
+#include "cmdline32.c"
+
 /* native32_registry: the guest's own registry subtrees, from a .reg file. */
 #include "reg32.c"
 
@@ -1370,6 +1401,18 @@ int native32_bind(uint32_t base, native32_shim_t* shims, int nshims) {
             char ordname[MAX_PATH + 8];
             if (by_ord) _snprintf(ordname, sizeof ordname, "%s#%u", dll, *ilt & 0xFFFF);
             uint32_t va = 0;
+            /* "<dll>!<name>" replaces that export even of a GUEST module: a
+             * lifted ntdll's CsrClient* are answered by the host, not by
+             * csrss (win2000). A plain name never shims a guest import. */
+            if (!by_ord) {
+                size_t dl = strlen(dll);
+                for (int i = 0; !va && i < nshims; i++)
+                    if (!_strnicmp(shims[i].name, dll, dl) && shims[i].name[dl] == '!' &&
+                        !strcmp(shims[i].name + dl + 1, nm)) {
+                        va = shims[i].va;
+                        shimmed++;
+                    }
+            }
             for (int i = 0; !guest && !va && i < nshims; i++)
                 if (by_ord ? !_stricmp(shims[i].name, ordname) : !strcmp(shims[i].name, nm)) {
                     va = shims[i].va;
