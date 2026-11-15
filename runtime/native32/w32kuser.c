@@ -80,6 +80,17 @@ static uint8_t* desk_alloc(uint32_t n) {
 static HWND g_wnds[MAX_WNDS];
 static int g_nwnds;
 uint8_t* native32_user_wnd(void* hv);
+static LRESULT CALLBACK wnd_thunk(HWND h, UINT m, WPARAM w, LPARAM l);
+/* the guest's window procedure of each class registered (the host class has
+ * wnd_thunk in its place) */
+#define MAX_CLASSES 256
+static struct { ATOM atom; uint32_t proc; } g_cls[MAX_CLASSES];
+static int g_ncls;
+static uint32_t class_proc(HWND h) {
+    ATOM a = (ATOM)GetClassWord(h, GCW_ATOM);
+    for (int i = 0; i < g_ncls; i++) if (g_cls[i].atom == a) return g_cls[i].proc;
+    return 0;
+}
 static void wnd_sync(HWND h, uint8_t* w) {
     RECT r;
     POINT o = { 0, 0 };
@@ -127,6 +138,7 @@ uint8_t* native32_user_wnd(void* hv) {
      * The guest's own for its classes; a host procedure is called through the
      * bridge like any host function. */
     *(uint32_t*)(w + 0x5C) = (uint32_t)GetWindowLongPtrW(h, GWLP_WNDPROC);
+    if (*(uint32_t*)(w + 0x5C) == (uint32_t)(uintptr_t)wnd_thunk) *(uint32_t*)(w + 0x5C) = class_proc(h);
     /* +0x88 cbwndExtra (a dialog's must be DLGWINDOWEXTRA); the extra bytes
      * follow the WND at +0x9C (a dialog's: its DIALOG structure) */
     *(uint32_t*)(w + 0x88) = (uint32_t)GetClassLongW(h, GCL_CBWNDEXTRA);
@@ -233,10 +245,60 @@ static uint32_t s_register_class(uint32_t* a) {
         w.hbrBackground = (HBRUSH)(uintptr_t)native32_gdi_host((uint32_t)(uintptr_t)w.hbrBackground);
     if (getenv("NATIVE32_SYSCALLS"))
         fprintf(stderr, "[user] class background %p (guest %08X)\n", w.hbrBackground, ((WNDCLASSEXW*)(uintptr_t)a[0])->hbrBackground);
+    uint32_t guest_proc = (uint32_t)(uintptr_t)w.lpfnWndProc;
+    w.lpfnWndProc = wnd_thunk;
     ATOM r = RegisterClassExW(&w);
+    if (r && g_ncls < MAX_CLASSES) g_cls[g_ncls].atom = r, g_cls[g_ncls++].proc = guest_proc;
     if (!r) fprintf(stderr, "[user] RegisterClassExW %ls failed: %lu\n",
                     (uintptr_t)w.lpszClassName < 0x10000 ? L"(atom)" : w.lpszClassName, GetLastError());
     return r;
+}
+
+/* ---- messages: win32k's callback ------------------------------------------
+ * A message the host sends a guest window reaches its procedure the way
+ * Windows 2000's win32k delivers it: KeUserModeCallback(__fnDWORD, FNDWORDMSG
+ * { pwnd, msg, wParam, lParam, xParam = the procedure, xpfnProc =
+ * DispatchClientMessage }) through the guest ntdll's KiUserCallbackDispatcher
+ * and user32's own __fnDWORD (KernelCallbackTable[2]), which returns the
+ * result with NtCallbackReturn. DispatchClientMessage(pwnd, msg, w, l, pfn)
+ * takes the HWND from CLIENTINFO's CallbackWnd (TEB+0x6F4), set first.
+ * ponytail: every message through the generic DWORD layout; win32k's
+ * per-message ones (__fnINLPCREATESTRUCT, __fnINSTRING, ...) copy and convert
+ * A/W, which a flat in-process address space does not need yet. */
+static uint32_t g_dcm;        /* user32's DispatchClientMessage */
+static uint32_t find_dcm(void) {
+    /* It is in no export and no code names it: only PFNCLIENT (apfnClientA /
+     * apfnClientW, user32's data, handed to win32k by csrss) holds it, at
+     * +0x24 from pfnDialogWndProc, the same in both. */
+    uint32_t u = native32_module("user32.dll"), da, dw;
+    if (!u) return 0;
+    da = native32_export(u, "DefDlgProcA"), dw = native32_export(u, "DefDlgProcW");
+    uint32_t size = MEM32(u + MEM32(u + 0x3C) + 0x50);
+    for (uint32_t o = 0x1000; o + 0x28 < size; o += 4)
+        if (MEM32(u + o) == dw)
+            for (uint32_t p = 0x1000; p + 0x28 < size; p += 4)
+                if (MEM32(u + p) == da && MEM32(u + p + 0x24) == MEM32(u + o + 0x24)) return MEM32(u + o + 0x24);
+    return 0;
+}
+static LRESULT CALLBACK wnd_thunk(HWND h, UINT m, WPARAM w, LPARAM l) {
+    uint8_t* pw = native32_user_wnd(h);
+    uint32_t pfn = pw ? *(uint32_t*)(pw + 0x5C) : 0, args[4] = { (uint32_t)(uintptr_t)h, m, (uint32_t)w, (uint32_t)l };
+    uint32_t teb, oh, op, out = 0, outlen = 0, r = 0;
+    if (!g_dcm && (g_dcm = find_dcm()) != 0 && getenv("NATIVE32_SYSCALLS"))
+        fprintf(stderr, "[user] messages through KiUserCallbackDispatcher, DispatchClientMessage %08X\n", g_dcm);
+    if (!pfn || !g_dcm) return DefWindowProcW(h, m, w, l);
+    if (native32_cb_in) native32_cb_in(args);   /* (as the bridge would: the WND, GDI handles) */
+    teb = MEM32(g_fs_base + 0x18), oh = MEM32(teb + 0x6F4), op = MEM32(teb + 0x6F8);
+    MEM32(teb + 0x6F4) = args[0], MEM32(teb + 0x6F8) = (uint32_t)(uintptr_t)pw;
+    {
+        uint32_t msg[6] = { (uint32_t)(uintptr_t)pw, args[1], args[2], args[3], pfn, g_dcm };
+        uint32_t st = native32_nt_callback(2, (uint32_t)(uintptr_t)msg, sizeof msg, &out, &outlen);
+        if (st == 0 && out && outlen >= 4) r = MEM32(out);
+        else if (st) fprintf(stderr, "[user] callback for message 0x%X: status %08X\n", m, st);
+    }
+    MEM32(teb + 0x6F4) = oh, MEM32(teb + 0x6F8) = op;
+    if (native32_cb_out) native32_cb_out(args, &r);
+    return (LRESULT)r;
 }
 
 /* NtUserCreateWindowEx(exstyle, LARGE_STRING* class, LARGE_STRING* name, style,
@@ -403,7 +465,7 @@ static uint32_t s_hwnd_param(uint32_t* a) {
         *(uint32_t*)(w + 0x9C) = a[1];
         w[0x16] |= 1;
         if (ddp) {
-            SetWindowLongPtrW((HWND)(uintptr_t)a[0], GWLP_WNDPROC, (LONG_PTR)ddp);
+            SetWindowLongPtrW((HWND)(uintptr_t)a[0], GWLP_WNDPROC, (LONG_PTR)wnd_thunk);
             *(uint32_t*)(w + 0x5C) = ddp;
         }
         return 1;
