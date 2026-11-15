@@ -122,6 +122,8 @@ static uint32_t s_register_class(uint32_t* a) {
     if (a[2]) w.lpszMenuName = (LPCWSTR)(uintptr_t)MEM32(a[2] + 4);   /* pwszClientUnicodeMenuName */
     if ((uintptr_t)w.hbrBackground > 0x40 && native32_gdi_host((uint32_t)(uintptr_t)w.hbrBackground))
         w.hbrBackground = (HBRUSH)(uintptr_t)native32_gdi_host((uint32_t)(uintptr_t)w.hbrBackground);
+    if (getenv("NATIVE32_SYSCALLS"))
+        fprintf(stderr, "[user] class background %p (guest %08X)\n", w.hbrBackground, ((WNDCLASSEXW*)(uintptr_t)a[0])->hbrBackground);
     ATOM r = RegisterClassExW(&w);
     if (!r) fprintf(stderr, "[user] RegisterClassExW %ls failed: %lu\n",
                     (uintptr_t)w.lpszClassName < 0x10000 ? L"(atom)" : w.lpszClassName, GetLastError());
@@ -146,9 +148,88 @@ static uint32_t s_accel(uint32_t* a) { return (uint32_t)(uintptr_t)CreateAcceler
  * DefWindowProc's: the host's. */
 static uint32_t s_message_call(uint32_t* a) {
     HWND h = (HWND)(uintptr_t)a[0];
+    /* a DC the guest got in the message (WM_ERASEBKGND, WM_CTLCOLOR*, ...)
+     * goes back to the host as the host's */
+    if (a[2] && ((a[2] >> 16) & 0x1F) == 1 && native32_gdi_host(a[2])) a[2] = native32_gdi_host(a[2]);
     if (a[5] == 0x29E) return (uint32_t)(a[6] ? DefWindowProcA(h, a[1], a[2], a[3]) : DefWindowProcW(h, a[1], a[2], a[3]));
     fprintf(stderr, "[user] NtUserMessageCall fnid 0x%X (msg 0x%X) not answered\n", a[5], a[1]);
     return 0;
+}
+
+/* Any USER object a guest handle should validate as: menus (bType 2) get an
+ * entry and a zeroed object in the desktop heap, like windows (1). */
+static void user_object(uint32_t h, uint8_t type, uint32_t size) {
+    uint32_t e = (uint32_t)(uintptr_t)native32_user_ahe + 12 * (h & 0xFFFF);
+    if (!native32_user_ahe || !h || (MEM32(e) && MEM16(e + 0xA) == (uint16_t)(h >> 16))) return;
+    thread_setup();
+    uint8_t* o = desk_alloc(size);
+    if (!o) return;
+    memset(o, 0, size);
+    *(uint32_t*)o = h;
+    MEM32(e) = (uint32_t)(uintptr_t)o;
+    MEM8(e + 8) = type;
+    MEM16(e + 0xA) = (uint16_t)(h >> 16);
+}
+static uint32_t menu(HMENU m) { user_object((uint32_t)(uintptr_t)m, 2, 0x100); return (uint32_t)(uintptr_t)m; }
+
+/* NtUserCallNoParam(index): 0 CreateMenu, 1 CreatePopupMenu (Windows 2000's
+ * order, from what user32 does with the result) */
+static uint32_t s_call_noparam(uint32_t* a) {
+    if (a[0] == 0) return menu(CreateMenu());
+    if (a[0] == 1) return menu(CreatePopupMenu());
+    fprintf(stderr, "[user] NtUserCallNoParam %u not answered\n", a[0]);
+    return 0;
+}
+/* NtUserCallOneParam(param, index): 0x29 ReleaseDC */
+static uint32_t s_call_oneparam(uint32_t* a) {
+    if (a[1] == 0x29) {
+        uint32_t h = native32_gdi_host(a[0]);
+        return ReleaseDC(NULL, (HDC)(uintptr_t)(h ? h : a[0]));
+    }
+    fprintf(stderr, "[user] NtUserCallOneParam(%08X, 0x%X) not answered\n", a[0], a[1]);
+    return 0;
+}
+
+/* NtUserThunkedMenuItemInfo(hmenu, item, fByPosition, fInsert, MENUITEMINFOW*,
+ * UNICODE_STRING* text) */
+static uint32_t s_menu_item(uint32_t* a) {
+    MENUITEMINFOW mi = *(MENUITEMINFOW*)(uintptr_t)a[4];
+    mi.cbSize = sizeof mi;
+    if (a[5] && MEM32(a[5] + 4)) mi.dwTypeData = (LPWSTR)(uintptr_t)MEM32(a[5] + 4), mi.cch = MEM16(a[5]) / 2;
+    return a[3] ? InsertMenuItemW((HMENU)(uintptr_t)a[0], a[1], a[2], &mi)
+                : SetMenuItemInfoW((HMENU)(uintptr_t)a[0], a[1], a[2], &mi);
+}
+static uint32_t s_destroy_menu(uint32_t* a) { return DestroyMenu((HMENU)(uintptr_t)a[0]); }
+
+/* NtUserGetMenuItemRect(hwnd, hmenu, item, RECT*) */
+static uint32_t s_menu_rect(uint32_t* a) {
+    return GetMenuItemRect((HWND)(uintptr_t)a[0], (HMENU)(uintptr_t)a[1], a[2], (RECT*)(uintptr_t)a[3]);
+}
+/* NtUserFindExistingCursorIcon(UNICODE_STRING* module, UNICODE_STRING* resource,
+ * ...): Windows 2000 asks win32k's cache before building an icon or cursor
+ * from the resource itself. Answered with the host's own load of the same
+ * resource (a guest module's resources are mapped where the host can read
+ * them; user32's are the system's), entered as a cursor/icon (type 3). */
+static uint32_t s_find_icon(uint32_t* a) {
+    const wchar_t* mod = a[0] ? (const wchar_t*)(uintptr_t)MEM32(a[0] + 4) : NULL;
+    uint32_t res = a[1] ? MEM32(a[1] + 4) : 0;
+    if (getenv("NATIVE32_SYSCALLS") && a[2])
+        fprintf(stderr, "[user] cursorfind %08X %08X %08X %08X %08X %08X\n", MEM32(a[2]), MEM32(a[2] + 4),
+                MEM32(a[2] + 8), MEM32(a[2] + 12), MEM32(a[2] + 16), MEM32(a[2] + 20));
+    HINSTANCE h = NULL;
+    if (mod && !wcsstr(mod, L"USER32") && !wcsstr(mod, L"user32")) {
+        char n[MAX_PATH];
+        WideCharToMultiByte(CP_ACP, 0, mod, -1, n, MAX_PATH, NULL, NULL);
+        h = (HINSTANCE)(uintptr_t)native32_module(n);
+    }
+    /* the third argument: { ?, resource type (+4: 3 RT_ICON, 1 RT_CURSOR), cx,
+     * cy, bpp }. Shared, as LoadIcon's are: the title bar's small icon is then
+     * the resource's own 16x16 image, not the large one scaled. */
+    UINT type = a[2] && MEM32(a[2] + 4) == 1 ? IMAGE_CURSOR : IMAGE_ICON;
+    int cx = a[2] ? (int)MEM32(a[2] + 8) : 0, cy = a[2] ? (int)MEM32(a[2] + 12) : 0;
+    HANDLE r = LoadImageW(h, (LPCWSTR)(uintptr_t)res, type, cx, cy, LR_SHARED | (cx ? 0 : LR_DEFAULTSIZE));
+    if (r) user_object((uint32_t)(uintptr_t)r, 3, 0x80);
+    return (uint32_t)(uintptr_t)r;
 }
 
 #define HW(x) ((HWND)(uintptr_t)(x))
@@ -186,6 +267,9 @@ void native32_user_install(void) {
         { "NtUserGetMessage", s_getmessage }, { "NtUserPeekMessage", s_peekmessage },
         { "NtUserTranslateMessage", s_translate }, { "NtUserDispatchMessage", s_dispatch },
         { "NtUserBeginPaint", s_beginpaint }, { "NtUserEndPaint", s_endpaint },
+        { "NtUserThunkedMenuItemInfo", s_menu_item }, { "NtUserDestroyMenu", s_destroy_menu },
+        { "NtUserGetMenuItemRect", s_menu_rect }, { "NtUserFindExistingCursorIcon", s_find_icon },
+        { "NtUserCallNoParam", s_call_noparam }, { "NtUserCallOneParam", s_call_oneparam },
     };
     for (int i = 0; i < (int)(sizeof svc / sizeof svc[0]); i++) native32_nt_win32k_override(svc[i].name, svc[i].fn);
     (void)s_update;
