@@ -26,7 +26,8 @@
 /* UNICODE_STRING (buffer at +4) / LARGE_STRING (buffer at +8): a name, or an
  * atom in its place */
 static const wchar_t* ustr_name(uint32_t us) { return us ? (const wchar_t*)(uintptr_t)MEM32(us + 4) : NULL; }
-static const wchar_t* lstr_name(uint32_t ls) { return ls ? (const wchar_t*)(uintptr_t)MEM32(ls + 8) : NULL; }
+/* (a class may come as an atom instead: #32770 is 0x8002, the same on the host) */
+static const wchar_t* lstr_name(uint32_t ls) { return ls < 0x10000 ? (const wchar_t*)(uintptr_t)ls : (const wchar_t*)(uintptr_t)MEM32(ls + 8); }
 
 /* ---- the desktop heap, CLIENTINFO and the handle table -------------------
  * user32's ValidateHwnd: index = LOWORD(h) < psi->cHandleEntries (+8);
@@ -36,7 +37,7 @@ static const wchar_t* lstr_name(uint32_t ls) { return ls ? (const wchar_t*)(uint
  * limit }) and the WND user32 reads is phead - CLIENTINFO+0x1C (the client
  * delta, 0 here: the heap is ours). A host HWND's own index and uniq are
  * used as they are. WND, Windows 2000 SP4: +0x00 hwnd (THRDESKHEAD.h),
- * +0x10 pSelf. */
+ * +0x10 pSelf, +0x16 state bits, +0x5C lpfnWndProc. */
 #define DESK_SIZE (16u << 20)
 static uint8_t* g_desk, *g_deskinfo;
 static uint32_t g_desk_top;
@@ -80,6 +81,11 @@ uint8_t* native32_user_wnd(void* hv) {
     memset(w, 0, 0x200);
     *(uint32_t*)(w + 0x00) = (uint32_t)(uintptr_t)h;
     *(uint32_t*)(w + 0x10) = (uint32_t)(uintptr_t)w;
+    /* +0x5C lpfnWndProc: DispatchMessage calls it client-side (unless +0x16
+     * bit 4, a server-side procedure, sends it to NtUserDispatchMessage).
+     * The guest's own for its classes; a host procedure is called through the
+     * bridge like any host function. */
+    *(uint32_t*)(w + 0x5C) = (uint32_t)GetWindowLongPtrW(h, GWLP_WNDPROC);
     MEM32(e) = (uint32_t)(uintptr_t)w;
     MEM32(e + 4) = 0;
     MEM8(e + 8) = 1;                                                            /* TYPE_WINDOW */
@@ -97,6 +103,22 @@ static void server_info(void) {
     done = 1;
     for (int i = 0; i < 0x53; i++) *(int32_t*)(psi + 0x59C + 4 * i) = GetSystemMetrics(i);
     for (int i = 0; i < 0x1D; i++) *(uint32_t*)(psi + 0x6E8 + 4 * i) = GetSysColor(i);
+    /* DISPLAYINFO (SHAREDINFO's pDispInfo): +0x2C cMonitors, +0x30
+     * pMonitorPrimary, +0x34 pMonitorFirst. MONITOR: +0x0C flags (bit 0
+     * attached), +0x10 rcMonitor, +0x20 rcWork. Dialogs place themselves by it
+     * (MonitorFromRect). */
+    if (native32_user_disp) {
+        static uint8_t mon[0x80];
+        MONITORINFO mi = { sizeof mi };
+        POINT o = { 0, 0 };
+        GetMonitorInfoW(MonitorFromPoint(o, MONITOR_DEFAULTTOPRIMARY), &mi);
+        *(uint32_t*)(mon + 0x0C) = 1;
+        memcpy(mon + 0x10, &mi.rcMonitor, sizeof(RECT));
+        memcpy(mon + 0x20, &mi.rcWork, sizeof(RECT));
+        *(uint32_t*)(native32_user_disp + 0x2C) = 1;
+        *(uint32_t*)(native32_user_disp + 0x30) = (uint32_t)(uintptr_t)mon;
+        *(uint32_t*)(native32_user_disp + 0x34) = (uint32_t)(uintptr_t)mon;
+    }
 }
 
 static void (*g_prev_pre)(void);
@@ -232,6 +254,24 @@ static uint32_t s_find_icon(uint32_t* a) {
     return (uint32_t)(uintptr_t)r;
 }
 
+/* NtUserSetCursor(hcursor) */
+static uint32_t s_setcursor(uint32_t* a) { return (uint32_t)(uintptr_t)SetCursor((HCURSOR)(uintptr_t)a[0]); }
+
+/* NtUserSetTimer(hwnd, id, elapse, TIMERPROC) / NtUserKillTimer(hwnd, id):
+ * the host's (a TIMERPROC is guest code: the host calls it through the
+ * trampoline) */
+static uint32_t s_settimer(uint32_t* a) {
+    return (uint32_t)SetTimer((HWND)(uintptr_t)a[0], a[1], a[2], (TIMERPROC)(uintptr_t)a[3]);
+}
+static uint32_t s_killtimer(uint32_t* a) { return KillTimer((HWND)(uintptr_t)a[0], a[1]); }
+/* NtUserCallHwndParamLock(hwnd, param, index): 0x53 EnableWindow (the
+ * dialog manager re-enables its owner with it) */
+static uint32_t s_hwnd_param_lock(uint32_t* a) {
+    if (a[2] == 0x53) return EnableWindow((HWND)(uintptr_t)a[0], a[1]);
+    fprintf(stderr, "[user] NtUserCallHwndParamLock index 0x%X not answered\n", a[2]);
+    return 0;
+}
+
 #define HW(x) ((HWND)(uintptr_t)(x))
 static uint32_t s_thread_state(uint32_t* a) { return a[0] == 0x11 ? 1 : 0; }
 static uint32_t s_move(uint32_t* a) { return MoveWindow(HW(a[0]), (int)a[1], (int)a[2], (int)a[3], (int)a[4], a[5]); }
@@ -269,7 +309,8 @@ void native32_user_install(void) {
         { "NtUserBeginPaint", s_beginpaint }, { "NtUserEndPaint", s_endpaint },
         { "NtUserThunkedMenuItemInfo", s_menu_item }, { "NtUserDestroyMenu", s_destroy_menu },
         { "NtUserGetMenuItemRect", s_menu_rect }, { "NtUserFindExistingCursorIcon", s_find_icon },
-        { "NtUserCallNoParam", s_call_noparam }, { "NtUserCallOneParam", s_call_oneparam },
+        { "NtUserSetCursor", s_setcursor }, { "NtUserSetTimer", s_settimer }, { "NtUserKillTimer", s_killtimer },
+        { "NtUserCallHwndParamLock", s_hwnd_param_lock }, { "NtUserCallNoParam", s_call_noparam }, { "NtUserCallOneParam", s_call_oneparam },
     };
     for (int i = 0; i < (int)(sizeof svc / sizeof svc[0]); i++) native32_nt_win32k_override(svc[i].name, svc[i].fn);
     (void)s_update;

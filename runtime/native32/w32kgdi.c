@@ -278,6 +278,8 @@ static uint32_t s_textout(uint32_t* a) {
                        (const wchar_t*)(uintptr_t)a[5], a[6], (const INT*)(uintptr_t)a[7]);
 }
 static uint32_t s_flushbatch(uint32_t* a) { (void)a; batch(); return 0; }
+/* NtGdiGetTextCharsetInfo(hdc, FONTSIGNATURE*, flags) */
+static uint32_t s_charset(uint32_t* a) { return GetTextCharsetInfo(dc(a[0]), (FONTSIGNATURE*)(uintptr_t)a[1], a[2]); }
 /* NtGdiGetDCPoint(hdc, iPoint, POINTL*): 6 the DC's origin (GetDCOrgEx); the
  * other points gdi32 reads from DC_ATTR itself */
 static uint32_t s_dcpoint(uint32_t* a) {
@@ -499,7 +501,7 @@ void native32_gdi_install(void) {
         { "NtGdiExtGetObjectW", s_getobject }, { "NtGdiComputeXformCoefficients", s_one },
         { "NtGdiGetTextMetricsW", s_textmetrics }, { "NtGdiOpenDCW", s_opendc },
         { "NtGdiHfontCreate", s_font }, { "NtGdiExtTextOutW", s_textout },
-        { "NtGdiFlushUserBatch", s_flushbatch }, { "NtGdiGetTextExtent", s_textextent },
+        { "NtGdiFlushUserBatch", s_flushbatch }, { "NtGdiGetTextExtent", s_textextent }, { "NtGdiGetTextCharsetInfo", s_charset },
         { "NtGdiGetDCPoint", s_dcpoint }, { "NtGdiGetTextFaceW", s_textface },
         { "NtGdiEnumFontOpen", s_enumopen }, { "NtGdiEnumFontChunk", s_enumchunk }, { "NtGdiEnumFontClose", s_one }, { "NtGdiGetPixel", s_getpixel },
     };

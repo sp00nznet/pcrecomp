@@ -76,6 +76,7 @@ static uint32_t base_static_server_data(void) {
  * (w32kuser.c fills them in) */
 uint8_t* native32_user_psi;
 uint8_t* native32_user_ahe;
+uint8_t* native32_user_disp;
 
 /* ---- the api handlers ---------------------------------------------------- */
 static native32_csr_api_fn g_api[8][1024];
@@ -102,12 +103,12 @@ static uint32_t client_connect(uint32_t data, uint32_t capture) {
          * SERVERINFO, the handle table (w32kuser.c keeps both) and the
          * display info (zeroed). */
         uint8_t *psi = native32_user_psi, *ahe = native32_user_ahe;
-        static uint8_t* disp;
+        uint8_t* disp = native32_user_disp;
         if (!psi) {
             psi = native32_user_psi = (uint8_t*)VirtualAlloc(NULL, 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             /* 0x10000 HANDLEENTRYs of 12 bytes: a host HWND's own index fits */
             ahe = native32_user_ahe = (uint8_t*)VirtualAlloc(NULL, 0xC0000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-            disp = (uint8_t*)VirtualAlloc(NULL, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            disp = native32_user_disp = (uint8_t*)VirtualAlloc(NULL, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             *(uint32_t*)(psi + 8) = 0x10000;                  /* cHandleEntries */
         }
         MEM32(ci + 0x04) = MEM32(ci + 0x00);

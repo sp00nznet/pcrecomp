@@ -313,6 +313,7 @@ void native32_user_install(void);
 uint8_t* native32_user_wnd(void* hwnd);   /* the Windows 2000 WND user32 sees for a host window */
 extern uint8_t* native32_user_psi;   /* csr32.c: SERVERINFO, Windows 2000 layout */
 extern uint8_t* native32_user_ahe;   /* csr32.c: the USER handle table */
+extern uint8_t* native32_user_disp;  /* csr32.c: DISPLAYINFO */
 uint32_t native32_gdi_handle(uint32_t host_handle);   /* -> the guest's handle */
 uint32_t native32_gdi_host(uint32_t guest_handle);     /* -> the host's, 0 if none */
 uint8_t* native32_gdi_attr(uint32_t hdc);
