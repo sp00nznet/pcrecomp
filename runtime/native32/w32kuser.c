@@ -86,6 +86,9 @@ uint8_t* native32_user_wnd(void* hv) {
      * The guest's own for its classes; a host procedure is called through the
      * bridge like any host function. */
     *(uint32_t*)(w + 0x5C) = (uint32_t)GetWindowLongPtrW(h, GWLP_WNDPROC);
+    /* +0x88 cbwndExtra (a dialog's must be DLGWINDOWEXTRA); the extra bytes
+     * follow the WND at +0x9C (a dialog's: its DIALOG structure) */
+    *(uint32_t*)(w + 0x88) = (uint32_t)GetClassLongW(h, GCL_CBWNDEXTRA);
     MEM32(e) = (uint32_t)(uintptr_t)w;
     MEM32(e + 4) = 0;
     MEM8(e + 8) = 1;                                                            /* TYPE_WINDOW */
@@ -103,6 +106,18 @@ static void server_info(void) {
     done = 1;
     for (int i = 0; i < 0x53; i++) *(int32_t*)(psi + 0x59C + 4 * i) = GetSystemMetrics(i);
     for (int i = 0; i < 0x1D; i++) *(uint32_t*)(psi + 0x6E8 + 4 * i) = GetSysColor(i);
+    /* +0x800 / +0x804 the system font's character size (GetDialogBaseUnits) */
+    *(uint16_t*)(psi + 0x800) = (uint16_t)LOWORD(GetDialogBaseUnits());
+    *(uint16_t*)(psi + 0x804) = (uint16_t)HIWORD(GetDialogBaseUnits());
+    /* +0x1A0 the system classes' atoms, by dialog-template ordinal & 0x7F
+     * (0x80 Button .. 0x85 ComboBox): the host's */
+    {
+        static const wchar_t* cls[] = { L"Button", L"Edit", L"Static", L"ListBox", L"ScrollBar", L"ComboBox" };
+        for (int i = 0; i < 6; i++) {
+            WNDCLASSEXW wc = { sizeof wc };
+            *(uint16_t*)(psi + 0x1A0 + 2 * i) = (uint16_t)GetClassInfoExW(NULL, cls[i], &wc);
+        }
+    }
     /* DISPLAYINFO (SHAREDINFO's pDispInfo): +0x2C cMonitors, +0x30
      * pMonitorPrimary, +0x34 pMonitorFirst. MONITOR: +0x0C flags (bit 0
      * attached), +0x10 rcMonitor, +0x20 rcWork. Dialogs place themselves by it
@@ -159,6 +174,9 @@ static uint32_t s_create_window(uint32_t* a) {
                              (HWND)(uintptr_t)a[8], (HMENU)(uintptr_t)a[9], (HINSTANCE)(uintptr_t)a[10],
                              (void*)(uintptr_t)a[11]);
     if (!h) fprintf(stderr, "[user] CreateWindowExW failed: %lu\n", GetLastError());
+    /* a window of a host class (a dialog's #32770) never calls the guest
+     * while it is made, so its WND is entered here */
+    if (h) native32_user_wnd(h);
     return (uint32_t)(uintptr_t)h;
 }
 static uint32_t s_getdc(uint32_t* a) { return native32_gdi_handle((uint32_t)(uintptr_t)GetDC((HWND)(uintptr_t)a[0])); }
@@ -173,6 +191,12 @@ static uint32_t s_message_call(uint32_t* a) {
     /* a DC the guest got in the message (WM_ERASEBKGND, WM_CTLCOLOR*, ...)
      * goes back to the host as the host's */
     if (a[2] && ((a[2] >> 16) & 0x1F) == 1 && native32_gdi_host(a[2])) a[2] = native32_gdi_host(a[2]);
+    /* a GDI object in wParam (WM_SETFONT's font) goes to the host as the host's */
+    if (a[2] && native32_gdi_host(a[2])) a[2] = native32_gdi_host(a[2]);
+    if (a[5] == 0x2AE) {                   /* SendMessage */
+        LRESULT r = a[6] ? SendMessageA(h, a[1], a[2], a[3]) : SendMessageW(h, a[1], a[2], a[3]);
+        return (uint32_t)(a[1] == WM_GETFONT && r ? native32_gdi_handle((uint32_t)r) : r);
+    }
     if (a[5] == 0x29E) return (uint32_t)(a[6] ? DefWindowProcA(h, a[1], a[2], a[3]) : DefWindowProcW(h, a[1], a[2], a[3]));
     fprintf(stderr, "[user] NtUserMessageCall fnid 0x%X (msg 0x%X) not answered\n", a[5], a[1]);
     return 0;
@@ -194,11 +218,12 @@ static void user_object(uint32_t h, uint8_t type, uint32_t size) {
 }
 static uint32_t menu(HMENU m) { user_object((uint32_t)(uintptr_t)m, 2, 0x100); return (uint32_t)(uintptr_t)m; }
 
-/* NtUserCallNoParam(index): 0 CreateMenu, 1 CreatePopupMenu (Windows 2000's
+/* NtUserCallNoParam(index): 0 CreateMenu, 1 CreatePopupMenu, 8 ReleaseCapture (Windows 2000's
  * order, from what user32 does with the result) */
 static uint32_t s_call_noparam(uint32_t* a) {
     if (a[0] == 0) return menu(CreateMenu());
     if (a[0] == 1) return menu(CreatePopupMenu());
+    if (a[0] == 8) return ReleaseCapture();
     fprintf(stderr, "[user] NtUserCallNoParam %u not answered\n", a[0]);
     return 0;
 }
@@ -272,6 +297,24 @@ static uint32_t s_hwnd_param_lock(uint32_t* a) {
     return 0;
 }
 
+/* NtUserCallHwndParam(hwnd, param, index): 0x43 attaches a dialog's DIALOG
+ * structure: WND+0x9C, and WND+0x16 bit 0 says it is there */
+static uint32_t s_hwnd_param(uint32_t* a) {
+    uint8_t* w = native32_user_wnd((void*)(uintptr_t)a[0]);
+    if (a[2] == 0x43 && w) {
+        *(uint32_t*)(w + 0x9C) = a[1];
+        w[0x16] |= 1;
+        return 1;
+    }
+    fprintf(stderr, "[user] NtUserCallHwndParam index 0x%X not answered\n", a[2]);
+    return 0;
+}
+
+static uint32_t s_destroy(uint32_t* a) { return DestroyWindow((HWND)(uintptr_t)a[0]); }
+static uint32_t s_setcapture(uint32_t* a) { return (uint32_t)(uintptr_t)SetCapture((HWND)(uintptr_t)a[0]); }
+
+static uint32_t s_waitmessage(uint32_t* a) { (void)a; return WaitMessage(); }
+
 #define HW(x) ((HWND)(uintptr_t)(x))
 static uint32_t s_thread_state(uint32_t* a) { return a[0] == 0x11 ? 1 : 0; }
 static uint32_t s_move(uint32_t* a) { return MoveWindow(HW(a[0]), (int)a[1], (int)a[2], (int)a[3], (int)a[4], a[5]); }
@@ -310,7 +353,9 @@ void native32_user_install(void) {
         { "NtUserThunkedMenuItemInfo", s_menu_item }, { "NtUserDestroyMenu", s_destroy_menu },
         { "NtUserGetMenuItemRect", s_menu_rect }, { "NtUserFindExistingCursorIcon", s_find_icon },
         { "NtUserSetCursor", s_setcursor }, { "NtUserSetTimer", s_settimer }, { "NtUserKillTimer", s_killtimer },
-        { "NtUserCallHwndParamLock", s_hwnd_param_lock }, { "NtUserCallNoParam", s_call_noparam }, { "NtUserCallOneParam", s_call_oneparam },
+        { "NtUserCallHwndParamLock", s_hwnd_param_lock }, { "NtUserCallHwndParam", s_hwnd_param },
+        { "NtUserDestroyWindow", s_destroy }, { "NtUserSetCapture", s_setcapture },
+        { "NtUserWaitMessage", s_waitmessage }, { "NtUserCallNoParam", s_call_noparam }, { "NtUserCallOneParam", s_call_oneparam },
     };
     for (int i = 0; i < (int)(sizeof svc / sizeof svc[0]); i++) native32_nt_win32k_override(svc[i].name, svc[i].fn);
     (void)s_update;
