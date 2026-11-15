@@ -278,6 +278,15 @@ uint32_t native32_nt_forward(const char* name, uint32_t* args);
  * PEB's OSCSDVersion (0x0400 for SP4). Returns 0 on failure. */
 int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, const wchar_t* cmdline,
                      const wchar_t* dll_path, const char* nls_dir, uint16_t csd);
+/* win32k (services 0x1000..): numbers and argument counts from the guest's
+ * own user32/gdi32 stubs, names from a "0xNNNN Name" file. Unanswered
+ * services are logged and return 0; a host answers by name. */
+int native32_nt_win32k(const uint32_t* bases, int nbases, const char* names_file);
+void native32_nt_win32k_override(const char* name, native32_syscall_fn fn);
+/* A user-mode callback, as win32k makes one (KeUserModeCallback): the guest
+ * ntdll's KiUserCallbackDispatcher runs KernelCallbackTable[api](in, len);
+ * returns its status, and the NtCallbackReturn output. */
+uint32_t native32_nt_callback(uint32_t api, uint32_t in, uint32_t len, uint32_t* out, uint32_t* outlen);
 /* A named section the guest opens that a server process of its own OS would
  * have created (csrss's \NLS\NlsSection* for kernel32): NtOpenSection on
  * that name returns a read-only section of the file. */

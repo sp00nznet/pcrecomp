@@ -114,9 +114,21 @@ int native32_nt_syscalls(uint32_t base) {
 }
 
 /* ---- the gate ------------------------------------------------------------ */
+static uint32_t win32k_call(uint32_t svc, uint32_t* args);
+static void callback_return(uint32_t out, uint32_t outlen, uint32_t status);
+
 void recomp_syscall(int vector) {
     uint32_t svc = g_eax, *args = (uint32_t*)(uintptr_t)g_edx, r;
     if (g_trace < 0) g_trace = getenv("NATIVE32_SYSCALLS") != NULL;
+    if (g_trace < 0) g_trace = getenv("NATIVE32_SYSCALLS") != NULL;
+    if (vector == 0x2B) {                 /* the callback dispatcher's own NtCallbackReturn */
+        callback_return(g_ecx, g_edx, g_eax);
+        return;
+    }
+    if (vector == 0x2E && svc >= 0x1000) {
+        g_eax = win32k_call(svc, args);
+        return;
+    }
     if (vector != 0x2E || svc >= MAX_SVC || !g_svc[svc].name) {
         fprintf(stderr, "[syscall] int %02Xh service 0x%X: not in the table\n", vector, svc);
         g_eax = 0xC0000002u;
@@ -457,6 +469,134 @@ static uint32_t ovr_no_process(uint32_t* a) {
     return 0xC0000022u;
 }
 
+/* ---- win32k: the window manager's and GDI's system calls (0x1000..) -----
+ * user32 and gdi32 call win32k.sys through the same gate, with service
+ * numbers from 0x1000. The numbers and argument counts are the guest's own,
+ * read from its user32/gdi32 stubs (most are not exported, so the stubs are
+ * found by their shape); the names come from a "0xNNNN Name" file
+ * (tools/w32k_names.py). A host answers a service by name
+ * (native32_nt_win32k_override); an unanswered one is logged once and
+ * returns 0. */
+#define W32K_MAX 0x400
+static struct { char name[64]; uint8_t argc, seen; native32_syscall_fn fn; } g_w32k[W32K_MAX];
+
+int native32_nt_win32k(const uint32_t* bases, int nbases, const char* names_file) {
+    int stubs = 0, named = 0;
+    for (int m = 0; m < nbases; m++) {
+        uint32_t base = bases[m], size = image_size(base);
+        for (uint32_t p = base + 0x1000; p + 16 < base + size; p++) {
+            const uint8_t* b = (const uint8_t*)(uintptr_t)p;
+            if (b[0] != 0xB8 || b[5] != 0x8D || b[6] != 0x54 || b[7] != 0x24 || b[8] != 0x04 ||
+                b[9] != 0xCD || b[10] != 0x2E) continue;
+            uint32_t svc = *(const uint32_t*)(b + 1);
+            if (svc < 0x1000 || svc >= 0x1000 + W32K_MAX) continue;
+            g_w32k[svc - 0x1000].argc = b[11] == 0xC2 ? (uint8_t)(*(const uint16_t*)(b + 12) / 4) : 0;
+            stubs++;
+        }
+    }
+    FILE* f = names_file ? fopen(names_file, "r") : NULL;
+    if (f) {
+        char line[128], name[64];
+        unsigned num;
+        while (fgets(line, sizeof line, f))
+            if (sscanf(line, "%x %63s", &num, name) == 2 && num >= 0x1000 && num < 0x1000 + W32K_MAX) {
+                strcpy(g_w32k[num - 0x1000].name, name);
+                named++;
+            }
+        fclose(f);
+    }
+    fprintf(stderr, "[win32k] %d stubs in the guest's user32/gdi32, %d names\n", stubs, named);
+    return stubs;
+}
+
+void native32_nt_win32k_override(const char* name, native32_syscall_fn fn) {
+    for (int i = 0; i < W32K_MAX; i++)
+        if (!strcmp(g_w32k[i].name, name)) { g_w32k[i].fn = fn; return; }
+    fprintf(stderr, "[win32k] no service named %s\n", name);
+}
+
+static uint32_t win32k_call(uint32_t svc, uint32_t* args) {
+    int i = (int)(svc - 0x1000);
+    if (i < 0 || i >= W32K_MAX) return 0xC000001Cu;                       /* STATUS_INVALID_SYSTEM_SERVICE */
+    uint32_t r = g_w32k[i].fn ? g_w32k[i].fn(args) : 0;
+    if (g_trace || (!g_w32k[i].fn && !g_w32k[i].seen)) {
+        fprintf(stderr, "[win32k] %-34s(", g_w32k[i].name[0] ? g_w32k[i].name : "?");
+        for (int k = 0; k < g_w32k[i].argc && k < 8; k++) fprintf(stderr, k ? " %08X" : "%08X", args[k]);
+        fprintf(stderr, ") -> %08X%s  0x%X from sub_%08X\n", r, g_w32k[i].fn ? "" : "  NOT SHIMMED", svc, g_cur_func);
+    }
+    g_w32k[i].seen = 1;
+    return r;
+}
+
+/* ---- user-mode callbacks ---------------------------------------------------
+ * win32k calls user32 back (a window procedure, a hook, a client-side
+ * allocation) through KiUserCallbackDispatcher(ApiNumber, Input, Length),
+ * which calls Peb->KernelCallbackTable[ApiNumber](Input, Length). The routine
+ * ends in NtCallbackReturn(Output, Length, Status), or returns and the
+ * dispatcher's `int 2Bh` does it. Neither unwinds here: they record the
+ * result, the routine returns, and the dispatcher's trailing int3 (lifted as
+ * a return) comes back to native32_nt_callback. */
+#define CB_DEPTH 32
+static struct { uint32_t out, outlen, status, done; } g_cb[CB_DEPTH];
+static int g_cbn;
+
+static void callback_return(uint32_t out, uint32_t outlen, uint32_t status) {
+    if (g_cbn <= 0 || g_cb[g_cbn - 1].done) return;
+    g_cb[g_cbn - 1].out = out, g_cb[g_cbn - 1].outlen = outlen, g_cb[g_cbn - 1].status = status;
+    g_cb[g_cbn - 1].done = 1;
+}
+
+/* NtCallbackReturn(Output, OutputLength, Status) */
+static uint32_t ovr_callback_return(uint32_t* a) {
+    if (g_cbn <= 0) return 0xC0000258u;                                    /* STATUS_NO_CALLBACK_ACTIVE */
+    callback_return(a[0], a[1], a[2]);
+    return 0;
+}
+
+uint32_t native32_nt_callback(uint32_t api, uint32_t in, uint32_t len, uint32_t* out, uint32_t* outlen) {
+    uint32_t kucd = native32_export(native32_module("ntdll.dll"), "KiUserCallbackDispatcher");
+    if (!kucd || g_cbn >= CB_DEPTH) return 0xC0000258u;
+    uint32_t args[3] = { api, in, len };
+    mach_enter();
+    uint32_t sp = g_esp;
+    g_cb[g_cbn].done = 0;
+    g_cbn++;
+    native32_call_guest(kucd, 3, args);
+    g_cbn--;
+    if (!g_cb[g_cbn].done) g_cb[g_cbn].status = g_eax, g_cb[g_cbn].out = 0, g_cb[g_cbn].outlen = 0;
+    g_esp = sp;
+    mach_leave();
+    if (out) *out = g_cb[g_cbn].out;
+    if (outlen) *outlen = g_cb[g_cbn].outlen;
+    return g_cb[g_cbn].status;
+}
+
+/* ---- exceptions ------------------------------------------------------------
+ * RtlRaiseException is the guest's own (lifted ntdll): it dispatches over the
+ * guest's fs:[0] chain itself, and a handler's jump into its __except block
+ * goes through native32's landing pads (eh32). Only what reaches the kernel
+ * is answered here: NtRaiseException, the second chance (no guest handler),
+ * ends the process like Windows 2000's would, with a report;
+ * NtContinue(Context, TestAlert), ExceptionContinueExecution, resumes at the
+ * caller of RtlRaiseException with the context's registers when the context
+ * says so (the common case: the context was captured there). */
+static uint32_t ovr_raise_exception(uint32_t* a) {
+    uint32_t rec = a[0], ctx = a[1];
+    fprintf(stderr, "\n[nt] unhandled guest exception %08X at %08X (first chance %u), eip %08X esp %08X\n",
+            rec ? MEM32(rec) : 0, rec ? MEM32(rec + 12) : 0, a[2], ctx ? MEM32(ctx + 0xB8) : 0, ctx ? MEM32(ctx + 0xC4) : 0);
+    fflush(NULL);
+    TerminateProcess(GetCurrentProcess(), rec ? MEM32(rec) : 1);
+    return 0;
+}
+
+static uint32_t ovr_continue(uint32_t* a) {
+    uint32_t ctx = a[0];
+    if (getenv("NATIVE32_SYSCALLS"))
+        fprintf(stderr, "[nt] NtContinue to eip %08X esp %08X: returning to the raiser\n", MEM32(ctx + 0xB8), MEM32(ctx + 0xC4));
+    g_eax = MEM32(ctx + 0xB0);
+    return MEM32(ctx + 0xB0);
+}
+
 /* ---- process start ------------------------------------------------------ */
 static void* load_file(const char* dir, const char* name) {
     char path[MAX_PATH];
@@ -517,6 +657,9 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
     native32_nt_override("NtQuerySection", ovr_query_section);
     native32_nt_override("NtOpenDirectoryObject", ovr_open_directory);
     native32_nt_override("NtRaiseHardError", ovr_hard_error);
+    native32_nt_override("NtCallbackReturn", ovr_callback_return);
+    native32_nt_override("NtRaiseException", ovr_raise_exception);
+    native32_nt_override("NtContinue", ovr_continue);
     native32_nt_override("NtCreateProcess", ovr_no_process);
     native32_nt_override("NtCreateProcessEx", ovr_no_process);
     csr32_install();

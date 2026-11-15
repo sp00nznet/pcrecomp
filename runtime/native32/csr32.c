@@ -88,6 +88,23 @@ static uint32_t client_connect(uint32_t data, uint32_t capture) {
     (void)capture;
     if (getenv("NATIVE32_SYSCALLS"))
         fprintf(stderr, "[csr] client connect, server %u, info %08X len %u\n", index, ci, MEM32(data + 8));
+    if (index == 3 && ci && MEM32(data + 8) >= 0x104) {
+        /* usersrv: USERCONNECT { ulVersion, ulCurrentVersion, dwDispatchCount,
+         * SHAREDINFO siClient { psi, aheList, pDispInfo, ulSharedDelta, ... } }.
+         * ponytail: zeroed SERVERINFO, handle table and display info, a probe
+         * of what a lifted user32 asks next; the real ones are win32k's
+         * state, which nothing emulates yet (docs/findings.md, stage 3). */
+        static uint8_t* psi, *ahe, *disp;
+        if (!psi) {
+            psi = (uint8_t*)VirtualAlloc(NULL, 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            ahe = (uint8_t*)VirtualAlloc(NULL, 0x100000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            disp = (uint8_t*)VirtualAlloc(NULL, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        }
+        MEM32(ci + 0x04) = MEM32(ci + 0x00);
+        MEM32(ci + 0x0C) = (uint32_t)(uintptr_t)psi;
+        MEM32(ci + 0x10) = (uint32_t)(uintptr_t)ahe;
+        MEM32(ci + 0x14) = (uint32_t)(uintptr_t)disp;
+    }
     if (index == 2 && ci) {
         MEM32(ci + 0x00) = 0x0C0Eu;
         MEM32(ci + 0x04) = (uint32_t)(uintptr_t)CreateEventA(NULL, TRUE, FALSE, NULL);
