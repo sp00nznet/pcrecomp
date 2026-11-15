@@ -248,6 +248,28 @@ def push_return_label(insn, nxt, leaders, body=()):
     return None
 
 
+# Flags are machine state: a `jmp` from one lifted body into another (an
+# optimiser's shared tail, Windows 2000 ntdll's LdrpSnapThunk jumping to
+# `sbb ecx, ecx; sbb ecx, -1` inside LdrpNameToOrdinal's body) carries them,
+# and RECOMP_CALL / RECOMP_ITAIL store them on the way out. A body whose entry
+# reads a flag before anything sets one reloads them; with fresh locals that
+# sbb read CF 0, every export lookup's hint check failed, and the guest's own
+# loader could not find MSVCRT!longjmp.
+_FLAG_READ = ('adc', 'sbb', 'rcl', 'rcr', 'pushfd', 'pushf', 'lahf', 'cmc', 'into', 'loope', 'loopne')
+_FLAG_WRITE = ('cmp', 'test', 'add', 'sub', 'and', 'or', 'xor', 'neg', 'clc', 'stc', 'sahf', 'popfd', 'popf',
+               'bt', 'bts', 'btr', 'btc', 'cmpxchg', 'xadd', 'imul', 'mul', 'scasb', 'scasd', 'cmpsb', 'cmpsd')
+
+
+def entry_reads_flags(instructions):
+    for ins in instructions[:32]:
+        m = ins.mnemonic
+        if m in _FLAG_READ or m.startswith(('set', 'cmov')) or (m.startswith('j') and m not in ('jmp', 'jecxz', 'jcxz')):
+            return True
+        if m in _FLAG_WRITE or m.startswith(('call', 'ret', 'jmp')):
+            return False
+    return False
+
+
 def lift_function_linear(lifter, name, instructions, leaders, func_start,
                          indirect_targets=None, eh_resume=None, alias_entries=None,
                          eh_off=None):
@@ -292,6 +314,8 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
         lines.append(f'    {decl}')
     lines.append('    RECOMP_REGS_LOCALS')   # empty unless RECOMP_LOCAL_REGS
     lines.append(f'    RECOMP_ENTER(0x{va:08X}u);')
+    if entry_reads_flags(instructions):
+        lines.append('    RECOMP_FLAGS_IN();   /* the entry reads flags its caller or jumper set */')
     eh = sorted(a for a in (eh_resume or ()) if a in {i.address for i in instructions})
     if eh and eh_off is not None:
         lines.append('    static const uint32_t _eh_at[] = { %s, 0 };'
@@ -303,7 +327,7 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
         leaders = set(leaders) | set(eh)
     aliases = sorted(a for a in (alias_entries or ()) if a in {i.address for i in instructions})
     if aliases:
-        lines.append('    if (g_alias_entry) { _itail_tgt = g_alias_entry; g_alias_entry = 0; goto _ljump; }')
+        lines.append('    if (g_alias_entry) { RECOMP_FLAGS_IN(); _itail_tgt = g_alias_entry; g_alias_entry = 0; goto _ljump; }')
         leaders = set(leaders) | set(aliases)
     lines.append('')
 
