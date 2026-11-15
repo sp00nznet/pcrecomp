@@ -53,6 +53,15 @@ def rebase(path, base):
                     raise ValueError('%s: relocation type %d' % (path, e.type))
         off = pe.OPTIONAL_HEADER.get_file_offset() + 28   # ImageBase
         data[off:off + 4] = base.to_bytes(4, 'little')
+    # Bound imports: the IAT in the file holds the imports' addresses at
+    # their LINKED bases, and a real NT loader keeps them when the import's
+    # timestamp matches. Every module of a rebased set has moved or may
+    # import one that has, so the bound import directory goes: the loader
+    # (Windows 2000's own, lifted) then snaps the IAT. Moved or not.
+    dd = pe.OPTIONAL_HEADER.DATA_DIRECTORY
+    if len(dd) > 11 and dd[11].VirtualAddress:
+        off = dd[11].get_file_offset()
+        data[off:off + 8] = bytes(8)
     return bytes(data), pe.OPTIONAL_HEADER.SizeOfImage, linked
 
 
