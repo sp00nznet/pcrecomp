@@ -536,7 +536,7 @@ static uint32_t win32k_call(uint32_t svc, uint32_t* args) {
     uint32_t r = g_w32k[i].fn ? g_w32k[i].fn(args) : 0;
     if (g_trace || (!g_w32k[i].fn && !g_w32k[i].seen)) {
         fprintf(stderr, "[win32k] %-34s(", g_w32k[i].name[0] ? g_w32k[i].name : "?");
-        for (int k = 0; k < g_w32k[i].argc && k < 8; k++) fprintf(stderr, k ? " %08X" : "%08X", args[k]);
+        for (int k = 0; k < g_w32k[i].argc && k < 16; k++) fprintf(stderr, k ? " %08X" : "%08X", args[k]);
         fprintf(stderr, ") -> %08X%s  0x%X from sub_%08X\n", r, g_w32k[i].fn ? "" : "  NOT SHIMMED", svc, g_cur_func);
     }
     g_w32k[i].seen = 1;

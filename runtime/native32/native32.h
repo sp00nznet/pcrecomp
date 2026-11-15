@@ -308,6 +308,11 @@ void native32_nt_proxy_hook(const char* name, void* fn);
 /* w32kgdi.c: GDI's shared state for a lifted gdi32 on host GDI (see there). */
 void native32_gdi_install(void);
 int native32_gdi_start(uint32_t gdi32_base);   /* GdiDllInitialize, when user32 is the host's */
+/* w32kuser.c: USER's half, for a lifted user32 (with w32kgdi). */
+void native32_user_install(void);
+uint8_t* native32_user_wnd(void* hwnd);   /* the Windows 2000 WND user32 sees for a host window */
+extern uint8_t* native32_user_psi;   /* csr32.c: SERVERINFO, Windows 2000 layout */
+extern uint8_t* native32_user_ahe;   /* csr32.c: the USER handle table */
 uint32_t native32_gdi_handle(uint32_t host_handle);   /* -> the guest's handle */
 uint32_t native32_gdi_host(uint32_t guest_handle);     /* -> the host's, 0 if none */
 uint8_t* native32_gdi_attr(uint32_t hdc);

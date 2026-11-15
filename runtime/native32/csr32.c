@@ -72,6 +72,11 @@ static uint32_t base_static_server_data(void) {
 }
 
 
+/* SERVERINFO and the USER handle table the user server's connect hands out
+ * (w32kuser.c fills them in) */
+uint8_t* native32_user_psi;
+uint8_t* native32_user_ahe;
+
 /* ---- the api handlers ---------------------------------------------------- */
 static native32_csr_api_fn g_api[8][1024];
 
@@ -94,19 +99,31 @@ static uint32_t client_connect(uint32_t data, uint32_t capture) {
     if (index == 3 && ci && MEM32(data + 8) >= 0x104) {
         /* usersrv: USERCONNECT { ulVersion, ulCurrentVersion, dwDispatchCount,
          * SHAREDINFO siClient { psi, aheList, pDispInfo, ulSharedDelta, ... } }.
-         * ponytail: zeroed SERVERINFO, handle table and display info, a probe
-         * of what a lifted user32 asks next; the real ones are win32k's
-         * state, which nothing emulates yet (docs/findings.md, stage 3). */
-        static uint8_t* psi, *ahe, *disp;
+         * SERVERINFO, the handle table (w32kuser.c keeps both) and the
+         * display info (zeroed). */
+        uint8_t *psi = native32_user_psi, *ahe = native32_user_ahe;
+        static uint8_t* disp;
         if (!psi) {
-            psi = (uint8_t*)VirtualAlloc(NULL, 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-            ahe = (uint8_t*)VirtualAlloc(NULL, 0x100000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            psi = native32_user_psi = (uint8_t*)VirtualAlloc(NULL, 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            /* 0x10000 HANDLEENTRYs of 12 bytes: a host HWND's own index fits */
+            ahe = native32_user_ahe = (uint8_t*)VirtualAlloc(NULL, 0xC0000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             disp = (uint8_t*)VirtualAlloc(NULL, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            *(uint32_t*)(psi + 8) = 0x10000;                  /* cHandleEntries */
         }
         MEM32(ci + 0x04) = MEM32(ci + 0x00);
         MEM32(ci + 0x0C) = (uint32_t)(uintptr_t)psi;
         MEM32(ci + 0x10) = (uint32_t)(uintptr_t)ahe;
         MEM32(ci + 0x14) = (uint32_t)(uintptr_t)disp;
+        {
+            /* SHAREDINFO +0xE8 DefWindowMsgs { maxMsgs, abMsgs }: the messages
+             * DefWindowProc hands to win32k. All of them: the host's
+             * DefWindowProc answers (w32kuser.c). +0xF0 DefWindowSpecMsgs,
+             * the ones user32 answers itself from the WND: none. */
+            static uint8_t all[0x80];
+            memset(all, 0xFF, sizeof all);
+            MEM32(ci + 0x0C + 0xE8) = 0x3FF;
+            MEM32(ci + 0x0C + 0xEC) = (uint32_t)(uintptr_t)all;
+        }
     }
     if (index == 2 && ci) {
         MEM32(ci + 0x00) = 0x0C0Eu;
