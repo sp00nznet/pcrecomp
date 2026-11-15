@@ -517,6 +517,13 @@ static uint32_t s_hwnd_param(uint32_t* a) {
         }
         return 1;
     }
+    /* 0x46 SetWindowState: param is a WND state bit as (byte offset from
+     * +0x14) << 8 | mask (user32 tests it client-side first; a dialog sets
+     * 0x502 at each WM_CTLCOLOR) */
+    if (a[2] == 0x46 && w && (a[1] >> 8) < 8) {
+        w[0x14 + (a[1] >> 8)] |= (uint8_t)a[1];
+        return 1;
+    }
     fprintf(stderr, "[user] NtUserCallHwndParam index 0x%X not answered\n", a[2]);
     return 0;
 }
