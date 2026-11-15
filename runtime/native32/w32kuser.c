@@ -59,6 +59,10 @@ static void thread_setup(void) {
     if (MEM32(ci + 0x18) != (uint32_t)(uintptr_t)g_deskinfo) {
         MEM32(ci + 0x18) = (uint32_t)(uintptr_t)g_deskinfo;
         MEM32(ci + 0x1C) = 0;                                                   /* ulClientDelta */
+        /* +0x08 dwExpWinVer (GETAPPVER): >= 4.0 gives dialogs DS_3DLOOK and
+         * a normal-weight font. ponytail: 5.0 for every program, read the
+         * image's subsystem version if a 3.x one ever runs */
+        MEM32(ci + 0x08) = 0x500;
     }
 }
 
@@ -66,6 +70,43 @@ static uint8_t* desk_alloc(uint32_t n) {
     uint8_t* p = g_desk + g_desk_top;
     g_desk_top += (n + 15) & ~15u;
     return g_desk_top <= DESK_SIZE ? p : NULL;
+}
+
+/* WND fields kept from the host window: +0x1C ExStyle, +0x20 style, +0x30
+ * spwndParent (top-level: none), +0x38 spwndOwner, +0x3C rcWindow, +0x4C
+ * rcClient, both in screen coordinates. A dialog places itself at the
+ * owner's rcClient (ClientToScreen is client-side). */
+#define MAX_WNDS 512
+static HWND g_wnds[MAX_WNDS];
+static int g_nwnds;
+uint8_t* native32_user_wnd(void* hv);
+static void wnd_sync(HWND h, uint8_t* w) {
+    RECT r;
+    POINT o = { 0, 0 };
+    HWND p = GetAncestor(h, GA_PARENT), own = GetWindow(h, GW_OWNER);
+    *(uint32_t*)(w + 0x1C) = (uint32_t)GetWindowLongW(h, GWL_EXSTYLE);
+    *(uint32_t*)(w + 0x20) = (uint32_t)GetWindowLongW(h, GWL_STYLE);
+    GetWindowRect(h, &r);
+    memcpy(w + 0x3C, &r, sizeof r);
+    GetClientRect(h, &r);
+    ClientToScreen(h, &o);
+    OffsetRect(&r, o.x, o.y);
+    memcpy(w + 0x4C, &r, sizeof r);
+    *(uint32_t*)(w + 0x30) = p && p != GetDesktopWindow() ? (uint32_t)(uintptr_t)native32_user_wnd(p) : 0;
+    *(uint32_t*)(w + 0x38) = own ? (uint32_t)(uintptr_t)native32_user_wnd(own) : 0;
+    /* +0x34 spwndChild, and for a child +0x2C spwndNext and +0x74 its ID
+     * (spmenu's place): GetDlgItem walks them client-side. A top-level
+     * window's spwndNext stays 0 (the next is anyone's window) and its spmenu
+     * is a menu, not kept here. */
+    {
+        HWND c = GetWindow(h, GW_CHILD);
+        *(uint32_t*)(w + 0x34) = c ? (uint32_t)(uintptr_t)native32_user_wnd(c) : 0;
+        if (GetWindowLongW(h, GWL_STYLE) & WS_CHILD) {
+            HWND n = GetWindow(h, GW_HWNDNEXT);
+            *(uint32_t*)(w + 0x2C) = n ? (uint32_t)(uintptr_t)native32_user_wnd(n) : 0;
+            *(uint32_t*)(w + 0x74) = (uint32_t)GetDlgCtrlID(h);
+        }
+    }
 }
 
 /* The WND for a host window, made the first time the guest meets it */
@@ -94,7 +135,20 @@ uint8_t* native32_user_wnd(void* hv) {
     MEM8(e + 8) = 1;                                                            /* TYPE_WINDOW */
     MEM8(e + 9) = 0;
     MEM16(e + 0xA) = (uint16_t)((uint32_t)(uintptr_t)h >> 16);
+    if (g_nwnds < MAX_WNDS) g_wnds[g_nwnds++] = h;
+    wnd_sync(h, w);
     return w;
+}
+
+/* Every WND's fields from its host window, before each win32k service and
+ * callback (user32 reads them with no call between). ponytail: a linear
+ * pass over every window met, an event hook if there are ever hundreds */
+static void wnd_sync_all(void) {
+    for (int i = 0; i < g_nwnds; i++) {
+        if (!IsWindow(g_wnds[i])) { g_wnds[i--] = g_wnds[--g_nwnds]; continue; }
+        uint32_t e = (uint32_t)(uintptr_t)native32_user_ahe + 12 * ((uint32_t)(uintptr_t)g_wnds[i] & 0xFFFF);
+        if (MEM32(e)) wnd_sync(g_wnds[i], (uint8_t*)(uintptr_t)MEM32(e));
+    }
 }
 
 /* SERVERINFO, once: +0x59C aiSysMet[0x53] (GetSystemMetrics), +0x6E8
@@ -109,6 +163,23 @@ static void server_info(void) {
     /* +0x800 / +0x804 the system font's character size (GetDialogBaseUnits) */
     *(uint16_t*)(psi + 0x800) = (uint16_t)LOWORD(GetDialogBaseUnits());
     *(uint16_t*)(psi + 0x804) = (uint16_t)HIWORD(GetDialogBaseUnits());
+    /* +0xE50 the UserPreferencesMask: 0x80000000 UI effects, 0x20 keyboard
+     * cues always shown. A dialog hides its underlines and focus rectangle
+     * (WM_CHANGEUISTATE UIS_INITIALIZE) when effects are on and cues are
+     * not. ponytail: only these two bits, the host's; the rest (menu and
+     * combo animations, ...) stay off */
+    {
+        BOOL fx = FALSE, cues = FALSE;
+        SystemParametersInfoW(SPI_GETUIEFFECTS, 0, &fx, 0);
+        SystemParametersInfoW(SPI_GETKEYBOARDCUES, 0, &cues, 0);
+        *(uint32_t*)(psi + 0xE50) = (fx ? 0x80000000u : 0) | (cues ? 0x20u : 0);
+    }
+    /* +0xE4A dmLogPixels: a dialog font's height is -MulDiv(points, it, 72) */
+    {
+        HDC s = GetDC(NULL);
+        *(uint16_t*)(psi + 0xE4A) = (uint16_t)GetDeviceCaps(s, LOGPIXELSY);
+        ReleaseDC(NULL, s);
+    }
     /* +0x1A0 the system classes' atoms, by dialog-template ordinal & 0x7F
      * (0x80 Button .. 0x85 ComboBox): the host's */
     {
@@ -139,13 +210,14 @@ static void server_info(void) {
 static void (*g_prev_pre)(void);
 static void user_pre(void) {        /* before every win32k service */
     server_info();
-    if (native32_user_ahe) thread_setup();
+    if (native32_user_ahe) { thread_setup(); wnd_sync_all(); }
     if (g_prev_pre) g_prev_pre();
 }
 
 static void (*g_prev_cb_in)(uint32_t* args);
 static void cb_in(uint32_t* a) {             /* a window the guest is about to hear from */
     if (IsWindow((HWND)(uintptr_t)a[0])) native32_user_wnd((HWND)(uintptr_t)a[0]);
+    if (native32_user_ahe) wnd_sync_all();
     if (g_prev_cb_in) g_prev_cb_in(a);
 }
 
@@ -170,7 +242,22 @@ static uint32_t s_register_class(uint32_t* a) {
 /* NtUserCreateWindowEx(exstyle, LARGE_STRING* class, LARGE_STRING* name, style,
  * x, y, cx, cy, parent, menu, hInstance, lpParam, flags) */
 static uint32_t s_create_window(uint32_t* a) {
-    HWND h = CreateWindowExW(a[0], lstr_name(a[1]), lstr_name(a[2]), a[3], (int)a[4], (int)a[5], (int)a[6], (int)a[7],
+    /* A top-level frame: Windows 2000 sized it with its own borders (one
+     * SM_CXBORDER each for WS_EX_WINDOWEDGE x2 and a caption or modal frame,
+     * GetWindowBorders); the host's frame is thicker (padded borders). The
+     * client area is what the guest meant, so the difference goes on. */
+    int cx = (int)a[6], cy = (int)a[7];
+    if (!(a[3] & WS_CHILD) && cx > 0 && cy > 0 && cx != CW_USEDEFAULT) {
+        int b = (a[0] & WS_EX_WINDOWEDGE) ? 2 : (a[0] & WS_EX_STATICEDGE) ? 1 : 0;
+        RECT r = { 0, 0, 0, 0 };
+        if ((a[3] & WS_CAPTION) || (a[0] & WS_EX_DLGMODALFRAME)) b++;
+        if (a[3] & WS_THICKFRAME) { UINT g = 1; SystemParametersInfoW(SPI_GETBORDER, 0, &g, 0); b += g; }
+        if (a[0] & WS_EX_CLIENTEDGE) b += 2;
+        b *= GetSystemMetrics(SM_CXBORDER);
+        AdjustWindowRectEx(&r, a[3], FALSE, a[0]);
+        if (-r.left > b) { cx += 2 * (-r.left - b); cy += 2 * (-r.left - b); }
+    }
+    HWND h = CreateWindowExW(a[0], lstr_name(a[1]), lstr_name(a[2]), a[3], (int)a[4], (int)a[5], cx, cy,
                              (HWND)(uintptr_t)a[8], (HMENU)(uintptr_t)a[9], (HINSTANCE)(uintptr_t)a[10],
                              (void*)(uintptr_t)a[11]);
     if (!h) fprintf(stderr, "[user] CreateWindowExW failed: %lu\n", GetLastError());
@@ -197,7 +284,12 @@ static uint32_t s_message_call(uint32_t* a) {
         LRESULT r = a[6] ? SendMessageA(h, a[1], a[2], a[3]) : SendMessageW(h, a[1], a[2], a[3]);
         return (uint32_t)(a[1] == WM_GETFONT && r ? native32_gdi_handle((uint32_t)r) : r);
     }
-    if (a[5] == 0x29E) return (uint32_t)(a[6] ? DefWindowProcA(h, a[1], a[2], a[3]) : DefWindowProcW(h, a[1], a[2], a[3]));
+    if (a[5] == 0x29E) {
+        LRESULT r = a[6] ? DefWindowProcA(h, a[1], a[2], a[3]) : DefWindowProcW(h, a[1], a[2], a[3]);
+        /* WM_CTLCOLOR*: the brush goes back to the guest's gdi32 as its own */
+        if (a[1] >= WM_CTLCOLORMSGBOX && a[1] <= WM_CTLCOLORSTATIC && r) return native32_gdi_handle((uint32_t)r);
+        return (uint32_t)r;
+    }
     fprintf(stderr, "[user] NtUserMessageCall fnid 0x%X (msg 0x%X) not answered\n", a[5], a[1]);
     return 0;
 }
@@ -302,14 +394,56 @@ static uint32_t s_hwnd_param_lock(uint32_t* a) {
 static uint32_t s_hwnd_param(uint32_t* a) {
     uint8_t* w = native32_user_wnd((void*)(uintptr_t)a[0]);
     if (a[2] == 0x43 && w) {
+        /* the window procedure becomes Windows 2000's own DefDlgProcW (its
+         * apfnClientW dialog procedure): it keeps the dialog in that DIALOG
+         * and calls the guest's dialog procedure, which the host's
+         * DefDlgProc knows nothing of */
+        static uint32_t ddp;
+        if (!ddp) ddp = native32_export(native32_module("user32.dll"), "DefDlgProcW");
         *(uint32_t*)(w + 0x9C) = a[1];
         w[0x16] |= 1;
+        if (ddp) {
+            SetWindowLongPtrW((HWND)(uintptr_t)a[0], GWLP_WNDPROC, (LONG_PTR)ddp);
+            *(uint32_t*)(w + 0x5C) = ddp;
+        }
         return 1;
     }
     fprintf(stderr, "[user] NtUserCallHwndParam index 0x%X not answered\n", a[2]);
     return 0;
 }
 
+/* NtUserSetWindowFNID(hwnd, fnid): WND+0x2A (a dialog's 0x2A2) */
+static uint32_t s_set_fnid(uint32_t* a) {
+    uint8_t* w = native32_user_wnd((void*)(uintptr_t)a[0]);
+    if (w) *(uint16_t*)(w + 0x2A) = (uint16_t)a[1];
+    return w != NULL;
+}
+/* NtUserQueryWindow(hwnd, what): 0 the process, 1 the thread; for the
+ * guest's own windows its TEB's ClientId (SetWindowText sends WM_SETTEXT
+ * only to a window of its own process) */
+static uint32_t s_query_window(uint32_t* a) {
+    DWORD pid = 0, tid = GetWindowThreadProcessId((HWND)(uintptr_t)a[0], &pid);
+    uint32_t teb = MEM32(g_fs_base + 0x18);
+    int own = pid == GetCurrentProcessId();
+    if (a[1] == 0) return own ? MEM32(teb + 0x20) : pid;
+    if (a[1] == 1) return own ? MEM32(teb + 0x24) : tid;
+    fprintf(stderr, "[user] NtUserQueryWindow %u not answered\n", a[1]);
+    return 0;
+}
+/* NtUserFillWindow(hwndBrush, hwnd, hdc, hbr): a CTLCOLOR_* index in hbr
+ * asks hwndBrush for the brush (WM_CTLCOLORMSGBOX + index) */
+static uint32_t s_fill_window(uint32_t* a) {
+    HWND hb = (HWND)(uintptr_t)a[0], h = (HWND)(uintptr_t)a[1];
+    HDC dc = (HDC)(uintptr_t)native32_gdi_host(a[2]);
+    uint32_t br = a[3];
+    RECT r;
+    if (br <= 6) br = (uint32_t)SendMessageW(hb ? hb : h, WM_CTLCOLORMSGBOX + br, (WPARAM)a[2], (LPARAM)h);
+    if (native32_gdi_host(br)) br = native32_gdi_host(br);
+    if (!dc || !br) return 0;
+    GetClientRect(h, &r);
+    return FillRect(dc, &r, (HBRUSH)(uintptr_t)br);
+}
+static uint32_t s_setfocus(uint32_t* a) { return (uint32_t)(uintptr_t)SetFocus((HWND)(uintptr_t)a[0]); }
 static uint32_t s_destroy(uint32_t* a) { return DestroyWindow((HWND)(uintptr_t)a[0]); }
 static uint32_t s_setcapture(uint32_t* a) { return (uint32_t)(uintptr_t)SetCapture((HWND)(uintptr_t)a[0]); }
 
@@ -354,7 +488,8 @@ void native32_user_install(void) {
         { "NtUserGetMenuItemRect", s_menu_rect }, { "NtUserFindExistingCursorIcon", s_find_icon },
         { "NtUserSetCursor", s_setcursor }, { "NtUserSetTimer", s_settimer }, { "NtUserKillTimer", s_killtimer },
         { "NtUserCallHwndParamLock", s_hwnd_param_lock }, { "NtUserCallHwndParam", s_hwnd_param },
-        { "NtUserDestroyWindow", s_destroy }, { "NtUserSetCapture", s_setcapture },
+        { "NtUserDestroyWindow", s_destroy }, { "NtUserSetWindowFNID", s_set_fnid }, { "NtUserSetFocus", s_setfocus },
+        { "NtUserQueryWindow", s_query_window }, { "NtUserFillWindow", s_fill_window }, { "NtUserSetCapture", s_setcapture },
         { "NtUserWaitMessage", s_waitmessage }, { "NtUserCallNoParam", s_call_noparam }, { "NtUserCallOneParam", s_call_oneparam },
     };
     for (int i = 0; i < (int)(sizeof svc / sizeof svc[0]); i++) native32_nt_win32k_override(svc[i].name, svc[i].fn);

@@ -115,6 +115,10 @@ static uint32_t client_connect(uint32_t data, uint32_t capture) {
         MEM32(ci + 0x0C) = (uint32_t)(uintptr_t)psi;
         MEM32(ci + 0x10) = (uint32_t)(uintptr_t)ahe;
         MEM32(ci + 0x14) = (uint32_t)(uintptr_t)disp;
+        /* ulSharedDelta: user32 subtracts it from every kernel pointer in the
+         * shared section (pDispInfo->pMonitorPrimary, ...). The section is
+         * ours, so 0; left unset it was the caller's stack (0xCCCC...) */
+        MEM32(ci + 0x18) = 0;
         {
             /* SHAREDINFO +0xE8 DefWindowMsgs { maxMsgs, abMsgs }: the messages
              * DefWindowProc hands to win32k. All of them: the host's
