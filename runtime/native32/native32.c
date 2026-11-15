@@ -624,7 +624,19 @@ static recomp_func_t dispatch_find(uint32_t va) {
     return NULL;
 }
 
+/* native32_replace: a lifted function answered by the host instead, for every
+ * call that resolves its address (indirect calls, imports the guest's own
+ * loader snapped). Direct calls inside its own module still reach the lift. */
+#define MAX_REPLACE 32
+static struct { uint32_t va; recomp_func_t fn; } g_replace[MAX_REPLACE];
+static int g_nreplace;
+void native32_replace(uint32_t va, recomp_func_t fn) {
+    if (g_nreplace < MAX_REPLACE) g_replace[g_nreplace].va = va, g_replace[g_nreplace++].fn = fn;
+}
+
 recomp_func_t recomp_lookup(uint32_t va) {
+    for (int i = 0; i < g_nreplace; i++)
+        if (g_replace[i].va == va) return g_replace[i].fn;
     if (native_module_at(va)) return NULL;    /* its original code runs: recomp_lookup_import */
     return dispatch_find(va);
 }
@@ -1898,4 +1910,11 @@ int native32_headless(void) {
     CloseHandle(pi.hProcess);
     CloseDesktop(desk);
     return (int)rc;
+}
+
+/* A built-in shim by name ("RtlUnwind"): for native32_replace. */
+recomp_func_t native32_shim(const char* name) {     /* a built-in shim, by name */
+    for (int i = 0; i < (int)(sizeof g_builtin / sizeof g_builtin[0]); i++)
+        if (!strcmp(g_builtin[i].name, name)) return g_builtin[i].fn;
+    return NULL;
 }

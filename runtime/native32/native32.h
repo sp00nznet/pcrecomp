@@ -136,6 +136,13 @@ void native32_call_guest(uint32_t va, int nargs, const uint32_t* args);
 void mach_enter(void);
 void mach_leave(void);
 
+/* A lifted function answered by the host instead, wherever its address is
+ * resolved (indirect calls, snapped imports); and a built-in shim by name.
+ * A lifted ntdll's RtlUnwind ends in NtContinue, a resume the lift cannot
+ * make; native32_nt_boot puts the seh32 one in its place. */
+void native32_replace(uint32_t va, recomp_func_t fn);
+recomp_func_t native32_shim(const char* name);
+
 /* Name for a native address ("kernel32.dll!CreateFileA"), or NULL. */
 const char* native32_name(uint32_t va);
 
@@ -287,6 +294,15 @@ void native32_nt_win32k_override(const char* name, native32_syscall_fn fn);
  * ntdll's KiUserCallbackDispatcher runs KernelCallbackTable[api](in, len);
  * returns its status, and the NtCallbackReturn output. */
 uint32_t native32_nt_callback(uint32_t api, uint32_t in, uint32_t len, uint32_t* out, uint32_t* outlen);
+/* A host function in place of a host DLL's export in its proxy image (same
+ * signature): a host notes what the guest gets from the host's DLLs. */
+void native32_nt_proxy_hook(const char* name, void* fn);
+/* w32kgdi.c: GDI's shared state for a lifted gdi32 on host GDI (see there). */
+void native32_gdi_install(void);
+int native32_gdi_start(uint32_t gdi32_base);   /* GdiDllInitialize, when user32 is the host's */
+uint32_t native32_gdi_handle(uint32_t host_handle);   /* -> the guest's handle */
+uint32_t native32_gdi_host(uint32_t guest_handle);     /* -> the host's, 0 if none */
+uint8_t* native32_gdi_attr(uint32_t hdc);
 /* A named section the guest opens that a server process of its own OS would
  * have created (csrss's \NLS\NlsSection* for kernel32): NtOpenSection on
  * that name returns a read-only section of the file. */

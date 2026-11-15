@@ -279,7 +279,19 @@ static const struct { const char* name; void* fn; } g_deny[] = {
     { "ShellExecuteA", deny_se }, { "ShellExecuteW", deny_se }, { "WinExec", deny_winexec },
 };
 
+/* Host functions a host puts in place of a proxied export (native32_nt_proxy_hook):
+ * the same signature, usually calling the real one and noting its result
+ * (w32kgdi.c registers the HDC host user32's BeginPaint returns). */
+#define MAX_HOOKS 32
+static struct { const char* name; void* fn; } g_hook[MAX_HOOKS];
+static int g_nhook;
+void native32_nt_proxy_hook(const char* name, void* fn) {
+    if (g_nhook < MAX_HOOKS) g_hook[g_nhook].name = name, g_hook[g_nhook++].fn = fn;
+}
+
 static void* denied(const char* name) {
+    for (int i = 0; i < g_nhook; i++)
+        if (!strcmp(g_hook[i].name, name)) return g_hook[i].fn;
     for (int i = 0; i < (int)(sizeof g_deny / sizeof g_deny[0]); i++)
         if (!strcmp(g_deny[i].name, name)) return g_deny[i].fn;
     return NULL;
@@ -582,6 +594,25 @@ uint32_t native32_nt_callback(uint32_t api, uint32_t in, uint32_t len, uint32_t*
  * says so (the common case: the context was captured there). */
 static uint32_t ovr_raise_exception(uint32_t* a) {
     uint32_t rec = a[0], ctx = a[1];
+    /* First chance (x86 RtlRaiseException asks the kernel first): back to
+     * user mode through the guest's KiUserExceptionDispatcher(Record,
+     * Context), which runs RtlDispatchException over the guest's frames. A
+     * handler that takes it jumps into its __except block through native32's
+     * landing pads (eh32) and never comes back here; the machine lock is not
+     * taken again, so that jump leaves nothing held. */
+    static int depth;
+    uint32_t kued = native32_export(native32_module("ntdll.dll"), "KiUserExceptionDispatcher");
+    recomp_func_t f = kued ? recomp_lookup(kued) : NULL;
+    if (a[2] && f && depth < 8) {
+        uint32_t sp = g_esp;
+        g_esp -= 0x400;                                /* below the raiser's frame */
+        PUSH32(g_esp, ctx);
+        PUSH32(g_esp, rec);
+        depth++;
+        f();
+        depth--;
+        g_esp = sp;                                    /* it came back: not handled */
+    }
     fprintf(stderr, "\n[nt] unhandled guest exception %08X at %08X (first chance %u), eip %08X esp %08X\n",
             rec ? MEM32(rec) : 0, rec ? MEM32(rec + 12) : 0, a[2], ctx ? MEM32(ctx + 0xB8) : 0, ctx ? MEM32(ctx + 0xC4) : 0);
     fflush(NULL);
@@ -663,6 +694,10 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
     native32_nt_override("NtCreateProcess", ovr_no_process);
     native32_nt_override("NtCreateProcessEx", ovr_no_process);
     csr32_install();
+    /* RtlUnwind ends in NtContinue to its caller, which a lift cannot do:
+     * native32's own (seh32.c) unwinds the guest's frames and returns. */
+    if (native32_export(ntdll, "RtlUnwind") && native32_shim("RtlUnwind"))
+        native32_replace(native32_export(ntdll, "RtlUnwind"), native32_shim("RtlUnwind"));
 
     /* PEB: the fields the kernel sets (NT 5 offsets). Ldr, the heap, the
      * locks and the TLS bitmap are the guest ntdll's to make. */
