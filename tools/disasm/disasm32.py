@@ -2049,8 +2049,11 @@ def main(argv=None):
     # were missing, and the engine's first call into the module was an
     # unresolved ICALL. An export into a code section only: a forwarder or an
     # exported variable is not a function.
+    # Windows 2000's kernel32 keeps its export directory, forwarder strings
+    # and all, inside .text: "NTDLL.RtlAllocateHeap" was seeded and lifted.
     exported = {info.image_base + e.rva for e in info.exports
-                if info.code_start <= info.image_base + e.rva < info.code_end}
+                if info.code_start <= info.image_base + e.rva < info.code_end
+                and not getattr(e, 'forwarder', None)}
     if exported:
         print(f"[*] {len(exported)} exports seeded")
     seeds |= exported

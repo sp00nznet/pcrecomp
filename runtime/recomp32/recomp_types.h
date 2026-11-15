@@ -234,6 +234,9 @@ extern uint32_t g_es_base, g_cs_base;
 #define CS_BASE  g_cs_base
 uint32_t recomp_sel_base(uint32_t selector);
 void     recomp_int(int n);
+/* NT system call gate (int 2Eh / int 2Bh), lifted outside DOS mode: eax = service,
+ * edx -> arguments. runtime/native32/syscall32.c. */
+void     recomp_syscall(int vector);
 uint8_t  recomp_in8(uint32_t port);
 uint16_t recomp_in16(uint32_t port);
 uint32_t recomp_in32(uint32_t port);

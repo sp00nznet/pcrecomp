@@ -2073,6 +2073,15 @@ class Lifter:
             # unreachable fallthrough would run the next block's code.
             lines.append(f"/* int3 breakpoint */ return; {comment}")
 
+        elif m == 'int' and not self.dos and ops and ops[0].imm in (0x2B, 0x2E):
+            # Windows NT's system call gate (not a #GP: NT 4/2000 user code
+            # enters the kernel by it): int 2Eh with the service number
+            # in eax and edx -> the arguments (ntdll's NtXxx stubs, user32's
+            # and gdi32's win32k stubs); int 2Bh is NtCallbackReturn. The
+            # host's syscall layer (native32 syscall32.c) answers both.
+            lines.append(f"RECOMP_REGS_OUT(); recomp_syscall({ops[0].imm:#04x}); RECOMP_REGS_IN(); {comment}")
+            self._flag_state = None
+
         elif not self.dos and (m == 'int1' or (m == 'int' and insn.op_str not in ('3', '0x3'))):
             # A software interrupt faults on NT: `int n` (n != 3) is a #GP,
             # an access violation; `int1` (icebp) a single step. Protection

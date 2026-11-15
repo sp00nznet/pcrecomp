@@ -706,7 +706,9 @@ def find_splits(md, code, code_start, code_end, entries):
         back = set()
         true_extent(md, code, code_start, e, min(e + EXTENT_REACH, code_end), entries,
                     behind=back)
-        back = {t for t in back if t < e and code[t - code_start - 1] != 0xCC}
+        # A branch out of the code section (kernel32 2000 has them, into data
+        # the walk decoded) is no back edge of this one.
+        back = {t for t in back if code_start < t < e and code[t - code_start - 1] != 0xCC}
         if any(ordered[i - 1] <= t for t in back) or any(
                 reaches(p, t) for t in back for p in ordered[max(0, i - CHAIN):i] if p <= t):
             splits.add(e)
