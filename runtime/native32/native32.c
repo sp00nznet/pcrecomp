@@ -1271,7 +1271,26 @@ X87CRT(adj_fprem) X87CRT(adj_fprem1) X87CRT(adj_fptan) X87CRT(adj_fpatan)
 /* native32_registry: the guest's own registry subtrees, from a .reg file. */
 #include "reg32.c"
 
+/* msvcrt's _EH_prolog (and _EH_prolog3 kin are inline): not a C function. It
+ * builds its CALLER's frame -- pushes -1, the handler in eax and fs:[0], links
+ * the new record, saves ebp over its own return address and points ebp at it,
+ * then returns with esp 12 lower. Through the bridge the frame would be built
+ * on the host stack and the caller's ebp-relative arguments read garbage
+ * (Windows 2000 calc's WinMain got hInstance 0). */
+static void shim_EH_prolog(void) {
+    uint32_t ret = MEM32(g_esp);
+    g_esp -= 12;
+    MEM32(g_esp + 8) = 0xFFFFFFFFu;
+    MEM32(g_esp + 4) = g_eax;
+    MEM32(g_esp) = MEM32(g_fs_base);
+    MEM32(g_fs_base) = g_esp;
+    MEM32(g_esp + 12) = g_ebp;
+    g_ebp = g_esp + 12;
+    g_eax = ret;               /* "push eax; ret" leaves esp at E-12 */
+}
+
 static native32_shim_t g_builtin[] = {
+    { "_EH_prolog", shim_EH_prolog },
     { "CreateThread", shim_CreateThread },
     { "RaiseException", shim_RaiseException },
     { "RtlUnwind", shim_RtlUnwind },
