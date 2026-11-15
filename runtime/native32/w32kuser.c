@@ -372,6 +372,40 @@ static void user_object(uint32_t h, uint8_t type, uint32_t size) {
 }
 static uint32_t menu(HMENU m) { user_object((uint32_t)(uintptr_t)m, 2, 0x100); return (uint32_t)(uintptr_t)m; }
 
+/* The MENU's items, from the host menu, for what user32 looks up client-side
+ * (CheckMenuItem calls win32k only when the state changes): MENU +0x10 pSelf,
+ * +0x20 cItems, +0x34 rgItems; ITEM (0x4C bytes) +0 fType, +4 fState, +8
+ * wID, +0xC spSubMenu. Kept after every call that changes a menu.
+ * ponytail: up to 64 items a menu */
+#define MENU_ITEMS 64
+static void menu_sync(HMENU m) {
+    uint32_t h = (uint32_t)(uintptr_t)m, e = (uint32_t)(uintptr_t)native32_user_ahe + 12 * (h & 0xFFFF);
+    uint8_t* o;
+    int n = GetMenuItemCount(m);
+    if (!native32_user_ahe || n < 0 || !MEM32(e) || MEM8(e + 8) != 2) return;
+    o = (uint8_t*)(uintptr_t)MEM32(e);
+    if (!*(uint32_t*)(o + 0x34)) *(uint32_t*)(o + 0x34) = (uint32_t)(uintptr_t)desk_alloc(MENU_ITEMS * 0x4C);
+    if (!*(uint32_t*)(o + 0x34)) return;
+    if (n > MENU_ITEMS) n = MENU_ITEMS;
+    *(uint32_t*)(o + 0x10) = (uint32_t)(uintptr_t)o;
+    *(uint32_t*)(o + 0x20) = (uint32_t)n;
+    for (int i = 0; i < n; i++) {
+        uint8_t* it = (uint8_t*)(uintptr_t)*(uint32_t*)(o + 0x34) + i * 0x4C;
+        MENUITEMINFOW mi = { sizeof mi, MIIM_FTYPE | MIIM_STATE | MIIM_ID | MIIM_SUBMENU };
+        memset(it, 0, 0x4C);
+        if (!GetMenuItemInfoW(m, i, TRUE, &mi)) continue;
+        *(uint32_t*)(it + 0) = mi.fType;
+        *(uint32_t*)(it + 4) = mi.fState;
+        *(uint32_t*)(it + 8) = mi.wID;
+        if (mi.hSubMenu) {
+            uint32_t se = (uint32_t)(uintptr_t)native32_user_ahe + 12 * ((uint32_t)(uintptr_t)mi.hSubMenu & 0xFFFF);
+            menu(mi.hSubMenu);
+            menu_sync(mi.hSubMenu);       /* (a by-command lookup goes down into it) */
+            *(uint32_t*)(it + 0xC) = MEM32(se);
+        }
+    }
+}
+
 /* NtUserCallNoParam(index): 0 CreateMenu, 1 CreatePopupMenu, 8 ReleaseCapture (Windows 2000's
  * order, from what user32 does with the result) */
 static uint32_t s_call_noparam(uint32_t* a) {
@@ -397,8 +431,21 @@ static uint32_t s_menu_item(uint32_t* a) {
     MENUITEMINFOW mi = *(MENUITEMINFOW*)(uintptr_t)a[4];
     mi.cbSize = sizeof mi;
     if (a[5] && MEM32(a[5] + 4)) mi.dwTypeData = (LPWSTR)(uintptr_t)MEM32(a[5] + 4), mi.cch = MEM16(a[5]) / 2;
-    return a[3] ? InsertMenuItemW((HMENU)(uintptr_t)a[0], a[1], a[2], &mi)
-                : SetMenuItemInfoW((HMENU)(uintptr_t)a[0], a[1], a[2], &mi);
+    BOOL r = a[3] ? InsertMenuItemW((HMENU)(uintptr_t)a[0], a[1], a[2], &mi)
+                  : SetMenuItemInfoW((HMENU)(uintptr_t)a[0], a[1], a[2], &mi);
+    menu_sync((HMENU)(uintptr_t)a[0]);
+    return r;
+}
+/* NtUserCheckMenuItem(hmenu, id, flags) / NtUserEnableMenuItem: the previous state */
+static uint32_t s_check_menu(uint32_t* a) {
+    DWORD r = CheckMenuItem((HMENU)(uintptr_t)a[0], a[1], a[2]);
+    menu_sync((HMENU)(uintptr_t)a[0]);
+    return r;
+}
+static uint32_t s_enable_menu(uint32_t* a) {
+    BOOL r = EnableMenuItem((HMENU)(uintptr_t)a[0], a[1], a[2]);
+    menu_sync((HMENU)(uintptr_t)a[0]);
+    return (uint32_t)r;
 }
 static uint32_t s_destroy_menu(uint32_t* a) { return DestroyMenu((HMENU)(uintptr_t)a[0]); }
 
@@ -547,6 +594,7 @@ void native32_user_install(void) {
         { "NtUserTranslateMessage", s_translate }, { "NtUserDispatchMessage", s_dispatch },
         { "NtUserBeginPaint", s_beginpaint }, { "NtUserEndPaint", s_endpaint },
         { "NtUserThunkedMenuItemInfo", s_menu_item }, { "NtUserDestroyMenu", s_destroy_menu },
+        { "NtUserCheckMenuItem", s_check_menu }, { "NtUserEnableMenuItem", s_enable_menu },
         { "NtUserGetMenuItemRect", s_menu_rect }, { "NtUserFindExistingCursorIcon", s_find_icon },
         { "NtUserSetCursor", s_setcursor }, { "NtUserSetTimer", s_settimer }, { "NtUserKillTimer", s_killtimer },
         { "NtUserCallHwndParamLock", s_hwnd_param_lock }, { "NtUserCallHwndParam", s_hwnd_param },
