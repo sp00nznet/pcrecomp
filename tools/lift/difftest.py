@@ -819,7 +819,11 @@ def _sse_forms():
                      'pcmpgtb': '660f64c1', 'pcmpgtw': '660f65c1', 'pcmpgtd': '660f66c1',
                      'pmaxsw': '660feec1', 'pminsw': '660feac1',
                      'pextrw': '660fc5c003', 'pextrw.6': '660fc5c906', 'pinsrw': '660fc4c005',
-                     'pinsrw.mem': '660fc44e0802', 'pmovmskb': '660fd7c0', 'cvtdq2pd': 'f30fe6c1'}.items():
+                     'pinsrw.mem': '660fc44e0802', 'pmovmskb': '660fd7c0', 'cvtdq2pd': 'f30fe6c1',
+                     'paddb': '660ffcc1', 'psubb': '660ff8c1', 'paddw': '660ffdc1', 'psubw': '660ff9c1',
+                     'paddusb': '660fdcc1', 'psubusb': '660fd8c1', 'paddusw': '660fddc1', 'psubusw': '660fd9c1',
+                     'punpcklbw': '660f60c1', 'punpcklwd': '660f61c1', 'punpckldq': '660f62c1',
+                     'punpckhbw': '660f68c1', 'punpckhwd': '660f69c1', 'punpckhdq': '660f6ac1'}.items():
         for tag, data in (('', ps), ('.int', ints)):
             out.append(Case('sse.%s%s' % (name, tag), load + bytes.fromhex(op) + store,
                             regs={'eax': 0xFFFFFF85, 'ecx': 0x12345678}, mem={SCRATCH: data + extra}))
@@ -827,7 +831,8 @@ def _sse_forms():
     for name, op in {'addsd': 'f20f58c1', 'subsd': 'f20f5cc1', 'mulsd': 'f20f59c1', 'divsd': 'f20f5ec1',
                      'minsd': 'f20f5dc1', 'maxsd': 'f20f5fc1', 'comisd': '660f2fc1', 'ucomisd': '660f2ec1',
                      'cvtsd2ss': 'f20f5ac1', 'cvttsd2si': 'f20f2cc1', 'xorpd': '660f57c1',
-                     'movsd.reg': 'f20f10c1', 'movsd.load': 'f20f104618', 'unpcklpd': '660f14c1'}.items():
+                     'movsd.reg': 'f20f10c1', 'movsd.load': 'f20f104618', 'unpcklpd': '660f14c1',
+                     'cvttpd2dq': '660fe6c1', 'cvtpd2dq': 'f20fe6c1'}.items():
         out.append(Case('sse.%s' % name, load + bytes.fromhex(op) + store, mem={SCRATCH: pd + extra}))
     # fcomi: fld [esi]; fld [esi+4]; fcomi st(1) / fcomip st(1) / fucomip; fstp what is left
     for name, op, pops in (('fcomi', 'dbf1', 0), ('fcomip', 'dff1', 1), ('fucomip', 'dfe9', 1)):

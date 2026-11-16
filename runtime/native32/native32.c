@@ -77,6 +77,7 @@ static DWORD g_mach_tls = TLS_OUT_OF_INDEXES;
 #define BRIDGE_SLOTS 24
 
 #define GUEST_STACK (4u << 20)
+#define IN_PLACE_ROOM (1u << 20)   /* see native_bridge */
 
 /* Static TLS (__declspec(thread), Borland's threadvars): the guest reads its
  * block as fs:[2Ch][index]. Windows sets that up only for modules its loader
@@ -512,6 +513,12 @@ static void native_bridge(void) {
     }
     g_cur_import = native32_name(fn);
     if (!g_cur_import) g_cur_import = "(native)";
+    /* Told by its mark: an argument word pointing back into the argument
+     * block (see the in-place call below). */
+    int in_place_call = 0;
+    for (int k = 0; k < BRIDGE_SLOTS && !in_place_call; k++)
+        in_place_call = src[k] - (uint32_t)(uintptr_t)src < BRIDGE_SLOTS * 4u;
+    if (in_place_call) g_esp -= IN_PLACE_ROOM;
     mach_leave();
     SetLastError(guest_error);
     /* The locals are reached through whatever base register the compiler
@@ -530,6 +537,56 @@ static void native_bridge(void) {
      * stack, and the esp anchor is kept in this thread's TEB
      * (ArbitraryUserPointer, fs:[0x14], its old value saved and put back, so a
      * nested bridge through a callback unwinds in order). */
+    /* A by-value argument that points into itself (MSVC's std::function keeps
+     * its small callable inline and a pointer to it at +0x24) breaks when
+     * copied: the callee sees the pointer leave its own storage, takes it for
+     * heap, and calls through junk (Rise of Nations: CrossplayNetLib's
+     * set_p2p_callbacks, CrossplayProxy's logger). Such a callee runs on the guest stack itself, its
+     * arguments where the guest built them, with the TEB's stack bounds moved
+     * there for the call so SEH inside it still validates. Its own frames grow
+     * down from the arguments, so a callback it makes into the guest starts
+     * IN_PLACE_ROOM lower (via the esp mach_leave saved) instead of on top of
+     * them.
+     * ponytail: a fixed split; a callee needing more than IN_PLACE_ROOM of
+     * native stack would run into the callback's frames. */
+    if (in_place_call) {
+        NT_TIB* tib = (NT_TIB*)NtCurrentTeb();
+        MEMORY_BASIC_INFORMATION mbi;
+        VirtualQuery(src, &mbi, sizeof mbi);
+        void *base = tib->StackBase, *limit = tib->StackLimit;
+        uint32_t at = (uint32_t)(uintptr_t)src, after;
+        tib->StackLimit = mbi.AllocationBase;
+        tib->StackBase = (char*)mbi.BaseAddress + mbi.RegionSize;
+        __asm {
+            fnstsw ax
+            mov  sw0, ax
+            mov  edx, src
+            mov  eax, fn
+            mov  edi, this_ecx
+            push ebp
+            push esi
+            push ebx
+            push dword ptr fs:[0x14]
+            mov  fs:[0x14], esp
+            mov  esp, edx        ; the guest's own arguments
+            mov  ecx, edi
+            call eax             ; its ret lands in the guest's dummy slot
+            mov  ecx, esp
+            mov  esp, fs:[0x14]
+            pop  dword ptr fs:[0x14]
+            pop  ebx
+            pop  esi
+            pop  ebp
+            mov  r_eax, eax
+            mov  r_edx, edx
+            mov  after, ecx
+            fxam
+            fnstsw ax
+            mov  sw1, ax
+        }
+        tib->StackBase = base; tib->StackLimit = limit;
+        purge = after - at;
+    } else
     __asm {
         fnstsw ax
         mov  sw0, ax             ; x87 TOP before
@@ -577,6 +634,7 @@ static void native_bridge(void) {
      * itself and back out of FindNextFileA. */
     DWORD last_error = GetLastError();
     mach_enter();
+    if (in_place_call) g_esp += IN_PLACE_ROOM;
     if (st_ret) fp_push_impl(g_st, &g_fp_top, r_st);
     g_cur_import = saved_import;
     g_eax = r_eax;
@@ -1449,6 +1507,8 @@ static uint64_t __cdecl cb_run(uint32_t va, uint32_t* sp, uint32_t ecx, uint32_t
     if (!setjmp(guard.jb)) {
         f();
         eax = g_eax, edx = g_edx, purge = g_esp - before - 4;
+        if (native32_trace_callbacks)
+            fprintf(stderr, "[callback] sub_%08X -> %08X:%08X purge %u\n", va, edx, eax, purge);
         cb_purge[slot].va = va, cb_purge[slot].purge = purge;
     } else {
         /* ponytail: a callback never seen to return is assumed stdcall with
