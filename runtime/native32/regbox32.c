@@ -537,6 +537,15 @@ void* native32_registry_sandbox_fn(const char* name) {
     return NULL;
 }
 
+int native32_registry_box_sz(const wchar_t* sub, const wchar_t* value, wchar_t* out, DWORD cch) {
+    wchar_t key[KP];
+    DWORD n = cch * sizeof(wchar_t);
+    if (!g_on) return 0;
+    _snwprintf(key, KP - 1, L"%ls\\HKCU\\%ls", g_root_rel, sub);
+    key[KP - 1] = 0;
+    return !RegGetValueW(HKEY_CURRENT_USER, key, value, RRF_RT_REG_SZ, NULL, out, &n);
+}
+
 int native32_registry_sandbox(const char* name) {
     char path[300];
     HKEY cu, root;

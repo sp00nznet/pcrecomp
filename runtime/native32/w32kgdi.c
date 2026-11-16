@@ -295,6 +295,9 @@ static uint32_t s_randomrgn(uint32_t* a) { return (uint32_t)GetRandomRgn((HDC)(u
 static uint32_t s_intersectclip(uint32_t* a) {
     return (uint32_t)IntersectClipRect((HDC)(uintptr_t)HOST(a[0]), (int)a[1], (int)a[2], (int)a[3], (int)a[4]);
 }
+/* NtGdiGetAppClipBox(hdc, RECT*): GetClipBox (comctl32's listview paints
+ * only the items inside it: an unanswered 0 drew no desktop icons) */
+static uint32_t s_appclipbox(uint32_t* a) { return (uint32_t)GetClipBox(dc(a[0]), (RECT*)(uintptr_t)a[1]); }
 static uint32_t s_selectcliprgn(uint32_t* a) {
     return (uint32_t)ExtSelectClipRgn((HDC)(uintptr_t)HOST(a[0]), (HRGN)(uintptr_t)HOST(a[1]), (int)a[2]);
 }
@@ -760,7 +763,7 @@ void native32_gdi_install(void) {
         { "NtGdiCreatePen", s_pen }, { "NtGdiCreateRectRgn", s_rectrgn }, { "NtGdiCreateDIBitmapInternal", s_dibitmap }, { "NtGdiCreateBitmap", s_bitmap }, { "NtGdiCreatePatternBrushInternal", s_patbrush }, { "NtGdiCreateDIBSection", s_dibsection },
         { "NtGdiGetDCObject", s_dcobject }, { "NtGdiExcludeClipRect", s_excludeclip },
         { "NtGdiGetRegionData", s_rgndata }, { "NtGdiGetDCforBitmap", s_dcforbitmap }, { "NtGdiSaveDC", s_savedc }, { "NtGdiRestoreDC", s_restoredc },
-        { "NtGdiGetRandomRgn", s_randomrgn }, { "NtGdiIntersectClipRect", s_intersectclip }, { "NtGdiExtSelectClipRgn", s_selectcliprgn }, { "NtGdiCreateSolidBrush", s_brush },
+        { "NtGdiGetRandomRgn", s_randomrgn }, { "NtGdiIntersectClipRect", s_intersectclip }, { "NtGdiGetAppClipBox", s_appclipbox }, { "NtGdiExtSelectClipRgn", s_selectcliprgn }, { "NtGdiCreateSolidBrush", s_brush },
         { "NtGdiSelectBitmap", s_select_bitmap }, { "NtGdiSelectBrush", s_select }, { "NtGdiSelectPen", s_select },
         { "NtGdiSelectFont", s_select }, { "NtGdiDeleteObjectApp", s_delete }, { "NtGdiBitBlt", s_bitblt },
         { "NtGdiLineTo", s_lineto }, { "NtGdiMoveTo", s_moveto }, { "NtGdiSetPixel", s_setpixel },

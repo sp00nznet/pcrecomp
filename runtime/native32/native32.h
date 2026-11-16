@@ -84,6 +84,9 @@ int native32_registry_sandbox(const char* name);
  * native32_nt_proxy_hook (before native32_nt_boot). */
 void native32_registry_sandbox_nt(void (*ovr)(const char*, uint32_t (*)(uint32_t*)),
                                   uint32_t (*fwd)(const char*, uint32_t*), void (*hook)(const char*, void*));
+/* A REG_SZ the guest's own box holds under HKCU\sub (never the real
+ * registry's): 1 and the text in out, 0 if there is no box or no value. */
+int native32_registry_box_sz(const wchar_t* sub, const wchar_t* value, wchar_t* out, unsigned long cch);
 /* A sandbox replacement by its export name (WriteProfileStringW...), or NULL. */
 void* native32_registry_sandbox_fn(const char* name);
 

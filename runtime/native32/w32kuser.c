@@ -110,6 +110,7 @@ static int class_ansi(HWND h) { int i = class_index(h); return i >= 0 && g_cls[i
  * Guest top-level windows are SetParent'ed into it (still popups to the
  * host: menus stay) and PrintWindow of it is the whole screen. A runner
  * started by a guest in it gets W2K_SCREEN_HWND and joins the same one. */
+static COLORREF sys_color(int i);
 static HWND g_screen;
 static int g_scx, g_scy;
 static RECT g_work;
@@ -121,7 +122,7 @@ static void screen_init(void) {
         WNDCLASSW wc = { 0 };
         wc.lpfnWndProc = DefWindowProcW;
         wc.hInstance = GetModuleHandleW(NULL);
-        wc.hbrBackground = (HBRUSH)(COLOR_BACKGROUND + 1);
+        wc.hbrBackground = CreateSolidBrush(sys_color(COLOR_BACKGROUND));
         wc.lpszClassName = L"pcrecomp.screen";
         RegisterClassW(&wc);
         g_screen = CreateWindowExW(0, wc.lpszClassName, L"Windows 2000", WS_POPUP | WS_CLIPCHILDREN | WS_VISIBLE,
@@ -172,6 +173,11 @@ static void wnd_sync(HWND h, uint8_t* w) {
         *(uint16_t*)(w + 0x2A) = 0x29D;
     }
     *(uint32_t*)(w + 0x38) = own ? (uint32_t)(uintptr_t)native32_user_wnd(own) : 0;
+    /* +0x64 hrgnUpdate: user32's GetUpdateRect answers FALSE client-side
+     * when it is 0 (the listview then never painted: WM_PAINT forever, no
+     * icons or labels). HRGN_FULL (1) when the host window has one; the
+     * rectangle itself comes from NtUserGetUpdateRect. */
+    *(uint32_t*)(w + 0x64) = GetUpdateRect(h, NULL, FALSE) ? 1 : 0;
     /* +0x34 spwndChild, and for a child +0x2C spwndNext and +0x74 its ID
      * (spmenu's place): GetDlgItem walks them client-side. A top-level
      * window's spwndNext stays 0 (the next is anyone's window) and its spmenu
@@ -218,7 +224,17 @@ uint8_t* native32_user_wnd(void* hv) {
         *(uint32_t*)(w + 0x60) = (uint32_t)(uintptr_t)cls;
     }
     MEM32(e) = (uint32_t)(uintptr_t)w;
-    MEM32(e + 4) = 0;
+    /* +4 pOwner, the window's THREADINFO: 0 made GetWindowThreadProcessId
+     * answer 0, and comctl32 sends WM_NOTIFY only to a parent of its own
+     * process (no LVN_GETDISPINFO: the desktop listview's items had no text
+     * or icon). Never the threads' shared one (user32 would take every
+     * window for the caller's own): a stand-in, so it asks
+     * NtUserQueryWindow, which answers from the host. */
+    {
+        static uint8_t* other;
+        if (!other) other = (uint8_t*)calloc(1, 0x400);
+        MEM32(e + 4) = (uint32_t)(uintptr_t)other;
+    }
     MEM8(e + 8) = 1;                                                            /* TYPE_WINDOW */
     MEM8(e + 9) = 0;
     MEM16(e + 0xA) = (uint16_t)((uint32_t)(uintptr_t)h >> 16);
@@ -241,6 +257,24 @@ static void wnd_sync_all(void) {
 /* SERVERINFO, once: +0x59C aiSysMet[0x53] (GetSystemMetrics), +0x6E8
  * argbSystem[0x1D] (GetSysColor), from the host's */
 static uint8_t* g_mon;      /* the primary MONITOR, for the work area */
+/* COLOR_* i: the guest's box's Control Panel\Colors (what win32k reads at
+ * logon: a Windows 2000 profile's 58 110 165 desktop), else the host's */
+static uint32_t g_boxcolor;  /* bit i: colour i came from the box */
+static COLORREF sys_color(int i) {
+    static const wchar_t* names[0x1D] = {
+        L"Scrollbar", L"Background", L"ActiveTitle", L"InactiveTitle", L"Menu", L"Window", L"WindowFrame",
+        L"MenuText", L"WindowText", L"TitleText", L"ActiveBorder", L"InactiveBorder", L"AppWorkspace",
+        L"Hilight", L"HilightText", L"ButtonFace", L"ButtonShadow", L"GrayText", L"ButtonText",
+        L"InactiveTitleText", L"ButtonHilight", L"ButtonDkShadow", L"ButtonLight", L"InfoText", L"InfoWindow",
+        L"ButtonAlternateFace", L"HotTrackingColor", L"GradientActiveTitle", L"GradientInactiveTitle" };
+    wchar_t v[64];
+    int r, g, b;
+    if (native32_registry_box_sz(L"Control Panel\\Colors", names[i], v, 64) && swscanf(v, L"%d %d %d", &r, &g, &b) == 3) {
+        g_boxcolor |= 1u << i;
+        return RGB(r, g, b);
+    }
+    return GetSysColor(i);
+}
 static void server_info(void) {
     static int done;
     uint8_t* psi = native32_user_psi;
@@ -260,7 +294,7 @@ static void server_info(void) {
         m[SM_CXMAXTRACK] = m[SM_CXMAXIMIZED] + 4 * GetSystemMetrics(SM_CXFRAME);
         m[SM_CYMAXTRACK] = m[SM_CYMAXIMIZED] + 4 * GetSystemMetrics(SM_CYFRAME);
     }
-    for (int i = 0; i < 0x1D; i++) *(uint32_t*)(psi + 0x6E8 + 4 * i) = GetSysColor(i);
+    for (int i = 0; i < 0x1D; i++) *(uint32_t*)(psi + 0x6E8 + 4 * i) = sys_color(i);
     /* +0x800 / +0x804 the system font's character size (GetDialogBaseUnits) */
     *(uint16_t*)(psi + 0x800) = (uint16_t)LOWORD(GetDialogBaseUnits());
     *(uint16_t*)(psi + 0x804) = (uint16_t)HIWORD(GetDialogBaseUnits());
@@ -322,8 +356,14 @@ static void server_info(void) {
 static void sys_brushes(void) {
     uint8_t* psi = native32_user_psi;
     if (!psi || *(uint32_t*)(psi + 0x75C)) return;
+    {   /* (no table yet) */
+        uint32_t s = (uint32_t)(uintptr_t)GetSysColorBrush(0);
+        if (native32_gdi_handle(s) == s) return;
+    }
     for (int i = 0; i < 0x1D; i++) {
-        uint32_t h = (uint32_t)(uintptr_t)GetSysColorBrush(i), g = native32_gdi_handle(h);
+        /* a box colour gets its own brush (ponytail: never deleted, like the system's) */
+        uint32_t h = (uint32_t)(uintptr_t)(g_boxcolor & (1u << i) ? CreateSolidBrush(*(uint32_t*)(psi + 0x6E8 + 4 * i))
+                                                                   : GetSysColorBrush(i)), g = native32_gdi_handle(h);
         if (g == h) { *(uint32_t*)(psi + 0x75C) = 0; return; }       /* (no table yet) */
         *(uint32_t*)(psi + 0x75C + 4 * i) = g;
     }
@@ -360,6 +400,22 @@ static void cb_in(uint32_t* a) {             /* a window the guest is about to h
     if (g_prev_cb_in) g_prev_cb_in(a);
 }
 
+/* A class the guest registered (its procedure is the thunk), found under inst */
+static int guest_class(HINSTANCE inst, const wchar_t* name, WNDCLASSEXW* wc) {
+    wc->cbSize = sizeof *wc;
+    return GetClassInfoExW(inst, name, wc) && wc->lpfnWndProc == wnd_thunk;
+}
+/* A class a host DLL registered globally (not the host user32's system
+ * classes, which stand in for the guest user32's own; their procedures are
+ * user32's, or ntdll's stubs in a WOW64 process) */
+static int host_dll_class(const wchar_t* name) {
+    WNDCLASSEXW wc = { sizeof wc };
+    HMODULE owner = NULL;
+    return GetClassInfoExW(NULL, name, &wc) &&
+           GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                              (LPCWSTR)(void*)wc.lpfnWndProc, &owner) &&
+           owner != GetModuleHandleW(L"user32.dll") && owner != GetModuleHandleW(L"ntdll.dll");
+}
 /* NtUserRegisterClassExWOW(WNDCLASSEXW*, PUNICODE_STRING class, CLSMENUNAME*,
  * WORD fnid, DWORD flags, DWORD* wow): the host class, with the guest's
  * window procedure and the host's background brush. */
@@ -379,6 +435,12 @@ static uint32_t s_register_class(uint32_t* a) {
     uint32_t guest_proc = (uint32_t)(uintptr_t)w.lpfnWndProc;
     w.lpfnWndProc = wnd_thunk;
     ATOM r = RegisterClassExW(&w);
+    /* a host DLL in the process (Win11's language bar loads the host comctl32)
+     * holds the global name: the guest's class is then its DLL's local one */
+    if (!r && GetLastError() == ERROR_CLASS_ALREADY_EXISTS && (w.style & CS_GLOBALCLASS) && host_dll_class(w.lpszClassName)) {
+        w.style &= ~CS_GLOBALCLASS;
+        r = RegisterClassExW(&w);
+    }
     /* flags (a[4]) bit 1 is CSF_ANSIPROC: RegisterClassExA passes 2 (0x82
      * past 3.10), the W form 0 (0x80) */
     if (r && g_ncls < MAX_CLASSES)
@@ -536,14 +598,20 @@ static uint32_t s_create_window(uint32_t* a) {
         AdjustWindowRectEx(&r, a[3], FALSE, a[0]);
         if (-r.left > b) { cx += 2 * (-r.left - b); cy += 2 * (-r.left - b); }
     }
-    /* No instance: win32k finds a DLL's local class anyway (ole32's
-     * OleMainThreadWndClass); the host only under the instance it was
-     * registered with, so that one. */
-    if (!a[10])
-        for (int i = 0; i < g_ncls; i++) {
-            WNDCLASSEXW wc = { sizeof wc };
-            if (g_cls[i].inst && GetClassInfoExW(g_cls[i].inst, lstr_name(a[1]), &wc)) { a[10] = (uint32_t)(uintptr_t)g_cls[i].inst; break; }
-        }
+    /* The guest's own class, under the instance it was registered with: win32k
+     * finds a DLL's local class with no instance (ole32's OleMainThreadWndClass)
+     * and a guest DLL's global class from any instance (comctl32's controls,
+     * made local when a host DLL holds the global name: s_register_class); the
+     * host only under that instance. Host system classes stay as they are. */
+    {
+        WNDCLASSEXW wc = { sizeof wc };
+        int mine = a[10] && guest_class((HINSTANCE)(uintptr_t)a[10], lstr_name(a[1]), &wc);
+        for (int i = 0; i < g_ncls && !mine; i++)
+            if (g_cls[i].inst && guest_class(g_cls[i].inst, lstr_name(a[1]), &wc)) {
+                a[10] = (uint32_t)(uintptr_t)g_cls[i].inst;
+                break;
+            }
+    }
     /* 0x80000000 WS_EX_ANSICREATOR: CreateWindowExA's mark for win32k, not the host's */
     HWND h = CreateWindowExW(a[0] & ~0x80000000u, lstr_name(a[1]), lstr_name(a[2]), a[3], (int)a[4], (int)a[5], cx, cy,
                              (HWND)(uintptr_t)a[8], (HMENU)(uintptr_t)a[9], (HINSTANCE)(uintptr_t)a[10],
@@ -1106,7 +1174,16 @@ static uint32_t s_classinfo(uint32_t* a) {
     ATOM r = (ATOM)GetClassInfoExW((HINSTANCE)(uintptr_t)a[0], ustr_name(a[1]), w);
     if (!r) r = (ATOM)GetClassInfoExW(NULL, ustr_name(a[1]), w);
     if (r) {
-        for (int i = 0; i < g_ncls; i++) if (g_cls[i].atom == r) w->lpfnWndProc = (WNDPROC)(uintptr_t)g_cls[i].proc;
+        /* a host DLL's global class (the host comctl32's SysListView32) is
+         * not the guest's: its comctl32 would skip registering its own and
+         * get the host's controls, which take none of its handles (the
+         * desktop listview's image lists). Only the host user32's system
+         * classes stand in for the guest's. */
+        int mine = w->lpfnWndProc == wnd_thunk;
+        for (int i = 0; i < g_ncls && !mine; i++)       /* a guest DLL's class made local */
+            if (g_cls[i].inst && guest_class(g_cls[i].inst, ustr_name(a[1]), w)) mine = 1;
+        if (!mine && host_dll_class(ustr_name(a[1]))) return 0;
+        for (int i = 0; i < g_ncls && mine; i++) if (g_cls[i].atom == r) w->lpfnWndProc = (WNDPROC)(uintptr_t)g_cls[i].proc;
         if (a[3]) MEM32(a[3]) = (uint32_t)(uintptr_t)w->lpszMenuName;
     }
     return r;
@@ -1179,6 +1256,8 @@ static uint32_t s_beginpaint(uint32_t* a) {
     ps->hdc = (HDC)(uintptr_t)native32_gdi_handle((uint32_t)(uintptr_t)ps->hdc);
     return native32_gdi_handle((uint32_t)(uintptr_t)h);
 }
+/* NtUserGetUpdateRect(hwnd, RECT*, bErase) */
+static uint32_t s_getupdaterect(uint32_t* a) { return GetUpdateRect(HW(a[0]), (RECT*)(uintptr_t)a[1], (BOOL)a[2]); }
 static uint32_t s_endpaint(uint32_t* a) {
     PAINTSTRUCT* ps = (PAINTSTRUCT*)(uintptr_t)a[1];
     HDC g = ps->hdc;
@@ -1194,7 +1273,7 @@ void native32_user_install(void) {
         { "NtUserInvalidateRect", s_invalidate }, { "NtUserShowWindow", s_show }, { "NtUserRedrawWindow", s_redraw },
         { "NtUserGetMessage", s_getmessage }, { "NtUserPeekMessage", s_peekmessage },
         { "NtUserTranslateMessage", s_translate }, { "NtUserDispatchMessage", s_dispatch },
-        { "NtUserBeginPaint", s_beginpaint }, { "NtUserEndPaint", s_endpaint },
+        { "NtUserBeginPaint", s_beginpaint }, { "NtUserGetUpdateRect", s_getupdaterect }, { "NtUserEndPaint", s_endpaint },
         { "NtUserThunkedMenuItemInfo", s_menu_item }, { "NtUserDestroyMenu", s_destroy_menu },
         { "NtUserCheckMenuItem", s_check_menu }, { "NtUserEnableMenuItem", s_enable_menu },
         { "NtUserGetMenuItemRect", s_menu_rect }, { "NtUserFindExistingCursorIcon", s_find_icon }, { "NtUserSetCursorIconData", s_set_cursor_data },
