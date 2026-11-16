@@ -929,6 +929,60 @@ static uint32_t s_scrollwindow(uint32_t* a) {
 static uint32_t s_clipfmt_avail(uint32_t* a) { return IsClipboardFormatAvailable(a[0]); }
 static uint32_t s_accel(uint32_t* a) { return (uint32_t)(uintptr_t)CreateAcceleratorTableW((ACCEL*)(uintptr_t)a[0], (int)a[1]); }
 
+/* The active caption on the screen. The host draws a re-parented top-level's
+ * caption as its root window's activation says, and the screen (the host's
+ * window) is never the host's active one, so every caption was grey: forcing
+ * WM_NCACTIVATE TRUE and SetForegroundWindow did not change it (findings).
+ * The screen's topmost captioned window is the active one, as on Windows 2000
+ * (a program's window comes to the top when activated): after the host's
+ * DefWindowProc paints its frame, its caption is painted again active, left
+ * of the caption buttons. */
+static void screen_caption(HWND h) {
+    if (!g_screen || GetAncestor(h, GA_PARENT) != g_screen || (GetWindowLongW(h, GWL_STYLE) & WS_CAPTION) != WS_CAPTION) return;
+    HWND top = GetWindow(g_screen, GW_CHILD);
+    while (top && (!IsWindowVisible(top) || (GetWindowLongW(top, GWL_STYLE) & WS_CAPTION) != WS_CAPTION)) top = GetWindow(top, GW_HWNDNEXT);
+    if (top != h) return;
+    TITLEBARINFOEX t = { sizeof t };
+    RECT w;
+    if (!SendMessageW(h, WM_GETTITLEBARINFOEX, 0, (LPARAM)&t) || !GetWindowRect(h, &w)) return;
+    RECT r = t.rcTitleBar;
+    r.left = w.left + (r.top - w.top);                 /* rcTitleBar leaves out the window menu: from the border (as thick as the top) */
+    for (int i = 2; i <= 5; i++)                       /* minimize, maximize, help, close */
+        if (!(t.rgstate[i] & (STATE_SYSTEM_INVISIBLE | STATE_SYSTEM_OFFSCREEN)) && t.rgrect[i].right > t.rgrect[i].left &&
+            t.rgrect[i].left < r.right) r.right = t.rgrect[i].left - 2;
+    if (r.right <= r.left) return;
+    OffsetRect(&r, -w.left, -w.top);
+    HDC dc = GetWindowDC(h);
+    if (!dc) return;
+    /* in the box's colours (DrawCaption takes the host's): the gradient, the small icon, the bold title */
+    COLORREF c1 = sys_color(COLOR_ACTIVECAPTION), c2 = sys_color(COLOR_GRADIENTACTIVECAPTION);
+    int wd = r.right - r.left, ht = r.bottom - r.top, x = r.left + 2;
+    for (int i = 0; i < wd; i++) {
+        RECT l = { r.left + i, r.top, r.left + i + 1, r.bottom };
+        HBRUSH b = CreateSolidBrush(RGB(GetRValue(c1) + (GetRValue(c2) - GetRValue(c1)) * i / wd,
+                                        GetGValue(c1) + (GetGValue(c2) - GetGValue(c1)) * i / wd,
+                                        GetBValue(c1) + (GetBValue(c2) - GetBValue(c1)) * i / wd));
+        FillRect(dc, &l, b);
+        DeleteObject(b);
+    }
+    if (GetWindowLongW(h, GWL_STYLE) & WS_SYSMENU) {
+        HICON ic = (HICON)SendMessageW(h, WM_GETICON, ICON_SMALL, 0);
+        if (!ic) ic = (HICON)GetClassLongPtrW(h, GCLP_HICONSM);
+        if (!ic) ic = (HICON)SendMessageW(h, WM_GETICON, ICON_BIG, 0);
+        if (ic) DrawIconEx(dc, x, r.top + (ht - 16) / 2, ic, 16, 16, 0, NULL, DI_NORMAL), x += 18;
+    }
+    wchar_t text[256];
+    int n = GetWindowTextW(h, text, 256);
+    HFONT font = CreateFontW(-11, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, 0, 0, L"Tahoma"), old = (HFONT)SelectObject(dc, font);
+    RECT tr = { x, r.top, r.right - 2, r.bottom };
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, sys_color(COLOR_CAPTIONTEXT));
+    DrawTextW(dc, text, n, &tr, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+    SelectObject(dc, old);
+    DeleteObject(font);
+    ReleaseDC(h, dc);
+}
+
 /* NtUserMessageCall(hwnd, msg, wParam, lParam, xParam, fnid, bAnsi): the
  * kernel half of a message function, by fnid. 0x29E (FNID_DEFWINDOWPROC) is
  * DefWindowProc's: the host's. */
@@ -952,6 +1006,7 @@ static uint32_t s_message_call(uint32_t* a) {
     }
     if (a[5] == 0x29E) {
         LRESULT r = a[6] ? DefWindowProcA(h, a[1], a[2], a[3]) : DefWindowProcW(h, a[1], a[2], a[3]);
+        if (a[1] == WM_NCPAINT || a[1] == WM_NCACTIVATE || a[1] == WM_SETTEXT) screen_caption(h);
         /* WM_CTLCOLOR*: the brush goes back to the guest's gdi32 as its own */
         if (a[1] >= WM_CTLCOLORMSGBOX && a[1] <= WM_CTLCOLORSTATIC && r) return native32_gdi_handle((uint32_t)r);
         return (uint32_t)r;

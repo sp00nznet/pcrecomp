@@ -207,7 +207,7 @@ static int under(const wchar_t* path, const wchar_t* dir);
 #define FB_RO_MAX 8
 static int fb_on;
 static wchar_t fb_root[MAX_PATH], fb_ro[FB_RO_MAX][MAX_PATH];
-static int fb_nro, fb_log = -1;
+static int fb_nro, fb_log = -1, fb_run;
 enum { FB_ORIG, FB_PASS, FB_RO, FB_BOX };
 
 static int fb_dotdot(const wchar_t* s, int n) {             /* a "." or ".." component */
@@ -241,10 +241,12 @@ dos:
     for (int i = 0; i < fb_nro; i++)
         if (under(p, fb_ro[i])) {                             /* out: an NT path */
             _snwprintf(out, MAX_PATH * 2, L"\\??\\%ls", p);
-            if (i > 0 && i == fb_nro - 1) {                  /* the DLL path ends at the system directory: the guest's system32 is the lifted modules' first */
+            /* the DLL path ends at the system directory: the guest's system32 is the
+             * loader's directories first (the lifted modules, then the runners: App Paths) */
+            for (int k = 0; i > 0 && i == fb_nro - 1 && k < i; k = k ? i : fb_run) {   /* the modules, the runners (not the NLS directory: original DLLs) */
                 wchar_t m[MAX_PATH * 2 + 8];
-                _snwprintf(m, MAX_PATH * 2, L"%ls%ls", fb_ro[0], p + wcslen(fb_ro[i]));
-                if (GetFileAttributesW(m) != INVALID_FILE_ATTRIBUTES) _snwprintf(out, MAX_PATH * 2, L"\\??\\%ls", m);
+                _snwprintf(m, MAX_PATH * 2, L"%ls%ls", fb_ro[k], p + wcslen(fb_ro[i]));
+                if (GetFileAttributesW(m) != INVALID_FILE_ATTRIBUTES) { _snwprintf(out, MAX_PATH * 2, L"\\??\\%ls", m); break; }
             }
             *kind = FB_RO;
             return 0;
@@ -419,6 +421,7 @@ static int fb_install(const wchar_t* image_path, const wchar_t* dll_path, const 
     MultiByteToWideChar(CP_ACP, 0, nls_dir, -1, nls, MAX_PATH);
     fb_ro_add(nls, wcslen(nls));
     GetModuleFileNameW(NULL, nls, MAX_PATH);                  /* the host runners' (App Paths: the lifted programs) */
+    fb_run = fb_nro;
     if (wcsrchr(nls, L'\\')) fb_ro_add(nls, wcsrchr(nls, L'\\') - nls);
     for (const wchar_t* p = dll_path; *p;) {
         const wchar_t* e = wcschr(p, L';') ? wcschr(p, L';') : p + wcslen(p);
