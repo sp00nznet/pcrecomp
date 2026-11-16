@@ -1310,6 +1310,14 @@ static uint32_t vwin32_int21(const uint32_t* a) {
     return 0;
 }
 
+/* The same table for lifted 16-bit code (identity.c dos_int21): the caller
+ * has put flat pointers in the globals (ds:dx -> g_edx, ...). Returns CF. */
+int native32_w9x_int21(uint32_t eax, uint32_t ecx) {
+    uint32_t a[2] = { eax, ecx };
+    g_eax = vwin32_int21(a);
+    return g_cf;
+}
+
 static const vxd_service_t g_services[] = {
     { 0x002A0010, 2, vwin32_int21, "VWIN32_Int21Dispatch" },
     { 0x002A000C, 1, vwin32_first_thread, "VWIN32_CreateFirstThread" },
@@ -1441,6 +1449,11 @@ void native32_w9x_set_sel(uint16_t sel, uint32_t base, uint32_t limit, int code)
     if ((uint16_t)((sel | 7) + 8) > g_next_sel) g_next_sel = (uint16_t)((sel | 7) + 8);
 }
 
+/* The raw 8-byte descriptor, for 16-bit DPMI (int 31h 0B/0C) in identity mode. */
+uint8_t* native32_w9x_desc(uint16_t sel) { return g_ldt + (sel & ~7u); }
+uint16_t native32_w9x_next_sel(void) { return g_next_sel; }
+uint16_t native32_w9x_ldt_alias(void) { return (uint16_t)(g_ldt_alias | 7); }
+
 static const uint8_t* ldt_desc(uint16_t sel) {
     if (!(sel & 4) || (sel & ~7u) == g_ldt_alias) return NULL;
     const uint8_t* d = g_ldt + (sel & ~7u);
@@ -1477,7 +1490,7 @@ void recomp_set_seg(int sreg, uint32_t sel) {
 }
 
 /* A far jump into a lifted 16-bit code selector (QT_Thunk's o16 retf):
- * the Win16 identity bridge (runtime/win16/identity.c w16_enter), when the
+ * the Win16 identity bridge (runtime/win16/identity/identity.c w16_enter), when the
  * host links one. */
 int (*native32_w16_enter)(uint32_t target);
 
