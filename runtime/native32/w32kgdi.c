@@ -275,6 +275,21 @@ static uint32_t s_setdibits(uint32_t* a) {
     return SetDIBitsToDevice(dc(a[0]), a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8],
                              (void*)(uintptr_t)a[9], (BITMAPINFO*)(uintptr_t)a[10], a[11]);
 }
+/* NtGdiCreateDIBitmapInternal(hdc, cx, cy, fInit, pjInit, pbmi, iUsage,
+ * cjMaxInitInfo, cjMaxBits, fl, hcmXform): fInit 4 CBM_INIT (bits given),
+ * 2 a DIB-format bitmap (cards.dll's, through lifted LoadBitmap); the
+ * host's CreateDIBitmap of the same header. ponytail: fInit 2 becomes a
+ * device-compatible bitmap, which is what the host gives LoadBitmap too */
+static uint32_t s_dibitmap(uint32_t* a) {
+    BITMAPINFO* bi = (BITMAPINFO*)(uintptr_t)a[5];
+    HDC h = (HDC)(uintptr_t)HOST(a[0]);
+    if (!bi) return GUEST(CreateCompatibleBitmap(h ? h : GetDC(NULL), (int)a[1], (int)a[2]));
+    return GUEST(CreateDIBitmap(h ? h : GetDC(NULL), &bi->bmiHeader, a[3] & CBM_INIT, (void*)(uintptr_t)a[4], bi, a[6]));
+}
+/* NtGdiCreateBitmap(cx, cy, planes, bpp, bits) */
+static uint32_t s_bitmap(uint32_t* a) {
+    return GUEST(CreateBitmap((int)a[0], (int)a[1], a[2], a[3], (void*)(uintptr_t)a[4]));
+}
 /* NtGdiExtGetObjectW(h, count, buffer) */
 static uint32_t s_getobject(uint32_t* a) {
     return GetObjectW((HGDIOBJ)(uintptr_t)HOST(a[0]), (int)a[1], (void*)(uintptr_t)a[2]);
@@ -517,7 +532,7 @@ void native32_gdi_install(void) {
     static const struct { const char* name; native32_syscall_fn fn; } svc[] = {
         { "NtGdiInit", s_init }, { "NtGdiQueryFontAssocInfo", s_zero }, { "NtGdiGetStockObject", s_stock },
         { "NtGdiCreateCompatibleDC", s_compat_dc }, { "NtGdiCreateCompatibleBitmap", s_compat_bitmap },
-        { "NtGdiCreatePen", s_pen }, { "NtGdiCreateRectRgn", s_rectrgn },
+        { "NtGdiCreatePen", s_pen }, { "NtGdiCreateRectRgn", s_rectrgn }, { "NtGdiCreateDIBitmapInternal", s_dibitmap }, { "NtGdiCreateBitmap", s_bitmap },
         { "NtGdiGetRandomRgn", s_randomrgn }, { "NtGdiIntersectClipRect", s_intersectclip }, { "NtGdiExtSelectClipRgn", s_selectcliprgn }, { "NtGdiCreateSolidBrush", s_brush },
         { "NtGdiSelectBitmap", s_select }, { "NtGdiSelectBrush", s_select }, { "NtGdiSelectPen", s_select },
         { "NtGdiSelectFont", s_select }, { "NtGdiDeleteObjectApp", s_delete }, { "NtGdiBitBlt", s_bitblt },

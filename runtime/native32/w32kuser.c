@@ -395,7 +395,7 @@ static uint32_t s_create_window(uint32_t* a) {
      * GetWindowBorders); the host's frame is thicker (padded borders). The
      * client area is what the guest meant, so the difference goes on. */
     int cx = (int)a[6], cy = (int)a[7];
-    if (!(a[3] & WS_CHILD) && cx > 0 && cy > 0 && cx != CW_USEDEFAULT) {
+    if (a[4] != CW_USEDEFAULT && !(a[3] & WS_CHILD) && cx > 0 && cy > 0 && cx != CW_USEDEFAULT) {
         int b = (a[0] & WS_EX_WINDOWEDGE) ? 2 : (a[0] & WS_EX_STATICEDGE) ? 1 : 0;
         RECT r = { 0, 0, 0, 0 };
         if ((a[3] & WS_CAPTION) || (a[0] & WS_EX_DLGMODALFRAME)) b++;
@@ -414,6 +414,17 @@ static uint32_t s_create_window(uint32_t* a) {
     if (h) native32_user_wnd(h);
     return (uint32_t)(uintptr_t)h;
 }
+/* NtUserPostMessage(hwnd, msg, wParam, lParam); NtUserValidateTimerCallback
+ * (hwnd, wParam, lParam): a WM_TIMER's TIMERPROC is the guest's own, valid */
+static uint32_t s_post(uint32_t* a) { return PostMessageW((HWND)(uintptr_t)a[0], a[1], a[2], a[3]); }
+static uint32_t s_validate_timer(uint32_t* a) { (void)a; return 1; }
+/* NtUserSystemParametersInfo(action, uiParam, pvParam, fWinIni): the host's */
+static uint32_t s_spi(uint32_t* a) { return SystemParametersInfoW(a[0], a[1], (void*)(uintptr_t)a[2], a[3]); }
+/* NtUserGetDCEx(hwnd, hrgnClip, flags), NtUserGetWindowDC(hwnd) */
+static uint32_t s_getdcex(uint32_t* a) {
+    return native32_gdi_handle((uint32_t)(uintptr_t)GetDCEx((HWND)(uintptr_t)a[0], (HRGN)(uintptr_t)native32_gdi_host(a[1]), a[2]));
+}
+static uint32_t s_getwindowdc(uint32_t* a) { return native32_gdi_handle((uint32_t)(uintptr_t)GetWindowDC((HWND)(uintptr_t)a[0])); }
 static uint32_t s_getdc(uint32_t* a) { return native32_gdi_handle((uint32_t)(uintptr_t)GetDC((HWND)(uintptr_t)a[0])); }
 /* NtUserCreateAcceleratorTable(ACCEL*, count) */
 static uint32_t s_accel(uint32_t* a) { return (uint32_t)(uintptr_t)CreateAcceleratorTableW((ACCEL*)(uintptr_t)a[0], (int)a[1]); }
@@ -716,6 +727,11 @@ void native32_user_install(void) {
     native32_cb_in = cb_in;
     native32_nt_win32k_override("NtUserCreateWindowEx", s_create_window);
     native32_nt_win32k_override("NtUserGetDC", s_getdc);
+    native32_nt_win32k_override("NtUserGetDCEx", s_getdcex);
+    native32_nt_win32k_override("NtUserGetWindowDC", s_getwindowdc);
+    native32_nt_win32k_override("NtUserSystemParametersInfo", s_spi);
+    native32_nt_win32k_override("NtUserPostMessage", s_post);
+    native32_nt_win32k_override("NtUserValidateTimerCallback", s_validate_timer);
     native32_nt_win32k_override("NtUserCreateAcceleratorTable", s_accel);
     native32_nt_win32k_override("NtUserRegisterClassExWOW", s_register_class);
 }
