@@ -287,7 +287,9 @@ static void int2f(CPU *c) {
     switch (c->ax) {
     case 0x4A16: case 0x4A17: case 0x4A18:   /* IO.SYS boot log open/write/close (KRNL386 seg002_4B5C): no BOOTLOG.TXT, ax unchanged */
         return;
-    case 0x168D:   /* es:di into the table KRNL386 hands VWIN32 0Ch (seg001_6B2A, unchecked): kernel32
+    case 0x4A32:   /* IO.SYS service bl (USER seg072_3742: bl=5, result unread); ponytail: a no-op, ax unchanged */
+        return;
+    case 0x168D:  /* es:di into the table KRNL386 hands VWIN32 0Ch (seg001_6B2A, unchecked): kernel32
                     * is the host's already, so nothing reads it: 0:0 */
         c->es = 0; c->di = 0; return;
     case 0x150B:   /* MSCDEX drive check, cx = drive (KRNL386 seg001_7AD6, kernel32 thunk 0Dh: drive type):
@@ -567,6 +569,49 @@ void w16_raise(CPU *c, int n, uint16_t cs, uint16_t ip) {
     dispatch_far(c, ncs, nip);
 }
 
+/* A far return that does not come back to its C caller. KRNL386's
+ * parameter validation (seg1 9D47) unwinds to the API's frame on an invalid
+ * handle and returns through `push ax; push bx; retf` into the API's error
+ * exit (GetModuleFileName(0): 2:00C4), whose retf N goes back to the API's
+ * caller -- but the C stack still holds the API body after its validator
+ * call. Every lifted direct far call runs through w16_farcall, which keeps
+ * the 16-bit sp at entry (the far return's slot); w16_unwind, after such a
+ * pushed retf, throws to the far call whose frame the 16-bit sp has passed.
+ * ponytail: direct far calls only (not dispatch_far's indirect ones, not
+ * `push cs; call near`); add them when an unwind targets one. */
+typedef struct w16_ff { struct w16_ff *up; uint16_t ss, sp; } w16_ff;
+static __declspec(thread) w16_ff *g_ff, *g_ff_to;
+#define W16_UNWIND_CODE 0xE0571601u
+void w16_farcall(CPU *c, void (*f)(CPU *)) {
+    w16_ff fr = { g_ff, c->ss, c->sp };
+    g_ff = &fr;
+    __try { f(c); }
+    __except (GetExceptionCode() == W16_UNWIND_CODE && g_ff_to == &fr ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        if (getenv("W16_TRACE")) fprintf(stderr, "[w16] unwound to the far call at ss:sp %04X:%04X (now %04X)\n", fr.ss, fr.sp, c->sp);
+    }
+    g_ff = fr.up;
+}
+/* The host's own entries (w16_enter, w16_call) into lifted code: a far call
+ * frame with nothing above it, so an error return out of the entry lands here. */
+static int w16_entry(CPU *c, uint16_t seg, uint16_t off) {
+    w16_ff fr = { NULL, c->ss, c->sp }, *up = g_ff;
+    int ok = 1;
+    g_ff = &fr;
+    __try { ok = recomp_dispatch_lookup(c, seg, off); }
+    __except (GetExceptionCode() == W16_UNWIND_CODE && g_ff_to == &fr ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        if (getenv("W16_TRACE")) fprintf(stderr, "[w16] unwound to the host's entry at ss:sp %04X:%04X (now %04X)\n", fr.ss, fr.sp, c->sp);
+    }
+    g_ff = up;
+    return ok;
+}
+void w16_unwind(CPU *c) {
+    w16_ff *t = NULL;
+    for (w16_ff *f = g_ff; f && f->ss == c->ss && (uint32_t)f->sp + 4 <= c->sp; f = f->up) t = f;
+    if (!t) return;
+    g_ff_to = t;
+    RaiseException(W16_UNWIND_CODE, 0, 0, NULL);
+}
+
 void dispatch_near(CPU *cpu, uint16_t seg, uint16_t off) {   /* seg: the segment index */
     if (!recomp_dispatch_lookup(cpu, seg, off)) w16_stop("near call miss", seg, off);
 }
@@ -613,13 +658,14 @@ int w16_retf(CPU *c) {
     recomp_set_seg(2, c->ss); g_esp = c->sp;
     recomp_set_seg(3, c->ds); recomp_set_seg(0, c->es); recomp_set_seg(4, c->fs); recomp_set_seg(5, c->gs);
     CPU keep = *c;
+    w16_ff *ff = g_ff;   /* the stub's return longjmps past nested far calls */
     int k = g_nthk++;
     g_thk[k].back = mem_read32(c, c->ss, c->sp);   /* the 16-bit caller's far return */
     if (!setjmp(g_thk[k].jb)) {
         f();
         w16_stop("16->32 stub's function returned without its retf", eip >> 16, eip & 0xFFFF);
     }
-    g_nthk = k;
+    g_nthk = k; g_ff = ff;
     *c = keep;   /* g_w16 may have been reused by a nested 32->16 call */
     c->eax = g_eax; c->ecx = g_ecx; c->edx = g_edx; c->ebx = g_ebx;
     c->ebp = g_ebp; c->esi = g_esi; c->edi = g_edi;
@@ -670,7 +716,7 @@ int w16_enter(uint32_t target) {
         if (stub[0] != 0x66 || stub[1] != 0xEA) w16_stop("thunk return is not a jmp far 32", ret >> 16, ret & 0xFFFF);
         memcpy(&cont, stub + 2, 4);
     }
-    if (!recomp_dispatch_lookup(c, seg_of(sel), off)) w16_stop("no lifted function at", sel, off);
+    if (!w16_entry(c, seg_of(sel), off)) w16_stop("no lifted function at", sel, off);
     g_w16_ret = prev;
     g_eax = c->eax; g_ecx = c->ecx; g_edx = c->edx; g_ebx = c->ebx;
     g_esi = c->esi; g_edi = c->edi; g_ebp = c->ebp;
@@ -701,7 +747,7 @@ int w16_call(CPU *r) {
     g_w16 = *r; g_w16.mem = NULL;
     if (getenv("W16_FN")) g_fncount = 1;
     push16(&g_w16, 0); push16(&g_w16, 0);
-    int okc = recomp_dispatch_lookup(&g_w16, (uint16_t)(r->cs >> 3), r->ip);
+    int okc = w16_entry(&g_w16, (uint16_t)(r->cs >> 3), r->ip);
     *r = g_w16;
     g_w16 = saved;
     return okc;

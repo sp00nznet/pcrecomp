@@ -1135,6 +1135,15 @@ static uint32_t vwin32_int21(const uint32_t* a) {
     case 0x0D: return g_eax;                                   /* disk reset (KRNL386 at boot): nothing cached */
     case 0x0E: SET8L(g_eax, 26); return g_eax;                 /* select drive: 26 letters */
     case 0x19: SET8L(g_eax, 2); return g_eax;                  /* current drive: C: */
+    case 0x1C: {   /* DL drive's allocation: AL sectors/cluster, CX bytes/sector, DX clusters, DS:BX media byte
+                    * (KRNL386's GetPrivateProfileSection path through kernel32, from USER's LibEntry).
+                    * ponytail: a fixed 2 GB FAT drive, nothing of the host's; AL FFh for any drive but C:. */
+        static uint8_t media = 0xF8;
+        uint8_t d = (uint8_t)g_edx;
+        if (d != 0 && d != 3) { SET8L(g_eax, 0xFF); return g_eax; }
+        SET8L(g_eax, 64); SET16(g_ecx, 512); SET16(g_edx, 0xFFFF); g_ebx = (uint32_t)(uintptr_t)&media;
+        return g_eax;
+    }
     case 0x2A: { SYSTEMTIME t; GetLocalTime(&t);
         SET16(g_ecx, t.wYear); SET16(g_edx, t.wMonth << 8 | t.wDay); SET8L(g_eax, t.wDayOfWeek); return g_eax; }
     case 0x2C: { SYSTEMTIME t; GetLocalTime(&t);

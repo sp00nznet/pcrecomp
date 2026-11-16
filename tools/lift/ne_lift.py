@@ -51,6 +51,11 @@ from fpu_decode import decode_fpu, format_fpu
 import win16
 from win16 import get_import, module_name, is_fpu_module
 _IDENTITY = os.environ.get('NE_IDENTITY_SEL') == '1'   # Win16 identity mode (gen_image.IDENTITY)
+# `push ...; retf` in identity mode: a far jump. Its target's own retf comes
+# back here as a C return, but the 16-bit stack has returned to whichever far
+# call's frame it passed (identity.c w16_unwind throws there).
+_PUSHED_RETF = '{ uint16_t _o = pop16(cpu); uint16_t _s = pop16(cpu); dispatch_far(cpu, _s, _o); w16_unwind(cpu); return; }'
+_NO_SP = ('mov', 'xor', 'cwd', 'cdq', 'and', 'or', 'sub', 'add', 'lea', 'movzx', 'movsx', 'xchg', 'inc', 'dec', 'neg', 'not')
 
 
 # Project identity for generated code. A driver sets PREFIX before lifting; the
@@ -244,7 +249,7 @@ class NELifter(Lifter):
             return
         if _IDENTITY and m == 'retf' and op1 is None and prev is not None and prev.mnemonic == 'push' and \
                 prev.address >= 0 and prev.address + prev.length == inst.address:
-            self._emit('{ uint16_t _o = pop16(cpu); uint16_t _s = pop16(cpu); dispatch_far(cpu, _s, _o); return; }',
+            self._emit(_PUSHED_RETF,
                        orig + ' (after a push: a far jump)')
             return
 
@@ -288,7 +293,9 @@ class NELifter(Lifter):
                 tn = re.match(r'seg(\d+)_', func_name)
                 if _IDENTITY and tn and int(tn.group(1)) != self.seg.index:
                     self._emit(f'W16_SEGIN({int(tn.group(1))});', 'target segment bound')
-                self._emit(f'{func_name}(cpu);', orig)
+                # identity: through w16_farcall, so a far return that skips its C
+                # caller (identity.c w16_unwind) can land back here
+                self._emit(f'{{ void {func_name}(CPU *); w16_farcall(cpu, {func_name}); }}' if _IDENTITY else f'{func_name}(cpu);', orig)
             elif func_name:
                 self._emit(func_name, orig)
             else:
@@ -1036,6 +1043,26 @@ def lift_segment(ne: NEHeader, seg_num: int, func_offset: int = -1, xmod=None):
         last = func_insts[-1]
         if last.mnemonic not in TERMINATORS:
             nxt = off_to_label.get(fall_off)
+            # Falling into a bare retf right after a push (no sp change between)
+            # is the same far jump as `push; retf` in one function: KRNL386's
+            # parameter-error exit (seg1 9D47: push ax; push bx; xor eax,eax;
+            # cwd; xor cx,cx; mov es,ax; then 9D76 retf, also its normal return)
+            if _IDENTITY and nxt and nxt != func.label:
+                nx = [i for i in instructions if i.offset - seg.file_offset == fall_off]
+                tail = None
+                for i in reversed(func_insts):
+                    ops = repr(i).lower().split(None, 1)[-1] if ' ' in repr(i) else ''
+                    if i.mnemonic == 'push':
+                        tail = i
+                        break
+                    if i.mnemonic not in _NO_SP or 'sp' in ops or 'ss' in ops:
+                        break
+                if (tail is not None and nx and nx[0].mnemonic == 'retf' and nx[0].op1 is None
+                        and nx[0].raw[:1] != b'\x66'):
+                    close = code.rfind('}')
+                    code = (code[:close] + f'    {_PUSHED_RETF} /* falls into {nxt}: a retf after a push */\n'
+                            + code[close:])
+                    nxt = None
             if nxt and nxt != func.label:
                 close = code.rfind('}')
                 code = (code[:close]

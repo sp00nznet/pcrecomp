@@ -26,7 +26,7 @@ import os
 import re
 
 DEF_RE = re.compile(r"^void (seg\d+_[0-9A-Fa-f]+)\(CPU \*cpu\)", re.M)
-CALL_RE = re.compile(r"\b(seg\d+_[0-9A-Fa-f]+)\(cpu\)")
+CALL_RE = re.compile(r"\b(seg\d+_[0-9A-Fa-f]+)\((?:cpu|CPU \*)\)")   # a call, or w16_farcall's prototype
 
 
 def main():
