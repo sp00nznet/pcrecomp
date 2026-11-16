@@ -136,6 +136,8 @@ void recomp_syscall(int vector) {
     }
     if (g_svc[svc].fn) r = g_svc[svc].fn(args);
     else if (g_svc[svc].host) {
+        if (g_trace && strstr(g_svc[svc].name, "Wait"))   /* a wait that never returns is otherwise never printed */
+            fprintf(stderr, "[syscall] t%lu waits in %s(%08X) from sub_%08X\n", GetCurrentThreadId(), g_svc[svc].name, args[0], g_cur_func);
         mach_leave();                                 /* a wait must not hold the machine */
         r = call_std(g_svc[svc].host, args, g_svc[svc].argc);
         mach_enter();
@@ -701,7 +703,19 @@ static uint32_t win32k_call(uint32_t svc, uint32_t* args) {
     int i = (int)(svc - 0x1000);
     if (native32_win32k_pre) native32_win32k_pre();
     if (i < 0 || i >= W32K_MAX) return 0xC000001Cu;                       /* STATUS_INVALID_SYSTEM_SERVICE */
+    /* The services that wait on another thread (a SendMessage across threads,
+     * GetMessage, WaitMessage) give up the machine like an Nt wait: explorer's
+     * main thread sent to the desktop thread's window while holding it, and
+     * the desktop thread could never run the window procedure. The host calls
+     * back into a guest window procedure through mach_enter as usual. */
+    const char* nm = g_w32k[i].name;
+    int blocks = g_w32k[i].fn && (!strcmp(nm, "NtUserMessageCall") || !strcmp(nm, "NtUserGetMessage") ||
+                                  !strcmp(nm, "NtUserWaitMessage"));
+    if (g_trace && blocks)
+        fprintf(stderr, "[win32k] t%lu enters %s(%08X %08X)\n", GetCurrentThreadId(), nm, args[0], args[1]);
+    if (blocks) mach_leave();
     uint32_t r = g_w32k[i].fn ? g_w32k[i].fn(args) : 0;
+    if (blocks) mach_enter();
     if (g_trace || (!g_w32k[i].fn && !g_w32k[i].seen)) {
         fprintf(stderr, "[win32k] %-34s(", g_w32k[i].name[0] ? g_w32k[i].name : "?");
         for (int k = 0; k < g_w32k[i].argc && k < 16; k++) fprintf(stderr, k ? " %08X" : "%08X", args[k]);
