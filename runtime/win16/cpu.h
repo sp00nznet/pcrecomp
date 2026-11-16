@@ -141,7 +141,21 @@ typedef struct CPU {
      * its return address and returns to its caller's caller, GDI seg 5
      * AC05/AC24): it returns too. */
     uint16_t  ret_ip;
+
+    /* Win16 identity mode: the body a tail jump left for its trampoline. */
+    void    (*tail)(struct CPU *);
 } CPU;
+
+/* Identity mode: a jump into another lifted function (a tail jump, a jcc or a
+ * fall-through across a block) must not grow the C stack -- a 16-bit loop that
+ * spans blocks (KRNL386's scheduler, seg1 5F21 -> 73B4 -> 5F57) would overflow
+ * it. ne_lift emits each function as a public wrapper that runs a loop and a
+ * body (NAME__b); a tail jump leaves the next body in cpu->tail and returns.
+ * Every caller -- lifted calls, dispatch, the runtime -- calls the wrapper. */
+#define RECOMP_TAIL(f) { cpu->tail = f##__b; return; }
+static __inline void recomp_tramp(CPU *cpu, void (*f)(CPU *)) {
+    do { cpu->tail = 0; f(cpu); f = cpu->tail; } while (f);
+}
 void w16_retpast(CPU *c, uint16_t ip, const char *fn);   /* identity.c: W16_TRACE logs it */
 #define W16_RETPAST(c, ip) w16_retpast((c), (ip), __func__)
 void w16_retjump(CPU *c, uint16_t seg, uint16_t ip);    /* identity.c: run what a ret-jump returned into */

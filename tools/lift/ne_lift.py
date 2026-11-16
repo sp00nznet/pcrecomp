@@ -1313,6 +1313,16 @@ def lift_segment(ne: NEHeader, seg_num: int, func_offset: int = -1, xmod=None):
                         + f'    {nxt}(cpu); return; /* fall-through */\n'
                         + code[close:])
 
+        if _IDENTITY:
+            # Trampoline (cpu.h RECOMP_TAIL): the public name is a loop around
+            # the body, and a jump into another function returns to that loop
+            # instead of nesting a C call. Normal mode keeps plain tail calls.
+            code = re.sub(r'\b(seg\d{3}_[0-9A-F]{4})\(cpu\); return;', r'RECOMP_TAIL(\1)', code)
+            hdr = f'void {func.label}(CPU *cpu)\n'
+            code = code.replace(hdr, f'void {func.label}__b(CPU *cpu);\n'
+                                     f'{hdr[:-1]} {{ recomp_tramp(cpu, {func.label}__b); }}\n'
+                                     f'void {func.label}__b(CPU *cpu)\n', 1)
+
         print(code)
         print()
 

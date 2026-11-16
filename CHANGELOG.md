@@ -7,6 +7,10 @@ versions follow [SemVer](https://semver.org/).
 
 ### Added
 
+- ne_lift, Win16 identity mode: jumps into another lifted function are
+  trampolined (each function is a wrapper loop around its body, NAME__b;
+  RECOMP_TAIL leaves the next body in cpu->tail), so a 16-bit loop that spans
+  function blocks no longer grows the C stack. Normal mode output unchanged.
 - native32 (Windows 2000 user32/gdi32 layer): window extra bytes kept in the
   WND (+0x98), GWL_STYLE/GWL_EXSTYLE forwarded (WS_VISIBLE stays the host's),
   caret, ShowScrollBar, GetKeyState, ScrollWindowEx, TranslateAccelerator,

@@ -87,6 +87,8 @@ def main():
         names = by_seg[seg]
         L.append(f"/* seg{seg:03d} ({len(names)} functions) */")
         L += [f"void {n}(CPU *cpu);" for n in names]
+        if ident:   # the bodies RECOMP_TAIL jumps to (ne_lift's trampoline)
+            L += [f"void {n}__b(CPU *cpu);" for n in names]
         L.append("")
         total += len(names)
     L.append(f"#endif /* {args.guard} */")
