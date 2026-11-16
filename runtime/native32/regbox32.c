@@ -28,9 +28,8 @@
  *
  * ponytail: RegEnumKey/RegEnumValue see one side only (the handle's), and a
  * delete of a value that is only in the real key is a no-op (no tombstones).
- * Host DLLs in the process (comdlg32, shell32, shlwapi's SHSetValue) call
- * the host advapi32 directly and are not boxed: add RegOverridePredefKey on
- * their threads if one is seen writing.
+ * Host DLLs in the process (comdlg32, shell32, shlwapi) are boxed through
+ * their import slots (box_host_dlls), not their GetProcAddress lookups.
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -172,6 +171,15 @@ static LONG WINAPI g_RegOpenKeyExW(HKEY k, LPCWSTR sub, DWORD opt, REGSAM sam, P
     wchar_t full[KP];
     if (!key_path(k, full)) return RegOpenKeyExW(k, sub, opt, (sam & ~WRITE_BITS) | KEY_READ, out);
     join(full, sub);
+    if (!in_box(full)) {
+        /* the box's, else the real key opened from k itself: a 32-bit process's
+         * HKLM\Software is WOW64-redirected and HKCR is merged per user, which
+         * an absolute NT path would miss (the Open dialog's COM classes) */
+        wchar_t rel[KP];
+        to_box(full, rel);
+        if (!RegOpenKeyExW(HKEY_CURRENT_USER, rel, 0, sam, out)) return 0;
+        return RegOpenKeyExW(k, sub, opt, (sam & ~WRITE_BITS) | KEY_READ, out);
+    }
     return sb_open(full, sam, 0, 0, out, NULL);
 }
 static LONG WINAPI g_RegCreateKeyExA(HKEY k, LPCSTR sub, DWORD res, LPSTR cls, DWORD opt, REGSAM sam,
@@ -410,6 +418,74 @@ static const struct { const char* name; void* fn; } g_fns[] = {
 };
 #define NFNS ((int)(sizeof g_fns / sizeof g_fns[0]))
 
+/* ---- host DLLs in the process (comdlg32, shell32, shlwapi...) --------------
+ * Their imports of the same functions, through advapi32, kernel32 or the
+ * api-ms-win-core-registry sets, all resolve to a few host addresses: every
+ * import slot (and delay-load slot) holding one of them, in every module but
+ * the host exe and the core DLLs that implement the registry, is pointed at the
+ * sandbox's function. Modules loaded later are patched as they load
+ * (LdrRegisterDllNotification). ponytail: a host DLL that finds these with
+ * GetProcAddress is not covered. */
+static void* g_orig[96][3];
+static void patch_slot(void** slot, int delay_unbound, const char* name) {
+    DWORD old;
+    for (int i = 0; i < NFNS; i++) {
+        if (!g_fns[i].fn) continue;
+        int hit = delay_unbound ? name && !strcmp(name, g_fns[i].name) : 0;
+        for (int j = 0; !hit && j < 3; j++) hit = g_orig[i][j] && *slot == g_orig[i][j];
+        if (!hit) continue;
+        if (VirtualProtect(slot, 4, PAGE_READWRITE, &old)) { *slot = g_fns[i].fn; VirtualProtect(slot, 4, old, &old); }
+        return;
+    }
+}
+static void patch_module(HMODULE m) {
+    static const char* skip[] = { "ntdll.dll", "kernel32.dll", "kernelbase.dll", "advapi32.dll", "sechost.dll" };
+    char path[MAX_PATH];
+    const char* base;
+    BYTE* b = (BYTE*)m;
+    if (!m || m == GetModuleHandleA(NULL) || !GetModuleFileNameA(m, path, MAX_PATH)) return;
+    base = strrchr(path, '\\') ? strrchr(path, '\\') + 1 : path;
+    for (int i = 0; i < (int)(sizeof skip / sizeof skip[0]); i++) if (!_stricmp(base, skip[i])) return;
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(b + ((IMAGE_DOS_HEADER*)b)->e_lfanew);
+    IMAGE_DATA_DIRECTORY* dd = nt->OptionalHeader.DataDirectory;
+    if (dd[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress)
+        for (IMAGE_IMPORT_DESCRIPTOR* d = (void*)(b + dd[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress); d->Name; d++)
+            for (void** s = (void**)(b + d->FirstThunk); *s; s++) patch_slot(s, 0, NULL);
+    if (dd[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].VirtualAddress)
+        for (IMAGE_DELAYLOAD_DESCRIPTOR* d = (void*)(b + dd[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].VirtualAddress); d->DllNameRVA; d++) {
+            void** s = (void**)(b + d->ImportAddressTableRVA);
+            IMAGE_THUNK_DATA32* n = (IMAGE_THUNK_DATA32*)(b + d->ImportNameTableRVA);
+            for (; n->u1.AddressOfData; s++, n++) {
+                const char* nm = n->u1.Ordinal & IMAGE_ORDINAL_FLAG32 ? NULL : ((IMAGE_IMPORT_BY_NAME*)(b + n->u1.AddressOfData))->Name;
+                int unbound = (BYTE*)*s >= b && (BYTE*)*s < b + nt->OptionalHeader.SizeOfImage;
+                patch_slot(s, unbound, nm);
+            }
+        }
+}
+typedef struct { ULONG Flags; void* FullName; void* BaseName; PVOID DllBase; ULONG SizeOfImage; } DLL_NOTE;
+static VOID CALLBACK on_dll(ULONG reason, DLL_NOTE* d, PVOID ctx) {
+    (void)ctx;
+    if (reason == 1 /* loaded */) patch_module((HMODULE)d->DllBase);
+}
+static void box_host_dlls(void) {
+    const char* dlls[3] = { "advapi32.dll", "kernelbase.dll", "kernel32.dll" };
+    HMODULE ms[512];
+    DWORD got;
+    PVOID cookie;
+    LONG (WINAPI* reg)(ULONG, void*, PVOID, PVOID*) =
+        (void*)GetProcAddress(GetModuleHandleA("ntdll.dll"), "LdrRegisterDllNotification");
+    for (int i = 0; i < NFNS && i < 96; i++)
+        for (int j = 0; j < 3; j++) {
+            HMODULE h = GetModuleHandleA(dlls[j]);
+            g_orig[i][j] = h ? (void*)GetProcAddress(h, g_fns[i].name) : NULL;
+        }
+    if (reg) reg(0, (void*)on_dll, NULL, &cookie);
+    BOOL (WINAPI* en)(HANDLE, HMODULE*, DWORD, DWORD*) =
+        (void*)GetProcAddress(GetModuleHandleA("kernel32.dll"), "K32EnumProcessModules");
+    if (en && en(GetCurrentProcess(), ms, sizeof ms, &got))
+        for (DWORD i = 0; i < got / sizeof ms[0] && i < 512; i++) patch_module(ms[i]);
+}
+
 void* native32_registry_sandbox_fn(const char* name) {
     for (int i = 0; g_on && i < NFNS; i++)
         if (g_fns[i].fn && !strcmp(g_fns[i].name, name)) return g_fns[i].fn;
@@ -435,6 +511,7 @@ int native32_registry_sandbox(const char* name) {
     g_on = 1;
     for (int i = 0; i < NFNS; i++)
         if (g_fns[i].fn) native32_redirect(g_fns[i].name, g_fns[i].fn);
+    box_host_dlls();
     return 1;
 }
 
