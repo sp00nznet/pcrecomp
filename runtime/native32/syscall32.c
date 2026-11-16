@@ -947,11 +947,11 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
     *(uint32_t*)(peb + 0xB4) = ent->OptionalHeader.Subsystem;
     *(uint32_t*)(peb + 0xB8) = ent->OptionalHeader.MajorSubsystemVersion;
     *(uint32_t*)(peb + 0xBC) = ent->OptionalHeader.MinorSubsystemVersion;
-    {
-        DWORD session = 0;
-        ProcessIdToSessionId(GetCurrentProcessId(), &session);
-        *(uint32_t*)(peb + 0x1D4) = session;
-    }
+    /* SessionId (+0x1D4) stays 0: the guest is on Windows 2000's local console.
+     * Its user32 answers GetSystemMetrics(SM_REMOTESESSION) with PEB SessionId
+     * != 0, and every Windows 10/11 desktop is session 1+, so explorer showed the
+     * "Windows 2000 Terminal" banner. Named objects use the host's session
+     * through BASE_STATIC_SERVER_DATA (csr32.c), not this field. */
 
     /* Process parameters, normalized, with the current directory's handle
      * open the way the creating process leaves it. */

@@ -246,9 +246,12 @@ static void batch(void) {
             COLORREF old = SetBkColor(h, MEM32(e + 4));
             ExtTextOutW(h, 0, 0, MEM32(e + 8), (RECT*)(uintptr_t)(e + 0xC), NULL, 0, NULL);
             SetBkColor(h, old);
-        } else if (cmd == 5) {                                 /* ExtSelectClipRgn { mode, RECT }; mode bit 31: no rect (NULL region) */
+        } else if (cmd == 5) {                                 /* ExtSelectClipRgn { mode, RECT } */
+            /* no rect (a NULL region): mode | 0x08000000, as Windows 2000's gdi32 writes it
+             * (ExtSelectClipRgn(hdc, NULL, RGN_COPY) after DrawText; read as a rect, the
+             * stale entry clipped the rest of the paint: the Start menu showed one item) */
             uint32_t m = MEM32(e + 4);
-            HRGN r = (m & 0x80000000u) ? NULL : CreateRectRgn((int)MEM32(e + 8), (int)MEM32(e + 0xC), (int)MEM32(e + 0x10), (int)MEM32(e + 0x14));
+            HRGN r = (m & 0x88000000u) ? NULL : CreateRectRgn((int)MEM32(e + 8), (int)MEM32(e + 0xC), (int)MEM32(e + 0x10), (int)MEM32(e + 0x14));
             ExtSelectClipRgn((HDC)(uintptr_t)HOST(hdc), r, (int)(m & 0xFF));
             if (r) DeleteObject(r);
         } else if (cmd == 6) {                                 /* select a font: DC_ATTR's is current */
@@ -467,6 +470,9 @@ static uint32_t s_dcpoint(uint32_t* a) {
     return 0;
 }
 static uint32_t s_getpixel(uint32_t* a) { return GetPixel(dc(a[0]), (int)a[1], (int)a[2]); }
+/* NtGdiGetBitmapBits(hbm, cb, buf), NtGdiGetNearestColor(hdc, color) */
+static uint32_t s_bitmapbits(uint32_t* a) { return (uint32_t)GetBitmapBits((HBITMAP)(uintptr_t)HOST(a[0]), (LONG)a[1], (void*)(uintptr_t)a[2]); }
+static uint32_t s_nearestcolor(uint32_t* a) { return GetNearestColor(dc(a[0]), a[1]); }
 /* NtGdiStretchDIBitsInternal(hdc, xDst, yDst, cxDst, cyDst, xSrc, ySrc, cxSrc,
  * cySrc, pjInit, pbmi, iUsage, rop, cjMaxInfo, cjMaxBits, hcmXform) */
 static uint32_t s_stretchdib(uint32_t* a) {
@@ -798,7 +804,7 @@ void native32_gdi_install(void) {
         { "NtGdiHfontCreate", s_font }, { "NtGdiExtTextOutW", s_textout },
         { "NtGdiFlushUserBatch", s_flushbatch }, { "NtGdiGetTextExtent", s_textextent }, { "NtGdiGetTextCharsetInfo", s_charset },
         { "NtGdiGetDCPoint", s_dcpoint }, { "NtGdiGetTextFaceW", s_textface },
-        { "NtGdiEnumFontOpen", s_enumopen }, { "NtGdiEnumFontChunk", s_enumchunk }, { "NtGdiEnumFontClose", s_one }, { "NtGdiGetPixel", s_getpixel },
+        { "NtGdiEnumFontOpen", s_enumopen }, { "NtGdiEnumFontChunk", s_enumchunk }, { "NtGdiEnumFontClose", s_one }, { "NtGdiGetPixel", s_getpixel }, { "NtGdiGetBitmapBits", s_bitmapbits }, { "NtGdiGetNearestColor", s_nearestcolor },
         { "NtGdiStretchDIBitsInternal", s_stretchdib }, { "NtGdiGetCharSet", s_getcharset }, { "NtGdiGetCharWidthW", s_charwidth }, { "NtGdiGetOutlineTextMetricsInternalW", s_otm }, { "NtGdiGetAndSetDCDword", s_getsetdword }, { "NtGdiGetDCDword", s_getdword },
     };
     static const struct { const char* name; void* fn; } hooks[] = {

@@ -755,6 +755,12 @@ static uint32_t s_spi(uint32_t* a) {
         fprintf(stderr, "[user] SystemParametersInfo 0x%X (a SET) refused\n", a[0]);
         return 0;
     }
+    /* SPI_GETNONCLIENTMETRICS: Windows 2000's SystemParametersInfoA passes
+     * its NONCLIENTMETRICSW with cbSize unset and uiParam the A size (0x154);
+     * its win32k filled it anyway, the host refuses, and the A caller (the
+     * Start menu's menuband) made its menu font from stack garbage: no item
+     * text. The NT 5 size (no iPaddedBorderWidth). */
+    if (a[0] == SPI_GETNONCLIENTMETRICS && a[2]) MEM32(a[2]) = a[1] = 0x1F4;
     return SystemParametersInfoW(a[0], a[1], (void*)(uintptr_t)a[2], 0);
 }
 /* NtUserGetDCEx(hwnd, hrgnClip, flags), NtUserGetWindowDC(hwnd) */
@@ -827,7 +833,9 @@ static uint32_t menu(HMENU m) { user_object((uint32_t)(uintptr_t)m, 2, 0x100); r
 /* The MENU's items, from the host menu, for what user32 looks up client-side
  * (CheckMenuItem calls win32k only when the state changes): MENU +0x10 pSelf,
  * +0x20 cItems, +0x34 rgItems; ITEM (0x4C bytes) +0 fType, +4 fState, +8
- * wID, +0xC spSubMenu. Kept after every call that changes a menu.
+ * wID, +0xC spSubMenu, +0x18 lpstr, +0x1C cch, +0x20 dwItemData. Kept after
+ * every call that changes a menu. GetMenuItemInfo/GetMenuString read the text
+ * here: without it the Start menu's menuband items had none.
  * ponytail: up to 64 items a menu */
 #define MENU_ITEMS 64
 static void menu_sync(HMENU m) {
@@ -843,9 +851,18 @@ static void menu_sync(HMENU m) {
     *(uint32_t*)(o + 0x20) = (uint32_t)n;
     for (int i = 0; i < n; i++) {
         uint8_t* it = (uint8_t*)(uintptr_t)*(uint32_t*)(o + 0x34) + i * 0x4C;
-        MENUITEMINFOW mi = { sizeof mi, MIIM_FTYPE | MIIM_STATE | MIIM_ID | MIIM_SUBMENU };
+        MENUITEMINFOW mi = { sizeof mi, MIIM_FTYPE | MIIM_STATE | MIIM_ID | MIIM_SUBMENU | MIIM_DATA | MIIM_STRING };
+        uint32_t str = *(uint32_t*)(it + 0x18), cap = *(uint32_t*)(it + 0x1C);   /* reused when the text fits */
         memset(it, 0, 0x4C);
         if (!GetMenuItemInfoW(m, i, TRUE, &mi)) continue;
+        if (mi.cch) {
+            if (mi.cch > cap || !str) str = (uint32_t)(uintptr_t)desk_alloc(2 * (mi.cch + 1));
+            mi.dwTypeData = (LPWSTR)(uintptr_t)str, mi.cch++, mi.fMask = MIIM_STRING;
+            if (str && GetMenuItemInfoW(m, i, TRUE, &mi)) *(uint32_t*)(it + 0x18) = str, *(uint32_t*)(it + 0x1C) = mi.cch;
+            mi.fMask = MIIM_FTYPE | MIIM_STATE | MIIM_ID | MIIM_SUBMENU | MIIM_DATA;
+            GetMenuItemInfoW(m, i, TRUE, &mi);
+        }
+        *(uint32_t*)(it + 0x20) = (uint32_t)mi.dwItemData;
         *(uint32_t*)(it + 0) = mi.fType;
         *(uint32_t*)(it + 4) = mi.fState;
         *(uint32_t*)(it + 8) = mi.wID;
@@ -1167,11 +1184,14 @@ static uint32_t s_setlong(uint32_t* a) {
     }
     /* The window's extra bytes (index >= 0) are the WND's from +0x98, where
      * the guest's GetWindowLong reads them: RichEdit keeps its object at 0,
-     * and without it every message it gets returns 0 (wordpad) */
+     * and without it every message it gets returns 0 (wordpad). A dialog
+     * (WND+0x16 bit 0) reads DWL_USER from there too (+0xA0): the Run
+     * dialog's RunDlgProc kept its data in it and faulted on 0. Its
+     * DWL_DLGPROC (4) is not a plain slot and stays unanswered. */
     if ((int)a[1] >= 0) {
         uint8_t* w = native32_user_wnd(h);
         uint32_t old;
-        if (!w || (w[0x16] & 1) || a[1] + 4 > *(uint32_t*)(w + 0x88) || a[1] + 4 > 0x200 - 0x98) return 0;
+        if (!w || ((w[0x16] & 1) && a[1] != DWLP_USER) || a[1] + 4 > *(uint32_t*)(w + 0x88) || a[1] + 4 > 0x200 - 0x98) return 0;
         old = *(uint32_t*)(w + 0x98 + a[1]);
         *(uint32_t*)(w + 0x98 + a[1]) = a[2];
         return old;
@@ -1209,6 +1229,20 @@ static uint32_t s_sethook(uint32_t* a) {
     if ((int)a[3] == WH_CBT) g_cbt = a[4];
     return (uint32_t)(uintptr_t)SetWindowsHookExW((int)a[3], (int)a[3] == WH_CBT ? cbt_thunk : (HOOKPROC)(uintptr_t)a[4],
                                                   NULL, GetCurrentThreadId());
+}
+/* NtUserDrawCaptionTemp(hwnd, hdc, RECT*, hfont, hicon, UNICODE_STRING* text,
+ * flags): the host's DrawCaptionTempW. explorer draws the Start button's logo
+ * and "Start" with it (DC_INBUTTON | DC_ICON | DC_TEXT) into the button's
+ * bitmap; unanswered, the bitmap stayed black. */
+static uint32_t s_drawcaptiontemp(uint32_t* a) {
+    typedef BOOL (WINAPI *dct_t)(HWND, HDC, const RECT*, HFONT, HICON, LPCWSTR, UINT);
+    static dct_t dct;
+    uint32_t dc = native32_gdi_host(a[1]), f = a[3] ? native32_gdi_host(a[3]) : 0;
+    wchar_t text[256] = { 0 };
+    if (!dct) dct = (dct_t)GetProcAddress(GetModuleHandleA("user32.dll"), "DrawCaptionTempW");
+    if (a[5] && MEM32(a[5] + 4)) wcsncpy(text, (const wchar_t*)(uintptr_t)MEM32(a[5] + 4), min(MEM16(a[5]) / 2, 255));
+    return dct && dct((HWND)(uintptr_t)a[0], (HDC)(uintptr_t)(dc ? dc : a[1]), (const RECT*)(uintptr_t)a[2],
+                      (HFONT)(uintptr_t)(f ? f : a[3]), (HICON)(uintptr_t)cur_host(a[4]), a[5] ? text : NULL, a[6]);
 }
 /* NtUserCallNextHookEx(nCode, wParam, lParam, bAnsi) */
 static uint32_t s_nexthook(uint32_t* a) { return (uint32_t)CallNextHookEx(NULL, (int)a[0], a[1], a[2]); }
@@ -1382,7 +1416,7 @@ void native32_user_install(void) {
         { "NtUserRemoveMenu", s_remove_menu }, { "NtUserDeleteMenu", s_delete_menu },
         { "NtUserCheckMenuItem", s_check_menu }, { "NtUserEnableMenuItem", s_enable_menu },
         { "NtUserGetMenuItemRect", s_menu_rect }, { "NtUserFindExistingCursorIcon", s_find_icon }, { "NtUserSetCursorIconData", s_set_cursor_data },
-        { "NtUserSetWindowsHookEx", s_sethook }, { "NtUserCallNextHookEx", s_nexthook }, { "NtUserUnhookWindowsHookEx", s_unhook },
+        { "NtUserDrawCaptionTemp", s_drawcaptiontemp }, { "NtUserSetWindowsHookEx", s_sethook }, { "NtUserCallNextHookEx", s_nexthook }, { "NtUserUnhookWindowsHookEx", s_unhook },
         { "NtUserDestroyCursor", s_destroy_cursor }, { "NtUserGetIconSize", s_get_icon_size }, { "NtUserGetIconInfo", s_get_icon_info }, { "NtUserDrawIconEx", s_drawiconex }, { "NtUserDeferWindowPos", s_deferpos }, { "NtUserEndDeferWindowPosEx", s_enddeferpos },
         { "NtUserSetProp", s_setprop }, { "NtUserSelectPalette", s_selectpal }, { "NtUserSetParent", s_setparent }, { "NtUserSetScrollInfo", s_setscroll },
         { "NtUserWindowFromPoint", s_frompoint }, { "NtUserSetActiveWindow", s_setactive }, { "NtUserRemoveProp", s_removeprop }, { "NtUserSetWindowPlacement", s_setplacement }, { "NtUserGetWindowPlacement", s_getplacement }, { "NtUserGetClassInfo", s_classinfo },
