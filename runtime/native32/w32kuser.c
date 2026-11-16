@@ -1088,6 +1088,16 @@ static uint32_t s_get_icon_info(uint32_t* a) {
     }
     return 1;
 }
+/* NtUserDrawIconEx(hdc, x, y, hicon, cx, cy, step, hbrFlicker, flags, fMeta,
+ * DRAWICONEXDATA*): the host draws its icon into the host DC. Unanswered,
+ * ImageList_ReplaceIcon left the image list empty (no desktop icons).
+ * ponytail: fMeta (a metafile DC) ignored */
+static uint32_t s_drawiconex(uint32_t* a) {
+    uint32_t dc = native32_gdi_host(a[0]) ? native32_gdi_host(a[0]) : a[0];
+    uint32_t br = a[7] && native32_gdi_host(a[7]) ? native32_gdi_host(a[7]) : a[7];
+    return DrawIconEx((HDC)(uintptr_t)dc, (int)a[1], (int)a[2], (HICON)(uintptr_t)cur_host(a[3]), (int)a[4], (int)a[5],
+                      a[6], (HBRUSH)(uintptr_t)br, a[8]);
+}
 /* NtUserGetClassInfo(hInstance, UNICODE_STRING* class, WNDCLASSEXW*, LPWSTR* menu, bAnsi):
  * the atom, as GetClassInfoEx's result */
 static uint32_t s_classinfo(uint32_t* a) {
@@ -1189,7 +1199,7 @@ void native32_user_install(void) {
         { "NtUserCheckMenuItem", s_check_menu }, { "NtUserEnableMenuItem", s_enable_menu },
         { "NtUserGetMenuItemRect", s_menu_rect }, { "NtUserFindExistingCursorIcon", s_find_icon }, { "NtUserSetCursorIconData", s_set_cursor_data },
         { "NtUserSetWindowsHookEx", s_sethook }, { "NtUserCallNextHookEx", s_nexthook }, { "NtUserUnhookWindowsHookEx", s_unhook },
-        { "NtUserDestroyCursor", s_destroy_cursor }, { "NtUserGetIconSize", s_get_icon_size }, { "NtUserGetIconInfo", s_get_icon_info }, { "NtUserDeferWindowPos", s_deferpos }, { "NtUserEndDeferWindowPosEx", s_enddeferpos },
+        { "NtUserDestroyCursor", s_destroy_cursor }, { "NtUserGetIconSize", s_get_icon_size }, { "NtUserGetIconInfo", s_get_icon_info }, { "NtUserDrawIconEx", s_drawiconex }, { "NtUserDeferWindowPos", s_deferpos }, { "NtUserEndDeferWindowPosEx", s_enddeferpos },
         { "NtUserSetProp", s_setprop }, { "NtUserSelectPalette", s_selectpal }, { "NtUserSetParent", s_setparent }, { "NtUserSetScrollInfo", s_setscroll },
         { "NtUserWindowFromPoint", s_frompoint }, { "NtUserSetActiveWindow", s_setactive }, { "NtUserRemoveProp", s_removeprop }, { "NtUserSetWindowPlacement", s_setplacement }, { "NtUserGetWindowPlacement", s_getplacement }, { "NtUserGetClassInfo", s_classinfo },
         { "NtUserSetCursor", s_setcursor }, { "NtUserSetTimer", s_settimer }, { "NtUserKillTimer", s_killtimer },
