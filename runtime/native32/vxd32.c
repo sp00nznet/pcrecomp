@@ -650,7 +650,12 @@ static uint32_t g_threads[MAXTHREADS];     /* every r0 twin, for vxd_wake */
 static int g_nthreads;
 static HANDLE thread_wake(void);
 static void track_thread(uint32_t r0) { if (g_nthreads < MAXTHREADS) g_threads[g_nthreads++] = r0; }
+static uint32_t g_console_obj;   /* VCOND 2's object: its input is the host's stdin */
 static uint32_t vwin32_wait_multiple(const uint32_t* a) {
+    /* A wait on the console (ReadFile on a console handle, 0xBFF774E4)
+     * waits for input: always ready, the read itself blocks on stdin. */
+    for (uint32_t i = 0; g_console_obj && i < a[0]; i++)
+        if (MEM32(a[1] + 4 * i) == g_console_obj) return i;
     uint32_t r0 = t_r0 ? t_r0 : g_boot_r0;
     MEM32(r0 + R0T_WAITN) = a[0];
     MEM32(r0 + R0T_WAITS) = a[1];
@@ -730,7 +735,7 @@ static uint32_t vcond_write(const uint32_t* a) {
 
 /* VCOND 2 (info, obj): the constructor registers the object; the result is
  * its handle (+150; -1 fails). The object itself serves. */
-static uint32_t vcond_register(const uint32_t* a) { return a[1]; }
+static uint32_t vcond_register(const uint32_t* a) { return g_console_obj = a[1]; }
 
 /* VCOND services the attach (0xBFFA2100) and the console set-up call on the
  * console handle (+150) that need nothing from a host console: 18 (h) and
@@ -738,6 +743,33 @@ static uint32_t vcond_register(const uint32_t* a) { return a[1]; }
  * it, 14 (h, exit code low byte / -1 / 8) when a process lets it go
  * (0xBFF9090A, 0xBFF90E7A). All answer 0. */
 static uint32_t vcond_zero(const uint32_t* a) { (void)a; return 0; }
+
+/* VCOND F (h): the input mode ReadConsole (0xBFFA5F98) and GetConsoleMode
+ * (0xBFFA27B4) see: 1 processed, 2 line input, 4 echo (the console's
+ * default, 7). kernel32 does the line editing and the echo itself, reading
+ * one byte at a time with VCOND 10 (h, buf, n, 1) -> bytes read
+ * (0xBFFA5CC1). The host's stdin serves (scripted input); a bare LF is
+ * taken as CR, which is what a console's Enter gives. At EOF, CR then ^Z.
+ * ponytail: the read blocks under the machine lock; fine for one console
+ * thread, a reader thread + w9x_wait if a GUI ever shares it. */
+static uint32_t vcond_input_mode(const uint32_t* a) { (void)a; return 7; }
+static uint32_t vcond_read(const uint32_t* a) {
+    static int eof;
+    uint8_t* p = (uint8_t*)(uintptr_t)a[1];
+    DWORD n = 0;
+    if (!a[2]) return 0;
+    if (eof || !ReadFile(GetStdHandle(STD_INPUT_HANDLE), p, 1, &n, NULL) || !n) {
+        *p = eof++ ? 0x1A : '\r';
+        return 1;
+    }
+    if (*p == '\n') *p = '\r';
+    else if (*p == '\r') {   /* CRLF: drop the LF that follows */
+        static uint8_t skip; DWORD m = 0;
+        PeekNamedPipe(GetStdHandle(STD_INPUT_HANDLE), &skip, 1, &m, NULL, NULL);
+        if (m && skip == '\n') ReadFile(GetStdHandle(STD_INPUT_HANDLE), &skip, 1, &m, NULL);
+    }
+    return 1;
+}
 
 /* VWIN32 1D (crst) / 1E (crst): a critical section's contention. kernel32's
  * EnterCriticalSection (0xBFF741B4) calls 1D when another thread owns it
@@ -1308,6 +1340,8 @@ static const vxd_service_t g_services[] = {
     { 0x0038001E, 2, vcond_zero, "VCOND_1E_Set" },
     { 0x0038000E, 2, vcond_zero, "VCOND_0E" },
     { 0x00380013, 1, vcond_zero, "VCOND_13_Attached" },
+    { 0x0038000F, 1, vcond_input_mode, "VCOND_0F_InputMode" },
+    { 0x00380010, 4, vcond_read, "VCOND_10_Read" },
     { 0x002A002D, 2, vwin32_block, "VWIN32_BlockThread" },
     { 0x002A005C, 3, vwin32_wait_single, "VWIN32_WaitSingle" },
     { 0x002A005D, 5, vwin32_wait_multiple, "VWIN32_WaitMultiple" },
