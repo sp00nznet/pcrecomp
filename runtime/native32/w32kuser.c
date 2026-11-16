@@ -680,7 +680,7 @@ static uint32_t s_post_thread(uint32_t* a) {
 }
 /* SetWindowRgn: the system owns the region it is given, so the host gets a copy */
 static uint32_t s_setrgn(uint32_t* a) {
-    HRGN g = (HRGN)(uintptr_t)native32_gdi_host(a[1]), c = NULL;
+    HRGN g = (HRGN)(uintptr_t)native32_gdi_rgn(a[1]), c = NULL;
     if (!own_window(a[0])) return 0;
     if (g && (c = CreateRectRgn(0, 0, 0, 0)) != NULL) CombineRgn(c, g, NULL, RGN_COPY);
     return SetWindowRgn((HWND)(uintptr_t)a[0], c, (BOOL)a[2]);

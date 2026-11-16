@@ -86,17 +86,22 @@ static void hdel(uint32_t h) {
 uint32_t native32_gdi_host(uint32_t g) {
     int i = (int)(g & 0xFFFF);
     if (!g || !g_table || i >= GDI_ENTRIES || !g_host[i] || MEM16(ea(i) + 8) != (g >> 16)) return 0;
-    /* A region gdi32 changed client-side (CreateRectRgn, SetRectRgn): RGNATTR
-     * { +0 AttrFlags (0x20 ATTR_RGN_DIRTY), +4 complexity (1 NULLREGION),
-     * +8 RECT } is applied before the host sees the region, as win32k does on
-     * every call that takes one (explorer's taskbar region was the host's
-     * stale 0,0,1,1: the taskbar never showed) */
+    return g_host[i];
+}
+
+/* A region gdi32 changed client-side (CreateRectRgn, SetRectRgn): RGNATTR
+ * { +0 AttrFlags (0x20 ATTR_RGN_DIRTY), +4 complexity (1 NULLREGION), +8 RECT }
+ * applied to the host's region (explorer's taskbar region was the host's stale
+ * 0,0,1,1). ponytail: only SetWindowRgn calls it; done for every caller in
+ * native32_gdi_host, mspaint faulted at start, so find why before widening */
+uint32_t native32_gdi_rgn(uint32_t g) {
+    int i = (int)(g & 0xFFFF);
+    if (!native32_gdi_host(g)) return 0;
     uint8_t* r = (uint8_t*)(uintptr_t)MEM32(ea(i) + 12);
     if (MEM8(ea(i) + 10) == 4 && r && (*(uint32_t*)r & 0x20)) {
         int32_t* q = (int32_t*)(r + 8);
         if (*(uint32_t*)(r + 4) == NULLREGION) SetRectRgn((HRGN)(uintptr_t)g_host[i], 0, 0, 0, 0);
         else SetRectRgn((HRGN)(uintptr_t)g_host[i], q[0], q[1], q[2], q[3]);
-        *(uint32_t*)r &= ~0x20u;
     }
     return g_host[i];
 }
