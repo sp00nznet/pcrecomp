@@ -511,7 +511,7 @@ static uint32_t proxy_image(int k) {
 }
 
 /* ------------------------------------------------------------- objects */
-enum { O_FILE = 1, O_EVENT, O_SECTION, O_IMAGE, O_PORT, O_DIROBJ, O_MUTANT, O_SEM, O_TOKEN, O_KEY };
+enum { O_FILE = 1, O_EVENT, O_SECTION, O_IMAGE, O_PORT, O_DIROBJ, O_MUTANT, O_SEM, O_TOKEN, O_KEY, O_THREAD };
 typedef struct obj {
     int type, refs;
     int fd, keepfd;              /* keepfd: stdin/out/err, never closed */
@@ -524,6 +524,8 @@ typedef struct obj {
     int signaled, manual;        /* events */
     uint32_t size, base;         /* sections: size; images: base */
     int image;
+    uint32_t ctx[9], teb, tid;   /* a thread: edi esi ebx edx ecx eax ebp eip esp; its TEB, its id */
+    int suspended;
 } obj_t;
 
 #define MAXH 4096
@@ -1079,9 +1081,93 @@ static uint32_t s_open_mutant(uint32_t* a) {
     return ST_NAME_NOT_FOUND;
 }
 
+/* ------------------------------------------------------------- threads
+ * Guest threads on host threads under one big lock: the thread holding it
+ * runs guest code; a wait hands it over. The register file is global, so
+ * whoever gives the lock up keeps its registers on its own host stack.
+ * ponytail: waits poll (1 ms) instead of being woken; MMX/SSE and the x87
+ * ring are not switched (a syscall is not reached mid-expression). */
+static pthread_mutex_t g_big = PTHREAD_MUTEX_INITIALIZER;
+static int g_nthreads = 1;
+static __thread obj_t* t_self;                     /* this host thread's guest thread (NULL: the first) */
+typedef struct { uint32_t r[8], fs, cur; double st[8]; int top; uint16_t cw; } regs_t;
+static void regs_save(regs_t* r) {
+    uint32_t v[8] = { g_eax, g_ecx, g_edx, g_ebx, g_esp, g_ebp, g_esi, g_edi };
+    memcpy(r->r, v, sizeof v), r->fs = g_fs_base, r->cur = g_cur_func;
+    memcpy(r->st, g_st, sizeof g_st), r->top = g_fp_top, r->cw = g_fpu_cw;
+}
+static void regs_load(const regs_t* r) {
+    g_eax = r->r[0], g_ecx = r->r[1], g_edx = r->r[2], g_ebx = r->r[3], g_esp = r->r[4], g_ebp = r->r[5], g_esi = r->r[6], g_edi = r->r[7];
+    g_fs_base = r->fs, g_cur_func = r->cur, memcpy(g_st, r->st, sizeof g_st), g_fp_top = r->top, g_fpu_cw = r->cw;
+}
+/* let the other guest threads run for a while (a wait, an idle message loop) */
+void ntp_yield(void) {
+    if (g_nthreads < 2) return;
+    regs_t r;
+    regs_save(&r);
+    pthread_mutex_unlock(&g_big);
+    struct timespec d = { 0, 1000000 };
+    nanosleep(&d, NULL);
+    pthread_mutex_lock(&g_big);
+    regs_load(&r);
+}
+static void* thread_main(void* arg) {
+    obj_t* t = arg;
+    pthread_mutex_lock(&g_big);
+    t_self = t;
+    g_edi = t->ctx[0], g_esi = t->ctx[1], g_ebx = t->ctx[2], g_edx = t->ctx[3], g_ecx = t->ctx[4], g_eax = t->ctx[5], g_ebp = t->ctx[6];
+    g_esp = t->ctx[8], g_fs_base = t->teb, g_fp_top = 0, g_fpu_cw = 0x027F;
+    recomp_func_t f = recomp_lookup(t->ctx[7]);
+    if (f) f();                                    /* BaseThreadStartThunk: it ends in NtTerminateThread */
+    else fprintf(stderr, "[nt] thread start %08X is not lifted\n", t->ctx[7]);
+    t->signaled = 1, g_nthreads--;
+    pthread_mutex_unlock(&g_big);
+    return NULL;
+}
+static uint32_t g_teb, g_pid, g_tid;
+/* NtResumeThread(Handle, PreviousCount*) */
+static uint32_t s_resume_thread(uint32_t* a) {
+    obj_t* t = h_get(a[0]);
+    if (a[1]) MEM32(a[1]) = t && t->type == O_THREAD ? (uint32_t)t->suspended : 0;
+    if (!t || t->type != O_THREAD || !t->suspended) return 0;
+    t->suspended = 0;
+    if (g_nthreads == 1) pthread_mutex_trylock(&g_big);   /* (the first thread takes the lock now) */
+    g_nthreads++;
+    pthread_t p;
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setstacksize(&at, 8u << 20);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&p, &at, thread_main, t)) { g_nthreads--; return 0xC0000001u; }
+    t->refs++;                                     /* (the running thread keeps its object) */
+    fprintf(stderr, "[nt] thread %X starts at %08X (eax %08X), on a host thread\n", t->tid, t->ctx[7], t->ctx[5]);
+    return 0;
+}
+/* NtCreateThread(Handle*, Access, OA, Process, ClientId*, CONTEXT*, INITIAL_TEB*, CreateSuspended) */
+static uint32_t s_create_thread(uint32_t* a) {
+    static uint32_t next;
+    obj_t* t = obj_new(O_THREAD);
+    uint32_t c = a[5];
+    for (int i = 0; i < 8; i++) t->ctx[i] = MEM32(c + 0x9C + 4 * i);
+    t->ctx[8] = MEM32(c + 0xC4);
+    t->teb = ntp_alloc(0x2000);
+    memcpy((void*)(uintptr_t)t->teb, (void*)(uintptr_t)g_teb, 0x2000);   /* (the first thread's, USER's thread info with it) */
+    t->tid = g_tid + 4 * ++next;
+    MEM32(t->teb + 0x00) = 0xFFFFFFFFu;
+    MEM32(t->teb + 0x04) = MEM32(a[6] + 8), MEM32(t->teb + 0x08) = MEM32(a[6] + 12);
+    MEM32(t->teb + 0x18) = t->teb, MEM32(t->teb + 0x24) = t->tid;
+    MEM32(t->teb + 0xBFC) = t->teb + 0xC00, MEM32(t->teb + 0xE0C) = MEM32(a[6] + 16);
+    t->suspended = 1;
+    MEM32(a[0]) = h_put(t);
+    if (a[4]) MEM32(a[4]) = g_pid, MEM32(a[4] + 4) = t->tid;
+    if (!a[7]) { uint32_t r[2] = { MEM32(a[0]), 0 }; s_resume_thread(r); }
+    return 0;
+}
+
 static int signaled(uint32_t h, int consume) {
     obj_t* o = h_get(h);
     if (!o) return 0;                              /* this process / thread: alive */
+    if (o->type == O_THREAD) return o->signaled;
     if (o->type != O_EVENT) return 1;
     int s = o->signaled;
     if (s && consume && !o->manual) o->signaled = 0;
@@ -1108,11 +1194,29 @@ static uint32_t wait_timeout(uint32_t to, const char* what) {
 }
 
 /* NtWaitForSingleObject(Handle, Alertable, Timeout*) */
-static uint32_t s_wait1(uint32_t* a) { return signaled(a[0], 1) ? 0 : wait_timeout(a[2], "NtWaitForSingleObject"); }
+static uint64_t real_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000; }
+/* with other threads, a wait polls them (to: the timeout's address, 0 forever); 0 when it is over */
+static int wait_more(uint32_t to, uint64_t* end) {
+    if (g_nthreads < 2) return 0;
+    if (!*end) {
+        int64_t t = to ? *(int64_t*)(uintptr_t)to : 0;
+        *end = !to ? UINT64_MAX : t < 0 ? real_ms() + (uint64_t)(-t / 10000) : real_ms();
+    }
+    if (real_ms() >= *end) return 0;
+    ntp_yield();
+    return 1;
+}
+static uint32_t s_wait1(uint32_t* a) {
+    for (uint64_t end = 0;;) {
+        if (signaled(a[0], 1)) return 0;
+        if (!wait_more(a[2], &end)) return end ? ST_TIMEOUT : wait_timeout(a[2], "NtWaitForSingleObject");
+    }
+}
 
 /* NtWaitForMultipleObjects(Count, Handles*, WaitType(0 all, 1 any), Alertable, Timeout*) */
 static uint32_t s_waitn(uint32_t* a) {
     uint32_t n = a[0], hs = a[1];
+    for (uint64_t end = 0;;) {
     if (a[2] == 1) {
         for (uint32_t i = 0; i < n; i++) if (signaled(MEM32(hs + 4 * i), 1)) return i;
     } else {
@@ -1120,11 +1224,17 @@ static uint32_t s_waitn(uint32_t* a) {
         for (i = 0; i < n && signaled(MEM32(hs + 4 * i), 0); i++) ;
         if (i == n) { for (i = 0; i < n; i++) signaled(MEM32(hs + 4 * i), 1); return 0; }
     }
-    return wait_timeout(a[4], "NtWaitForMultipleObjects");
+    if (!wait_more(a[4], &end)) return end ? ST_TIMEOUT : wait_timeout(a[4], "NtWaitForMultipleObjects");
+    }
 }
 
 /* NtDelayExecution(Alertable, Interval*) */
-static uint32_t s_delay(uint32_t* a) { wait_timeout(a[1], "NtDelayExecution"); return 0; }
+static uint32_t s_delay(uint32_t* a) {
+    uint64_t end = 0;
+    while (wait_more(a[1], &end)) ;
+    if (!end) wait_timeout(a[1], "NtDelayExecution");
+    return 0;
+}
 
 /* ------------------------------------------------------------- sections */
 #define MAX_NLS 32
@@ -1286,7 +1396,7 @@ static uint32_t s_query_section(uint32_t* a) {
 }
 
 /* ------------------------------------------------------------- system info */
-static uint32_t g_peb, g_teb, g_pid, g_tid, g_harderror;
+static uint32_t g_peb, g_harderror;
 
 static void basic_info(uint32_t o) {
     memset((void*)(uintptr_t)o, 0, 0x2C);
@@ -1394,6 +1504,11 @@ static uint32_t s_terminate_process(uint32_t* a) {
     _exit((int)a[1]);
 }
 static uint32_t s_terminate_thread(uint32_t* a) {
+    if (t_self && (!a[0] || a[0] == 0xFFFFFFFEu || h_get(a[0]) == t_self)) {   /* a second thread ends */
+        t_self->signaled = 1, g_nthreads--;
+        pthread_mutex_unlock(&g_big);
+        pthread_exit(NULL);
+    }
     if (a[0] && a[0] != 0xFFFFFFFEu) return ST_INVALID_HANDLE;
     fflush(NULL);
     _exit((int)a[1]);
@@ -1803,6 +1918,7 @@ static const struct { const char* name; uint32_t (*fn)(uint32_t*); } g_impl[] = 
     { "NtQueryDefaultUILanguage", s_ui_language }, { "NtQueryInstallUILanguage", s_ui_language },
     { "NtQueryInformationProcess", s_query_process }, { "NtSetInformationProcess", s_set_process },
     { "NtQueryInformationThread", s_query_thread }, { "NtSetInformationThread", s_ok },
+    { "NtCreateThread", s_create_thread }, { "NtResumeThread", s_resume_thread },
     { "NtTerminateProcess", s_terminate_process }, { "NtTerminateThread", s_terminate_thread },
     { "NtRaiseHardError", s_hard_error },
     { "NtCreateProcess", s_no_process }, { "NtCreateProcessEx", s_no_process },

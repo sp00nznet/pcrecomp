@@ -2924,6 +2924,7 @@ static void run_event(ev_t* e) {
  * the next timer; with neither, the run is over */
 static int live_idle(uint32_t now, uint32_t next);
 static int script_idle(void) {
+    ntp_yield();                                  /* (another guest thread may have work) */
     uint32_t now = ntp_clock_ms(), next = UINT32_MAX;
     if (g_popup_next >= 0) {                      /* (the queue is empty: the windows have repainted) */
         int k = g_popup_next;

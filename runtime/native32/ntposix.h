@@ -52,5 +52,6 @@ extern void (*ntp_csr_connect)(uint32_t index, uint32_t info, uint32_t len);
 void ntp_clock_virtual(void);
 void ntp_clock_advance(uint32_t ms);
 uint32_t ntp_clock_ms(void);
+void ntp_yield(void);   /* let the other guest threads run (an idle loop) */
 
 #endif
