@@ -346,6 +346,15 @@ static uint32_t ovr_fb_volume(uint32_t* a) {
         MEM32(a[2] + 8) = 0x20001D2Bu;                        /* VolumeSerialNumber */
         MEM32(a[2] + 12) = 0;                                 /* VolumeLabelLength: no label */
     }
+    /* the size and free space are the box's, not the host disk's: ponytail: a fixed
+     * 4 GB disk with 2.5 GB free (4 KB clusters); the box's real use if it ever matters */
+    if (!r && (a[4] == 3 || a[4] == 7) && a[3] >= (a[4] == 3 ? 24u : 32u)) {
+        uint32_t* p = (uint32_t*)(uintptr_t)a[2];
+        p[0] = 0x100000u, p[1] = 0;                           /* TotalAllocationUnits: 4 GB */
+        p[2] = 0xA0000u, p[3] = 0;                            /* (Caller)AvailableAllocationUnits: 2.5 GB */
+        if (a[4] == 7) p[4] = 0xA0000u, p[5] = 0, p += 2;     /* ActualAvailableAllocationUnits */
+        p[4] = 8, p[5] = 512;                                 /* SectorsPerAllocationUnit, BytesPerSector */
+    }
     return r;
 }
 

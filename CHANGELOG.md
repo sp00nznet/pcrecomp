@@ -7,6 +7,15 @@ versions follow [SemVer](https://semver.org/).
 
 ### Added
 
+- native32 file box: the disk's size and free space are the box's (a fixed
+  4 GB, 2.5 GB free); CreatePipe's pipe is no longer refused (a 29-character
+  prefix compared as 30); `PCRECOMP_GUEST_PATH` adds guest directories to the
+  guest's Path. regbox32: a class the box has is answered by the box alone
+  (no host subkeys or values under it), the per-user Explorer\CLSID overrides
+  are hidden like CLSID; `PCRECOMP_REGTRACE` prints every host key read.
+  w32kuser: a screen window's menu bar text is redrawn in the box's colours
+  (the host greys it for another process's window).
+
 - native32 (Windows 2000 user32/gdi32 layer): window extra bytes kept in the
   WND (+0x98), GWL_STYLE/GWL_EXSTYLE forwarded (WS_VISIBLE stays the host's),
   caret, ShowScrollBar, GetKeyState, ScrollWindowEx, TranslateAccelerator,

@@ -116,19 +116,40 @@ static int from_box(const wchar_t* nt, wchar_t* real) {
  * DLLs (explorerframe.dll for browseui's classes). Under any Classes\CLSID
  * or Classes\AppID only the box answers, seeded from Windows 2000's own
  * registration INFs (win2000 tools/reginst.py).
- * ponytail: CLSID and AppID only; Interface/TypeLib still read the host's. */
+ * Any other class the box has is answered by the box alone too.
+ * ponytail: Interface/TypeLib and classes only the host has still read the host's. */
 static int g_guest_classes;
 static int host_class_key(const wchar_t* nt) {
     wchar_t u[KP];
     if (g_guest_classes < 0 && native32_module("ole32.dll")) g_guest_classes = 1;   /* Windows 2000's own COM, lifted (asked until the guest's modules are mapped) */
     if (g_guest_classes <= 0) return 0;
     wcsncpy(u, nt, KP - 1), u[KP - 1] = 0, _wcsupr(u);
-    if (!wcsstr(u, L"CLASSES\\CLSID\\") && !wcsstr(u, L"CLASSES\\WOW6432NODE\\CLSID\\") && !wcsstr(u, L"CLASSES\\APPID\\")) return 0;
+    if (!wcsstr(u, L"CLASSES\\CLSID\\") && !wcsstr(u, L"CLASSES\\WOW6432NODE\\CLSID\\") && !wcsstr(u, L"CLASSES\\APPID\\") &&
+        !wcsstr(u, L"\\CURRENTVERSION\\EXPLORER\\CLSID\\")) {   /* the per-user overrides (Recycle Bin's imageres icons) */
+        /* any other class the box has (Windows 2000's .txt, txtfile, Folder, Drive...):
+         * the box answers it whole, so the host's newer values and subkeys under it
+         * (imageres.dll icons, Win11 verbs) are not seen. A class only the host has
+         * still reads through. */
+        const wchar_t* c = wcsstr(u, L"CLASSES\\");
+        wchar_t rel[KP];
+        HKEY h;
+        size_t n;
+        if (!c) return 0;
+        c += 8;
+        if (!wcsncmp(c, L"WOW6432NODE\\", 12)) c += 12;
+        n = wcscspn(c, L"\\");
+        if (!n) return 0;
+        _snwprintf(rel, KP - 1, L"%ls\\HKLM\\SOFTWARE\\Classes\\%.*ls", g_root_rel, (int)n, nt + (c - u));
+        rel[KP - 1] = 0;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, rel, 0, KEY_READ, &h)) return 0;
+        RegCloseKey(h);
+    }
     if (getenv("PCRECOMP_REGTRACE")) fprintf(stderr, "[regbox] %ls: the host's class, not the guest's\n", nt);
     return 1;
 }
 static LONG real_open(const wchar_t* nt, REGSAM sam, HKEY* out) {
     if (host_class_key(nt)) return ERROR_FILE_NOT_FOUND;
+    if (getenv("PCRECOMP_REGTRACE")) fprintf(stderr, "[regbox] host key read: %ls\n", nt);
     US us = { (USHORT)(wcslen(nt) * 2), (USHORT)(wcslen(nt) * 2), (PWSTR)nt };
     OA oa = { sizeof oa, NULL, &us, 0x40 /* OBJ_CASE_INSENSITIVE */, NULL, NULL };
     LONG st = p_NtOpenKey((HANDLE*)out, (sam & ~WRITE_BITS) | KEY_READ, &oa);
@@ -200,6 +221,7 @@ static LONG WINAPI g_RegOpenKeyExW(HKEY k, LPCWSTR sub, DWORD opt, REGSAM sam, P
         to_box(full, rel);
         if (!RegOpenKeyExW(HKEY_CURRENT_USER, rel, 0, sam, out)) return 0;
         if (host_class_key(full)) return ERROR_FILE_NOT_FOUND;
+        if (getenv("PCRECOMP_REGTRACE")) fprintf(stderr, "[regbox] host key read: %ls\n", full);
         return RegOpenKeyExW(k, sub, opt, (sam & ~WRITE_BITS) | KEY_READ, out);
     }
     return sb_open(full, sam, 0, 0, out, NULL);

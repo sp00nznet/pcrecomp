@@ -937,10 +937,46 @@ static uint32_t s_accel(uint32_t* a) { return (uint32_t)(uintptr_t)CreateAcceler
  * (a program's window comes to the top when activated): after the host's
  * DefWindowProc paints its frame, its caption is painted again active, left
  * of the caption buttons. */
+/* The menu bar the same way: the host greys a menu bar's text while its
+ * window's queue is not the foreground one (a program explorer launched is
+ * its own process); Windows 2000 never does. Each item's text again in
+ * MENUTEXT on MENU, prefixes hidden (no keyboard cues). ponytail: text items
+ * only, no hot or pushed state (the host draws those while it tracks). */
+static void screen_menubar(HWND h) {
+    HMENU m = GetMenu(h);
+    RECT w;
+    int n = m ? GetMenuItemCount(m) : 0;
+    if (n <= 0 || !GetWindowRect(h, &w)) return;
+    HDC dc = GetWindowDC(h);
+    if (!dc) return;
+    NONCLIENTMETRICSW ncm = { sizeof ncm };
+    SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof ncm, &ncm, 0);
+    HFONT font = CreateFontIndirectW(&ncm.lfMenuFont), old = (HFONT)SelectObject(dc, font);
+    HBRUSH bg = CreateSolidBrush(sys_color(COLOR_MENU));
+    SetBkMode(dc, TRANSPARENT);
+    MENUBARINFO mb = { sizeof mb };
+    if (GetMenuBarInfo(h, OBJID_MENU, 0, &mb)) OffsetRect(&mb.rcBar, -w.left, -w.top), FillRect(dc, &mb.rcBar, bg);   /* the bar in the box's MENU */
+    for (int i = 0; i < n; i++) {
+        wchar_t text[128];
+        RECT r;
+        MENUITEMINFOW mi = { sizeof mi, MIIM_STATE | MIIM_FTYPE };
+        if (!GetMenuItemRect(h, m, (UINT)i, &r) || !GetMenuItemInfoW(m, (UINT)i, TRUE, &mi) || (mi.fType & (MFT_BITMAP | MFT_OWNERDRAW)) ||
+            GetMenuStringW(m, (UINT)i, text, 128, MF_BYPOSITION) <= 0) continue;
+        OffsetRect(&r, -w.left, -w.top);
+        FillRect(dc, &r, bg);
+        SetTextColor(dc, sys_color((mi.fState & MFS_DISABLED) ? COLOR_GRAYTEXT : COLOR_MENUTEXT));
+        DrawTextW(dc, text, -1, &r, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_HIDEPREFIX);
+    }
+    DeleteObject(bg);
+    SelectObject(dc, old);
+    DeleteObject(font);
+    ReleaseDC(h, dc);
+}
 static void screen_caption(HWND h) {
     if (!g_screen || GetAncestor(h, GA_PARENT) != g_screen || (GetWindowLongW(h, GWL_STYLE) & WS_CAPTION) != WS_CAPTION) return;
     HWND top = GetWindow(g_screen, GW_CHILD);
     while (top && (!IsWindowVisible(top) || (GetWindowLongW(top, GWL_STYLE) & WS_CAPTION) != WS_CAPTION)) top = GetWindow(top, GW_HWNDNEXT);
+    screen_menubar(h);
     if (top != h) return;
     TITLEBARINFOEX t = { sizeof t };
     RECT w;
