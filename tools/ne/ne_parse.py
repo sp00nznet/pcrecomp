@@ -324,6 +324,17 @@ def parse_ne(filepath: str) -> NEHeader:
                     seg.relocations.append(rel)
                     reloc_off += 8
 
+        # A fixup may run past the file's bytes into the zero-filled tail the
+        # loader allocates (GDI seg 43 ends in `jmp far KERNEL.630` whose
+        # selector word is beyond file_size 2433h, alloc 2435h). Pad the data
+        # with that tail so the instruction decodes and the fixup lands.
+        if seg.data and seg.relocations:
+            sizes = {0: 1, 2: 2, 3: 4, 5: 2, 11: 6, 13: 4}
+            need = max(r.offset + sizes.get(r.src_type, 2) for r in seg.relocations)
+            alloc = seg.alloc_size or 0x10000
+            if len(seg.data) < need <= alloc:
+                seg.data = seg.data + bytes(need - len(seg.data))
+
         ne.segments.append(seg)
 
     # --- Module Reference Table + Import Name Table ---

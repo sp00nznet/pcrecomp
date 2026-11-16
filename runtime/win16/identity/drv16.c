@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <windows.h>
 #include "cpu.h"
 
 uint32_t recomp_sel_base(uint32_t selector);
@@ -17,7 +18,7 @@ void w16_drv_stop(const char *what, unsigned a, unsigned b);
 
 #define E_LIBENTRY 0x08     /* the NE's cs:ip */
 #define E_FIRST    0x10     /* entry n (ordinal) at E_FIRST + 2 * (n - 1) */
-#define NORD       64       /* ordinals 1..NORD exported; ponytail: enough for the four drivers' callers so far */
+#define NORD       140      /* ordinals 1..NORD exported (KEYBOARD goes to 136) */
 
 typedef void (*drv_fn)(CPU *c);
 typedef struct { const char *name; drv_fn fn[NORD + 1]; } drv_t;
@@ -26,9 +27,33 @@ static uint16_t arg16(CPU *c, int i) { return mem_read16(c, c->ss, (uint16_t)(c-
 static void ret_far(CPU *c, int argbytes) { c->sp = (uint16_t)(c->sp + 4 + argbytes); }
 static void libentry(CPU *c) { c->ax = 1; ret_far(c, 0); }   /* LibEntry: success, nothing to set up */
 
+static uint32_t argfar(CPU *c, int i) { return (uint32_t)arg16(c, i + 1) << 16 | arg16(c, i); }
+static char *farptr(uint32_t p) { return (char *)(uintptr_t)(recomp_sel_base(p >> 16) + (p & 0xFFFF)); }
+
+/* Code-page conversion between the guest's ANSI (1252) and OEM (437) sets: Win98 SE US.
+ * ponytail: both fixed; read them off system.ini [boot.description]/the keyboard's tables if another locale turns up. */
+static void cp_convert(const char *src, char *dst, int n, UINT from, UINT to) {
+    WCHAR w[1024];
+    while (n > 0) {
+        int k = n > 1024 ? 1024 : n;
+        MultiByteToWideChar(from, 0, src, k, w, k);
+        WideCharToMultiByte(to, 0, w, k, dst, k, NULL, NULL);
+        src += k; dst += k; n -= k;
+    }
+}
+/* KEYBOARD.5 AnsiToOem(LPCSTR src, LPSTR dst) / .6 OemToAnsi: KRNL386 seg1 A5C2 (OpenFile's path)
+ * calls them through DGROUP:1250 once the keyboard is loaded; pascal, TRUE back. */
+static void kb_xlat(CPU *c, UINT from, UINT to) {
+    char *dst = farptr(argfar(c, 0)), *src = farptr(argfar(c, 2));
+    cp_convert(src, dst, (int)strlen(src) + 1, from, to);
+    c->ax = 0xFFFF; ret_far(c, 8);
+}
+static void kb_ansi_to_oem(CPU *c) { kb_xlat(c, 1252, 437); }
+static void kb_oem_to_ansi(CPU *c) { kb_xlat(c, 437, 1252); }
+
 static drv_t g_drv[] = {
     { "SYSTEM",   { 0 } },
-    { "KEYBOARD", { 0 } },
+    { "KEYBOARD", { [5] = kb_ansi_to_oem, [6] = kb_oem_to_ansi } },
     { "MOUSE",    { 0 } },
     { "DISPLAY",  { 0 } },
     { "MMSOUND",  { 0 } },   /* SlowBoot: sound.drv= default; makes no sound */

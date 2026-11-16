@@ -895,6 +895,9 @@ def lift_segment(ne: NEHeader, seg_num: int, func_offset: int = -1, xmod=None):
     lifter.xmod = xmod or {}
     # Function entry offsets in this segment, for near-jmp-to-another-function.
     lifter.seg_func_offsets = {f.offset for f in functions}
+    from ne_decode import collect_entry_table_targets, collect_internal_code_targets
+    _known_entries = (collect_entry_table_targets(ne).get(seg.index, set())
+                      | collect_internal_code_targets(ne).get(seg.index, set()))
     # Functions whose first instruction pops the return address into a register
     # that the function later jumps through (see the near-call case).
     lifter.popret_offsets = set()
@@ -954,6 +957,44 @@ def lift_segment(ne: NEHeader, seg_num: int, func_offset: int = -1, xmod=None):
             offs = {i.offset - seg.file_offset for i in run}
             if lo in offs and func.offset in offs:
                 func_insts, entry = run, func.offset
+        # The last instruction can end short of the next function's start when
+        # that start is an entry inside an instruction of this one's stream:
+        # KRNL386 seg3 3162 `mov cl,2` / 3164 `mov bx,01B1` hides AddAtom's
+        # 3165 `mov cl,1` (and 3167 `mov bx,00B1` FindAtom's 3168 `mov cl,0`).
+        # Falling through to the next function would run the hidden entry's
+        # instruction too (DeleteAtom became FindAtom). Decode on along this
+        # function's own stream until it lands on a function start.
+        # ponytail: the extension skips _fpu_fixup; no FPU in the cases seen.
+        fall_off = func.end
+        last = func_insts[-1]
+        e = last.offset - seg.file_offset + last.length
+        dec = Decoder(seg.data, base_offset=seg.file_offset)
+        if last.mnemonic not in TERMINATORS and e < func.end and e not in off_to_label:
+            dec.pos = e
+            i = dec.decode_one()
+            # only when the instruction there straddles the next entry (data
+            # decoded as code ends anywhere; this is the one shape that hides code)
+            # of an entry Windows or a far call is known to enter (exports,
+            # far-call fixups) -- not a branch target in data decoded as code
+            # and only the classic skip idiom: a 3-byte `mov r16, imm16` /
+            # `cmp ax, imm16` / `test ax, imm16` whose immediate is the entry's
+            # code (padding before a prologue straddles entries too, never runs)
+            if (i is not None and e + i.length > func.end and func.end in _known_entries
+                    and i.length == 3 and seg.data[e] in (0x3D, 0xA9, *range(0xB8, 0xC0))):
+                ext, ok = [], False
+                while len(ext) < 512 and 0 <= e < len(seg.data):
+                    dec.pos = e
+                    i = dec.decode_one()
+                    if i is None:
+                        break
+                    ext.append(i)
+                    e += i.length
+                    if i.mnemonic in TERMINATORS or e in off_to_label:
+                        ok = True
+                        break
+                if ok:
+                    func_insts = func_insts + ext
+                    fall_off = e
         code = lifter.lift_function(
             func.label, func_insts, seg.file_offset + func.offset, func.is_far, entry_addr=entry)
         # Inject an entry-trace marker (compiles to nothing without -DELFISH_TRACE_FN)
@@ -994,7 +1035,7 @@ def lift_segment(ne: NEHeader, seg_num: int, func_offset: int = -1, xmod=None):
         # control flow isn't lost at the function boundary.
         last = func_insts[-1]
         if last.mnemonic not in TERMINATORS:
-            nxt = off_to_label.get(func.end)
+            nxt = off_to_label.get(fall_off)
             if nxt and nxt != func.label:
                 close = code.rfind('}')
                 code = (code[:close]
