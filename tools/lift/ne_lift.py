@@ -212,6 +212,21 @@ class NELifter(Lifter):
                 return True
         return False
 
+    @staticmethod
+    def _pushed_words(run):
+        """Words pushed by the straight run before its last instruction (a
+        retf), counting back over pushes and instructions that leave sp alone;
+        0 when something else (a call, a pop, a write to sp) comes first."""
+        n = 0
+        for i in reversed(run[:-1]):
+            if i.mnemonic == 'push':
+                n += 2 if i.raw[:1] == b'\x66' else 1
+            elif i.mnemonic in _NO_SP and not (i.op1 and 'sp' in repr(i.op1).lower()):
+                continue
+            else:
+                break
+        return n
+
     def lift_instruction(self, inst: Instruction, func_start: int):
         """Override to handle FPU instructions and NE-specific features."""
         m = inst.mnemonic
@@ -234,6 +249,11 @@ class NELifter(Lifter):
         # dispatch (seg035_03B2: mov sp,bx; push dx; push ax; retf) works as a
         # return under patch_borland_eh, and changing it is untested there.
         prev, self._prev_inst = getattr(self, '_prev_inst', None), inst
+        # The straight run of instructions before this one (for retf below).
+        run = getattr(self, '_run', [])
+        if not (run and run[-1].address + run[-1].length == inst.address and inst.address not in self.labels_needed):
+            run = []
+        self._run = run + [inst]
         # An o32 retf pops eip and a 32-bit cs: KRNL386's call into flat
         # 32-bit code (identity.c w16_far32).
         # A near ret, and a far one, record the offset they pop (cpu->ret_ip)
@@ -251,6 +271,14 @@ class NELifter(Lifter):
         # Any other far return may land on code KRNL386 wrote at run time
         # (seg001_76BA writes a thunk over seg 3 +41F6 and retfs into it):
         # identity.c w16_retf runs such a stub, else it is a C return.
+        # `push cont_seg; push cont_off; ...; push seg; push off; [mov ...;] retf`:
+        # a far call whose return address the code pushed itself (KRNL386's
+        # LibEntry call, seg2 0D3A, retfs into the DLL's entry and comes back
+        # at 0D83). As a C return it skipped the entry and the continuation.
+        if _IDENTITY and m == 'retf' and op1 is None and inst.raw[:1] != b'\x66' and \
+                prev is not None and prev.mnemonic != 'push' and self._pushed_words(self._run) >= 4:
+            self._emit('w16_retf_call(cpu); return;', orig + ' (a far call to what was pushed, back to the pushed continuation)')
+            return
         if _IDENTITY and m == 'retf' and op1 is None and not (prev is not None and prev.mnemonic == 'push' and
                 prev.address >= 0 and prev.address + prev.length == inst.address):
             self._emit('if (w16_retf(cpu)) return; cpu->sp += 4; return;', orig + ' (or into a generated stub)')

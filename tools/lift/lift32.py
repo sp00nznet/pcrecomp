@@ -439,6 +439,12 @@ class Lifter:
         if not parts:
             parts.append("0")
         addr = ' + '.join(parts)
+        # 67h in 32-bit code: a 16-bit address ([bx], [bp+si]...) wraps at 64K
+        # and ignores the registers' upper halves (kernel32's ThunkConnect16
+        # helper reads `gs:[bx]` after `lgs bx`, with ebx's high word set).
+        # ponytail: a bare 67h [disp16] (no register) is not caught.
+        if mem.base in REG_NAMES_16 or mem.index in REG_NAMES_16:
+            addr = f"(uint16_t)({addr})"
         # Segment override: fs/gs are thread-relative (TIB/TEB) and must NOT be
         # treated as flat. Route them through a runtime base so e.g. `fs:[0]`
         # (the SEH chain head) reads the simulated TIB instead of VA 0.

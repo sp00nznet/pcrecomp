@@ -396,16 +396,27 @@ static void guest_message_box(void) {
 }
 uint32_t native32_w9x_message_box(void) { return MBOX_TAG; }
 
-/* kernel32's 32->16 slot (0xBFF9AD46) points at a stub in its .data
- * (0xBFFC9ED0) that rewrites itself on first call (patcher 0xBFF7273F) into
- * `xor ecx,ecx; mov cl,[ebp-4]; mov edx,[ecx*4+table]; mov eax,0xBFF727D9;
- * jmp eax`, table = the dword before the stub. Static code can't run the
- * rewritten bytes, so this is that stub, done once. */
-/* ponytail: Win98 SE kernel32 addresses hardcoded; read them off the patcher if another build shows up */
+/* A flat thunk's 32->16 stub in a DLL's .data (kernel32 0xBFFC9ED0 for its
+ * own 32->16 slot 0xBFF9AD46, user32 0xBFF5D400 for its thunks into
+ * USER.EXE): `jmp +20h` to `call $+5; pop eax; sub eax, 25h; mov edx, -4;
+ * push patcher; ret`, and the patcher (kernel32 0xBFF7273F) rewrites it on
+ * first call into `xor ecx,ecx; mov cl,[ebp-4]; mov edx,[ecx*4+table];
+ * mov eax,0xBFF727D9; jmp eax`, table = the dword at stub+edx. Static code
+ * can't run the rewritten bytes, so this is that stub, for any DLL's: the
+ * lookup recognizes the bytes and keeps the stub's address for the call it
+ * is about to make (the thread's last lookup of one).
+ * ponytail: the 0xBFF727D9 target (Win98 SE kernel32's) is hardcoded; read it off the patcher if another build shows up */
+static __declspec(thread) uint32_t t_qt_stub;
+static int is_qt_stub(uint32_t va) {
+    static const uint8_t tail[] = { 0xE8, 0, 0, 0, 0, 0x58, 0x2D, 0x25, 0, 0, 0, 0xBA };
+    return va >= 0x10000 && !IsBadReadPtr((void *)(uintptr_t)va, 0x31) && MEM8(va) == 0xEB && MEM8(va + 1) == 0x1E &&
+           !memcmp((const void *)(uintptr_t)(va + 0x20), tail, sizeof tail);
+}
 static void qt_stub(void) {
+    uint32_t va = t_qt_stub;
     g_ecx = MEM8(g_ebp - 4);
-    g_edx = MEM32(MEM32(0xBFFC9ECCu) + g_ecx * 4);
-    if (g_trace > 0 || getenv("W16_TRACE")) fprintf(stderr, "[qt] thunk %02X -> %04X:%04X (ss %04X@%08X esp %08X fs %04X)\n", g_ecx, g_edx >> 16, g_edx & 0xFFFF, g_seg_ss, g_ss_base, g_esp, g_seg_fs);
+    g_edx = MEM32(MEM32(va + MEM32(va + 0x2C)) + g_ecx * 4);
+    if (g_trace > 0 || getenv("W16_TRACE")) fprintf(stderr, "[qt] thunk %02X -> %04X:%04X (stub %08X ss %04X@%08X esp %08X fs %04X)\n", g_ecx, g_edx >> 16, g_edx & 0xFFFF, va, g_seg_ss, g_ss_base, g_esp, g_seg_fs);
     g_eax = 0xBFF727D9u;
     recomp_lookup(0xBFF727D9u)();
 }
@@ -415,7 +426,7 @@ recomp_func_t native32_w9x_lookup(uint32_t va) {
     if (va == K386_TAG) return krnl386_thunk;
     if (va == USIG_TAG) return user_signal_proc;
     if (va == MBOX_TAG) return guest_message_box;
-    if (va == 0xBFFC9ED0u) return qt_stub;
+    if (is_qt_stub(va)) { t_qt_stub = va; return qt_stub; }
     if ((va & 0xFFFF0000u) == R0F_TAG && (va & 0xFFFF) < 4 * 11 && !(va & 3)) return g_r0f[(va & 0xFFFF) / 4];
     return NULL;
 }

@@ -72,6 +72,7 @@ def main():
         L += [f"#define SEG_{n} (g_w16_segsel[{n}])" for n in range(1, max_seg + 1)]
         L += ["void w16_retf32(CPU *cpu);   /* an o32 retf (into flat 32-bit code) */"]
         L += ["int w16_retf(CPU *cpu);   /* a retf into a stub KRNL386 generated: run it */"]
+        L += ["void w16_retf_call(CPU *cpu);   /* push cont; push target; retf: a far call */"]
         L += ["void w16_farcall(CPU *cpu, void (*f)(CPU *));   /* a direct far call (w16_unwind lands here) */",
               "void w16_jmpf(CPU *cpu, uint16_t sel, uint16_t off);   /* push; retf: a far jump, or a return to a call site */"]
         L += ["void w16_segin(uint16_t n);   /* a direct far call into segment n: bind it first */",

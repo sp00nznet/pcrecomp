@@ -162,15 +162,22 @@ class CodeMap:
         # The bound: `cmp idx, N` on the register that ends up in bx, found by
         # walking back through `shl/add bx` and `mov bx, reg`. A cmp on anything
         # else (or one older than bx's last load) bounds some other test.
-        idx = 3
+        idx, scaled = 3, False
         for prev in reversed(recent[-12:-1]):
             o1, o2 = prev.op1, prev.op2
+            if prev.mnemonic == 'xchg' and o2 is not None and o2.type == OpType.REG16 and o2.reg == idx:
+                o1, o2 = o2, o1               # `xchg ax, bx` (93h) names bx second: USER seg 3 48F4
             if o1 is None or o1.type != OpType.REG16 or o1.reg != idx:
                 continue
             if prev.mnemonic == 'cmp':
                 if o2 is not None and o2.type in (OpType.IMM8, OpType.IMM16):
                     n = (o2.disp & 0xFFFF) + 1
+                    if not scaled:            # a byte offset, not an index: USER seg 4 4789
+                        n = (n + 1) // 2      # (`shr ax, 3; cmp ax, 32h; xchg bx, ax`)
                 break
+            if prev.mnemonic in ('shl', 'sal') or (prev.mnemonic == 'add' and o2 is not None
+                                                   and o2.type == OpType.REG16 and o2.reg == idx):
+                scaled = True
             if prev.mnemonic in ('mov', 'xchg') and o2 is not None and o2.type == OpType.REG16:
                 idx = o2.reg
             elif prev.mnemonic not in ('shl', 'sal', 'add', 'dec', 'inc', 'sub', 'and', 'test'):

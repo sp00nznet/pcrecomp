@@ -491,6 +491,13 @@ void dispatch_far(CPU *cpu, uint16_t sel, uint16_t off);
 /* A flat 32-bit stack: B bit and base 0 (KRNL386's __FLATDS). ponytail: the host gives every
  * data selector it allocates the B bit (QT_Thunk's alias stack too), so B alone is not enough. */
 int w16_ss_big(uint16_t ss) { return (ss & 4) && (native32_w9x_desc(ss)[6] & 0x40) && !recomp_sel_base(ss); }
+typedef struct w16_ff { struct w16_ff *up; uint16_t ss, sp; } w16_ff;
+static __declspec(thread) w16_ff *g_ff, *g_ff_to;
+/* 16->32 calls in flight whose 32-bit side comes back by a far jump into
+ * 16-bit code (w16_retf's generated stubs, w16_retf32's 16:16 returns):
+ * w16_enter longjmps here when its target is the pending return. */
+static __declspec(thread) struct { jmp_buf jb; uint32_t back; } g_thk[16];
+static __declspec(thread) int g_nthk;
 void w16_retf32(CPU *c) {
     /* eip and a 32-bit cs from ss:esp when ss is a big (B) segment, else ss:sp */
     uint32_t sb = recomp_sel_base(c->ss);
@@ -511,12 +518,19 @@ void w16_retf32(CPU *c) {
             for (int i = 0; i < 0xA0; i += 4) fprintf(stderr, "%s%08X", i % 32 ? " " : "\n  ", *(const uint32_t *)(uintptr_t)(a[0] + i));
         fprintf(stderr, "\n");
     }
+    /* The return is a 16:16 address in a present code selector: the flat
+     * function comes back by an o16 retf (USER seg 21 A7A7 pushes cs:A7E9,
+     * then __FLATCS:user32 BFF540DA, which ends `66 CB`). Its retf reaches
+     * w16_enter, which longjmps back here; the 16-bit code goes on there. */
+    uint32_t rr;
+    int recomp_lar32(uint16_t sel, uint32_t *rights);
+    int back16 = (ret >> 16 & 4) && recomp_lar32((uint16_t)(ret >> 16), &rr) && (rr & 0x8800) == 0x8800 && recomp_sel_base(ret >> 16);
     static const uint8_t stub[] = { 0x66, 0x8E, 0xD7, 0x2B, 0xE6, 0x66, 0x16, 0x66, 0x68, 0xFF, 0xFF, 0x53, 0x66, 0x68 };
     const uint8_t *r = (const uint8_t *)(uintptr_t)ret;
-    if (memcmp(r, stub, sizeof stub) || r[16] != 0x66 || r[17] != 0x68 || r[20] != 0x66 || r[21] != 0xCB)
+    if (!back16 && (memcmp(r, stub, sizeof stub) || r[16] != 0x66 || r[17] != 0x68 || r[20] != 0x66 || r[21] != 0xCB))
         w16_stop("flat return is not KRNL386's 32->16 stub", ret >> 16, ret & 0xFFFF);
     uint32_t se[8] = { g_eax, g_ecx, g_edx, g_ebx, g_esp, g_ebp, g_esi, g_edi };
-    uint16_t sss = g_seg_ss, sds = g_seg_ds, ses = g_seg_es; uint32_t ssb = g_ss_base;
+    uint16_t sss = g_seg_ss, sds = g_seg_ds, ses = g_seg_es; uint32_t ssb = g_ss_base, sdb = g_ds_base, seb = g_es_base;
     g_eax = c->eax; g_ecx = c->ecx; g_edx = c->edx; g_ebx = c->ebx;
     g_ebp = c->ebp; g_esi = c->esi; g_edi = c->edi;
     g_seg_ss = c->ss; g_ss_base = sb; g_esp = c->esp;
@@ -526,13 +540,34 @@ void w16_retf32(CPU *c) {
      * whatever fs kernel32 leaves (its _INIT loads its own) is KRNL386's */
     void recomp_set_seg(int sreg, uint32_t sel);
     recomp_set_seg(4, c->fs); recomp_set_seg(5, c->gs);
+    if (back16) {
+        if (g_nthk == 16) w16_stop("16->32 calls nested too deep", 0, 0);
+        CPU keep = *c;
+        w16_ff *ff = g_ff;
+        int k = g_nthk++;
+        g_thk[k].back = ret;
+        if (!setjmp(g_thk[k].jb)) {
+            recomp_set_seg(3, c->ds); recomp_set_seg(0, c->es);
+            f();
+            w16_stop("flat function returned without its retf to", ret >> 16, ret & 0xFFFF);
+        }
+        g_nthk = k; g_ff = ff;
+        *c = keep;
+        c->eax = g_eax; c->ecx = g_ecx; c->edx = g_edx; c->ebx = g_ebx;
+        c->ebp = g_ebp; c->esi = g_esi; c->edi = g_edi;
+        c->ss = g_seg_ss; c->sp = (uint16_t)g_esp; c->ds = g_seg_ds; c->es = g_seg_es; c->fs = g_seg_fs; c->gs = g_seg_gs;
+        g_eax = se[0]; g_ecx = se[1]; g_edx = se[2]; g_ebx = se[3]; g_esp = se[4]; g_ebp = se[5]; g_esi = se[6]; g_edi = se[7];
+        g_seg_ss = sss; g_seg_ds = sds; g_seg_es = ses; g_ss_base = ssb; g_ds_base = sdb; g_es_base = seb;
+        dispatch_far(c, (uint16_t)(ret >> 16), (uint16_t)ret);
+        return;
+    }
     f();
     c->fs = g_seg_fs; c->gs = g_seg_gs;
     c->eax = g_eax; c->ecx = g_ecx; c->edx = g_edx; c->ebx = g_ebx;
     c->ebp = g_ebp; c->esi = g_esi; c->edi = g_edi;
     uint32_t lin = g_esp + g_ss_base;   /* past the return the function popped */
     g_eax = se[0]; g_ecx = se[1]; g_edx = se[2]; g_ebx = se[3]; g_esp = se[4]; g_ebp = se[5]; g_esi = se[6]; g_edi = se[7];
-    g_seg_ss = sss; g_seg_ds = sds; g_seg_es = ses; g_ss_base = ssb;
+    g_seg_ss = sss; g_seg_ds = sds; g_seg_es = ses; g_ss_base = ssb; g_ds_base = sdb; g_es_base = seb;   /* the bases too: the 32-bit side loaded 16-bit ds/es */
     c->ss = c->di; c->esp = lin - c->esi;
     push16(c, c->ss); push16(c, 0xFFFF); push32(c, c->ebx);
     dispatch_far(c, *(const uint16_t *)(r + 14), *(const uint16_t *)(r + 18));
@@ -592,8 +627,6 @@ void w16_raise(CPU *c, int n, uint16_t cs, uint16_t ip) {
  * pushed retf, throws to the far call whose frame the 16-bit sp has passed.
  * ponytail: direct far calls only (not dispatch_far's indirect ones, not
  * `push cs; call near`); add them when an unwind targets one. */
-typedef struct w16_ff { struct w16_ff *up; uint16_t ss, sp; } w16_ff;
-static __declspec(thread) w16_ff *g_ff, *g_ff_to;
 #define W16_UNWIND_CODE 0xE0571601u
 void w16_farcall(CPU *c, void (*f)(CPU *)) {
     w16_ff fr = { g_ff, c->ss, c->sp };
@@ -642,6 +675,20 @@ void w16_jmpf(CPU *c, uint16_t sel, uint16_t off) {
     w16_unwind(c);
 }
 
+/* `push cont_seg; push cont_off; ...; push seg; push off; retf` (ne_lift: the
+ * same straight run pushed both): a far call to seg:off whose retf comes back
+ * to the pushed continuation. KRNL386 seg2 0D3A calls a DLL's LibEntry so
+ * and goes on at 0D83. If the callee left some other way (an unwind, a
+ * return elsewhere), that is where control is: no continuation. */
+void w16_retf_call(CPU *c) {
+    uint16_t off = pop16(c), sel = pop16(c);
+    uint16_t co = mem_read16(c, c->ss, c->sp), cs = mem_read16(c, c->ss, (uint16_t)(c->sp + 2)), sp = c->sp;
+    if (getenv("W16_TRACE")) fprintf(stderr, "[w16] retf call %04X:%04X, back to %04X:%04X\n", sel, off, cs, co);
+    dispatch_far(c, sel, off);
+    if (getenv("W16_TRACE")) fprintf(stderr, "[w16] retf call %04X:%04X returned ax %04X to %04X (sp %04X)\n", sel, off, c->ax, c->ret_ip, c->sp);
+    if (c->ret_ip == co && c->sp > sp) dispatch_far(c, cs, co);
+}
+
 void dispatch_near(CPU *cpu, uint16_t seg, uint16_t off) {   /* seg: the segment index */
     if (!recomp_dispatch_lookup(cpu, seg, off)) w16_stop("near call miss", seg, off);
 }
@@ -660,8 +707,6 @@ int w16_ss_big(uint16_t ss);
  * kernel32 dispatcher that runs entry edx and comes back to the 16-bit
  * caller with an o16 retf (w16_enter sees its return address and unwinds
  * here). Static code cannot hold it, so the runtime runs it. */
-static __declspec(thread) struct { jmp_buf jb; uint32_t back; } g_thk[16];
-static __declspec(thread) int g_nthk;
 int w16_retf(CPU *c) {
     uint32_t at = mem_read32(c, c->ss, c->sp);
     int recomp_lar32(uint16_t sel, uint32_t *rights);
@@ -681,7 +726,7 @@ int w16_retf(CPU *c) {
     if (!f) w16_stop("generated stub jumps to no lifted function", eip >> 16, eip & 0xFFFF);
     if (g_nthk == 16) w16_stop("16->32 stubs nested too deep", 0, 0);
     uint32_t se[8] = { g_eax, g_ecx, g_edx, g_ebx, g_esp, g_ebp, g_esi, g_edi };
-    uint16_t sss = g_seg_ss, sds = g_seg_ds, ses = g_seg_es; uint32_t ssb = g_ss_base;
+    uint16_t sss = g_seg_ss, sds = g_seg_ds, ses = g_seg_es; uint32_t ssb = g_ss_base, sdb = g_ds_base, seb = g_es_base;
     void recomp_set_seg(int sreg, uint32_t sel);
     g_eax = c->eax; g_ecx = c->ecx; g_edx = c->edx; g_ebx = c->ebx;
     g_ebp = c->ebp; g_esi = c->esi; g_edi = c->edi;
@@ -701,7 +746,7 @@ int w16_retf(CPU *c) {
     c->ebp = g_ebp; c->esi = g_esi; c->edi = g_edi;
     c->ss = g_seg_ss; c->sp = (uint16_t)g_esp; c->ds = g_seg_ds; c->es = g_seg_es; c->fs = g_seg_fs; c->gs = g_seg_gs;
     g_eax = se[0]; g_ecx = se[1]; g_edx = se[2]; g_ebx = se[3]; g_esp = se[4]; g_ebp = se[5]; g_esi = se[6]; g_edi = se[7];
-    g_seg_ss = sss; g_seg_ds = sds; g_seg_es = ses; g_ss_base = ssb;
+    g_seg_ss = sss; g_seg_ds = sds; g_seg_es = ses; g_ss_base = ssb; g_ds_base = sdb; g_es_base = seb;   /* the bases too: the 32-bit side loaded 16-bit ds/es */
     return 1;
 }
 
