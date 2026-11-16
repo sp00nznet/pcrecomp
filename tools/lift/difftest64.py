@@ -605,6 +605,7 @@ def main():
 
     import shutil
     shutil.copy(os.path.normpath(CPU64_H), outdir)
+    shutil.copy(os.path.join(os.path.dirname(os.path.normpath(CPU64_H)), "eh64.h"), outdir)   # cpu64.h includes it
     shutil.copy(os.path.join(HERE, 'difftest64.asm'), outdir)
 
     emit_seeds(outdir, 64, 8, rng)

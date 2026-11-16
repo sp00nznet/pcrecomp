@@ -255,11 +255,14 @@ class Disassembler64:
 
     def jump_table(self, fn, jmp):
         """Targets of an MSVC x64 switch ending in `jmp jmp.reg`, or []."""
-        prior = sorted(a for a in fn if a < jmp.address)[-16:]
-        prior = [fn[a] for a in prior]
+        before = [fn[a] for a in sorted(a for a in fn if a < jmp.address)]
+        prior = before[-16:]
         target = _canon(jmp.reg_name(jmp.operands[0].reg))
         bases, load = {}, None
-        for ins in prior:                   # imagebase leas, in order
+        # Imagebase leas from the whole body so far: MSVC hoists `lea rB,[__ImageBase]`
+        # into the prologue when one function has several switches (Wolfenstein TNO's
+        # GL sampler setup, 0x140478AA0, loads rsi ~150 instructions before its jmp).
+        for ins in before:
             if ins.mnemonic == 'lea' and ins.operands[1].type == X86_OP_MEM:
                 m = ins.operands[1].mem
                 if m.base == X86_REG_RIP and m.index == 0 and \
@@ -295,10 +298,22 @@ class Disassembler64:
                     bytes_at, idx = self.pe.base + bm.disp, _canon(ins.reg_name(bm.index))
                 break
         bound = None
+        # The bound may be on a register the index was copied from: `movsxd rax, r11d`
+        # after the cmp (Wolfenstein TNO 0x1409D5BA0) or `mov rax, r11` before it
+        # (0x140843F50). Either way the cmp is on r11.
+        alias = {idx}
+        for ins in prior:
+            if ins.address < load.address and ins.mnemonic in ('mov', 'movsxd') and \
+                    len(ins.operands) == 2 and ins.operands[0].type == X86_OP_REG and \
+                    ins.operands[1].type == X86_OP_REG and \
+                    _canon(ins.reg_name(ins.operands[0].reg)) in alias:
+                alias.add(_canon(ins.reg_name(ins.operands[1].reg)))
         for ins in reversed(prior):         # cmp rI, N ; ja default
+            if ins.address >= load.address:
+                continue
             if ins.mnemonic == 'cmp' and ins.operands[0].type == X86_OP_REG and \
                     ins.operands[1].type == X86_OP_IMM and \
-                    _canon(ins.reg_name(ins.operands[0].reg)) == idx:
+                    _canon(ins.reg_name(ins.operands[0].reg)) in alias:
                 nxt = fn.get(ins.address + ins.size)
                 if nxt is not None and nxt.mnemonic in ('ja', 'jae'):
                     bound = ins.operands[1].imm + (1 if nxt.mnemonic == 'ja' else 0)

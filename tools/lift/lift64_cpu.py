@@ -185,6 +185,7 @@ SSE64_EXTRA = (
                  'unpcklpd', 'unpckhpd', 'movhlps', 'movlhps',
                  'movmskps', 'movmskpd', 'sqrtps', 'rcpps',
                  'rsqrtps', 'rsqrtss', 'rcpss', 'cvtdq2pd',
+                 'cvttpd2dq', 'cvtpd2dq', 'haddps',
                  'movlps', 'movhps', 'movlpd', 'movhpd',
                  'cvtsi2ssl', 'cvtsi2sdl', 'cvtsi2ssq', 'cvtsi2sdq',
                  'ldmxcsr', 'stmxcsr'})
@@ -279,7 +280,7 @@ SSE64_MOV128 = frozenset({'movntdqa', 'lddqu'})
 
 PINTEGER_MISC = frozenset({
     'pmullw', 'pmulhw', 'pmulhuw', 'pmaddwd', 'pavgb', 'pavgw',
-    'pmovmskb', 'pslldq', 'psrldq', 'pextrw', 'pinsrw', 'pshufb',
+    'pmovmskb', 'pslldq', 'psrldq', 'pextrw', 'pinsrw', 'pshufb', 'psadbw',
 })
 
 SSE64_MNEMONICS = (SSE_MNEMONICS | SSE64_EXTRA
@@ -594,6 +595,15 @@ class Lifter:
             out.append(' }')
             return [''.join(out)]
 
+        if m == 'psadbw':
+            # Sum of |d - s| over each 8-byte half, into the low word of each qword.
+            k = self._xi(d)
+            out = ['{ XMM _d = c->xmm[%d], _s = %s; uint64_t _a = 0, _b = 0; int _i;' % (k, self._xm(insn, s)),
+                   ' for (_i = 0; _i < 8; _i++) { _a += (uint64_t)abs((int)_d.u8[_i] - (int)_s.u8[_i]);'
+                   ' _b += (uint64_t)abs((int)_d.u8[_i + 8] - (int)_s.u8[_i + 8]); }',
+                   ' c->xmm[%d].u64[0] = _a; c->xmm[%d].u64[1] = _b; }' % (k, k)]
+            return [''.join(out)]
+
         if m == 'pmaddwd':
             k = self._xi(d)
             out = ['{ XMM _d = c->xmm[%d], _s = %s;' % (k, self._xm(insn, s))]
@@ -851,7 +861,7 @@ class Lifter:
 
         # ---- compares that write a mask ----
         mm = SSE_CMP_RE.match(m)
-        if mm:
+        if mm and mm.group(2) in ("ss", "sd"):   # SSE_CMP_RE also takes ps/pd: those are packed, below
             pred, width = mm.group(1), mm.group(2)
             wide = width == 'sd'
             rd_ = self._sd if wide else self._ss
@@ -961,6 +971,21 @@ class Lifter:
                                 % (n, i, i))
             return ['{ XMM _s = %s; %s }' % (self._xm(insn, s), ' '.join(body))]
 
+        if m in ('cvttpd2dq', 'cvtpd2dq'):
+            # Two doubles to the low two dwords; the high qword is zeroed.
+            n = self._xi(d)
+            r = '' if m == 'cvttpd2dq' else 'nearbyint'
+            return ['{ XMM _s = %s; c->xmm[%d].i32[0] = sse_cvtt_i32(%s(_s.f64[0]));'
+                    ' c->xmm[%d].i32[1] = sse_cvtt_i32(%s(_s.f64[1])); c->xmm[%d].u64[1] = 0; }'
+                    % (self._xm(insn, s), n, r, n, r, n)]
+
+        if m == 'haddps':
+            n = self._xi(d)
+            return ['{ XMM _d = c->xmm[%d], _s = %s;'
+                    ' c->xmm[%d].f32[0] = _d.f32[0] + _d.f32[1]; c->xmm[%d].f32[1] = _d.f32[2] + _d.f32[3];'
+                    ' c->xmm[%d].f32[2] = _s.f32[0] + _s.f32[1]; c->xmm[%d].f32[3] = _s.f32[2] + _s.f32[3]; }'
+                    % (n, self._xm(insn, s), n, n, n, n)]
+
         if m == 'cvtdq2pd':
             # Two ints from the LOW 64 bits, two doubles out.
             n = self._xi(d)
@@ -1027,12 +1052,26 @@ class Lifter:
 
         # x87 and MMX are not modelled - see the module docstring. Caught here
         # so they cannot fall through into a same-named integer handler.
+        # Except the control word: the CRT's setjmp/longjmp and _control87 save and
+        # restore it, and with no x87 state that is a store of the default and a no-op.
+        if m in ('fnstcw', 'fstcw'):
+            return ['wr16(%s, 0x027Fu); /* x87 control word: the power-on default */' % self.addr_expr(insn, ops[0])]
+        if m == 'fldcw':
+            return ['/* fldcw: no x87 state to load into */']
         if m[0] == 'f' and m not in ('fs',):
             return [_todo(ea, '%s %s (x87 not modelled)' % (m, insn.op_str))]
+
+        if m == 'bswap':
+            v = self.src(insn, ops[0])
+            if ops[0].size == 8:
+                return [self.dst_write(insn, ops[0], '_byteswap_uint64(%s)' % v)]
+            return [self.dst_write(insn, ops[0], '_byteswap_ulong((unsigned long)(%s))' % v)]
 
         if self.is_sse(insn):
             return self.sse(insn)
 
+        if m in ('clflush', 'sfence', 'lfence', 'mfence'):
+            return ['/* %s: ordering/cache hint, no effect on what this thread sees */' % m]
         if m.startswith('prefetch'):
             return ['/* prefetch: hint only */']
 
@@ -1057,7 +1096,7 @@ class Lifter:
                         % (cond, self.dst_write(insn, d, self.src(insn, sop)))]
 
         # ---- data movement ----
-        if m in ('mov', 'movabs'):
+        if m in ('mov', 'movabs', 'movnti'):   # movnti: the non-temporal hint changes nothing a thread sees
             d, s = two()
             return [self.dst_write(insn, d, self.src_ext(insn, s, d.size))]
         if m == 'lea':
@@ -1315,13 +1354,10 @@ class Lifter:
                 # zero, so the 64/64 form below is what actually runs. A genuine
                 # 128-bit numerator would need __int128 and is caught, not guessed.
                 if sg:
-                    return ['{ int64_t _n=(int64_t)c->rax, _d=(int64_t)(%s);' % v,
-                            '  if ((c->rdx != 0) && (c->rdx != ~(uint64_t)0))'
-                            ' RECOMP_TODO(0x%X, "idiv: true 128-bit numerator");' % ea,
-                            '  c->rax=(uint64_t)(_n/_d); c->rdx=(uint64_t)(_n%_d); }']
-                return ['{ uint64_t _n=c->rax, _d=(uint64_t)(%s);' % v,
-                        '  if (c->rdx != 0) RECOMP_TODO(0x%X, "div: true 128-bit numerator");' % ea,
-                        '  c->rax=_n/_d; c->rdx=_n%_d; }']
+                    return ['{ int64_t _r, _q = _div128((int64_t)c->rdx, (int64_t)c->rax, (int64_t)(%s), &_r);' % v,
+                            '  c->rax=(uint64_t)_q; c->rdx=(uint64_t)_r; }']
+                return ['{ uint64_t _r, _q = _udiv128(c->rdx, c->rax, (uint64_t)(%s), &_r);' % v,
+                        '  c->rax=_q; c->rdx=_r; }']
             if sz == 4:
                 if sg:
                     return ['{ int64_t _n=(int64_t)(((uint64_t)R32(c->rdx)<<32)|R32(c->rax));'

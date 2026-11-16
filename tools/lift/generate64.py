@@ -230,7 +230,7 @@ def plausible_code(read_va, va):
         from capstone import Cs, CS_ARCH_X86, CS_MODE_64
         _CODE_MD = Cs(CS_ARCH_X86, CS_MODE_64)
     try:
-        code = read_va(va, 16)
+        code = read_va(va, 32)   # 16 cut off `mov dword [rcx],5; mov qword [rcx+8],0; ...` (14 bytes in two)
     except Exception:
         return False
     n = 0

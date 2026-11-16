@@ -291,20 +291,39 @@ static int catch_matches(uint32_t catch_td, uint32_t ti, uint32_t *size)
 }
 
 /* ---- the throw ------------------------------------------------------------ */
+/* The exception the innermost running catch funclet holds, for `throw;`. */
+static __declspec(thread) CPU rt_cpu;
+static __declspec(thread) uint64_t rt_obj, rt_ti, rt_pc, rt_est;
+static __declspec(thread) int rt_valid;
+
 int es3_eh_throw(CPU *c, uint64_t ret_pc, uint64_t obj, uint64_t throw_info)
 {
     uint64_t pc = ret_pc, establisher = 0;
     uint32_t ti;
     int depth;
+    int rethrow = 0;
 
+    if (!obj && !throw_info && ret_pc && rt_valid) {
+        /* `throw;` inside a catch funclet: resume the search above the frame
+         * that caught it. ponytail: an outer try in that same frame is not
+         * considered. */
+        *c = rt_cpu;
+        obj = rt_obj;
+        throw_info = rt_ti;
+        pc = rt_pc;
+        establisher = rt_est;
+        rethrow = 1;
+    }
     if (!obj || !throw_info || !ret_pc) return 0;
     eh_init();
     if (!pdata) return 0;
     ti = (uint32_t)(throw_info - es3_eh_image_base);
     if (g_eh_trace)
-        fprintf(stderr, "[eh] throw obj %#llx ti %#llx from %#llx, rsp %#llx\n",
+        fprintf(stderr, "[eh] %s obj %#llx ti %#llx from %#llx, rsp %#llx\n",
+                rethrow ? "rethrow" : "throw",
                 (unsigned long long)obj, (unsigned long long)throw_info,
                 (unsigned long long)ret_pc, (unsigned long long)c->rsp);
+    if (rethrow && !unwind_one(c, &pc, &establisher)) return 0;
 
     for (depth = 0; depth < 512 && pc; depth++) {
         uint32_t rva = (uint32_t)(pc - es3_eh_image_base);
@@ -369,11 +388,20 @@ int es3_eh_throw(CPU *c, uint64_t ret_pc, uint64_t obj, uint64_t throw_info)
                            obj_size < 64 ? obj_size : 64);
                 /* The catch funclet is guest code: it reaches the parent's
                  * locals through rdx and returns where to continue in rax. */
-                c->rdx = establisher;
-                c->rcx = 0;
-                c->rsp = (establisher - 0x200) & ~(uint64_t)15;
-                push64(c, 0);
-                dispatch(c, es3_eh_image_base + handler);
+                {
+                    CPU prev_cpu = rt_cpu;
+                    uint64_t prev_obj = rt_obj, prev_ti = rt_ti, prev_pc = rt_pc, prev_est = rt_est;
+                    int prev_valid = rt_valid;
+                    rt_cpu = *c; rt_obj = obj; rt_ti = throw_info; rt_pc = pc; rt_est = establisher;
+                    rt_valid = 1;
+                    c->rdx = establisher;
+                    c->rcx = 0;
+                    c->rsp = (establisher - 0x200) & ~(uint64_t)15;
+                    push64(c, 0);
+                    dispatch(c, es3_eh_image_base + handler);
+                    rt_cpu = prev_cpu; rt_obj = prev_obj; rt_ti = prev_ti; rt_pc = prev_pc;
+                    rt_est = prev_est; rt_valid = prev_valid;
+                }
                 cont = c->rax;
                 c->rsp = establisher;
                 if (g_eh_trace)
