@@ -400,7 +400,7 @@ class Lifter:
             # Segment registers and FPU ST(i) - use as comment
             if X86_REG_ST0 <= r <= X86_REG_ST0 + 7:
                 return f"_st[{r - X86_REG_ST0}] = {value}"
-            if (self.dos and r in DOS_SEG_IDX) or (W9X and r in (X86_REG_ES, X86_REG_DS, X86_REG_GS)):
+            if (self.dos and r in DOS_SEG_IDX) or (W9X and r in (X86_REG_ES, X86_REG_DS, X86_REG_FS, X86_REG_GS)):
                 if W9X and r == X86_REG_DS:
                     return f"recomp_set_seg(3, {value})"
                 return f"recomp_set_seg({DOS_SEG_IDX[r]}, {value})"
@@ -912,7 +912,7 @@ class Lifter:
                         lines[-1] = f"{r} = POP32_VAL(esp); {comment}"
                         if W9X and ops[0].reg == X86_REG_DS:
                             lines[-1] = f"recomp_set_seg(3, POP32_VAL(esp)); {comment}"
-                        elif (self.dos and ops[0].reg in DOS_SEG_IDX) or (W9X and ops[0].reg in (X86_REG_ES, X86_REG_GS)):
+                        elif (self.dos and ops[0].reg in DOS_SEG_IDX) or (W9X and ops[0].reg in (X86_REG_ES, X86_REG_FS, X86_REG_GS)):
                             lines[-1] = (f"recomp_set_seg({DOS_SEG_IDX[ops[0].reg]}, POP32_VAL(esp));"
                                          f" {comment}")
 
