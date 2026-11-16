@@ -247,7 +247,8 @@ int recomp_trace_arg(int argc, char** argv, int i) {
     const char* a = argv[i];
     if (!strcmp(a, "--calltrace") && i + 1 < argc) {
         g_calltrace = fopen(argv[i + 1], "w");
-        if (g_calltrace) setvbuf(g_calltrace, NULL, _IOFBF, 4u << 20);
+        /* 64 KB: a run ended by TerminateProcess (hiddenrun) loses at most that */
+        if (g_calltrace) setvbuf(g_calltrace, NULL, _IOFBF, 64u << 10);
         else fprintf(stderr, "[trace] cannot write %s\n", argv[i + 1]);
         return 2;
     }

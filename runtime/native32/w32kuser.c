@@ -742,6 +742,15 @@ static uint32_t s_spi(uint32_t* a) {
         if (g_mon) memcpy(g_mon + 0x20, &g_work, sizeof g_work);
         return 1;
     }
+    /* SPI_GETMENUANIMATION / SPI_GETMENUFADE: no. The virtual screen's
+     * top-level windows are host child windows, which cannot be
+     * WS_EX_LAYERED (not without a Windows 8 manifest), so AnimateWindow's
+     * AW_BLEND failed and the Start menu never showed; its slide times
+     * itself with the guest's GetTickCount, which reads KUSER_SHARED_DATA's
+     * TickCountLow (0 on Windows 10/11) and spun forever. ponytail: menus
+     * appear without animation; a moving guest tick is the upgrade (it sent
+     * ole32 into the COM+ catalog at start, not looked at) */
+    if (g_screen && (a[0] == SPI_GETMENUANIMATION || a[0] == SPI_GETMENUFADE) && a[2]) { MEM32(a[2]) = 0; return 1; }
     if (!spi_get(a[0], a[2])) {
         fprintf(stderr, "[user] SystemParametersInfo 0x%X (a SET) refused\n", a[0]);
         return 0;
@@ -778,8 +787,15 @@ static uint32_t s_message_call(uint32_t* a) {
     if (a[2] && ((a[2] >> 16) & 0x1F) == 1 && native32_gdi_host(a[2])) a[2] = native32_gdi_host(a[2]);
     /* a GDI object in wParam (WM_SETFONT's font) goes to the host as the host's */
     if (a[2] && native32_gdi_host(a[2])) a[2] = native32_gdi_host(a[2]);
+    /* BM_SETIMAGE / STM_SETIMAGE's bitmap in lParam (the Start button's logo
+     * and text are one bitmap on the host's Button); the old one comes back
+     * as the guest's */
+    int img = (a[1] == BM_SETIMAGE || a[1] == STM_SETIMAGE) && a[2] == IMAGE_BITMAP;
+    if (img && a[3] && native32_gdi_host(a[3])) a[3] = native32_gdi_host(a[3]);
     if (a[5] == 0x2AE) {                   /* SendMessage */
         LRESULT r = a[6] ? SendMessageA(h, a[1], a[2], a[3]) : SendMessageW(h, a[1], a[2], a[3]);
+        if ((img || ((a[1] == BM_GETIMAGE || a[1] == STM_GETIMAGE) && a[2] == IMAGE_BITMAP)) && r)
+            return native32_gdi_handle((uint32_t)r);
         return (uint32_t)(a[1] == WM_GETFONT && r ? native32_gdi_handle((uint32_t)r) : r);
     }
     if (a[5] == 0x29E) {
@@ -963,6 +979,19 @@ static uint32_t s_enable_menu(uint32_t* a) {
     return (uint32_t)r;
 }
 static uint32_t s_destroy_menu(uint32_t* a) { return DestroyMenu((HMENU)(uintptr_t)a[0]); }
+/* NtUserRemoveMenu / NtUserDeleteMenu(hmenu, item, flags): explorer takes the
+ * Start menu out of its LoadMenu bar with RemoveMenu before DestroyMenu(bar);
+ * unanswered, the bar's destroy took the Start menu with it */
+static uint32_t s_remove_menu(uint32_t* a) {
+    BOOL r = RemoveMenu((HMENU)(uintptr_t)a[0], a[1], a[2]);
+    menu_sync((HMENU)(uintptr_t)a[0]);
+    return r;
+}
+static uint32_t s_delete_menu(uint32_t* a) {
+    BOOL r = DeleteMenu((HMENU)(uintptr_t)a[0], a[1], a[2]);
+    menu_sync((HMENU)(uintptr_t)a[0]);
+    return r;
+}
 
 /* NtUserGetMenuItemRect(hwnd, hmenu, item, RECT*) */
 static uint32_t s_menu_rect(uint32_t* a) {
@@ -1089,7 +1118,12 @@ static uint32_t s_setcapture(uint32_t* a) { return (uint32_t)(uintptr_t)SetCaptu
 static uint32_t s_register_msg(uint32_t* a) { return RegisterWindowMessageW(ustr_name(a[0])); }
 /* NtUserSetWindowPos(hwnd, after, x, y, cx, cy, flags) */
 static uint32_t s_setpos(uint32_t* a) {
-    return SetWindowPos((HWND)(uintptr_t)a[0], (HWND)(uintptr_t)a[1], (int)a[2], (int)a[3], (int)a[4], (int)a[5], a[6]);
+    /* HWND_TOPMOST / NOTOPMOST on a window of the virtual screen (a host
+     * child): the top of the screen's children (the Start menu's BaseBar) */
+    if (g_screen && (a[1] == (uint32_t)-1 || a[1] == (uint32_t)-2) && GetAncestor((HWND)(uintptr_t)a[0], GA_PARENT) == g_screen)
+        a[1] = a[1] == (uint32_t)-1 ? 0 : 1, a[6] |= a[1] ? SWP_NOZORDER : 0;
+    BOOL r = SetWindowPos((HWND)(uintptr_t)a[0], (HWND)(uintptr_t)a[1], (int)a[2], (int)a[3], (int)a[4], (int)a[5], a[6]);
+    return r;
 }
 static uint32_t s_foreground(uint32_t* a) { (void)a; return (uint32_t)(uintptr_t)GetForegroundWindow(); }
 /* NtUserGetSystemMenu(hwnd, bRevert) */
@@ -1345,6 +1379,7 @@ void native32_user_install(void) {
         { "NtUserTranslateMessage", s_translate }, { "NtUserDispatchMessage", s_dispatch },
         { "NtUserBeginPaint", s_beginpaint }, { "NtUserGetUpdateRect", s_getupdaterect }, { "NtUserEndPaint", s_endpaint },
         { "NtUserThunkedMenuItemInfo", s_menu_item }, { "NtUserDestroyMenu", s_destroy_menu },
+        { "NtUserRemoveMenu", s_remove_menu }, { "NtUserDeleteMenu", s_delete_menu },
         { "NtUserCheckMenuItem", s_check_menu }, { "NtUserEnableMenuItem", s_enable_menu },
         { "NtUserGetMenuItemRect", s_menu_rect }, { "NtUserFindExistingCursorIcon", s_find_icon }, { "NtUserSetCursorIconData", s_set_cursor_data },
         { "NtUserSetWindowsHookEx", s_sethook }, { "NtUserCallNextHookEx", s_nexthook }, { "NtUserUnhookWindowsHookEx", s_unhook },
