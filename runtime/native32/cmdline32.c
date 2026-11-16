@@ -61,6 +61,18 @@ static int __cdecl cl_wgetmainargs(int* argc, wchar_t*** argv, wchar_t*** envp, 
     return r;
 }
 
+/* The CRT's own globals, read directly: mfc42u's __p___wargv, wordpad's
+ * _wcmdln (a data import: the IAT holds the variable's address) */
+static char* g_acmdln = g_cmd_a;
+static WCHAR* g_wcmdln = g_cmd_w;
+static int g_argc;
+static char** g_argv;
+static wchar_t** g_wargv;
+static void cl_args(void) { if (!g_argv) g_argv = (char**)make_argv(&g_argc, 0), g_wargv = (wchar_t**)make_argv(&g_argc, 1); }
+static int* __cdecl cl_p_argc(void) { cl_args(); return &g_argc; }
+static char*** __cdecl cl_p_argv(void) { cl_args(); return &g_argv; }
+static wchar_t*** __cdecl cl_p_wargv(void) { cl_args(); return &g_wargv; }
+
 void native32_set_command_line(const char* line) {
     strncpy(g_cmd_a, line, sizeof g_cmd_a - 1);
     MultiByteToWideChar(CP_ACP, 0, g_cmd_a, -1, g_cmd_w, 2048);
@@ -68,4 +80,9 @@ void native32_set_command_line(const char* line) {
     native32_redirect("GetCommandLineW", (void*)cl_GetCommandLineW);
     native32_redirect("__getmainargs", (void*)cl_getmainargs);
     native32_redirect("__wgetmainargs", (void*)cl_wgetmainargs);
+    native32_redirect("__p___argc", (void*)cl_p_argc);
+    native32_redirect("__p___argv", (void*)cl_p_argv);
+    native32_redirect("__p___wargv", (void*)cl_p_wargv);
+    native32_redirect("_acmdln", (void*)&g_acmdln);
+    native32_redirect("_wcmdln", (void*)&g_wcmdln);
 }

@@ -165,7 +165,7 @@ uint8_t* native32_user_wnd(void* hv) {
     *(uint32_t*)(w + 0x5C) = (uint32_t)GetWindowLongPtrW(h, GWLP_WNDPROC);
     if (*(uint32_t*)(w + 0x5C) == (uint32_t)(uintptr_t)wnd_thunk) *(uint32_t*)(w + 0x5C) = class_proc(h);
     /* +0x88 cbwndExtra (a dialog's must be DLGWINDOWEXTRA); the extra bytes
-     * follow the WND at +0x9C (a dialog's: its DIALOG structure) */
+     * follow the WND at +0x98 (a dialog keeps its DIALOG pointer at +0x9C) */
     *(uint32_t*)(w + 0x88) = (uint32_t)GetClassLongW(h, GCL_CBWNDEXTRA);
     /* +0x60 pcls: GetWindowLong(GWL_WNDPROC) reads the class's fnid (+6)
      * to map a server-side procedure back; a zeroed CLS has none. ponytail:
@@ -475,6 +475,27 @@ static uint32_t s_findwindow(uint32_t* a) {
 /* NtUserModifyUserStartupInfoFlags(set, clear): STARTF_* bits win32k keeps
  * for the first window; nothing to keep here */
 static uint32_t s_one_u(uint32_t* a) { (void)a; return 1; }
+/* RichEdit's (wordpad): read-only queries and its caret */
+static uint32_t s_dblclick(uint32_t* a) { (void)a; return GetDoubleClickTime(); }
+static uint32_t s_kblist(uint32_t* a) { return (uint32_t)GetKeyboardLayoutList((int)a[0], (HKL*)(uintptr_t)a[1]); }
+static uint32_t s_showcaret(uint32_t* a) { return ShowCaret((HWND)(uintptr_t)a[0]); }
+static uint32_t s_hidecaret(uint32_t* a) { return HideCaret((HWND)(uintptr_t)a[0]); }
+/* NtUserGetThreadDesktop(tid, hdeskConsole): this thread's (the guest tid is not the host's) */
+static uint32_t s_threaddesk(uint32_t* a) { (void)a; return (uint32_t)(uintptr_t)GetThreadDesktop(GetCurrentThreadId()); }
+static uint32_t s_showsb(uint32_t* a) { return ShowScrollBar((HWND)(uintptr_t)a[0], (int)a[1], a[2]); }
+static uint32_t s_keystate(uint32_t* a) { return (uint32_t)(uint16_t)GetKeyState((int)a[0]); }
+static uint32_t s_nclipfmt(uint32_t* a) { (void)a; return (uint32_t)CountClipboardFormats(); }
+/* NtUserCreateCaret(hwnd, hbm (0, 1 grey or a bitmap), cx, cy) */
+static uint32_t s_createcaret(uint32_t* a) {
+    uint32_t b = a[1] > 1 && native32_gdi_host(a[1]) ? native32_gdi_host(a[1]) : a[1];
+    return CreateCaret((HWND)(uintptr_t)a[0], (HBITMAP)(uintptr_t)b, (int)a[2], (int)a[3]);
+}
+/* NtUserCallTwoParam(p1, p2, index): 0x5E SetCaretPos (read off the export) */
+static uint32_t s_call_twoparam(uint32_t* a) {
+    if (a[2] == 0x5E) return SetCaretPos((int)a[0], (int)a[1]);
+    fprintf(stderr, "[user] NtUserCallTwoParam(%08X, %08X, 0x%X) not answered\n", a[0], a[1], a[2]);
+    return 0;
+}
 /* NtUserEnableScrollBar(hwnd, wSBflags, wArrows): the host's */
 static uint32_t s_enable_sb(uint32_t* a) { return EnableScrollBar((HWND)(uintptr_t)a[0], a[1], a[2]); }
 /* NtUserSystemParametersInfo(action, uiParam, pvParam, fWinIni): the host's */
@@ -506,6 +527,17 @@ static uint32_t s_getdcex(uint32_t* a) {
 static uint32_t s_getwindowdc(uint32_t* a) { return native32_gdi_handle((uint32_t)(uintptr_t)GetWindowDC((HWND)(uintptr_t)a[0])); }
 static uint32_t s_getdc(uint32_t* a) { return native32_gdi_handle((uint32_t)(uintptr_t)GetDC((HWND)(uintptr_t)a[0])); }
 /* NtUserCreateAcceleratorTable(ACCEL*, count) */
+/* NtUserTranslateAccelerator(hwnd, haccel, MSG*): the table is the host's (s_accel) */
+static uint32_t s_translate_accel(uint32_t* a) {
+    return (uint32_t)TranslateAcceleratorW((HWND)(uintptr_t)a[0], (HACCEL)(uintptr_t)a[1], (MSG*)(uintptr_t)a[2]);
+}
+/* NtUserScrollWindowEx(hwnd, dx, dy, prcScroll, prcClip, hrgnUpdate, prcUpdate, flags) */
+static uint32_t s_scrollwindow(uint32_t* a) {
+    uint32_t r = a[5] && native32_gdi_host(a[5]) ? native32_gdi_host(a[5]) : a[5];
+    return (uint32_t)ScrollWindowEx((HWND)(uintptr_t)a[0], (int)a[1], (int)a[2], (RECT*)(uintptr_t)a[3], (RECT*)(uintptr_t)a[4],
+                                    (HRGN)(uintptr_t)r, (RECT*)(uintptr_t)a[6], a[7]);
+}
+static uint32_t s_clipfmt_avail(uint32_t* a) { return IsClipboardFormatAvailable(a[0]); }
 static uint32_t s_accel(uint32_t* a) { return (uint32_t)(uintptr_t)CreateAcceleratorTableW((ACCEL*)(uintptr_t)a[0], (int)a[1]); }
 
 /* NtUserMessageCall(hwnd, msg, wParam, lParam, xParam, fnid, bAnsi): the
@@ -589,6 +621,7 @@ static uint32_t s_call_noparam(uint32_t* a) {
     if (a[0] == 1) return menu(CreatePopupMenu());
     if (a[0] == 8) return ReleaseCapture();
     if (a[0] == 5) return GetMessagePos();
+    if (a[0] == 2) return DestroyCaret();
     fprintf(stderr, "[user] NtUserCallNoParam %u not answered\n", a[0]);
     return 0;
 }
@@ -641,6 +674,7 @@ static uint32_t s_call_oneparam(uint32_t* a) {
     if (a[1] == 0x24) return getenv("PCRECOMP_MUTE") ? 1 : MessageBeep(a[0]);   /* (muted runs stay silent) */
     if (a[1] == 0x26) { PostQuitMessage((int)a[0]); return 1; }
     if (a[1] == 0x2D) return (uint32_t)ShowCursor(a[0]);
+    if (a[1] == 0x1E) return (uint32_t)(uintptr_t)GetKeyboardLayout(0);   /* (a guest tid: this thread's) */
     if (a[1] == 0x33) { DWORD l = 0; GetProcessDefaultLayout(&l); if (a[0]) MEM32(a[0]) = l; return 1; }
     if (a[1] == 0x29) {
         uint32_t h = native32_gdi_host(a[0]);
@@ -822,6 +856,33 @@ static uint32_t s_setlong(uint32_t* a) {
         *(uint32_t*)(w + 0x5C) = a[2];
         return old;
     }
+    /* Styles are the host window's: MFC's ModifyStyleEx drops WS_EX_CLIENTEDGE
+     * from a frame and its view, and the client edge moving is what sends
+     * WM_MOVE/WM_SIZE (wordpad sized its frame from them) */
+    if ((int)a[1] == GWL_STYLE || (int)a[1] == GWL_EXSTYLE) {
+        uint8_t* w = native32_user_wnd(h);
+        uint32_t v = a[2], old;
+        /* WS_VISIBLE stays the host's: the guest's value is read-modify-write
+         * from the WND, which can predate ShowWindow (RichEdit's view, made
+         * visible by CreateWindowEx after WM_CREATE, was hidden again).
+         * ponytail: a guest that shows a window through its style is not
+         * answered */
+        if ((int)a[1] == GWL_STYLE) v = (v & ~WS_VISIBLE) | ((uint32_t)GetWindowLongW(h, GWL_STYLE) & WS_VISIBLE);
+        old = (uint32_t)SetWindowLongW(h, (int)a[1], (LONG)v);
+        if (w) *(uint32_t*)(w + ((int)a[1] == GWL_STYLE ? 0x20 : 0x1C)) = (uint32_t)GetWindowLongW(h, (int)a[1]);
+        return old;
+    }
+    /* The window's extra bytes (index >= 0) are the WND's from +0x98, where
+     * the guest's GetWindowLong reads them: RichEdit keeps its object at 0,
+     * and without it every message it gets returns 0 (wordpad) */
+    if ((int)a[1] >= 0) {
+        uint8_t* w = native32_user_wnd(h);
+        uint32_t old;
+        if (!w || (w[0x16] & 1) || a[1] + 4 > *(uint32_t*)(w + 0x88) || a[1] + 4 > 0x200 - 0x98) return 0;
+        old = *(uint32_t*)(w + 0x98 + a[1]);
+        *(uint32_t*)(w + 0x98 + a[1]) = a[2];
+        return old;
+    }
     /* ponytail: other indexes unanswered (0), as before: forwarded to the
      * host they broke winmine's Custom dialog (a guest dialog's DWL_* live in
      * its own DIALOG, not the host window) */
@@ -872,8 +933,21 @@ static uint32_t s_classinfo(uint32_t* a) {
     }
     return r;
 }
-static uint32_t s_setplacement(uint32_t* a) { return SetWindowPlacement((HWND)(uintptr_t)a[0], (WINDOWPLACEMENT*)(uintptr_t)a[1]); }
-static uint32_t s_getplacement(uint32_t* a) { return GetWindowPlacement((HWND)(uintptr_t)a[0], (WINDOWPLACEMENT*)(uintptr_t)a[1]); }
+static uint32_t s_setplacement(uint32_t* a) {
+    WINDOWPLACEMENT* p = (WINDOWPLACEMENT*)(uintptr_t)a[1];
+    if (getenv("NATIVE32_SYSCALLS"))
+        fprintf(stderr, "[user] SetWindowPlacement len %u flags %u show %u normal %ld,%ld,%ld,%ld\n", p->length, p->flags, p->showCmd,
+                p->rcNormalPosition.left, p->rcNormalPosition.top, p->rcNormalPosition.right, p->rcNormalPosition.bottom);
+    return SetWindowPlacement((HWND)(uintptr_t)a[0], p);
+}
+static uint32_t s_getplacement(uint32_t* a) {
+    WINDOWPLACEMENT* p = (WINDOWPLACEMENT*)(uintptr_t)a[1];
+    BOOL r = GetWindowPlacement((HWND)(uintptr_t)a[0], p);
+    if (getenv("NATIVE32_SYSCALLS"))
+        fprintf(stderr, "[user] GetWindowPlacement -> %d show %u normal %ld,%ld,%ld,%ld\n", r, p->showCmd,
+                p->rcNormalPosition.left, p->rcNormalPosition.top, p->rcNormalPosition.right, p->rcNormalPosition.bottom);
+    return r;
+}
 /* NtUserDeferWindowPos(hdwp, hwnd, after, x, y, cx, cy, flags) /
  * NtUserEndDeferWindowPosEx(hdwp, async) */
 static uint32_t s_deferpos(uint32_t* a) {
@@ -966,6 +1040,19 @@ void native32_user_install(void) {
     native32_nt_win32k_override("NtUserEnableScrollBar", s_enable_sb);
     native32_nt_win32k_override("NtUserFindWindowEx", s_findwindow);
     native32_nt_win32k_override("NtUserModifyUserStartupInfoFlags", s_one_u);
+    native32_nt_win32k_override("NtUserGetDoubleClickTime", s_dblclick);
+    native32_nt_win32k_override("NtUserGetKeyboardLayoutList", s_kblist);
+    native32_nt_win32k_override("NtUserShowCaret", s_showcaret);
+    native32_nt_win32k_override("NtUserHideCaret", s_hidecaret);
+    native32_nt_win32k_override("NtUserGetThreadDesktop", s_threaddesk);
+    native32_nt_win32k_override("NtUserShowScrollBar", s_showsb);
+    native32_nt_win32k_override("NtUserGetKeyState", s_keystate);
+    native32_nt_win32k_override("NtUserCountClipboardFormats", s_nclipfmt);
+    native32_nt_win32k_override("NtUserCreateCaret", s_createcaret);
+    native32_nt_win32k_override("NtUserCallTwoParam", s_call_twoparam);
     native32_nt_win32k_override("NtUserCreateAcceleratorTable", s_accel);
+    native32_nt_win32k_override("NtUserTranslateAccelerator", s_translate_accel);
+    native32_nt_win32k_override("NtUserScrollWindowEx", s_scrollwindow);
+    native32_nt_win32k_override("NtUserIsClipboardFormatAvailable", s_clipfmt_avail);
     native32_nt_win32k_override("NtUserRegisterClassExWOW", s_register_class);
 }

@@ -135,6 +135,7 @@ uint32_t native32_gdi_handle(uint32_t h) {
         AT32(attr, 0x40) = (uint32_t)p.y;
         AT32(attr, 0x78) = AT32(attr, 0x7C) = GetTextAlign(d);
         AT32(attr, 0x90) = GUEST(GetCurrentObject(d, OBJ_FONT));
+        AT32(attr, 0x168) = (uint32_t)GetMapMode(d);   /* iMapMode (GetMapMode reads it; RichEdit relaid out on 0) */
         GetBrushOrgEx(d, &p);
         AT32(attr, 0x1B0) = (uint32_t)p.x;
         AT32(attr, 0x1B4) = (uint32_t)p.y;
@@ -166,6 +167,9 @@ static HDC dc(uint32_t g) {
         SetTextAlign(h, AT32(a, 0x7C));
         MoveToEx(h, (int)AT32(a, 0x3C), (int)AT32(a, 0x40), NULL);
         SetBrushOrgEx(h, (int)AT32(a, 0x1B0), (int)AT32(a, 0x1B4), NULL);
+        /* the viewport origin SetViewportOrgEx keeps client-side (wordpad's
+         * ruler). ponytail: window origin and extents not applied */
+        SetViewportOrgEx(h, (int)AT32(a, 0x184), (int)AT32(a, 0x188), NULL);
     }
     return h;
 }
@@ -217,6 +221,16 @@ static void batch(void) {
         } else if (cmd == 6) {                                 /* select a font: DC_ATTR's is current */
             uint8_t* a = native32_gdi_attr(hdc);
             if (a) AT32(a, 0x90) = MEM32(e + 4);
+        } else if (cmd == 2) {                                 /* TextOut { fg, bk, bk mode, ?, ?, x, y, options (bit 31: */
+            HDC h = dc(hdc);                                   /* no rect), RECT, cp, count, ?, font, align, viewport org, text } */
+            uint32_t f = HOST(MEM32(e + 0x38)), o = MEM32(e + 0x18);
+            HGDIOBJ old = f ? SelectObject(h, (HGDIOBJ)(uintptr_t)f) : NULL;
+            SetTextColor(h, MEM32(e + 4)), SetBkColor(h, MEM32(e + 8)), SetBkMode(h, (int)MEM32(e + 0xC));
+            SetTextAlign(h, MEM32(e + 0x3C));
+            SetViewportOrgEx(h, (int)MEM32(e + 0x40), (int)MEM32(e + 0x44), NULL);
+            ExtTextOutW(h, (int)MEM32(e + 0x10), (int)MEM32(e + 0x14), o & 0x7FFFFFFFu,
+                        (o & 0x80000000u) ? NULL : (RECT*)(uintptr_t)(e + 0x1C), (LPCWSTR)(uintptr_t)(e + 0x48), MEM32(e + 0x30), NULL);
+            if (old) SelectObject(h, old);
         } else
             fprintf(stderr, "[gdi] batch command %u (%u bytes) dropped\n", cmd, len);
         if (len < 4) break;
@@ -234,6 +248,19 @@ static uint32_t s_init(uint32_t* a) {
         /* the handle table and the shared data after it (gdi32 reads +0x40094) */
         g_table = (uint8_t*)VirtualAlloc(NULL, 0x80000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         MEM32(native32_guest_peb + 0x94) = (uint32_t)(uintptr_t)g_table;
+        /* +0x40000: the display's DEVCAPS, which GetDeviceCaps reads for a
+         * display DC it made itself (CreateDC("DISPLAY"): RichEdit's measuring
+         * DC; zeros there gave LOGPIXELSY 0 and a 1-pixel font, every
+         * character on its own line). { index, offset }, read off gdi32's
+         * GetDeviceCaps; the rest it asks NtGdiGetDeviceCaps for. */
+        static const uint8_t caps[][2] = { { 0, 0 }, { 2, 4 }, { 4, 8 }, { 6, 0xC }, { 8, 0x18 }, { 0xA, 0x1C }, { 0xC, 0x20 },
+            { 0xE, 0x24 }, { 0x12, 0x28 }, { 0x16, 0x2C }, { 0x18, 0x30 }, { 0x22, 0x64 }, { 0x26, 0x34 }, { 0x28, 0x38 },
+            { 0x2A, 0x3C }, { 0x58, 0x44 }, { 0x5A, 0x48 }, { 0x68, 0x4C }, { 0x6C, 0x50 }, { 0x6E, 0x54 }, { 0x6F, 0x58 },
+            { 0x70, 0x5C }, { 0x71, 0x60 }, { 0x74, 0x68 }, { 0x75, 0x70 }, { 0x76, 0x6C }, { 0x77, 0x74 } };
+        HDC s = GetDC(NULL);
+        for (int i = 0; i < (int)(sizeof caps / sizeof caps[0]); i++)
+            MEM32((uint32_t)(uintptr_t)g_table + 0x40000 + caps[i][1]) = (uint32_t)GetDeviceCaps(s, caps[i][0]);
+        ReleaseDC(NULL, s);
     }
     return 1;
 }
@@ -282,6 +309,10 @@ static uint32_t s_select(uint32_t* a) {
 }
 static uint32_t s_delete(uint32_t* a) {
     uint32_t h = HOST(a[0]);
+    /* A stock object is never deleted (TRUE, as Windows answers) and its
+     * guest handle stays: wordpad deletes DEFAULT_GUI_FONT, then sends it */
+    for (int i = 0; h && i <= DC_PEN; i++)
+        if ((uint32_t)(uintptr_t)GetStockObject(i) == h) return 1;
     BOOL r = !h ? FALSE : ((h >> 16) & 0x1F) == 1 ? DeleteDC((HDC)(uintptr_t)h) : DeleteObject((HGDIOBJ)(uintptr_t)h);
     if (r) forget(a[0]);
     for (int i = 0; r && i < 64; i++)
@@ -371,7 +402,13 @@ static uint32_t s_opendc(uint32_t* a) {
     return GUEST(h);
 }
 /* NtGdiHfontCreate(ENUMLOGFONTEXDVW*, cj, lft, fl, pvCliData): its LOGFONTW leads */
-static uint32_t s_font(uint32_t* a) { return GUEST(CreateFontIndirectW((LOGFONTW*)(uintptr_t)a[0])); }
+static uint32_t s_font(uint32_t* a) {
+    LOGFONTW* l = (LOGFONTW*)(uintptr_t)a[0];
+    if (getenv("NATIVE32_SYSCALLS"))
+        fprintf(stderr, "[gdi] font %ls h %ld w %ld weight %ld cs %u q %u pf %u\n", l->lfFaceName, l->lfHeight, l->lfWidth,
+                l->lfWeight, l->lfCharSet, l->lfQuality, l->lfPitchAndFamily);
+    return GUEST(CreateFontIndirectW(l));
+}
 /* NtGdiExtTextOutW(hdc, x, y, flOpts, prcl, pwsz, cwc, pdx, dwCodePage) */
 static uint32_t s_textout(uint32_t* a) {
     return ExtTextOutW(dc(a[0]), (int)a[1], (int)a[2], a[3], (RECT*)(uintptr_t)a[4],
@@ -388,15 +425,121 @@ static uint32_t s_dcpoint(uint32_t* a) {
     return 0;
 }
 static uint32_t s_getpixel(uint32_t* a) { return GetPixel(dc(a[0]), (int)a[1], (int)a[2]); }
+/* NtGdiStretchDIBitsInternal(hdc, xDst, yDst, cxDst, cyDst, xSrc, ySrc, cxSrc,
+ * cySrc, pjInit, pbmi, iUsage, rop, cjMaxInfo, cjMaxBits, hcmXform) */
+static uint32_t s_stretchdib(uint32_t* a) {
+    return (uint32_t)StretchDIBits(dc(a[0]), a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8],
+                                   (void*)(uintptr_t)a[9], (BITMAPINFO*)(uintptr_t)a[10], a[11], a[12]);
+}
+/* NtGdiGetCharSet(hdc): the charset, its ANSI code page in the high word */
+static uint32_t s_getcharset(uint32_t* a) {
+    CHARSETINFO ci = { 0 };
+    int cs = GetTextCharset(dc(a[0]));
+    TranslateCharsetInfo((DWORD*)(uintptr_t)cs, &ci, TCI_SRCCHARSET);
+    return ci.ciACP << 16 | (cs & 0xFFFF);
+}
+/* NtGdiGetAndSetDCDword(hdc, index, value, DWORD* old): 8 SetMapMode
+ * (RichEdit's MM_TEXT). ponytail: the other indexes when a caller needs one */
+static uint32_t s_getsetdword(uint32_t* a) {
+    if (a[1] == 8) {
+        int o = SetMapMode(dc(a[0]), (int)a[2]);
+        uint8_t* at = native32_gdi_attr(a[0]);
+        if (at && o) AT32(at, 0x168) = a[2];
+        if (a[3]) MEM32(a[3]) = (uint32_t)o;
+        return o != 0;
+    }
+    fprintf(stderr, "[gdi] NtGdiGetAndSetDCDword index %u not answered\n", a[1]);
+    return 0;
+}
+/* NtGdiGetDCDword(hdc, index, DWORD* out): 7 a memory DC (GetObjectType's
+ * OBJ_MEMDC, BitBlt), 6 GetFontLanguageInfo, 4 GetArcDirection */
+static uint32_t s_getdword(uint32_t* a) {
+    HDC h = dc(a[0]);
+    uint32_t v;
+    if (a[1] == 7) v = GetObjectType(h) == OBJ_MEMDC;
+    else if (a[1] == 6) v = GetFontLanguageInfo(h);
+    else if (a[1] == 4) v = (uint32_t)GetArcDirection(h);
+    else { fprintf(stderr, "[gdi] NtGdiGetDCDword index %u not answered\n", a[1]); return 0; }
+    if (a[2]) MEM32(a[2]) = v;
+    return 1;
+}
+/* NtGdiGetOutlineTextMetricsInternalW(hdc, cjotm, OUTLINETEXTMETRICW*, TMDIFF*):
+ * the host's; TMDIFF +0 cjotma, the size the A form needs */
+static uint32_t s_otm(uint32_t* a) {
+    HDC h = dc(a[0]);
+    if (a[3]) memset((void*)(uintptr_t)a[3], 0, 8), MEM32(a[3]) = GetOutlineTextMetricsA(h, 0, NULL);
+    return GetOutlineTextMetricsW(h, a[1], (OUTLINETEXTMETRICW*)(uintptr_t)a[2]);
+}
+/* NtGdiGetCharWidthW(hdc, first, count, WCHAR* list or NULL, fl, buffer):
+ * fl 2 GCW_INT (else FLOATs), 1 GCW_WIN3 */
+static uint32_t s_charwidth(uint32_t* a) {
+    HDC h = dc(a[0]);
+    const WCHAR* l = (const WCHAR*)(uintptr_t)a[3];
+    for (uint32_t i = 0; i < a[2]; i++) {
+        UINT c = l ? l[i] : a[1] + i;
+        void* out = (void*)(uintptr_t)(a[5] + 4 * i);
+        if (!(a[4] & 2 ? GetCharWidth32W(h, c, c, out) : GetCharWidthFloatW(h, c, c, out))) return 0;
+    }
+    return 1;
+}
 /* NtGdiGetTextFaceW(hdc, cChar, pszOut, bAliasName) */
 static uint32_t s_textface(uint32_t* a) {
     return GetTextFaceW(dc(a[0]), (int)a[1], (wchar_t*)(uintptr_t)a[2]);
 }
-/* NtGdiEnumFontOpen(hdc, iType, fl, cwchMax, pwszFace, lfCharSet, *pulCount) /
- * EnumFontChunk / EnumFontClose. ponytail: an enumeration that finds no
- * fonts; ENUMFONTDATAW's Windows 2000 layout is not filled in yet. */
-static uint32_t s_enumopen(uint32_t* a) { if (a[6]) MEM32(a[6]) = 0; return 1; }
-static uint32_t s_enumchunk(uint32_t* a) { if (a[3]) MEM32(a[3]) = 0; return 0; }
+/* NtGdiEnumFontOpen(hdc, iType, fl, cwchMax, pwszFace, lfCharSet, ULONG* cj)
+ * gives the size of the whole enumeration; NtGdiEnumFontChunk(hdc, id, cj,
+ * ULONG* cjOut, buffer) the entries; NtGdiEnumFontClose(id). The host's
+ * enumeration (iType 0 EnumFonts, 1 EnumFontFamilies, else ...Ex), in
+ * Windows 2000's ENUMFONTDATAW, read off gdi32's walk:
+ *   +0 cj (the next entry), +4 dpNtmi, +8 FontType, +0xC ENUMLOGFONTEXW
+ *   (0x15C) and a DESIGNVECTOR with no axes (8); at dpNtmi (0x170) the
+ *   NTMW_INTERNAL: TMDIFF (8: cjotma, chFirst, chLast, chDefault, chBreak),
+ *   NEWTEXTMETRICEXW (0x64), a DESIGNVECTOR (8). The W callback gets +0xC
+ *   and dpNtmi + 8. ponytail: one enumeration open at a time */
+#define EFD_NTM 0x170
+#define EFD_SIZE (EFD_NTM + 8 + 0x64 + 8)
+static uint8_t* g_efd;
+static uint32_t g_nefd;
+static int CALLBACK efd_add(const LOGFONTW* lf, const TEXTMETRICW* tm, DWORD type, LPARAM unused) {
+    uint8_t* p;
+    (void)unused;
+    if (!(p = (uint8_t*)realloc(g_efd, (g_nefd + 1) * EFD_SIZE))) return 0;
+    g_efd = p, p += g_nefd++ * EFD_SIZE;
+    memset(p, 0, EFD_SIZE);
+    AT32(p, 0) = EFD_SIZE, AT32(p, 4) = EFD_NTM, AT32(p, 8) = type;
+    memcpy(p + 0xC, lf, sizeof(ENUMLOGFONTEXW));
+    AT32(p, 0xC + sizeof(ENUMLOGFONTEXW)) = STAMP_DESIGNVECTOR;
+    p[EFD_NTM + 4] = (uint8_t)(tm->tmFirstChar > 0xFF ? 0xFF : tm->tmFirstChar);
+    p[EFD_NTM + 5] = (uint8_t)(tm->tmLastChar > 0xFF ? 0xFF : tm->tmLastChar);
+    p[EFD_NTM + 6] = (uint8_t)(tm->tmDefaultChar > 0xFF ? 0xFF : tm->tmDefaultChar);
+    p[EFD_NTM + 7] = (uint8_t)(tm->tmBreakChar > 0xFF ? 0xFF : tm->tmBreakChar);
+    memcpy(p + EFD_NTM + 8, tm, type & TRUETYPE_FONTTYPE ? 0x64 : sizeof(TEXTMETRICW));
+    AT32(p, EFD_NTM + 8 + 0x64) = STAMP_DESIGNVECTOR;
+    return 1;
+}
+static uint32_t s_enumopen(uint32_t* a) {
+    HDC h = a[0] ? dc(a[0]) : NULL, s = h ? h : GetDC(NULL);
+    const wchar_t* face = (const wchar_t*)(uintptr_t)a[4];
+    free(g_efd), g_efd = NULL, g_nefd = 0;
+    if (a[1] == 0) EnumFontsW(s, face, (FONTENUMPROCW)efd_add, 0);
+    else if (a[1] == 1) EnumFontFamiliesW(s, face, (FONTENUMPROCW)efd_add, 0);
+    else {
+        LOGFONTW lf = { 0 };
+        lf.lfCharSet = (BYTE)a[5];
+        if (face) wcsncpy(lf.lfFaceName, face, LF_FACESIZE - 1);
+        EnumFontFamiliesExW(s, &lf, (FONTENUMPROCW)efd_add, 0, 0);
+    }
+    if (!h) ReleaseDC(NULL, s);
+    if (a[6]) MEM32(a[6]) = g_nefd * EFD_SIZE;
+    return 1;
+}
+static uint32_t s_enumchunk(uint32_t* a) {
+    uint32_t n = g_nefd * EFD_SIZE;
+    if (n > a[2]) n = a[2] - a[2] % EFD_SIZE;
+    if (a[4] && n) memcpy((void*)(uintptr_t)a[4], g_efd, n);
+    if (a[3]) MEM32(a[3]) = n;
+    return n != 0;
+}
 /* NtGdiGetTextExtent(hdc, pwsz, cwc, SIZE*, flOpts) */
 static uint32_t s_textextent(uint32_t* a) {
     return GetTextExtentPoint32W(dc(a[0]), (const wchar_t*)(uintptr_t)a[1], (int)a[2], (SIZE*)(uintptr_t)a[3]);
@@ -479,6 +622,12 @@ static void cb_in(uint32_t* a) {
     else if (a[1] == WM_DRAWITEM && a[3]) {
         DRAWITEMSTRUCT* d = (DRAWITEMSTRUCT*)(uintptr_t)a[3];
         if (!HOST(d->hDC)) d->hDC = (HDC)(uintptr_t)fresh((uint32_t)(uintptr_t)d->hDC);
+    } else if (a[2] && !HOST(a[2])) {
+        /* a guest handle SendMessage turned into the host's (NtUserMessageCall)
+         * back to the guest's, for a guest procedure: RichEdit's
+         * EM_SETTARGETDEVICE printer DC, WM_SETFONT */
+        int i = hfind(a[2]);
+        if (i) a[2] = (a[2] & 0xFFFF0000u) | (uint32_t)i;
     }
 }
 static void cb_out(uint32_t* a, uint32_t* eax) {
@@ -607,6 +756,7 @@ void native32_gdi_install(void) {
         { "NtGdiFlushUserBatch", s_flushbatch }, { "NtGdiGetTextExtent", s_textextent }, { "NtGdiGetTextCharsetInfo", s_charset },
         { "NtGdiGetDCPoint", s_dcpoint }, { "NtGdiGetTextFaceW", s_textface },
         { "NtGdiEnumFontOpen", s_enumopen }, { "NtGdiEnumFontChunk", s_enumchunk }, { "NtGdiEnumFontClose", s_one }, { "NtGdiGetPixel", s_getpixel },
+        { "NtGdiStretchDIBitsInternal", s_stretchdib }, { "NtGdiGetCharSet", s_getcharset }, { "NtGdiGetCharWidthW", s_charwidth }, { "NtGdiGetOutlineTextMetricsInternalW", s_otm }, { "NtGdiGetAndSetDCDword", s_getsetdword }, { "NtGdiGetDCDword", s_getdword },
     };
     static const struct { const char* name; void* fn; } hooks[] = {
         { "BeginPaint", hk_BeginPaint }, { "EndPaint", hk_EndPaint }, { "GetDC", hk_GetDC },

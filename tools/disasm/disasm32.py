@@ -787,6 +787,19 @@ class Disassembler:
                     at = base + off
                     def ptr(o):
                         return 0 <= o <= len(data) - 4 and code_start <= int.from_bytes(data[o:o + 4], 'little') < code_end
+                    # The pfn of an AFX_MSGMAP_ENTRY { nMessage, nCode, nID,
+                    # nLastID, nSig, pfn }: a message, a notification code
+                    # (small or negative), IDs and an AfxSig all small. Two
+                    # pointers 24 bytes apart alone took any table: 22 -> 584
+                    # unimplemented instructions in mspaint, all dead code.
+                    # A neighbour entry, or the all-zero terminator after a
+                    # map of one (wordpad's WM_CREATE handler 0x0100C3C6).
+                    def msgmap(o):
+                        if o < 20 or not ptr(o):
+                            return False
+                        m, c, i, l, s = (int.from_bytes(data[o - 20 + 4 * k:o - 16 + 4 * k], 'little') for k in range(5))
+                        return m < 0x10000 and (c < 0x10000 or c >= 0xFFFF0000) and i < 0x10000 and l < 0x10000 \
+                            and (s < 0x100 or m == 0xC000)   # ON_REGISTERED_MESSAGE: &the message
                     # Three in a row are a table even where a body decoded
                     # from bad evidence claims the bytes (a vtable in
                     # Windows 2000's merged .text, run over by data decoded
@@ -794,9 +807,12 @@ class Disassembler:
                     run3 = ptr(off - 4) and ptr(off + 4)
                     if off % 4 or interior is None or not (code_start <= at and at + 4 <= code_end) \
                             or (not run3 and any(interior[at - code_start + k] for k in range(4))) \
-                            or not any(ptr(o) for o in (off - 4, off + 4, off - 24, off + 24)):
+                            or not (ptr(off - 4) or ptr(off + 4)
+                                    or (msgmap(off) and (msgmap(off - 24) or msgmap(off + 24)
+                                                         or data[off + 4:off + 28] == bytes(24)))):
                         continue
                     in_code += 1
+                table = s.is_code and run3
                 if va in queued or va in found:
                     continue
                 if va in covered:
@@ -823,7 +839,13 @@ class Disassembler:
                         in_run += 1
                         found.add(va)
                     continue
-                if interior is not None and interior[va - code_start]:
+                # A vtable (three code pointers in a row) inside code outranks
+                # a body decoded from data: riched20's slot 0x20711CA4 names
+                # 0x2070B6E0, the second byte of a `mov esi, imm32` that the
+                # GUID before it decoded as. Still probed below.
+                if table:
+                    self.table_targets.add(va)
+                if interior is not None and interior[va - code_start] and not table:
                     mid += 1
                     continue
                 probed += 1
@@ -865,6 +887,7 @@ class Disassembler:
         Returns dict of addr -> Function.
         """
         self.light_operands = release_operands
+        self.table_targets = set()   # vtable slots in code (find_data_code_pointers)
         print(f"[*] Scanning for call targets in 0x{code_start:08X}-0x{code_end:08X}...")
         call_targets = self.find_branch_targets(code_start, code_end)
         print(f"[*] Found {len(call_targets)} potential call targets")
@@ -906,7 +929,14 @@ class Disassembler:
         queue = list(all_targets)
         queued = set(all_targets)
 
+        # The import table is data even inside .text (Windows 2000 merges
+        # .idata into it): wordpad.exe's bound IAT decoded from a stray
+        # pointer to a slot as a 2,294-instruction body, 6,000 unimplemented.
+        iat_lo, iat_hi = (min(iat_map), max(iat_map) + 4) if iat_map else (0, 0)
+
         def _add_func(addr, entry_kind="start"):
+            if iat_lo <= addr < iat_hi:
+                return None
             real = self.past_padding(addr)
             if real != addr:
                 # Not a function: the one after the padding is. Queued rather
@@ -1033,7 +1063,15 @@ class Disassembler:
                               if not self.is_code_address(tgt):
                                   continue
                               loaded = (ins.mnemonic == 'mov' and ins.operands[0].type == X86_OP_REG)
-                              if own_lo < tgt < own_hi and tgt not in own and loaded:
+                              # Unless an instruction of another body ends right
+                              # at it: then it is past that body, not a hole in
+                              # this one (riched20's `mov eax, 0x207108C0`
+                              # stores a method that follows another's `ret`).
+                              after_other = any(
+                                  tgt - n in covered and tgt - n not in own
+                                  and all(interior[k - code_start] for k in range(tgt - n + 1, tgt))
+                                  for n in range(1, 16) if code_start <= tgt - n)
+                              if own_lo < tgt < own_hi and tgt not in own and loaded and not after_other:
                                   continue
                               # Data kept in code is loaded the same way: Theme
                               # Park's startup does `mov edx, offset "con"` for
@@ -1105,7 +1143,7 @@ class Disassembler:
         # Killing Floor's case).
         gone = drop_mid_instruction_entries(
             lambda va, n: self.read_bytes(va, n), sizes, code_start, code_end,
-            keep=set(seeds) & set(sizes), callers=callers, weak=weak & set(sizes))
+            keep=(set(seeds) | self.table_targets) & set(sizes), callers=callers, weak=weak & set(sizes))
         for a in list(functions):
             if a not in sizes:
                 del functions[a]
