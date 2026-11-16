@@ -23,8 +23,8 @@
  *                 { USHORT length, USHORT command, data }, +0xF70 their count.
  *                 win32k runs them on entry to any GDI service and at
  *                 NtGdiFlushUserBatch. Commands: 0 PatBlt { x, y, cx, cy,
- *                 brush, rop, colours... } (0x34 bytes), 4 SetBrushOrg { x, y },
- *                 6 select a font.
+ *                 brush, rop, colours... } (0x34 bytes), 1 PolyPatBlt (DrawEdge),
+ *                 4 SetBrushOrg { x, y }, 6 select a font, 8 DeleteObject.
  *
  * Here the table is ours, in that layout, over the host's GDI objects. The
  * guest never sees a host handle: a host's index runs to 0xFFFF, which
@@ -118,7 +118,10 @@ uint32_t native32_gdi_handle(uint32_t h) {
     MEM32(e + 4) = GetCurrentProcessId() & ~3u;
     MEM16(e + 8) = (uint16_t)(h >> 16);
     MEM8(e + 10) = (uint8_t)type;
-    MEM32(e + 12) = type == 1 ? (uint32_t)(uintptr_t)attr : 0;
+    /* a region's RGNATTR (gdi32 keeps a rectangular region's rectangle in
+     * it client-side, CreateRectRgn / SetRectRgn) */
+    if (type == 4 && !attr) attr = (uint8_t*)calloc(1, 0x20);
+    MEM32(e + 12) = type == 1 || type == 4 ? (uint32_t)(uintptr_t)attr : 0;
     if (type == 1) {                                                   /* a DC: its attributes, as it is */
         POINT p;
         GetCurrentPositionEx(d, &p);
@@ -174,6 +177,7 @@ static void dc_back(uint32_t g) {          /* after a draw that moves the pen */
 }
 
 /* ---- the TEB batch -------------------------------------------------------- */
+static uint32_t s_delete(uint32_t* a);
 static void batch(void) {
     uint32_t teb = MEM32(g_fs_base + 0x18), used = MEM32(teb + 0x1D4), hdc = MEM32(teb + 0x1D8);
     if (!used) return;
@@ -185,6 +189,16 @@ static void batch(void) {
             HGDIOBJ old = br ? SelectObject(h, (HGDIOBJ)(uintptr_t)br) : NULL;
             PatBlt(h, (int)MEM32(e + 4), (int)MEM32(e + 8), (int)MEM32(e + 0xC), (int)MEM32(e + 0x10), MEM32(e + 0x18));
             if (old) SelectObject(h, old);
+        } else if (cmd == 1) {                                 /* PolyPatBlt { rop, mode, count, ?, colour, ?, ?, */
+            HDC h = dc(hdc);                                   /* then count x { x, y, cx, cy, brush } at +0x24 } */
+            for (uint32_t k = 0, n = MEM32(e + 0xC); k < n && 0x24 + 0x14 * (k + 1) <= len; k++) {
+                uint32_t r = e + 0x24 + 0x14 * k, br = HOST(MEM32(r + 0x10));
+                HGDIOBJ old = br ? SelectObject(h, (HGDIOBJ)(uintptr_t)br) : NULL;
+                PatBlt(h, (int)MEM32(r), (int)MEM32(r + 4), (int)MEM32(r + 8), (int)MEM32(r + 0xC), MEM32(e + 4));
+                if (old) SelectObject(h, old);
+            }
+        } else if (cmd == 8) {                                 /* DeleteObject { handle } (a region) */
+            s_delete((uint32_t*)(uintptr_t)(e + 4));
         } else if (cmd == 4) {                                 /* SetBrushOrg { x, y } */
             SetBrushOrgEx((HDC)(uintptr_t)HOST(hdc), (int)MEM32(e + 4), (int)MEM32(e + 8), NULL);
         } else if (cmd == 6) {                                 /* select a font: DC_ATTR's is current */
@@ -219,6 +233,17 @@ static uint32_t s_compat_bitmap(uint32_t* a) {
 }
 static uint32_t s_pen(uint32_t* a) { return GUEST(CreatePen((int)a[0], (int)a[1], a[2])); }
 static uint32_t s_brush(uint32_t* a) { return GUEST(CreateSolidBrush(a[0])); }
+/* NtGdiGetRandomRgn(hdc, hrgn, which), NtGdiIntersectClipRect(hdc, l, t, r, b),
+ * NtGdiExtSelectClipRgn(hdc, hrgn, mode) */
+static uint32_t s_randomrgn(uint32_t* a) { return (uint32_t)GetRandomRgn((HDC)(uintptr_t)HOST(a[0]), (HRGN)(uintptr_t)HOST(a[1]), (INT)a[2]); }
+static uint32_t s_intersectclip(uint32_t* a) {
+    return (uint32_t)IntersectClipRect((HDC)(uintptr_t)HOST(a[0]), (int)a[1], (int)a[2], (int)a[3], (int)a[4]);
+}
+static uint32_t s_selectcliprgn(uint32_t* a) {
+    return (uint32_t)ExtSelectClipRgn((HDC)(uintptr_t)HOST(a[0]), (HRGN)(uintptr_t)HOST(a[1]), (int)a[2]);
+}
+/* NtGdiCreateRectRgn(l, t, r, b) */
+static uint32_t s_rectrgn(uint32_t* a) { return GUEST(CreateRectRgn((int)a[0], (int)a[1], (int)a[2], (int)a[3])); }
 static uint32_t s_select(uint32_t* a) {
     return GUEST(SelectObject((HDC)(uintptr_t)HOST(a[0]), (HGDIOBJ)(uintptr_t)HOST(a[1])));
 }
@@ -492,7 +517,8 @@ void native32_gdi_install(void) {
     static const struct { const char* name; native32_syscall_fn fn; } svc[] = {
         { "NtGdiInit", s_init }, { "NtGdiQueryFontAssocInfo", s_zero }, { "NtGdiGetStockObject", s_stock },
         { "NtGdiCreateCompatibleDC", s_compat_dc }, { "NtGdiCreateCompatibleBitmap", s_compat_bitmap },
-        { "NtGdiCreatePen", s_pen }, { "NtGdiCreateSolidBrush", s_brush },
+        { "NtGdiCreatePen", s_pen }, { "NtGdiCreateRectRgn", s_rectrgn },
+        { "NtGdiGetRandomRgn", s_randomrgn }, { "NtGdiIntersectClipRect", s_intersectclip }, { "NtGdiExtSelectClipRgn", s_selectcliprgn }, { "NtGdiCreateSolidBrush", s_brush },
         { "NtGdiSelectBitmap", s_select }, { "NtGdiSelectBrush", s_select }, { "NtGdiSelectPen", s_select },
         { "NtGdiSelectFont", s_select }, { "NtGdiDeleteObjectApp", s_delete }, { "NtGdiBitBlt", s_bitblt },
         { "NtGdiLineTo", s_lineto }, { "NtGdiMoveTo", s_moveto }, { "NtGdiSetPixel", s_setpixel },

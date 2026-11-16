@@ -10,11 +10,9 @@
  * for what user32 reads (docs/findings.md in win2000-recomp has the offsets
  * and where each came from).
  *
- * Messages: a class is registered with the host with the guest's window
- * procedure itself, so host user32 calls it through native32's trampoline.
- * ponytail: Windows 2000 sends them through KiUserCallbackDispatcher and
- * user32's __fn* routines (native32_nt_callback); that needs each routine's
- * message layout and is the next step.
+ * Messages: a guest class is registered with the host with wnd_thunk as
+ * its procedure, which sends each message the way win32k does, through the
+ * guest ntdll's KiUserCallbackDispatcher into user32's __fn* routines.
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -84,13 +82,16 @@ static LRESULT CALLBACK wnd_thunk(HWND h, UINT m, WPARAM w, LPARAM l);
 /* the guest's window procedure of each class registered (the host class has
  * wnd_thunk in its place) */
 #define MAX_CLASSES 256
-static struct { ATOM atom; uint32_t proc; } g_cls[MAX_CLASSES];
+static struct { ATOM atom; uint32_t proc; int ansi; } g_cls[MAX_CLASSES];
 static int g_ncls;
-static uint32_t class_proc(HWND h) {
+static int class_index(HWND h) {
     ATOM a = (ATOM)GetClassWord(h, GCW_ATOM);
-    for (int i = 0; i < g_ncls; i++) if (g_cls[i].atom == a) return g_cls[i].proc;
-    return 0;
+    for (int i = 0; i < g_ncls; i++) if (g_cls[i].atom == a) return i;
+    return -1;
 }
+static uint32_t class_proc(HWND h) { int i = class_index(h); return i < 0 ? 0 : g_cls[i].proc; }
+/* registered by RegisterClass(Ex)A: its procedure takes ANSI text */
+static int class_ansi(HWND h) { int i = class_index(h); return i >= 0 && g_cls[i].ansi; }
 static void wnd_sync(HWND h, uint8_t* w) {
     RECT r;
     POINT o = { 0, 0 };
@@ -219,9 +220,22 @@ static void server_info(void) {
     }
 }
 
+/* SERVERINFO +0x75C ahbrSystem[0x1D] (GetSysColorBrush; DrawEdge reads
+ * them directly), as guest handles of the host's: once the GDI table is up */
+static void sys_brushes(void) {
+    uint8_t* psi = native32_user_psi;
+    if (!psi || *(uint32_t*)(psi + 0x75C)) return;
+    for (int i = 0; i < 0x1D; i++) {
+        uint32_t h = (uint32_t)(uintptr_t)GetSysColorBrush(i), g = native32_gdi_handle(h);
+        if (g == h) { *(uint32_t*)(psi + 0x75C) = 0; return; }       /* (no table yet) */
+        *(uint32_t*)(psi + 0x75C + 4 * i) = g;
+    }
+}
+
 static void (*g_prev_pre)(void);
 static void user_pre(void) {        /* before every win32k service */
     server_info();
+    sys_brushes();
     if (native32_user_ahe) { thread_setup(); wnd_sync_all(); }
     if (g_prev_pre) g_prev_pre();
 }
@@ -248,7 +262,10 @@ static uint32_t s_register_class(uint32_t* a) {
     uint32_t guest_proc = (uint32_t)(uintptr_t)w.lpfnWndProc;
     w.lpfnWndProc = wnd_thunk;
     ATOM r = RegisterClassExW(&w);
-    if (r && g_ncls < MAX_CLASSES) g_cls[g_ncls].atom = r, g_cls[g_ncls++].proc = guest_proc;
+    /* flags (a[4]) bit 1 is CSF_ANSIPROC: RegisterClassExA passes 2 (0x82
+     * past 3.10), the W form 0 (0x80) */
+    if (r && g_ncls < MAX_CLASSES)
+        g_cls[g_ncls].atom = r, g_cls[g_ncls].ansi = (a[4] & 2) != 0, g_cls[g_ncls++].proc = guest_proc;
     if (!r) fprintf(stderr, "[user] RegisterClassExW %ls failed: %lu\n",
                     (uintptr_t)w.lpszClassName < 0x10000 ? L"(atom)" : w.lpszClassName, GetLastError());
     return r;
@@ -262,9 +279,7 @@ static uint32_t s_register_class(uint32_t* a) {
  * and user32's own __fnDWORD (KernelCallbackTable[2]), which returns the
  * result with NtCallbackReturn. DispatchClientMessage(pwnd, msg, w, l, pfn)
  * takes the HWND from CLIENTINFO's CallbackWnd (TEB+0x6F4), set first.
- * ponytail: every message through the generic DWORD layout; win32k's
- * per-message ones (__fnINLPCREATESTRUCT, __fnINSTRING, ...) copy and convert
- * A/W, which a flat in-process address space does not need yet. */
+ * Text messages go through their own routines (msg_call, below). */
 static uint32_t g_dcm;        /* user32's DispatchClientMessage */
 static uint32_t find_dcm(void) {
     /* It is in no export and no code names it: only PFNCLIENT (apfnClientA /
@@ -280,25 +295,96 @@ static uint32_t find_dcm(void) {
                 if (MEM32(u + p) == da && MEM32(u + p + 0x24) == MEM32(u + o + 0x24)) return MEM32(u + o + 0x24);
     return 0;
 }
+/* win32k's per-message callbacks (KernelCallbackTable index, read off
+ * user32's routines). The copying ones start with a capture-buffer header
+ * (0x18 bytes: +0 size, +8 pointers to fix up, none here, since the guest
+ * shares the host's address space) and take { pwnd, msg, wParam } at +0x18:
+ *   2  __fnDWORD             { pwnd, msg, w, l, xParam, xpfn }
+ *   7  __fnINCNTOUTSTRING    +0x24 xParam, +0x28 xpfn, +0x2C buffer, +0x30
+ *      its size in bytes; the reply is { result, size, the buffer written }
+ *      (user32's own stack buffer up to 0x800 bytes), copied from by win32k
+ *   9  __fnINLPCREATESTRUCT  +0x24 lParam != 0, +0x28 the CREATESTRUCT
+ *      itself (0x30 bytes), +0x58 xParam, +0x5C xpfn
+ *   25 __fnINSTRING          +0x24 xParam, +0x28 xpfn, +0x2C the string
+ * An ANSI class (class_ansi) gets its text converted here, as win32k does.
+ * ponytail: WM_CREATE/NCCREATE, WM_SETTEXT and WM_GETTEXT; every other
+ * message is __fnDWORD (WM_CHAR is not converted for an ANSI class) */
+static uint32_t msg_call(uint32_t api, uint32_t* msg, uint32_t len, uint32_t m, uint32_t* out) {
+    uint32_t o = 0, olen = 0, st;
+    msg[0] = len;
+    st = native32_nt_callback(api, (uint32_t)(uintptr_t)msg, len, &o, &olen);
+    if (st) { fprintf(stderr, "[user] callback for message 0x%X: status %08X\n", m, st); return 0; }
+    if (o && olen >= 4) memcpy(out, (void*)(uintptr_t)o, olen < 12 ? olen : 12);
+    return o && olen >= 4;
+}
 static LRESULT CALLBACK wnd_thunk(HWND h, UINT m, WPARAM w, LPARAM l) {
     uint8_t* pw = native32_user_wnd(h);
     uint32_t pfn = pw ? *(uint32_t*)(pw + 0x5C) : 0, args[4] = { (uint32_t)(uintptr_t)h, m, (uint32_t)w, (uint32_t)l };
-    uint32_t teb, oh, op, out = 0, outlen = 0, r = 0;
+    uint32_t teb, oh, op, rep[3] = { 0, 0, 0 };
+    int ansi;
     if (!g_dcm && (g_dcm = find_dcm()) != 0 && getenv("NATIVE32_SYSCALLS"))
         fprintf(stderr, "[user] messages through KiUserCallbackDispatcher, DispatchClientMessage %08X\n", g_dcm);
     if (!pfn || !g_dcm) return DefWindowProcW(h, m, w, l);
     if (native32_cb_in) native32_cb_in(args);   /* (as the bridge would: the WND, GDI handles) */
+    ansi = class_ansi(h);
     teb = MEM32(g_fs_base + 0x18), oh = MEM32(teb + 0x6F4), op = MEM32(teb + 0x6F8);
     MEM32(teb + 0x6F4) = args[0], MEM32(teb + 0x6F8) = (uint32_t)(uintptr_t)pw;
-    {
+    if ((m == WM_CREATE || m == WM_NCCREATE) && l) {
+        uint32_t msg[0x18] = { 0 };
+        char an[256], ac[256];
+        CREATESTRUCTW* cs = (CREATESTRUCTW*)&msg[0x0A];
+        msg[6] = (uint32_t)(uintptr_t)pw, msg[7] = m, msg[8] = args[2], msg[9] = 1;
+        *cs = *(CREATESTRUCTW*)l;
+        if (ansi && (uintptr_t)cs->lpszName >= 0x10000) {
+            WideCharToMultiByte(CP_ACP, 0, cs->lpszName, -1, an, sizeof an, NULL, NULL);
+            cs->lpszName = (LPCWSTR)an;
+        }
+        if (ansi && (uintptr_t)cs->lpszClass >= 0x10000) {
+            WideCharToMultiByte(CP_ACP, 0, cs->lpszClass, -1, ac, sizeof ac, NULL, NULL);
+            cs->lpszClass = (LPCWSTR)ac;
+        }
+        msg[0x16] = pfn, msg[0x17] = g_dcm;
+        msg_call(9, msg, sizeof msg, m, rep);
+    } else if (m == WM_SETTEXT) {
+        uint32_t msg[0x0C] = { 0 };
+        char* a = NULL;
+        msg[6] = (uint32_t)(uintptr_t)pw, msg[7] = m, msg[8] = args[2], msg[9] = pfn, msg[10] = g_dcm, msg[11] = args[3];
+        if (ansi && l) {
+            int n = WideCharToMultiByte(CP_ACP, 0, (LPCWSTR)l, -1, NULL, 0, NULL, NULL);
+            if ((a = (char*)malloc(n)) != NULL) WideCharToMultiByte(CP_ACP, 0, (LPCWSTR)l, -1, a, n, NULL, NULL);
+            msg[11] = (uint32_t)(uintptr_t)a;
+        }
+        msg_call(25, msg, sizeof msg, m, rep);
+        free(a);
+    } else if (m == WM_GETTEXT && l && w) {
+        uint32_t msg[0x0D] = { 0 };
+        char* a = ansi ? (char*)malloc(w * 2) : NULL;
+        msg[6] = (uint32_t)(uintptr_t)pw, msg[7] = m, msg[8] = args[2], msg[9] = pfn, msg[10] = g_dcm;
+        msg[11] = a ? (uint32_t)(uintptr_t)a : args[3], msg[12] = (uint32_t)w * 2;
+        if (msg_call(7, msg, sizeof msg, m, rep) && rep[2]) {
+            if (ansi) {
+                int n = MultiByteToWideChar(CP_ACP, 0, (char*)(uintptr_t)rep[2], (int)rep[0], (LPWSTR)l, (int)w - 1);
+                ((LPWSTR)l)[n] = 0;
+                rep[0] = (uint32_t)n;
+            } else if (rep[2] != args[3]) {
+                uint32_t n = rep[0] < w ? rep[0] : (uint32_t)w - 1;
+                memcpy((void*)l, (void*)(uintptr_t)rep[2], n * 2);
+                ((LPWSTR)l)[n] = 0;
+            }
+        }
+        free(a);
+    } else {
         uint32_t msg[6] = { (uint32_t)(uintptr_t)pw, args[1], args[2], args[3], pfn, g_dcm };
-        uint32_t st = native32_nt_callback(2, (uint32_t)(uintptr_t)msg, sizeof msg, &out, &outlen);
-        if (st == 0 && out && outlen >= 4) r = MEM32(out);
+        uint32_t o = 0, olen = 0, st = native32_nt_callback(2, (uint32_t)(uintptr_t)msg, sizeof msg, &o, &olen);
+        if (st == 0 && o && olen >= 4) rep[0] = MEM32(o);
         else if (st) fprintf(stderr, "[user] callback for message 0x%X: status %08X\n", m, st);
     }
     MEM32(teb + 0x6F4) = oh, MEM32(teb + 0x6F8) = op;
-    if (native32_cb_out) native32_cb_out(args, &r);
-    return (LRESULT)r;
+    /* the callback's return flushes the TEB's GDI batch, as win32k's does
+     * (calc's owner-drawn buttons: DrawEdge's PatBlts are batched) */
+    if (native32_win32k_pre) native32_win32k_pre();
+    if (native32_cb_out) native32_cb_out(args, &rep[0]);
+    return (LRESULT)rep[0];
 }
 
 /* NtUserCreateWindowEx(exstyle, LARGE_STRING* class, LARGE_STRING* name, style,
@@ -511,7 +597,9 @@ static uint32_t s_hwnd_param(uint32_t* a) {
         if (!ddp) ddp = native32_export(native32_module("user32.dll"), "DefDlgProcW");
         *(uint32_t*)(w + 0x9C) = a[1];
         w[0x16] |= 1;
-        if (ddp) {
+        /* (a dialog of the guest's own class, calc's SciCalc, keeps its
+         * procedure: that calls DefDlgProc itself) */
+        if (ddp && !class_proc((HWND)(uintptr_t)a[0])) {
             SetWindowLongPtrW((HWND)(uintptr_t)a[0], GWLP_WNDPROC, (LONG_PTR)wnd_thunk);
             *(uint32_t*)(w + 0x5C) = ddp;
         }
@@ -563,6 +651,15 @@ static uint32_t s_setfocus(uint32_t* a) { return (uint32_t)(uintptr_t)SetFocus((
 static uint32_t s_destroy(uint32_t* a) { return DestroyWindow((HWND)(uintptr_t)a[0]); }
 static uint32_t s_setcapture(uint32_t* a) { return (uint32_t)(uintptr_t)SetCapture((HWND)(uintptr_t)a[0]); }
 
+/* NtUserRegisterWindowMessage(UNICODE_STRING*) */
+static uint32_t s_register_msg(uint32_t* a) { return RegisterWindowMessageW(ustr_name(a[0])); }
+/* NtUserSetWindowPos(hwnd, after, x, y, cx, cy, flags) */
+static uint32_t s_setpos(uint32_t* a) {
+    return SetWindowPos((HWND)(uintptr_t)a[0], (HWND)(uintptr_t)a[1], (int)a[2], (int)a[3], (int)a[4], (int)a[5], a[6]);
+}
+static uint32_t s_foreground(uint32_t* a) { (void)a; return (uint32_t)(uintptr_t)GetForegroundWindow(); }
+/* NtUserGetSystemMenu(hwnd, bRevert) */
+static uint32_t s_sysmenu(uint32_t* a) { return menu(GetSystemMenu((HWND)(uintptr_t)a[0], a[1])); }
 static uint32_t s_waitmessage(uint32_t* a) { (void)a; return WaitMessage(); }
 
 #define HW(x) ((HWND)(uintptr_t)(x))
@@ -607,7 +704,8 @@ void native32_user_install(void) {
         { "NtUserCallHwndParamLock", s_hwnd_param_lock }, { "NtUserCallHwndParam", s_hwnd_param },
         { "NtUserDestroyWindow", s_destroy }, { "NtUserSetWindowFNID", s_set_fnid }, { "NtUserSetFocus", s_setfocus },
         { "NtUserQueryWindow", s_query_window }, { "NtUserFillWindow", s_fill_window }, { "NtUserSetCapture", s_setcapture },
-        { "NtUserWaitMessage", s_waitmessage }, { "NtUserCallNoParam", s_call_noparam }, { "NtUserCallOneParam", s_call_oneparam },
+        { "NtUserWaitMessage", s_waitmessage }, { "NtUserRegisterWindowMessage", s_register_msg },
+        { "NtUserSetWindowPos", s_setpos }, { "NtUserGetForegroundWindow", s_foreground }, { "NtUserGetSystemMenu", s_sysmenu }, { "NtUserCallNoParam", s_call_noparam }, { "NtUserCallOneParam", s_call_oneparam },
     };
     for (int i = 0; i < (int)(sizeof svc / sizeof svc[0]); i++) native32_nt_win32k_override(svc[i].name, svc[i].fn);
     (void)s_update;
