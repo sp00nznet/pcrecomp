@@ -728,8 +728,8 @@ static uint32_t s_call_noparam(uint32_t* a) {
  * cannot fill an HICON after the fact, so the empty object is a placeholder
  * host icon (a real, unique handle) and the filled host icon is kept beside
  * it; cur_host() turns one into the other where a cursor reaches the host.
- * ponytail: 64 built cursors, a table if a program makes more */
-#define MAX_CURS 64
+ * ponytail: 1024 built cursors (explorer makes over 100), a growing table if a program makes more */
+#define MAX_CURS 1024
 static uint32_t g_cur[MAX_CURS][2];
 static int g_ncur;
 static uint32_t cur_host(uint32_t h) {
@@ -754,9 +754,34 @@ static uint32_t s_set_cursor_data(uint32_t* a) {
     ICONINFO ii = { MEM16(cd + 8) != 1, (int16_t)MEM16(cd + 0x10), (int16_t)MEM16(cd + 0x12),
                     (HBITMAP)(uintptr_t)(native32_gdi_host(m) ? native32_gdi_host(m) : m),
                     (HBITMAP)(uintptr_t)(c && native32_gdi_host(c) ? native32_gdi_host(c) : c) };
+    /* Windows 2000's user32 hands a double-height mask (AND mask on top) even
+     * with a colour bitmap (explorer's icons); the host wants the AND mask
+     * alone, the colour bitmap's height (else ERROR_INVALID_PARAMETER). Only
+     * when the host refuses: notepad's icon is accepted as it is, and the
+     * half mask drew it differently. */
+    BITMAP bm, bc;
+    HBITMAP half = NULL;
     HICON h = CreateIconIndirect(&ii);
+    if (!h && ii.hbmColor && GetObjectW(ii.hbmMask, sizeof bm, &bm) && GetObjectW(ii.hbmColor, sizeof bc, &bc) &&
+        bm.bmHeight == 2 * bc.bmHeight) {
+        HDC s = CreateCompatibleDC(NULL), d = CreateCompatibleDC(NULL);
+        half = CreateBitmap(bm.bmWidth, bc.bmHeight, 1, 1, NULL);
+        HGDIOBJ os = SelectObject(s, ii.hbmMask), od = SelectObject(d, half);
+        BitBlt(d, 0, 0, bm.bmWidth, bc.bmHeight, s, 0, 0, SRCCOPY);
+        SelectObject(s, os), SelectObject(d, od), DeleteDC(s), DeleteDC(d);
+        ii.hbmMask = half;
+        h = CreateIconIndirect(&ii);
+    }
+    if (half) DeleteObject(half);
+    if (getenv("NATIVE32_SYSCALLS") && !h) {
+        BITMAP bm = { 0 }, bc = { 0 };
+        int gm = GetObjectW(ii.hbmMask, sizeof bm, &bm), gc = ii.hbmColor ? GetObjectW(ii.hbmColor, sizeof bc, &bc) : -1;
+        fprintf(stderr, "[user]   mask %d: %dx%d %dbpp; color %d: %dx%d %dbpp\n", gm, bm.bmWidth, bm.bmHeight, bm.bmBitsPixel,
+                gc, bc.bmWidth, bc.bmHeight, bc.bmBitsPixel);
+    }
     if (getenv("NATIVE32_SYSCALLS"))
-        fprintf(stderr, "[user] SetCursorIconData %08X rt %u mask %08X color %08X -> %p\n", a[0], MEM16(cd + 8), m, c, h);
+        fprintf(stderr, "[user] SetCursorIconData %08X rt %u mask %08X color %08X (host %08X %08X) -> %p err %lu\n", a[0], MEM16(cd + 8), m, c,
+                (uint32_t)(uintptr_t)ii.hbmMask, (uint32_t)(uintptr_t)ii.hbmColor, h, h ? 0 : GetLastError());
     for (int i = 0; i < g_ncur; i++) if (g_cur[i][0] == a[0]) g_cur[i][1] = (uint32_t)(uintptr_t)h;
     return h != NULL;
 }

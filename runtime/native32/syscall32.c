@@ -117,6 +117,7 @@ int native32_nt_syscalls(uint32_t base) {
 static uint32_t win32k_call(uint32_t svc, uint32_t* args);
 static void callback_return(uint32_t out, uint32_t outlen, uint32_t status);
 
+static const wchar_t* oa_name(uint32_t oa, int* len);
 void recomp_syscall(int vector) {
     uint32_t svc = g_eax, *args = (uint32_t*)(uintptr_t)g_edx, r;
     if (g_trace < 0) g_trace = getenv("NATIVE32_SYSCALLS") != NULL;
@@ -136,12 +137,23 @@ void recomp_syscall(int vector) {
     }
     if (g_svc[svc].fn) r = g_svc[svc].fn(args);
     else if (g_svc[svc].host) {
+        if (g_trace && !strcmp(g_svc[svc].name, "NtWaitForSingleObject"))
+            /* a critical section's wait: the section is on the stack, the one whose LockSemaphore (+0x10) this is */
+            for (int k = 0; k < 48; k++) {
+                uint32_t p = args[k];
+                if (p > 0x10000 && !IsBadReadPtr((void*)(uintptr_t)p, 0x18) && MEM32(p + 0x10) == args[0]) {
+                    fprintf(stderr, "[syscall] t%lu waits for lock %08X owned by t%lu (recursion %d)\n", GetCurrentThreadId(), p,
+                            (unsigned long)MEM32(p + 0xC), (int)MEM32(p + 8));
+                    break;
+                }
+            }
         if (g_trace && strstr(g_svc[svc].name, "Wait"))   /* a wait that never returns is otherwise never printed */
             fprintf(stderr, "[syscall] t%lu waits in %s(%08X) from sub_%08X  stack %08X %08X %08X %08X %08X %08X %08X %08X\n",
                     GetCurrentThreadId(), g_svc[svc].name, args[0], g_cur_func, args[3], args[4], args[5], args[6], args[7],
                     args[8], args[9], args[10]);
         mach_leave();                                 /* a wait must not hold the machine */
         r = call_std(g_svc[svc].host, args, g_svc[svc].argc);
+        if (g_trace && strstr(g_svc[svc].name, "Wait")) fprintf(stderr, "[syscall] t%lu woke from %08X\n", GetCurrentThreadId(), args[0]);
         mach_enter();
     } else {
         fprintf(stderr, "[syscall] %s: no host counterpart\n", g_svc[svc].name);
@@ -151,6 +163,11 @@ void recomp_syscall(int vector) {
         fprintf(stderr, "[syscall] %-32s(", g_svc[svc].name);
         for (int i = 0; i < g_svc[svc].argc && i < 10; i++) fprintf(stderr, i ? " %08X" : "%08X", args[i]);
         fprintf(stderr, ") -> %08X  from sub_%08X", r, g_cur_func);
+        if (strstr(g_svc[svc].name, "QueryAttributesFile") || strstr(g_svc[svc].name, "QueryFullAttributesFile")) {
+            int n;                                   /* the path (OBJECT_ATTRIBUTES is the first argument) */
+            const wchar_t* s = oa_name(args[0], &n);
+            fprintf(stderr, "  %.*ls", n > 200 ? 200 : n, s);
+        }
         /* the region a Nt{Allocate,Free,Protect}VirtualMemory ended up with: *Base, *Size */
         if (strstr(g_svc[svc].name, "VirtualMemory") && g_svc[svc].argc >= 4 && args[1] > 0x10000 &&
             !IsBadReadPtr((void*)(uintptr_t)args[1], 4)) {
@@ -722,6 +739,7 @@ static uint32_t win32k_call(uint32_t svc, uint32_t* args) {
     int held = blocks ? mach_release() : 0;
     uint32_t r = g_w32k[i].fn ? g_w32k[i].fn(args) : 0;
     if (blocks) mach_reacquire(held);
+    if (g_trace && blocks) fprintf(stderr, "[win32k] t%lu left %s\n", GetCurrentThreadId(), nm);
     if (g_trace || (!g_w32k[i].fn && !g_w32k[i].seen)) {
         fprintf(stderr, "[win32k] %-34s(", g_w32k[i].name[0] ? g_w32k[i].name : "?");
         for (int k = 0; k < g_w32k[i].argc && k < 16; k++) fprintf(stderr, k ? " %08X" : "%08X", args[k]);
