@@ -79,8 +79,16 @@ def main():
     assert 'cpu->ecx--' in lifted([0x67, 0xE2, 0xFE])
     assert 'cpu->cx--' in lifted([0xE2, 0xFE])
 
-    # string ops with 67h walk ESI/EDI: not modelled, so said so
-    assert 'UNHANDLED: addr32' in lifted([0x67, 0xA4])
+    # string ops with 67h walk ESI/EDI through the _32 accessors
+    assert 'mem_read8_32(cpu, cpu->ds, cpu->esi)' in lifted([0x67, 0xA4])           # movsb
+    c = lifted([0x67, 0x66, 0xAF])                                                    # scasd
+    assert 'flags_cmp32(cpu, cpu->eax, mem_read32_32(cpu, cpu->es, cpu->edi))' in c and 'cpu->edi +=' in c, c
+    c = lifted([0x67, 0xA7])                                                          # cmpsw
+    assert 'mem_read16_32(cpu, cpu->ds, cpu->esi)' in c and 'cpu->esi +=' in c, c
+    # movsx is not a string op (m[:4] == 'movs'): movsx eax, word [esi+16h]
+    c = lifted([0x66, 0x67, 0x0F, 0xBF, 0x46, 0x16])
+    assert 'UNHANDLED' not in c and 'int16_t' in c and 'cpu->esi' in c, c
+    assert 'UNHANDLED: addr32' in lifted([0x67, 0x6C])                               # insb: still not modelled
 
     # and without 67h nothing changes
     i = dec([0x89, 0x04])

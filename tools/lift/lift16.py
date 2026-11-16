@@ -57,7 +57,7 @@ def _sreg(op: Operand) -> str:
     return f'cpu->{SREG_NAMES[op.reg]}'
 
 # addr32 string ops lifted with 32-bit esi/edi: mnemonic -> (kind, width)
-_A32_STR = {f'{k}{c}': (k, w) for k in ('movs', 'stos', 'lods') for c, w in (('b', 8), ('w', 16), ('d', 32))}
+_A32_STR = {f'{k}{c}': (k, w) for k in ('movs', 'stos', 'lods', 'scas', 'cmps') for c, w in (('b', 8), ('w', 16), ('d', 32))}
 _A32_ACC = {8: 'cpu->al', 16: 'cpu->ax', 32: 'cpu->eax'}
 
 def _wsz(op: Operand) -> str:
@@ -332,12 +332,14 @@ class Lifter:
             src = f'mem_read{w}_32(cpu, {_ssg}, cpu->esi)'
             body = {'movs': f'mem_write{w}_32(cpu, cpu->es, cpu->edi, {src}); cpu->esi += {step}; cpu->edi += {step};',
                     'stos': f'mem_write{w}_32(cpu, cpu->es, cpu->edi, ({_A32_ACC[w]})); cpu->edi += {step};',
-                    'lods': f'{_A32_ACC[w]} = {src}; cpu->esi += {step};'}[k]
+                    'lods': f'{_A32_ACC[w]} = {src}; cpu->esi += {step};',
+                    'scas': f'flags_cmp{w}(cpu, {_A32_ACC[w]}, mem_read{w}_32(cpu, cpu->es, cpu->edi)); cpu->edi += {step};',
+                    'cmps': f'flags_cmp{w}(cpu, {src}, mem_read{w}_32(cpu, cpu->es, cpu->edi)); '
+                            f'cpu->esi += {step}; cpu->edi += {step};'}[k]
             self._emit(body, orig)
             return
         if getattr(inst, 'addr32', False) and (
-                m[:4] in ('movs', 'stos', 'lods', 'scas', 'cmps', 'outs') or m[:3] == 'ins'
-                or m == 'xlat'):
+                m[:4] in ('outs', 'insb', 'insw', 'insd') or m == 'xlat'):   # not movsx: m[:4] == 'movs'
             self._emit(f'/* UNHANDLED: addr32 {m} */', orig)
             return
 
@@ -1620,7 +1622,8 @@ class Lifter:
                 self._emit('}')
             elif inst.prefix == 'rep' and inst.mnemonic in ('scasb','scasw','scasd','cmpsb','cmpsw','cmpsd'):
                 self._emit_label(inst.address)
-                self._emit(f'while (cpu->cx != 0) {{ cpu->cx--;', f'repz {inst.mnemonic}')
+                _rc = 'cpu->ecx' if getattr(inst, 'addr32', False) else 'cpu->cx'   # 67h: counts ecx
+                self._emit(f'while ({_rc} != 0) {{ {_rc}--;', f'repz {inst.mnemonic}')
                 self.indent += 1
                 stripped = Instruction()
                 stripped.__dict__.update(inst.__dict__)
@@ -1632,7 +1635,8 @@ class Lifter:
                 self._emit('}')
             elif inst.prefix == 'repnz' and inst.mnemonic in ('scasb','scasw','scasd','cmpsb','cmpsw','cmpsd'):
                 self._emit_label(inst.address)
-                self._emit(f'while (cpu->cx != 0) {{ cpu->cx--;', f'repnz {inst.mnemonic}')
+                _rc = 'cpu->ecx' if getattr(inst, 'addr32', False) else 'cpu->cx'   # 67h: counts ecx
+                self._emit(f'while ({_rc} != 0) {{ {_rc}--;', f'repnz {inst.mnemonic}')
                 self.indent += 1
                 stripped = Instruction()
                 stripped.__dict__.update(inst.__dict__)

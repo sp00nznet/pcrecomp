@@ -22,6 +22,7 @@
 #include <string.h>
 #include <windows.h>
 #include "cpu.h"
+#include "mem_layout.h"   /* RECOMP_NUM_SEG */
 #define W16_PSP_PARA 0x1000   /* where the host puts KRNL386's PSP (w16test.c) */
 
 int recomp_dispatch_lookup(CPU *cpu, uint16_t seg, uint16_t off);
@@ -98,6 +99,7 @@ static void dpmi(CPU *c) {
     case 0x0001: memset(d, 0, 8); ok(c); return;                       /* free descriptor */
     case 0x0002: c->ax = rm_sel(c->bx); ok(c); return;                /* real-mode segment to selector */
     case 0x0003: c->ax = 8; ok(c); return;                             /* selector increment */
+    case 0x0004: case 0x0005: ok(c); return;                           /* lock/unlock selector (reserved, Windows-only): nothing to do */
     case 0x0006: { uint32_t b = d_base(d); c->cx = (uint16_t)(b >> 16); c->dx = (uint16_t)b; ok(c); return; }
     case 0x0007: d_set_base(d, (uint32_t)c->cx << 16 | c->dx); ok(c); return;
     case 0x0008: {                                                     /* set limit cx:dx */
@@ -152,8 +154,12 @@ static void host_far(CPU *c, uint16_t off) {
     }
     c->sp += 4;
     switch (off) {
-    case H_DPMI_SWITCH:   /* already in protected mode: cs/ds/ss are selectors; es = the PSP's */
+    case H_DPMI_SWITCH: { /* already in protected mode: cs/ds/ss are selectors; es = the PSP's,
+                           * and the PSP's environment paragraph (+2Ch) becomes a selector, as DPMI does */
+        uint16_t *env = (uint16_t *)(uintptr_t)(w16_real_base() + W16_PSP_PARA * 16u + 0x2C);
+        if (*env) *env = rm_sel(*env);
         c->es = rm_sel(W16_PSP_PARA); ok(c); return;
+    }
     case H_MSDOS_API:                    /* the "MS-DOS" vendor API (int 2Fh 168Ah) */
         if (c->ax == 0x100) { c->ax = native32_w9x_ldt_alias(); ok(c); return; }   /* LDT alias */
         break;
@@ -169,13 +175,16 @@ static void host_far(CPU *c, uint16_t off) {
         c->sp = (uint16_t)(c->sp + c->cx);
         if (getenv("W16_TRACE")) fprintf(stderr, "[w16] VMM page service %u (%08X %08X %08X)\n", c->al, a[0], a[1], a[2]);
         switch (c->al) {
-        case 0x00:   /* _PageReserve(page, npages, flags): PR_PRIVATE/SHARED/SYSTEM = anywhere */
-            p = VirtualAlloc(a[0] >= 0x80000000u ? NULL : (void *)(uintptr_t)(a[0] << 12), a[1] << 12, MEM_RESERVE, PAGE_READWRITE);
+        case 0x00:   /* _PageReserve(page, npages, flags): PR_PRIVATE/SHARED/SYSTEM = anywhere.
+                      * ponytail: committed at once (Windows commits lazily anyway): KRNL386
+                      * commits only the whole pages inside a block and counts on the partial
+                      * pages at its ends being there */
+            p = VirtualAlloc(a[0] >= 0x80000000u ? NULL : (void *)(uintptr_t)(a[0] << 12), a[1] << 12, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
             c->eax = p ? (uint32_t)(uintptr_t)p : 0xFFFFFFFFu; ok(c); return;
         case 0x01:   /* _PageCommit(page, npages, hpd, pagerdata, flags) */
             c->eax = VirtualAlloc((void *)(uintptr_t)(a[0] << 12), a[1] << 12, MEM_COMMIT, PAGE_READWRITE) != NULL; ok(c); return;
-        case 0x02:   /* _PageDecommit(page, npages, flags) */
-            c->eax = VirtualFree((void *)(uintptr_t)(a[0] << 12), a[1] << 12, MEM_DECOMMIT) != 0; ok(c); return;
+        case 0x02:   /* _PageDecommit(page, npages, flags): kept committed (see 0) */
+            c->eax = 1; ok(c); return;
         case 0x03:   /* _PageFree(laddr, flags) */
             c->eax = VirtualFree((void *)(uintptr_t)a[0], 0, MEM_RELEASE) != 0; ok(c); return;
         }
@@ -234,6 +243,7 @@ void dos_int21(CPU *c) {
         fprintf(stderr, "[w16] int 21h 09: %.*s\n", (int)strcspn(s, "$\r\n"), s);
         return;
     }
+    case 0x02: fputc(c->dl, stderr); return;                  /* write a character (KRNL386's messages) */
     case 0x47:   /* current directory of drive dl at ds:si, no drive or leading '\': the root */
         *(char *)(uintptr_t)(recomp_sel_base(c->ds) + c->si) = 0; ok(c); return;
     case 0x50: ok(c); return;                                 /* set PSP */
@@ -268,9 +278,26 @@ void int_handler(CPU *cpu, int vec) {
 void bios_int10(CPU *cpu) { int_handler(cpu, 0x10); }
 void bios_int16(CPU *cpu) { int_handler(cpu, 0x16); }
 
+/* A code selector the 16-bit side made itself (KRNL386's own loader: an
+ * alias over a segment already in memory) runs the lifted segment whose
+ * selector has the same base. ponytail: a linear scan per first sight,
+ * cached; a copy to a new base is not found (it would need the module
+ * database's segment table). */
+static uint16_t g_alias[8192];
+static uint16_t seg_of(uint16_t sel) {
+    uint16_t i = (uint16_t)(sel >> 3);
+    if (i <= RECOMP_NUM_SEG) return i;
+    if (!g_alias[i]) {
+        uint32_t b = recomp_sel_base(sel);
+        for (uint16_t n = 1; n <= RECOMP_NUM_SEG; n++)
+            if (recomp_sel_base((uint16_t)(n << 3 | 7)) == b) { g_alias[i] = n; break; }
+    }
+    return g_alias[i];
+}
 void dispatch_far(CPU *cpu, uint16_t sel, uint16_t off) {
+    if (getenv("W16_TRACE")) fprintf(stderr, "[w16] far %04X:%04X (seg %u) ss:sp %04X:%04X\n", sel, off, seg_of(sel), cpu->ss, cpu->sp);
     if (sel && sel == g_host_sel) { host_far(cpu, off); return; }
-    if (!(sel & 4) || !recomp_dispatch_lookup(cpu, (uint16_t)(sel >> 3), off)) w16_stop("far call miss", sel, off);
+    if (!(sel & 4) || !recomp_dispatch_lookup(cpu, seg_of(sel), off)) w16_stop("far call miss", sel, off);
 }
 void dispatch_near(CPU *cpu, uint16_t seg, uint16_t off) {   /* seg: the segment index */
     if (!recomp_dispatch_lookup(cpu, seg, off)) w16_stop("near call miss", seg, off);

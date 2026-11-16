@@ -50,6 +50,7 @@ from ne_decode import disassemble_segment, build_reloc_map
 from fpu_decode import decode_fpu, format_fpu
 import win16
 from win16 import get_import, module_name, is_fpu_module
+_IDENTITY = os.environ.get('NE_IDENTITY_SEL') == '1'   # Win16 identity mode (gen_image.IDENTITY)
 
 
 # Project identity for generated code. A driver sets PREFIX before lifting; the
@@ -219,6 +220,20 @@ class NELifter(Lifter):
 
         # A fixup on a direct memory displacement must land on the ADDRESS.
         self._resolve_mem_disp(inst, m, op1, op2)
+
+        # `push x; retf` is a far jump to what was pushed (KRNL386's BootStrap
+        # continues in its relocated copy: push cs; push [sel]; push B711h;
+        # retf). A far return ends `pop ...; retf` or `leave; retf`, never on
+        # a push, so lifted as a C return this one left BootStrap.
+        # Identity mode only (NE_IDENTITY_SEL=1): CivNet's Borland catch
+        # dispatch (seg035_03B2: mov sp,bx; push dx; push ax; retf) works as a
+        # return under patch_borland_eh, and changing it is untested there.
+        prev, self._prev_inst = getattr(self, '_prev_inst', None), inst
+        if _IDENTITY and m == 'retf' and op1 is None and prev is not None and prev.mnemonic == 'push' and \
+                prev.address >= 0 and prev.address + prev.length == inst.address:
+            self._emit('{ uint16_t _o = pop16(cpu); uint16_t _s = pop16(cpu); dispatch_far(cpu, _s, _o); return; }',
+                       orig + ' (after a push: a far jump)')
+            return
 
         # --- FWAIT / NOP are no-ops in our model ---
         # CATZ uses real x87 instructions (not inline FP-emulation trampolines
