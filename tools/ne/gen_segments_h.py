@@ -67,7 +67,11 @@ def main():
          " * Placeholder: selector == NE segment index. Replace with a real",
          " * selector->base table when the protected-mode memory model lands. */"]
     ident = os.environ.get("NE_IDENTITY_SEL") == "1"   # see gen_image.IDENTITY
-    L += [f"#define SEG_{n} ((uint16_t){(n << 3) | 7 if ident else n})" for n in range(1, max_seg + 1)]
+    if ident:   # the selector KRNL386's loader gave segment n (identity.c w16_rebind)
+        L += ["extern uint16_t g_w16_segsel[];"]
+        L += [f"#define SEG_{n} (g_w16_segsel[{n}])" for n in range(1, max_seg + 1)]
+    else:
+        L += [f"#define SEG_{n} ((uint16_t){n})" for n in range(1, max_seg + 1)]
     L.append("")
 
     total = 0

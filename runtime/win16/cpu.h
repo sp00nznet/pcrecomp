@@ -214,27 +214,26 @@ static inline uint32_t seg_off(CPU *cpu, uint16_t seg, uint16_t off) {
  * rights (0x9300: present, DPL0, data, writable -- executable bit 0x800 clear);
  * cpu_lsl reports a full 64K segment limit. */
 #ifdef RECOMP_W16_IDENTITY
+void w16_raise(CPU *cpu, int n, uint16_t cs, uint16_t ip);   /* identity.c: exception n at cs:ip */
 int recomp_lar32(uint16_t sel, uint32_t* rights);
 int recomp_lsl32(uint16_t sel, uint32_t* limit);
-static inline int cpu_lar(CPU *cpu, uint16_t sel, uint16_t *out) {
-    uint32_t r; (void)cpu;
-    if (!recomp_lar32(sel, &r)) return 0;
-    *out = (uint16_t)r;
-    return 1;
+/* *out is the 32-bit result (lar: rights bits 8-23; lsl: the byte limit);
+ * a 16-bit destination keeps its low word, as on the CPU. */
+static inline int cpu_lar(CPU *cpu, uint16_t sel, uint32_t *out) {
+    (void)cpu;
+    return recomp_lar32(sel, out);
 }
-static inline int cpu_lsl(CPU *cpu, uint16_t sel, uint16_t *out) {
-    uint32_t l; (void)cpu;
-    if (!recomp_lsl32(sel, &l)) return 0;
-    *out = (uint16_t)(l > 0xFFFF ? 0xFFFF : l);
-    return 1;
+static inline int cpu_lsl(CPU *cpu, uint16_t sel, uint32_t *out) {
+    (void)cpu;
+    return recomp_lsl32(sel, out);
 }
 #else
-static inline int cpu_lar(CPU *cpu, uint16_t sel, uint16_t *out) {
+static inline int cpu_lar(CPU *cpu, uint16_t sel, uint32_t *out) {
     if (sel == 0 || cpu->sel_base[sel] == RECOMP_GUARD_BASE) return 0;
     *out = 0x9300;
     return 1;
 }
-static inline int cpu_lsl(CPU *cpu, uint16_t sel, uint16_t *out) {
+static inline int cpu_lsl(CPU *cpu, uint16_t sel, uint32_t *out) {
     if (sel == 0 || cpu->sel_base[sel] == RECOMP_GUARD_BASE) return 0;
     *out = 0xFFFF;
     return 1;

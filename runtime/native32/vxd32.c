@@ -1460,9 +1460,19 @@ static const uint8_t* ldt_desc(uint16_t sel) {
     return (d[5] & 0x80) ? d : NULL;           /* present */
 }
 
+/* lar/lsl accept a not-present descriptor, as the CPU does (KRNL386 reads a
+ * discarded segment's handle with lar before reloading it): a code or data
+ * descriptor at DPL 3, or conforming code. */
+static const uint8_t* ldt_desc_any(uint16_t sel) {
+    if (!(sel & 4) || (sel & ~7u) == g_ldt_alias) return NULL;
+    const uint8_t* d = g_ldt + (sel & ~7u);
+    if (!(d[5] & 0x10)) return NULL;
+    return ((d[5] >> 5 & 3) == 3 || (d[5] & 0x0C) == 0x0C) ? d : NULL;
+}
+
 int recomp_lsl32(uint16_t sel, uint32_t* limit) {
     if ((sel & ~7u) == g_ldt_alias) { *limit = sizeof g_ldt - 1; return 1; }
-    const uint8_t* d = ldt_desc(sel);
+    const uint8_t* d = ldt_desc_any(sel);
     if (!d) return 0;
     uint32_t l = d[0] | d[1] << 8 | (uint32_t)(d[6] & 0x0F) << 16;
     *limit = (d[6] & 0x80) ? (l << 12) | 0xFFF : l;
@@ -1471,7 +1481,7 @@ int recomp_lsl32(uint16_t sel, uint32_t* limit) {
 
 int recomp_lar32(uint16_t sel, uint32_t* rights) {
     if ((sel & ~7u) == g_ldt_alias) { *rights = 0x00C0F200u; return 1; }
-    const uint8_t* d = ldt_desc(sel);
+    const uint8_t* d = ldt_desc_any(sel);
     if (!d) return 0;
     *rights = ((uint32_t)d[5] << 8 | (uint32_t)(d[6] & 0xF0) << 16);
     return 1;

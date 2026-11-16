@@ -44,7 +44,7 @@ for _d in ('disasm', 'lift', 'ne'):
     sys.path.insert(0, os.path.join(_PC, _d))
 
 from decode16 import Decoder, Instruction, OpType, Operand, REG16_NAMES
-from lift16 import Lifter, _read, _write, _reg16, _sreg, _mem_addr, _label
+from lift16 import Lifter, _read, _write, _reg16, _sreg, _mem_addr, _label, _cseg
 from ne_parse import parse_ne, NEHeader, Segment
 from ne_decode import disassemble_segment, build_reloc_map
 from fpu_decode import decode_fpu, format_fpu
@@ -233,6 +233,16 @@ class NELifter(Lifter):
                 prev.address >= 0 and prev.address + prev.length == inst.address:
             self._emit('{ uint16_t _o = pop16(cpu); uint16_t _s = pop16(cpu); dispatch_far(cpu, _s, _o); return; }',
                        orig + ' (after a push: a far jump)')
+            return
+
+        # An intentional invalid opcode (ud0/ud2) raises #UD: identity mode
+        # runs the exception handler the program set (DPMI 0203) and goes on
+        # where it says. Elsewhere it stays unhandled.
+        if m == 'ud':
+            if _IDENTITY:
+                self._emit(f'w16_raise(cpu, 6, {_cseg()}, 0x{inst.address & 0xFFFF:04X}); return;', orig)
+            else:
+                self._emit(f'/* UNHANDLED: {orig} */', orig)
             return
 
         # --- FWAIT / NOP are no-ops in our model ---

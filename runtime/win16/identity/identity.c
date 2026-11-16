@@ -87,9 +87,28 @@ static uint16_t rm_sel(uint16_t para) {
     return g_rm_sel[para];
 }
 
+static uint16_t host_sel(void);
+static uint32_t g_vec[256];          /* protected-mode vectors: int 21h 25h/35h, DPMI 0204/0205 */
+static uint32_t g_exc[32];           /* DPMI 0202/0203 exception handlers */
+static uint32_t g_rmvec[256];        /* DPMI 0200/0201 real-mode vectors */
+#define H_EXC 0xFE00                 /* host_far: H_EXC + n, the default handler of exception n */
+
 static void dpmi(CPU *c) {
     uint8_t *d = native32_w9x_desc(c->bx);
     switch (c->ax) {
+    /* Vectors: what the guest set, read back. Nothing raises an exception
+     * or a real-mode interrupt here, so a default handler only has to exist. */
+    case 0x0200: c->cx = (uint16_t)(g_rmvec[c->bl] >> 16); c->dx = (uint16_t)g_rmvec[c->bl]; ok(c); return;
+    case 0x0201: g_rmvec[c->bl] = (uint32_t)c->cx << 16 | c->dx; ok(c); return;
+    case 0x0202: case 0x0203: case 0x0283:   /* 0283: KRNL386's form of 0203 (seg001_8268 restores with it what 0202 read) */
+        if (c->bl >= 32) { c->flags |= FLAG_CF; return; }
+        if (c->ax != 0x0202) { g_exc[c->bl] = (uint32_t)c->cx << 16 | c->dx; ok(c); return; }
+        if (!g_exc[c->bl]) g_exc[c->bl] = (uint32_t)host_sel() << 16 | (H_EXC + c->bl);
+        c->cx = (uint16_t)(g_exc[c->bl] >> 16); c->dx = (uint16_t)g_exc[c->bl]; ok(c); return;
+    case 0x0204:
+        if (!g_vec[c->bl]) g_vec[c->bl] = (uint32_t)host_sel() << 16 | (0xFF00 + c->bl);   /* H_INT + n */
+        c->cx = (uint16_t)(g_vec[c->bl] >> 16); c->dx = (uint16_t)g_vec[c->bl]; ok(c); return;
+    case 0x0205: g_vec[c->bl] = (uint32_t)c->cx << 16 | c->dx; ok(c); return;
     case 0x0000: {   /* allocate cx descriptors (consecutive: the allocator bumps) */
         uint16_t first = 0;
         if ((0x10000u - native32_w9x_next_sel()) / 8 < c->cx) { c->ax = 0x8011; c->flags |= FLAG_CF; return; }   /* descriptor unavailable */
@@ -152,6 +171,7 @@ static void host_far(CPU *c, uint16_t off) {
         int_handler(c, off - H_INT);
         c->sp += 6; return;   /* CF stays the service's, not the pushed flags */
     }
+    if (off >= H_EXC && off < H_EXC + 32) w16_stop("exception with no handler of the guest's, n:ip", off - H_EXC, c->ip);
     c->sp += 4;
     switch (off) {
     case H_DPMI_SWITCH: { /* already in protected mode: cs/ds/ss are selectors; es = the PSP's,
@@ -207,6 +227,7 @@ static void int2f(CPU *c) {
     }
     case 0x1684: { /* VxD protected-mode API for bx, named from the call site */
         static const struct { uint16_t id; const char *name; int present; } vxd[] = {
+            { 0x0001, "VMM", 0 },        /* KRNL386 seg001_B83D (after BootStrap's reload): ax=26Dh/26Eh into DGROUP:1450, optional */
             { 0x0021, "PAGEFILE", 0 },   /* KRNL386 seg001_BEF9: paging-file info (ax=1), optional */
             { 0x002A, "VWIN32", 1 },     /* KRNL386 seg001_7293: ah=0, then ah=8 -> al into DGROUP:1417; GlobalInit's caller needs it */
         };
@@ -228,7 +249,6 @@ static void int2f(CPU *c) {
  * VWIN32 10 uses) with ds:dx, ds:si, es:di made flat. A register the
  * service did not touch keeps its 16-bit value; an unknown AH stops there. */
 int native32_w9x_int21(uint32_t eax, uint32_t ecx);
-static uint32_t g_vec[256];          /* int 21h 25h/35h: what the guest set */
 
 void dos_int21(CPU *c) {
     switch (c->ah) {
@@ -278,19 +298,75 @@ void int_handler(CPU *cpu, int vec) {
 void bios_int10(CPU *cpu) { int_handler(cpu, 0x10); }
 void bios_int16(CPU *cpu) { int_handler(cpu, 0x16); }
 
-/* A code selector the 16-bit side made itself (KRNL386's own loader: an
- * alias over a segment already in memory) runs the lifted segment whose
- * selector has the same base. ponytail: a linear scan per first sight,
- * cached; a copy to a new base is not found (it would need the module
- * database's segment table). */
+/* SEG_n (segments.h, identity mode) is g_w16_segsel[n]: the selector the
+ * lifted code uses for its own segment n. It starts as (n<<3)|7 and follows
+ * KRNL386's loader: when LoadSegment puts a segment in a block of its own
+ * (BootStrap moves KERNEL's segments off the DOS-loaded image, LoadModule
+ * loads GDI's and USER's), SEG_n becomes that block's selector, so `push
+ * cs`, cs:[n] and DGROUP fixups name what KRNL386's own tables know. */
+uint16_t g_w16_segsel[RECOMP_NUM_SEG + 1];
+static void segsel_init(void) {
+    for (uint16_t n = 0; n <= RECOMP_NUM_SEG; n++) g_w16_segsel[n] = (uint16_t)(n << 3 | 7);
+}
+
 static uint16_t g_alias[8192];
+
+/* Bind a module's loaded segments to the selectors KRNL386 gave them, read
+ * from its own data: sel's arena (KERNEL DGROUP:1234 selector table, in the
+ * Burgermaster segment DGROUP:121E) names the owner, the module database
+ * (NE header in memory: +1C segment count, +22 segment table of 10-byte
+ * entries {.., +4 flags (4 = loaded), +8 handle}, +26 resident names with
+ * the module name first). Returns sel's segment, or 0. */
+static uint16_t w16_rebind(uint16_t sel) {
+    uint16_t dgs = *(uint16_t *)(uintptr_t)(recomp_sel_base(g_w16_segsel[1]) + 2);   /* KERNEL cs:[2] */
+    uint32_t dg = recomp_sel_base(dgs);
+    if (!dg) return 0;
+    uint32_t bm = recomp_sel_base(*(uint16_t *)(uintptr_t)(dg + 0x121E));
+    uint16_t len = *(uint16_t *)(uintptr_t)(dg + 0x1232);
+    uint32_t tab = *(uint32_t *)(uintptr_t)(dg + 0x1234), ix = (uint32_t)(sel & ~7) >> 1;
+    if (!bm || ix >= len) return 0;
+    uint32_t a = *(uint32_t *)(uintptr_t)(bm + tab + ix);
+    if (!a) return 0;
+    uint16_t own = *(uint16_t *)(uintptr_t)(bm + a + 0x12);
+    const uint8_t *ne = (const uint8_t *)(uintptr_t)recomp_sel_base(own | 1);
+    if (!ne) return 0;   /* no 'NE' check: KERNEL's own reads 0 there during BootStrap */
+    const uint8_t *nm = ne + *(uint16_t *)(ne + 0x26);
+    if (getenv("W16_TRACE")) { const uint8_t *st = ne + *(uint16_t *)(ne + 0x22); fprintf(stderr, "[w16] rebind %04X: owner %04X %.*s, %u segments, flags:handle %04X:%04X %04X:%04X %04X:%04X %04X:%04X\n", sel, own, nm[0], nm + 1, *(uint16_t *)(ne + 0x1C), *(uint16_t *)(st + 4), *(uint16_t *)(st + 8), *(uint16_t *)(st + 14), *(uint16_t *)(st + 18), *(uint16_t *)(st + 24), *(uint16_t *)(st + 28), *(uint16_t *)(st + 34), *(uint16_t *)(st + 38)); }
+    uint16_t hit = 0;
+    for (int m = 0; m < RECOMP_NUM_MODULES; m++) {
+        const RecompModule *rm = &RECOMP_MODULES[m];
+        if (strlen(rm->name) != nm[0] || _strnicmp(rm->name, (const char *)nm + 1, nm[0])) continue;
+        uint16_t cnt = *(uint16_t *)(ne + 0x1C);
+        const uint8_t *st = ne + *(uint16_t *)(ne + 0x22);
+        for (uint16_t s = 0; s < cnt && rm->first_seg + s <= rm->last_seg; s++) {
+            uint16_t h = *(uint16_t *)(st + s * 10 + 8);
+            uint16_t n = (uint16_t)(rm->first_seg + s), ns = (uint16_t)(h | 1);
+            /* the segment called, and the module's DGROUP (loaded before any
+             * of its code runs). Other segments may hold a handle before
+             * their bytes are loaded (C597 allocates all of KERNEL's at
+             * once; the flags say nothing), so they wait for their own call. */
+            if (!h || ((ns | 7) != (sel | 7) && n != rm->dgroup)) continue;
+            if (g_w16_segsel[n] != ns && getenv("W16_TRACE"))
+                fprintf(stderr, "[w16] %s seg %u (lifted %u): selector %04X -> %04X\n", rm->name, s + 1, n, g_w16_segsel[n], ns);
+            g_w16_segsel[n] = ns; g_alias[ns >> 3] = n;
+            if (n != rm->dgroup || (ns | 7) == (sel | 7)) hit = n;
+        }
+    }
+    return hit;
+}
+
+/* A code selector the 16-bit side made itself runs the lifted segment it
+ * holds: one KRNL386 loaded a segment into (w16_rebind), or an alias over a
+ * segment already in memory (same base). ponytail: a linear scan per first
+ * sight, cached. */
 static uint16_t seg_of(uint16_t sel) {
     uint16_t i = (uint16_t)(sel >> 3);
     if (i <= RECOMP_NUM_SEG) return i;
     if (!g_alias[i]) {
         uint32_t b = recomp_sel_base(sel);
         for (uint16_t n = 1; n <= RECOMP_NUM_SEG; n++)
-            if (recomp_sel_base((uint16_t)(n << 3 | 7)) == b) { g_alias[i] = n; break; }
+            if (recomp_sel_base(g_w16_segsel[n]) == b) { g_alias[i] = n; break; }
+        if (!g_alias[i]) w16_rebind(sel);
     }
     return g_alias[i];
 }
@@ -299,6 +375,29 @@ void dispatch_far(CPU *cpu, uint16_t sel, uint16_t off) {
     if (sel && sel == g_host_sel) { host_far(cpu, off); return; }
     if (!(sel & 4) || !recomp_dispatch_lookup(cpu, seg_of(sel), off)) w16_stop("far call miss", sel, off);
 }
+/* Exception n at cs:ip (a lifted ud0/ud2): what a DPMI host does. The
+ * handler the guest set (0203) gets the 16-bit exception frame on a locked
+ * stack of the host's: far return, error code, ip, cs, flags, sp, ss. When
+ * it returns, execution goes on at the frame's cs:ip with its flags and
+ * ss:sp (KRNL386 BootStrap rewrites cs:ip to continue past its ud0). */
+void w16_raise(CPU *c, int n, uint16_t cs, uint16_t ip) {
+    uint32_t h = n < 32 ? g_exc[n] : 0;
+    if (!h || (uint16_t)(h >> 16) == g_host_sel) w16_stop("exception with no handler of the guest's, n:ip", (unsigned)n, ip);
+    static uint16_t xss;
+    if (!xss) xss = native32_w9x_alloc_sel((uint32_t)(uintptr_t)VirtualAlloc(NULL, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE), 0xFFF);
+    uint16_t ss = c->ss, sp = c->sp;
+    c->ss = xss; c->sp = 0x1000;
+    push16(c, ss); push16(c, sp); push16(c, c->flags); push16(c, cs); push16(c, ip); push16(c, 0);
+    push16(c, 0); push16(c, 0);   /* the far return the handler's retf pops */
+    if (getenv("W16_TRACE")) fprintf(stderr, "[w16] exception %d at %04X:%04X -> handler %04X:%04X\n", n, cs, ip, h >> 16, h & 0xFFFF);
+    if (!recomp_dispatch_lookup(c, seg_of((uint16_t)(h >> 16)), (uint16_t)h)) w16_stop("no lifted exception handler at", h >> 16, h & 0xFFFF);
+    c->sp += 2;   /* error code */
+    uint16_t nip = pop16(c), ncs = pop16(c);
+    c->flags = pop16(c);
+    uint16_t nsp = pop16(c); c->ss = pop16(c); c->sp = nsp;
+    dispatch_far(c, ncs, nip);
+}
+
 void dispatch_near(CPU *cpu, uint16_t seg, uint16_t off) {   /* seg: the segment index */
     if (!recomp_dispatch_lookup(cpu, seg, off)) w16_stop("near call miss", seg, off);
 }
@@ -309,7 +408,7 @@ static int g_w16_ready;
 
 int w16_enter(uint32_t target) {
     uint16_t sel = (uint16_t)(target >> 16), off = (uint16_t)target;
-    if (!g_w16_ready) { cpu_init(&g_w16); g_w16.mem = NULL; g_w16_ready = 1; }
+    if (!g_w16_ready) { cpu_init(&g_w16); g_w16.mem = NULL; g_w16_ready = 1; segsel_init(); }
     CPU saved = g_w16, *c = &g_w16;
     c->eax = g_eax; c->ecx = g_ecx; c->edx = g_edx; c->ebx = g_ebx;
     c->esi = g_esi; c->edi = g_edi; c->ebp = g_ebp; c->esp = g_esp;
@@ -339,7 +438,7 @@ int w16_enter(uint32_t target) {
  * just pops it), and *r gets the registers back. For module entry points
  * (LibMain) the host runs before any thunk. */
 int w16_call(CPU *r) {
-    if (!g_w16_ready) { cpu_init(&g_w16); g_w16.mem = NULL; g_w16_ready = 1; }
+    if (!g_w16_ready) { cpu_init(&g_w16); g_w16.mem = NULL; g_w16_ready = 1; segsel_init(); }
     CPU saved = g_w16;
     g_w16 = *r; g_w16.mem = NULL;
     if (getenv("W16_FN")) g_fncount = 1;

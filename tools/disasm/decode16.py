@@ -1023,6 +1023,8 @@ class Decoder:
             elif op2b in (0xA0, 0xA1, 0xA8, 0xA9):   # PUSH/POP FS/GS
                 inst.mnemonic = 'push' if op2b in (0xA0, 0xA8) else 'pop'
                 inst.op1 = Operand(type=OpType.SREG, reg=(4 if op2b in (0xA0, 0xA1) else 5), size=2)
+            elif op2b in (0x0B, 0xFF):        # UD2 / UD0 (386: no ModRM): #UD on purpose
+                inst.mnemonic = 'ud'          # (KRNL386 BootStrap raises it to continue in its handler)
             elif op2b == 0x1F:                # multi-byte NOP
                 self._decode_modrm(True, seg_override)
                 inst.mnemonic = 'nop'
