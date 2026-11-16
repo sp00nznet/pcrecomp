@@ -186,6 +186,30 @@ static uint32_t vmm_reg_set_value_sub(const uint32_t* a) {
 static uint32_t vmm_reg_set_value(const uint32_t* a) {
     return (uint32_t)REG("RegSetValueExA", LONG(WINAPI*)(HKEY, LPCSTR, DWORD, DWORD, const BYTE*, DWORD))((HKEY)P(0), P(1), 0, a[3], P(4), a[5]);
 }
+/* VMM 100h+, KRNL386's 16-bit registry (seg2 6B0C..), told apart by each
+ * entry's retf: a[] is the arguments in declaration order, far pointers
+ * already flat. Win16's HKEY_CLASSES_ROOT is 1. Everything goes through
+ * regbox32, like the 32-bit services; REG.DAT is never opened. The
+ * hive-file services (10C RegLoadKey, 10D RegUnLoadKey, 10E RegSaveKey)
+ * answer ERROR_ACCESS_DENIED: no guest file becomes a hive. */
+uint32_t native32_w9x_reg16(uint16_t svc, uint32_t* a) {
+    if (a[0] == 1) a[0] = (uint32_t)(uintptr_t)HKEY_CLASSES_ROOT;
+    switch (svc) {
+    case 0x100: return vmm_reg_open(a);
+    case 0x101: return vmm_reg_create(a);
+    case 0x102: return vmm_reg_close(a);
+    case 0x103: return vmm_reg_delete_key(a);
+    case 0x104: return vmm_reg_set_value_sub(a);   /* (hk, sub, type, data, cb) */
+    case 0x105: return (uint32_t)REG("RegQueryValueA", LONG(WINAPI*)(HKEY, LPCSTR, LPSTR, PLONG))((HKEY)P(0), P(1), P(2), P(3));
+    case 0x106: return vmm_reg_enum_key(a);
+    case 0x107: return (uint32_t)REG("RegDeleteValueA", LONG(WINAPI*)(HKEY, LPCSTR))((HKEY)P(0), P(1));
+    case 0x108: return vmm_reg_enum_value(a);
+    case 0x109: return vmm_reg_query_value(a);
+    case 0x10A: return vmm_reg_set_value(a);
+    case 0x10B: return 0;                          /* RegFlushKey: nothing buffered */
+    default: return ERROR_ACCESS_DENIED;
+    }
+}
 
 /* VWIN32 1 (p0..p9): VWIN32 hands kernel32 its ring-0 file entry points,
  * which kernel32 then calls directly (cdecl) for module images and their

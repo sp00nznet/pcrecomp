@@ -256,10 +256,25 @@ static void host_far(CPU *c, uint16_t off) {
     /* VMM 26Dh: KRNL386 seg1 B85A wants ah = 2 to read 26Eh too (DGROUP:1450);
      * ponytail: ax 0, the path it takes when VMM is absent */
     if (off == H_VXD + 0x001 && c->ax == 0x26D) { c->ax = 0; ok(c); return; }
-    /* VMM 100h+: KRNL386's 16-bit registry (seg2 6B0C..: RegOpenKey 100h, RegCreateKey 101h, ...).
-     * ponytail: dx:ax 3F3h (ERROR_REGISTRY_IO_FAILED), what KRNL386 returns itself with no VMM;
-     * route to regbox32 when a 16-bit caller needs a key */
-    if (off == H_VXD + 0x001 && c->ax >= 0x100 && c->ax < 0x120) { c->ax = 0x3F3; c->dx = 0; ok(c); return; }
+    /* VMM 100h+: KRNL386's 16-bit registry (seg2 6B0C..), into regbox32 (vxd32
+     * native32_w9x_reg16). The API's own frame holds the Pascal arguments at
+     * bp+6 (push bp; mov bp, sp; push ds; call far [12A8h]), first declared
+     * highest; which are far pointers is per service. dx:ax = the LONG. */
+    if (off == H_VXD + 0x001 && c->ax >= 0x100 && c->ax < 0x120) {
+        static const uint8_t nargs[15] = { 3, 3, 1, 2, 5, 4, 4, 2, 8, 6, 6, 1, 3, 2, 3 };
+        static const uint8_t isptr[15] = { 6, 6, 0, 2, 0xA, 0xE, 4, 2, 0xFC, 0x3E, 0x12, 0, 6, 2, 6 };   /* bit i: arg i is far */
+        uint32_t a[8] = { 0 }, n = c->ax - 0x100, r = ERROR_ACCESS_DENIED;
+        if (n < 15) {
+            for (uint32_t i = 0; i < nargs[n]; i++) {
+                uint32_t v = mem_read32(c, c->ss, (uint16_t)(c->bp + 6 + 4 * (nargs[n] - 1 - i)));
+                a[i] = (isptr[n] >> i & 1) && v ? (uint32_t)(uintptr_t)w16_lin(recomp_sel_base(v >> 16) + (v & 0xFFFF)) : v;
+            }
+            uint32_t native32_w9x_reg16(uint16_t svc, uint32_t *a);
+            r = native32_w9x_reg16(c->ax, a);
+        }
+        if (getenv("W16_TRACE")) fprintf(stderr, "[w16] VMM %03Xh registry -> %u\n", c->ax, r);
+        c->ax = (uint16_t)r; c->dx = (uint16_t)(r >> 16); ok(c); return;
+    }
     /* 0Ah: KRNL386 seg2 38F9, once per loaded code segment (flags&5004h == 4004h), cx = sel|1;
      * the result is not read. ponytail: nothing to tell, no-op. */
     if (off == H_VXD + 0x442 && c->ax == 0x0A) { ok(c); return; }
@@ -443,6 +458,8 @@ void dos_int21(CPU *c) {
     /* (and 55h's dx is the new PSP's selector) */
     if (c->ah == 0x42 || c->ah == 0x44 || c->ah == 0x57 || c->ah == 0x55) in_dx = c->dx;
     g_ebx = in_bx; g_ecx = in_cx; g_edx = in_dx; g_esi = in_si; g_edi = in_di;
+    if (getenv("W16_TRACE") && (c->ah == 0x3C || c->ah == 0x3D || c->ah == 0x5B || c->ax == 0x716C))
+        fprintf(stderr, "[w16] int 21h %04X \"%s\"\n", c->ax, (const char *)(uintptr_t)w16_lin(c->ax == 0x716C ? in_si : in_dx));
     int cf = native32_w9x_int21(c->ax, in_cx);
     c->ax = (uint16_t)g_eax;
     if (g_ebx != in_bx) c->bx = (uint16_t)g_ebx;
