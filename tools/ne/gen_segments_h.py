@@ -66,7 +66,8 @@ def main():
          " * Protected-mode NE selectors map to flat-memory bases at runtime.",
          " * Placeholder: selector == NE segment index. Replace with a real",
          " * selector->base table when the protected-mode memory model lands. */"]
-    L += [f"#define SEG_{n} ((uint16_t){n})" for n in range(1, max_seg + 1)]
+    ident = os.environ.get("NE_IDENTITY_SEL") == "1"   # see gen_image.IDENTITY
+    L += [f"#define SEG_{n} ((uint16_t){(n << 3) | 7 if ident else n})" for n in range(1, max_seg + 1)]
     L.append("")
 
     total = 0

@@ -1403,7 +1403,7 @@ uint32_t native32_vwin32_r0_table(void) {
  * selectors (the host's own flat ones) are base 0. */
 static uint8_t g_ldt[0x10000];
 static uint16_t g_ldt_alias;
-uint32_t g_es_base, g_cs_base, g_ds_base;
+uint32_t g_es_base, g_cs_base, g_ds_base, g_ss_base;
 
 void native32_w9x_ldt(uint16_t alias_sel, uint32_t* ldt_base) { g_ldt_alias = alias_sel & ~7; *ldt_base = (uint32_t)(uintptr_t)g_ldt; }
 
@@ -1426,6 +1426,19 @@ uint16_t native32_w9x_alloc_sel(uint32_t base, uint32_t limit) {
     d[5] = 0xF2;                            /* present, DPL 3, data, writable */
     d[6] = (uint8_t)((limit >> 16) & 0x0F) | 0x40;
     return sel;
+}
+
+/* A fixed selector for a lifted 16-bit segment (Win16 identity mode: ne_link
+ * NE_IDENTITY_SEL=1 gives segment n the selector (n << 3) | 7): code
+ * (execute/read) or data, 16-bit, DPL 3. The allocator above moves past
+ * it, so kernel32's own selectors never land on a lifted segment. */
+void native32_w9x_set_sel(uint16_t sel, uint32_t base, uint32_t limit, int code) {
+    uint8_t* d = g_ldt + (sel & ~7u);
+    d[0] = (uint8_t)limit; d[1] = (uint8_t)(limit >> 8);
+    d[2] = (uint8_t)base; d[3] = (uint8_t)(base >> 8); d[4] = (uint8_t)(base >> 16); d[7] = (uint8_t)(base >> 24);
+    d[5] = code ? 0xFA : 0xF2;
+    d[6] = (uint8_t)((limit >> 16) & 0x0F);
+    if ((uint16_t)((sel | 7) + 8) > g_next_sel) g_next_sel = (uint16_t)((sel | 7) + 8);
 }
 
 static const uint8_t* ldt_desc(uint16_t sel) {
@@ -1460,9 +1473,19 @@ void recomp_set_seg(int sreg, uint32_t sel) {
         if (g_trace) fprintf(stderr, "[vxd] fs=%04X base %08X (from sub_%08X)\n", sel & 0xFFFF, g_fs_base, g_cur_func);
     }
     if (sreg == 3) { g_seg_ds = (uint16_t)sel; g_ds_base = recomp_sel_base(sel); }
+    if (sreg == 2) { g_seg_ss = (uint16_t)sel; g_ss_base = recomp_sel_base(sel); }
 }
 
+/* A far jump into a lifted 16-bit code selector (QT_Thunk's o16 retf):
+ * the Win16 identity bridge (runtime/win16/identity.c w16_enter), when the
+ * host links one. */
+int (*native32_w16_enter)(uint32_t target);
+
 int recomp_retf32(uint32_t target) {
+    if (native32_w16_enter && (target >> 16) & 4) {
+        uint32_t r;
+        if (recomp_lar32((uint16_t)(target >> 16), &r) && (r & 0x0800)) return native32_w16_enter(target);
+    }
     if ((target & 0xFFFF0000u) != R0_TAG) return 0;
     uint32_t off = target & 0xFFFF;
     if (g_trace < 0) g_trace = getenv("NATIVE32_VXD") != NULL;

@@ -318,6 +318,7 @@ class Lifter:
         self._patched_disp = None   # (placeholder, expr) for a patched disp32
         self._labels = None        # block starts of the function being lifted
         self._seg_fn = False       # LIFT32_W9X: this function reloads ds/es
+        self._ss_fn = False        # LIFT32_W9X: this function reloads ss
         self._jump_targets = None  # arms its switch tables dispatch to
         self._flag_state = None  # (setter_mnemonic, operands_str)
         self._flag_seq = 0       # bumped whenever the flags are written
@@ -400,6 +401,8 @@ class Lifter:
             # Segment registers and FPU ST(i) - use as comment
             if X86_REG_ST0 <= r <= X86_REG_ST0 + 7:
                 return f"_st[{r - X86_REG_ST0}] = {value}"
+            if W9X and r == X86_REG_SS:
+                return f"recomp_set_seg(2, {value})"
             if (self.dos and r in DOS_SEG_IDX) or (W9X and r in (X86_REG_ES, X86_REG_DS, X86_REG_FS, X86_REG_GS)):
                 if W9X and r == X86_REG_DS:
                     return f"recomp_set_seg(3, {value})"
@@ -449,6 +452,11 @@ class Lifter:
         # the PSP and environment through it. ds/ss/cs stay flat (base 0).
         # ponytail: explicit es: overrides only; stos/movs still write flat
         # through edi, which holds while the program keeps es == ds for them.
+        # A function that loads ss (Win9x QT_Thunk: the 16-bit stack is an
+        # alias of the 32-bit one, sp = esp - base) addresses esp/ebp through
+        # SS_BASE, 0 again once ss is flat.
+        if self._ss_fn and seg in (0, X86_REG_SS) and mem.base in (X86_REG_ESP, X86_REG_EBP):
+            return f"SS_BASE + ({addr})"
         if self._seg_fn and seg in (0, X86_REG_DS) and mem.base not in (X86_REG_ESP, X86_REG_EBP):
             return f"DS_BASE + ({addr})"
         if seg == X86_REG_ES and (self.dos or W9X):
@@ -1618,8 +1626,9 @@ class Lifter:
                 # `66 CB` (o16 retf) pops a 16:16 target packed in one dword,
                 # into 16-bit code; the 16-bit side comes back by a 32-bit retf.
                 pop = 4 if bytes(insn.bytes)[0] == 0x66 else 8
-                lines.append(f"{{ uint32_t _ft = MEM32(esp); esp += {pop}; RECOMP_REGS_OUT(); {comment}")
-                lines.append("  if (recomp_retf32(_ft)) { RECOMP_REGS_IN(); _ft = MEM32(esp); esp += 8; } else RECOMP_REGS_IN();")
+                sp = "SS_BASE + esp" if self._ss_fn else "esp"
+                lines.append(f"{{ uint32_t _ft = MEM32({sp}); esp += {pop}; RECOMP_REGS_OUT(); {comment}")
+                lines.append(f"  if (recomp_retf32(_ft)) {{ RECOMP_REGS_IN(); _ft = MEM32({sp}); esp += 8; }} else RECOMP_REGS_IN();")
                 lines.append("  RECOMP_FLAGS_OUT();")
                 lines.append("RECOMP_ITAIL(_ft); return;")   # its own line: generate.py rewrites it whole
                 lines.append("}")
@@ -2433,6 +2442,14 @@ class Lifter:
         return lines
 
     @staticmethod
+    def ss_function(instructions) -> bool:
+        """LIFT32_W9X: a function that loads ss (QT_Thunk's switch to the
+        16-bit stack alias) addresses esp/ebp through SS_BASE."""
+        return W9X and any(i.mnemonic == 'lss' or
+                           (i.mnemonic in ('mov', 'pop') and i.op_str.split(',')[0].strip() == 'ss')
+                           for i in instructions)
+
+    @staticmethod
     def seg_function(instructions) -> bool:
         """LIFT32_W9X: a function that loads ds or es addresses through them
         (kernel32 copies the DOS environment with ds = its selector). The rest
@@ -2459,7 +2476,9 @@ class Lifter:
         lines.append(f"    RECOMP_ENTER(0x{func.address:08X}u);")
         lines.append(f"")
 
-        self._seg_fn = self.seg_function([i for b in func.blocks.values() for i in b.instructions])
+        _ins = [i for b in func.blocks.values() for i in b.instructions]
+        self._seg_fn = self.seg_function(_ins)
+        self._ss_fn = self.ss_function(_ins)
 
         # Emit blocks in address order
         self._labels = set(func.blocks.keys())

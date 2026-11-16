@@ -38,7 +38,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ne_parse import parse_ne
 
 PARA = 16
-MAX_SEL = 0x10000  # selector table covers any 16-bit value (raw selectors too)
+MAX_SEL = 0x10000
+# Identity mode (NE_IDENTITY_SEL=1, a 32-bit host sharing one LDT with lifted
+# 32-bit code, Windows 9x): segment n's selector is LDT index n, (n << 3) | 7,
+# a real selector MapSL can resolve; gen_segments_h emits SEG_n the same way.
+IDENTITY = os.environ.get('NE_IDENTITY_SEL') == '1'
+
+
+def sel_value(n):
+    return (n << 3) | 7 if IDENTITY else n  # selector table covers any 16-bit value (raw selectors too)
 NE_DLL = 0x8000    # NE header flag: library module
 
 
@@ -131,17 +139,17 @@ def build(nes, stack=0):
                 if addr + 1 >= len(image):
                     continue
                 if r.src_type == 2:        # SELECTOR (2 bytes)
-                    struct.pack_into('<H', image, addr, sel)
+                    struct.pack_into('<H', image, addr, sel_value(sel))
                 elif r.src_type == 5:      # OFFSET16 (2 bytes)
                     struct.pack_into('<H', image, addr, r.target_off & 0xFFFF)
                 elif r.src_type == 3:      # FAR_PTR (off16 + sel16)
                     if addr + 3 < len(image):
                         struct.pack_into('<H', image, addr, r.target_off & 0xFFFF)
-                        struct.pack_into('<H', image, addr + 2, sel)
+                        struct.pack_into('<H', image, addr + 2, sel_value(sel))
                 elif r.src_type == 11:     # PTR48 (off32 + sel16)
                     if addr + 5 < len(image):
                         struct.pack_into('<I', image, addr, r.target_off & 0xFFFFFFFF)
-                        struct.pack_into('<H', image, addr + 4, sel)
+                        struct.pack_into('<H', image, addr + 4, sel_value(sel))
                 else:
                     continue
                 applied += 1

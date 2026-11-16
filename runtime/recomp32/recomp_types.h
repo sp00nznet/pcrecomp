@@ -232,6 +232,9 @@ extern uint32_t g_es_base, g_cs_base;
 /* ds as a real selector, in the functions LIFT32_W9X lifts segmented */
 extern uint32_t g_ds_base;
 #define DS_BASE  g_ds_base
+/* ss as a real selector, in the functions LIFT32_W9X sees load ss (QT_Thunk) */
+extern uint32_t g_ss_base;
+#define SS_BASE  g_ss_base
 /* cs: overrides: 0 for the program, the module's base while a far call runs
  * code a program loaded at run time (a driver addressing its own tables). */
 #define CS_BASE  g_cs_base

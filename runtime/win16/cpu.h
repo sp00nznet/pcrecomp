@@ -190,8 +190,19 @@ extern unsigned g_ds_run;
  * at startup. Dynamically allocated selectors (TSXLIB memory alloc) get fresh
  * entries in sel_base. Unmapped selectors point at an isolated guard region.
  */
+/* Identity mode (RECOMP_W16_IDENTITY, a 32-bit host): cpu->mem is 0, so a
+ * flat address is the host address, and a selector's base comes from the
+ * host's descriptor table (native32's LDT on Windows 9x, the one kernel32
+ * writes and MapSL reads), not from cpu->sel_base. Lifted 16-bit code then
+ * shares memory with lifted 32-bit code, as Win9x's USER.EXE and user32 do. */
+#ifdef RECOMP_W16_IDENTITY
+uint32_t recomp_sel_base(uint32_t sel);
+#define W16_SEL_BASE(cpu, sel) ((void)(cpu), recomp_sel_base(sel))
+#else
+#define W16_SEL_BASE(cpu, sel) ((cpu)->sel_base[sel])
+#endif
 static inline uint32_t seg_off(CPU *cpu, uint16_t seg, uint16_t off) {
-    return cpu->sel_base[seg] + off;
+    return W16_SEL_BASE(cpu, seg) + off;
 }
 
 /* LAR/LSL: protected-mode selector queries the engine uses to validate a far
@@ -202,6 +213,22 @@ static inline uint32_t seg_off(CPU *cpu, uint16_t seg, uint16_t off) {
  * Returns 1 (valid) and fills *out, else 0. cpu_lar reports data-segment access
  * rights (0x9300: present, DPL0, data, writable -- executable bit 0x800 clear);
  * cpu_lsl reports a full 64K segment limit. */
+#ifdef RECOMP_W16_IDENTITY
+int recomp_lar32(uint16_t sel, uint32_t* rights);
+int recomp_lsl32(uint16_t sel, uint32_t* limit);
+static inline int cpu_lar(CPU *cpu, uint16_t sel, uint16_t *out) {
+    uint32_t r; (void)cpu;
+    if (!recomp_lar32(sel, &r)) return 0;
+    *out = (uint16_t)r;
+    return 1;
+}
+static inline int cpu_lsl(CPU *cpu, uint16_t sel, uint16_t *out) {
+    uint32_t l; (void)cpu;
+    if (!recomp_lsl32(sel, &l)) return 0;
+    *out = (uint16_t)(l > 0xFFFF ? 0xFFFF : l);
+    return 1;
+}
+#else
 static inline int cpu_lar(CPU *cpu, uint16_t sel, uint16_t *out) {
     if (sel == 0 || cpu->sel_base[sel] == RECOMP_GUARD_BASE) return 0;
     *out = 0x9300;
@@ -212,6 +239,7 @@ static inline int cpu_lsl(CPU *cpu, uint16_t sel, uint16_t *out) {
     *out = 0xFFFF;
     return 1;
 }
+#endif
 
 /* Not all of the address space is plain memory. A planar VGA in an unchained
  * mode turns one byte address into four pixels, one per plane, so a write there
@@ -332,7 +360,7 @@ static inline void mem_write32(CPU *cpu, uint16_t seg, uint16_t off, uint32_t va
  * a big limit does under 386 Enhanced mode. */
 #define ADDR32(x) ((uint32_t)(x))
 static inline uint8_t mem_read8_32(CPU *cpu, uint16_t seg, uint32_t off) {
-    uint32_t a = cpu->sel_base[seg] + off;
+    uint32_t a = W16_SEL_BASE(cpu, seg) + off;
 #ifdef RECOMP_MEM_HOOK
     uint8_t v;
     if (recomp_mem_read8(cpu, a, &v)) return v;
@@ -340,7 +368,7 @@ static inline uint8_t mem_read8_32(CPU *cpu, uint16_t seg, uint32_t off) {
     return cpu->mem[a];
 }
 static inline void mem_write8_32(CPU *cpu, uint16_t seg, uint32_t off, uint8_t v) {
-    uint32_t a = cpu->sel_base[seg] + off;
+    uint32_t a = W16_SEL_BASE(cpu, seg) + off;
 #ifdef RECOMP_MEM_HOOK
     if (recomp_mem_write8(cpu, a, v)) return;
 #endif
