@@ -456,7 +456,8 @@ static uint32_t ovr_create_section(uint32_t* a) {
         }
         if (!(base = proxy_image(path))) return 0xC000007Bu;                 /* STATUS_INVALID_IMAGE_FORMAT */
         size = image_size(base);
-        fprintf(stderr, "[nt] %ls: the host's, through a proxy image at 0x%08X\n", path, base);
+        /* loud on purpose: every host module in a guest is a decision to review */
+        fprintf(stderr, "[nt] HOST DLL in the guest: %ls, through a proxy image at 0x%08X\n", path, base);
     } else {
         fprintf(stderr, "[guard] %ls is neither lifted nor the host's: not mapped\n", path);
         return 0xC0000022u;                                                  /* STATUS_ACCESS_DENIED */
