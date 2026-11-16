@@ -228,6 +228,13 @@ static void host_far(CPU *c, uint16_t off) {
         break;
     }
     if (off == H_VXD + 0x442 && c->ax == 9) { c->ax = 0; ok(c); return; }   /* ponytail: 0 until a reader needs more */
+    /* VMM 26Dh: KRNL386 seg1 B85A wants ah = 2 to read 26Eh too (DGROUP:1450);
+     * ponytail: ax 0, the path it takes when VMM is absent */
+    if (off == H_VXD + 0x001 && c->ax == 0x26D) { c->ax = 0; ok(c); return; }
+    /* VMM 100h+: KRNL386's 16-bit registry (seg2 6B0C..: RegOpenKey 100h, RegCreateKey 101h, ...).
+     * ponytail: dx:ax 3F3h (ERROR_REGISTRY_IO_FAILED), what KRNL386 returns itself with no VMM;
+     * route to regbox32 when a 16-bit caller needs a key */
+    if (off == H_VXD + 0x001 && c->ax >= 0x100 && c->ax < 0x120) { c->ax = 0x3F3; c->dx = 0; ok(c); return; }
     /* 0Ah: KRNL386 seg2 38F9, once per loaded code segment (flags&5004h == 4004h), cx = sel|1;
      * the result is not read. ponytail: nothing to tell, no-op. */
     if (off == H_VXD + 0x442 && c->ax == 0x0A) { ok(c); return; }
@@ -298,10 +305,12 @@ static void int2f(CPU *c) {
     }
     case 0x1684: { /* VxD protected-mode API for bx, named from the call site */
         static const struct { uint16_t id; const char *name; int present; } vxd[] = {
-            { 0x0001, "VMM", 0 },        /* KRNL386 seg001_B83D (after BootStrap's reload): ax=26Dh/26Eh into DGROUP:1450, optional */
+            { 0x0001, "VMM", 1 },        /* USER.EXE calls its entry unchecked; KRNL386 seg001_B83D (after BootStrap's reload): ax=26Dh/26Eh into DGROUP:1450, optional */
             { 0x000A, "VDD", 0 },        /* KRNL386 seg001_BF33 (after kernel32's boot); ponytail: absent until a display driver here asks */
             { 0x0021, "PAGEFILE", 0 },   /* KRNL386 seg001_BEF9: paging-file info (ax=1), optional */
             { 0x002A, "VWIN32", 1 },
+            { 0x000C, "VMD", 0 },        /* USER.EXE LibEntry; ponytail: absent, the mouse is MOUSE.DRV's (drv16) */
+            { 0x0037, "ENABLE", 0 },     /* accessibility, during USER.EXE's LibEntry; ponytail: absent (no StickyKeys etc.) */
             { 0x0442, "VTDAPI", 1 },     /* KRNL386 seg001_6E8D: ax=9 -> DGROUP:1A88 and the table it hands kernel32, unchecked */     /* KRNL386 seg001_7293: ah=0, then ah=8 -> al into DGROUP:1417; GlobalInit's caller needs it */
         };
         for (unsigned i = 0; i < sizeof vxd / sizeof *vxd; i++)
@@ -310,7 +319,10 @@ static void int2f(CPU *c) {
                 c->di = vxd[i].present ? (uint16_t)(H_VXD + c->bx) : 0;
                 return;
             }
-        break;
+        /* any other VxD: absent (0:0), which every caller has to handle; ponytail: logged, not stopped */
+        if (getenv("W16_TRACE")) fprintf(stderr, "[w16] VxD %04X asked for: absent\n", c->bx);
+        c->es = 0; c->di = 0;
+        return;
     }
     }
     w16_stop("int 2Fh unknown, ax:bx", c->ax, c->bx);
