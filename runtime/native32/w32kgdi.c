@@ -170,6 +170,9 @@ static HDC dc(uint32_t g) {
     return h;
 }
 
+static void batch(void);
+void* native32_gdi_dc(uint32_t g) { batch(); return dc(g); }
+
 static void dc_back(uint32_t g) {          /* after a draw that moves the pen */
     uint8_t* a = native32_gdi_attr(g);
     POINT p;

@@ -442,10 +442,39 @@ static uint32_t s_create_window(uint32_t* a) {
  * (hwnd, wParam, lParam): a WM_TIMER's TIMERPROC is the guest's own, valid */
 static uint32_t s_post(uint32_t* a) { return PostMessageW((HWND)(uintptr_t)a[0], a[1], a[2], a[3]); }
 static uint32_t s_validate_timer(uint32_t* a) { (void)a; return 1; }
+/* NtUserFindWindowEx(parent, after, UNICODE_STRING* class, UNICODE_STRING* name,
+ * type): the host's (an absent class or name is a NULL pointer) */
+static uint32_t s_findwindow(uint32_t* a) {
+    return (uint32_t)(uintptr_t)FindWindowExW((HWND)(uintptr_t)a[0], (HWND)(uintptr_t)a[1],
+                                              a[2] ? ustr_name(a[2]) : NULL, a[3] ? ustr_name(a[3]) : NULL);
+}
+/* NtUserModifyUserStartupInfoFlags(set, clear): STARTF_* bits win32k keeps
+ * for the first window; nothing to keep here */
+static uint32_t s_one_u(uint32_t* a) { (void)a; return 1; }
 /* NtUserEnableScrollBar(hwnd, wSBflags, wArrows): the host's */
 static uint32_t s_enable_sb(uint32_t* a) { return EnableScrollBar((HWND)(uintptr_t)a[0], a[1], a[2]); }
 /* NtUserSystemParametersInfo(action, uiParam, pvParam, fWinIni): the host's */
-static uint32_t s_spi(uint32_t* a) { return SystemParametersInfoW(a[0], a[1], (void*)(uintptr_t)a[2], a[3]); }
+/* Only queries reach the host: a guest must never change the user's live
+ * settings. GET actions below 0x62 by name (winuser.h); from 0x62, and in
+ * the 0x1000/0x2000 ranges, GETs are even. ICON{HORIZONTAL,VERTICAL}SPACING
+ * (0xD, 0x18) query when given a buffer. SETs are refused (0) and logged. */
+static int spi_get(uint32_t act, uint32_t pv) {
+    static const uint8_t get[] = { 1, 3, 5, 0xA, 0xE, 0x10, 0x12, 0x16, 0x19, 0x1B, 0x1F, 0x23, 0x26, 0x29, 0x2B, 0x2D,
+        0x30, 0x32, 0x34, 0x36, 0x38, 0x3A, 0x3C, 0x3E, 0x40, 0x42, 0x44, 0x46, 0x48, 0x4A, 0x4F, 0x50, 0x53, 0x54,
+        0x59, 0x5E, 0x5F, 0x73 };
+    if (act == 0xD || act == 0x18) return pv != 0;
+    if (act >= 0x1000) return !(act & 1);
+    if (act >= 0x62) return !(act & 1) || act == 0x73;
+    for (unsigned i = 0; i < sizeof get; i++) if (get[i] == act) return 1;
+    return 0;
+}
+static uint32_t s_spi(uint32_t* a) {
+    if (!spi_get(a[0], a[2])) {
+        fprintf(stderr, "[user] SystemParametersInfo 0x%X (a SET) refused\n", a[0]);
+        return 0;
+    }
+    return SystemParametersInfoW(a[0], a[1], (void*)(uintptr_t)a[2], 0);
+}
 /* NtUserGetDCEx(hwnd, hrgnClip, flags), NtUserGetWindowDC(hwnd) */
 static uint32_t s_getdcex(uint32_t* a) {
     return native32_gdi_handle((uint32_t)(uintptr_t)GetDCEx((HWND)(uintptr_t)a[0], (HRGN)(uintptr_t)native32_gdi_host(a[1]), a[2]));
@@ -802,6 +831,8 @@ void native32_user_install(void) {
     native32_nt_win32k_override("NtUserPostMessage", s_post);
     native32_nt_win32k_override("NtUserValidateTimerCallback", s_validate_timer);
     native32_nt_win32k_override("NtUserEnableScrollBar", s_enable_sb);
+    native32_nt_win32k_override("NtUserFindWindowEx", s_findwindow);
+    native32_nt_win32k_override("NtUserModifyUserStartupInfoFlags", s_one_u);
     native32_nt_win32k_override("NtUserCreateAcceleratorTable", s_accel);
     native32_nt_win32k_override("NtUserRegisterClassExWOW", s_register_class);
 }

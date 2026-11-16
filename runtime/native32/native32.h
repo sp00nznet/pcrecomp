@@ -318,6 +318,8 @@ extern uint8_t* native32_user_disp;  /* csr32.c: DISPLAYINFO */
 uint32_t native32_gdi_handle(uint32_t host_handle);   /* -> the guest's handle */
 uint32_t native32_gdi_host(uint32_t guest_handle);     /* -> the host's, 0 if none */
 uint8_t* native32_gdi_attr(uint32_t hdc);
+/* a guest DC as the host's, its attributes applied and the TEB batch flushed (void*: an HDC) */
+void* native32_gdi_dc(uint32_t hdc);
 /* A named section the guest opens that a server process of its own OS would
  * have created (csrss's \NLS\NlsSection* for kernel32): NtOpenSection on
  * that name returns a read-only section of the file. */
