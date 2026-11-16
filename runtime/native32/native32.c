@@ -350,6 +350,7 @@ int native32_in_guest(uint32_t va) {
 #define NATIVE32_HELD_ENV "NATIVE32_HELD"
 
 int native32_hold_image(const char* path, uint32_t base) {
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);   /* no box on the real desktop; children inherit it */
     char flag[16], me[MAX_PATH];
     if (GetEnvironmentVariableA(NATIVE32_HELD_ENV, flag, sizeof flag)) {
         SetEnvironmentVariableA(NATIVE32_HELD_ENV, NULL);  /* not passed on to what the guest starts */
@@ -1881,6 +1882,7 @@ void native32_call_guest(uint32_t va, int nargs, const uint32_t* args) {
     mach_leave();
 }
 
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);   /* no box on the real desktop; children inherit it */
 void native32_dump_icalls(int n) {
     fprintf(stderr, "last indirect calls (newest first):\n");
     for (int i = 1; i <= n && i <= (int)g_icall_trace_idx; i++) {
