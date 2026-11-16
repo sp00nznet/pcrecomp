@@ -25,7 +25,19 @@
  * atom in its place */
 static const wchar_t* ustr_name(uint32_t us) { return us ? (const wchar_t*)(uintptr_t)MEM32(us + 4) : NULL; }
 /* (a class may come as an atom instead: #32770 is 0x8002, the same on the host) */
-static const wchar_t* lstr_name(uint32_t ls) { return ls < 0x10000 ? (const wchar_t*)(uintptr_t)ls : (const wchar_t*)(uintptr_t)MEM32(ls + 8); }
+/* LARGE_STRING { Length, MaximumLength:31 | bAnsi:1, Buffer }: CreateWindowExA
+ * passes its window name ANSI (bAnsi). ponytail: two rotating buffers of
+ * 512, enough for one call's class and name */
+static const wchar_t* lstr_name(uint32_t ls) {
+    static wchar_t buf[2][512];
+    static int k;
+    if (ls < 0x10000) return (const wchar_t*)(uintptr_t)ls;
+    if (!(MEM32(ls + 4) & 0x80000000u) || !MEM32(ls + 8)) return (const wchar_t*)(uintptr_t)MEM32(ls + 8);
+    wchar_t* w = buf[k ^= 1];
+    int n = MultiByteToWideChar(CP_ACP, 0, (const char*)(uintptr_t)MEM32(ls + 8), (int)MEM32(ls), w, 511);
+    w[n > 0 ? n : 0] = 0;
+    return w;
+}
 
 /* ---- the desktop heap, CLIENTINFO and the handle table -------------------
  * user32's ValidateHwnd: index = LOWORD(h) < psi->cHandleEntries (+8);
@@ -416,7 +428,8 @@ static uint32_t s_create_window(uint32_t* a) {
         AdjustWindowRectEx(&r, a[3], FALSE, a[0]);
         if (-r.left > b) { cx += 2 * (-r.left - b); cy += 2 * (-r.left - b); }
     }
-    HWND h = CreateWindowExW(a[0], lstr_name(a[1]), lstr_name(a[2]), a[3], (int)a[4], (int)a[5], cx, cy,
+    /* 0x80000000 WS_EX_ANSICREATOR: CreateWindowExA's mark for win32k, not the host's */
+    HWND h = CreateWindowExW(a[0] & ~0x80000000u, lstr_name(a[1]), lstr_name(a[2]), a[3], (int)a[4], (int)a[5], cx, cy,
                              (HWND)(uintptr_t)a[8], (HMENU)(uintptr_t)a[9], (HINSTANCE)(uintptr_t)a[10],
                              (void*)(uintptr_t)a[11]);
     if (!h) fprintf(stderr, "[user] CreateWindowExW failed: %lu\n", GetLastError());
@@ -429,6 +442,8 @@ static uint32_t s_create_window(uint32_t* a) {
  * (hwnd, wParam, lParam): a WM_TIMER's TIMERPROC is the guest's own, valid */
 static uint32_t s_post(uint32_t* a) { return PostMessageW((HWND)(uintptr_t)a[0], a[1], a[2], a[3]); }
 static uint32_t s_validate_timer(uint32_t* a) { (void)a; return 1; }
+/* NtUserEnableScrollBar(hwnd, wSBflags, wArrows): the host's */
+static uint32_t s_enable_sb(uint32_t* a) { return EnableScrollBar((HWND)(uintptr_t)a[0], a[1], a[2]); }
 /* NtUserSystemParametersInfo(action, uiParam, pvParam, fWinIni): the host's */
 static uint32_t s_spi(uint32_t* a) { return SystemParametersInfoW(a[0], a[1], (void*)(uintptr_t)a[2], a[3]); }
 /* NtUserGetDCEx(hwnd, hrgnClip, flags), NtUserGetWindowDC(hwnd) */
@@ -786,6 +801,7 @@ void native32_user_install(void) {
     native32_nt_win32k_override("NtUserSystemParametersInfo", s_spi);
     native32_nt_win32k_override("NtUserPostMessage", s_post);
     native32_nt_win32k_override("NtUserValidateTimerCallback", s_validate_timer);
+    native32_nt_win32k_override("NtUserEnableScrollBar", s_enable_sb);
     native32_nt_win32k_override("NtUserCreateAcceleratorTable", s_accel);
     native32_nt_win32k_override("NtUserRegisterClassExWOW", s_register_class);
 }
