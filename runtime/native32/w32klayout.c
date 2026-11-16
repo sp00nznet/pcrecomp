@@ -39,6 +39,12 @@ void w2k_user_connect(uint32_t ci, uint32_t psi, uint32_t ahe, uint32_t disp, ui
      * DefWindowSpecMsgs, the ones user32 answers itself: none) */
     MEM32(ci + 0x0C + 0xE8) = 0x3FF;
     MEM32(ci + 0x0C + 0xEC) = defmsgs;
+    /* +0x10 awmControl[27] { maxMsgs, abMsgs }, by fnid from FNID_START
+     * (0x29A): the messages each of user32's controls answers itself; the
+     * rest its procedure hands to DefWindowProc. All of them, so a control's
+     * own switch decides (left zero, the Edit control read its bitmap at
+     * address msg >> 3) */
+    for (int i = 0; i < 27; i++) MEM32(ci + 0x0C + 0x10 + 8 * i) = 0x3FF, MEM32(ci + 0x0C + 0x14 + 8 * i) = defmsgs;
 }
 
 void w2k_client_info(uint32_t teb, uint32_t threadinfo, uint32_t deskinfo) {

@@ -1484,6 +1484,74 @@ static void ncpaint(uobj_t* u) {
     gfree(d);
 }
 
+/* A menu bar item's popup, dropped down (SC_KEYMENU): WM_INITMENU and
+ * WM_INITMENUPOPUP first, then drawn on the screen below the item, the
+ * item pushed in. ponytail: not tracked; it stays until the next click or
+ * key, which closes it and repaints the window */
+static rc_t g_popup;
+static void invalidate(uobj_t* u, int erase);
+static void popup_draw(uobj_t* u, int k) {
+    uobj_t* m = U(u->menu, W2K_TYPE_MENU), *p;
+    if (!m || k < 0 || k >= m->nitems || !(p = U(m->items[k].sub, W2K_TYPE_MENU))) return;
+    send(u->h, 0x116, m->h, 0);                                       /* WM_INITMENU */
+    send(u->h, 0x117, p->h, (uint32_t)k);                             /* WM_INITMENUPOPUP */
+    menubar_layout(u);
+    gobj_t* d = window_dc(NULL, 0);
+    int bx = u->wr.l + m->items[k].x, by = u->wr.t + borders(u->style, u->ex) + caption_h(u->style, u->ex);
+    /* the bar item, pushed */
+    edge(d, (rc_t){ bx, by + 1, bx + m->items[k].w, by + SM(15) - 1 }, C[16], C[20], C[4], C[4]);
+    /* the popup: items 17 high (separators 9), text after the check column, accelerators right */
+    int w = 0, h = 6, tabw = 0;
+    for (int i = 0; i < p->nitems; i++) {
+        uint16_t t[64], *tab;
+        u16cpy(t, p->items[i].text, 64);
+        for (tab = t; *tab && *tab != 9; tab++) ;
+        int has = *tab == 9;
+        *tab = 0;
+        if (str_w(t, 0, 1) > w) w = str_w(t, 0, 1);
+        if (has && str_w(tab + 1, 0, 1) > tabw) tabw = str_w(tab + 1, 0, 1);
+        h += p->items[i].type & 0x800 ? 9 : 17;                       /* MFT_SEPARATOR */
+    }
+    w += 6 + 17 + 17 + (tabw ? tabw + 12 : 0);
+    rc_t r = { bx, by + SM(15), bx + w, by + SM(15) + h };
+    fill(d, r, C[4]);
+    edge(d, r, C[22], C[21], C[20], C[16]);
+    int y = r.t + 3;
+    for (int i = 0; i < p->nitems; i++) {
+        item_t* it = &p->items[i];
+        if (it->type & 0x800) { fill(d, (rc_t){ r.l + 3, y + 3, r.r - 3, y + 4 }, C[16]); fill(d, (rc_t){ r.l + 3, y + 4, r.r - 3, y + 5 }, C[20]); y += 9; continue; }
+        uint16_t t[64], *tab;
+        u16cpy(t, it->text, 64);
+        for (tab = t; *tab && *tab != 9; tab++) ;
+        int has = *tab == 9;
+        *tab = 0;
+        uint32_t col = it->state & 3 ? C[17] : C[7];
+        if (it->state & 8)                                            /* MFS_CHECKED: a check mark */
+            for (int j = 0; j < 7; j++) {
+                int cx = r.l + 7 + j, cy = y + 9 + (j < 3 ? j : 4 - j) - 1;
+                fill(d, (rc_t){ cx, cy - 1, cx + 1, cy + 2 }, col);
+            }
+        draw_text(d, r.l + 3 + 17, y + 2, t, col, 0, 1);
+        if (has) draw_text(d, r.r - 3 - 17 - str_w(tab + 1, 0, 1), y + 2, tab + 1, col, 0, 1);
+        y += 17;
+    }
+    gfree(d);
+    g_popup = r;
+}
+static void popup_close(void) {
+    if (rc_empty(&g_popup)) return;
+    g_popup = (rc_t){ 0, 0, 0, 0 };
+    for (int i = 2; i < MAXU; i++) if (g_u[i].type == W2K_TYPE_WINDOW && visible(&g_u[i])) invalidate(&g_u[i], 1);
+}
+static void keymenu(uobj_t* u, uint32_t ch) {
+    uobj_t* m = U(u->menu, W2K_TYPE_MENU);
+    if (!m) return;
+    for (int i = 0; i < m->nitems; i++)
+        for (uint16_t* t = m->items[i].text; *t; t++)
+            if (*t == '&' && t[1] && (t[1] | 0x20) == (ch | 0x20)) { popup_draw(u, i); return; }
+    if (!ch) popup_draw(u, 0);
+}
+
 /* ---- window operations ---------------------------------------------------- */
 static void invalidate(uobj_t* u, int erase) {
     u->dirty = u->ncdirty = 1;
@@ -1626,6 +1694,7 @@ static uint32_t defproc(uobj_t* u, uint32_t m, uint32_t w, uint32_t l) {
     case 0x10: destroy(u); return 0;                                 /* WM_CLOSE */
     case 0x112:                                                      /* WM_SYSCOMMAND */
         if ((w & 0xFFF0) == 0xF060) send(u->h, 0x10, 0, 0);          /* SC_CLOSE */
+        if ((w & 0xFFF0) == 0xF100) keymenu(u, l);                   /* SC_KEYMENU: the menu of that letter */
         return 0;
     case 0x84: {                                                     /* WM_NCHITTEST */
         int x = (int16_t)(l & 0xFFFF), y = (int16_t)(l >> 16);
@@ -1724,6 +1793,10 @@ static uint32_t s_register_class(uint32_t* a) {
     c->inst = MEM32(wc + 0x14), c->icon = MEM32(wc + 0x18), c->bg = MEM32(wc + 0x20), c->iconsm = MEM32(wc + 0x2C);
     c->menu = a[2] ? MEM32(a[2] + 4) : 0;
     c->cls = desk_alloc(0x80);
+    /* a window procedure the lifter never saw (only data points at it): said
+     * the way a missed indirect call is, for seed_from_log.py */
+    if (c->proc && !recomp_lookup(c->proc) && !recomp_lookup_manual(c->proc))
+        fprintf(stderr, "ICALL: unresolved VA 0x%08X from 0x%08X (a class's window procedure)\n", c->proc, MEM32(g_esp));
     static const char* sys[] = { "Button", "Edit", "Static", "ListBox", "ScrollBar", "ComboBox" };
     for (int k = 0; k < 6; k++) {
         uint16_t s[16];
@@ -2179,6 +2252,16 @@ static uint32_t s_fill_window(uint32_t* a) {     /* NtUserFillWindow(hwndBrush, 
     patblt(d, dc_rect(d, 0, 0, u->cr.r - u->cr.l, u->cr.b - u->cr.t), 0xF00021, br);
     return 1;
 }
+/* NtUserGetControlBrush(hwnd, hdc, msg) / NtUserGetControlColor(hwndParent,
+ * hwnd, hdc, msg): a control's WM_CTLCOLOR* to its parent; none there, the
+ * default's (DefWindowProc's colours on the DC) */
+static uint32_t ctlcolor(uint32_t parent, uint32_t hwnd, uint32_t hdc, uint32_t msg) {
+    uint32_t r = W(parent) ? send(parent, msg, hdc, hwnd) : 0;
+    uobj_t* u = W(hwnd);
+    return r ? r : u ? defproc(u, msg, hdc, hwnd) : 0;
+}
+static uint32_t s_ctlbrush(uint32_t* a) { uobj_t* u = W(a[0]); return u ? ctlcolor(u->parent, a[0], a[1], a[2]) : 0; }
+static uint32_t s_ctlcolor(uint32_t* a) { return ctlcolor(a[0], a[1], a[2], a[3]); }
 static uint32_t s_frompoint(uint32_t* a) {       /* NtUserWindowFromPoint(x, y) */
     uint32_t r = g_desktop;
     for (int i = 2; i < MAXU; i++) {
@@ -2324,6 +2407,7 @@ static void shot(uint32_t ms) {
     rc_t box = { 0, 0, 0, 0 };
     for (int i = 2; i < MAXU; i++)
         if (g_u[i].type == W2K_TYPE_WINDOW && g_u[i].parent == g_desktop && (g_u[i].style & WS_VISIBLE)) box = rc_or(box, g_u[i].wr);
+    box = rc_or(box, g_popup);
     snprintf(p, sizeof p, "%s_%u.png", g_out, ms / 1000);
     if (!rc_empty(&box) && png_write(p, &g_screen, box)) fprintf(stderr, "[shot] %u ms: %s (%dx%d)\n", ms, p, box.r - box.l, box.b - box.t);
     uobj_t* m = W(g_main);
@@ -2343,6 +2427,7 @@ static uint32_t find_child(uint32_t parent, uint32_t id) {
 static void run_event(ev_t* e) {
     uint32_t main = g_main, top = top_window();
     fprintf(stderr, "[script] %u ms: %s %s\n", e->ms, (const char*[]){ "shot", "click", "command", "post", "dlgcommand", "type" }[e->kind], e->arg);
+    if (e->kind != EV_SHOT) popup_close();
     switch (e->kind) {
     case EV_SHOT: shot(e->ms); break;
     case EV_CLICK: {
@@ -2446,6 +2531,7 @@ void w2kx_install(int cx, int cy, const char* fontdir) {
         { "NtUserSetWindowPlacement", s_one_u }, { "NtUserSystemParametersInfo", s_spi }, { "NtUserGetKeyState", s_zero_u },
         { "NtUserGetAsyncKeyState", s_zero_u }, { "NtUserShowCaret", s_one_u }, { "NtUserHideCaret", s_one_u },
         { "NtUserCreateCaret", s_one_u }, { "NtUserGetKeyboardLayoutList", s_zero_u },
+        { "NtUserGetControlBrush", s_ctlbrush }, { "NtUserGetControlColor", s_ctlcolor },
     };
     for (unsigned i = 0; i < sizeof svc / sizeof svc[0]; i++) ntp_win32k_override(svc[i].name, svc[i].fn);
 }

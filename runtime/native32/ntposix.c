@@ -47,6 +47,9 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <signal.h>
+#include <ucontext.h>
+#include <execinfo.h>
 #include "ntposix.h"
 
 #if !defined(__i386__)
@@ -1918,8 +1921,36 @@ void recomp_syscall(int vector) {
 }
 
 /* ------------------------------------------------------------- process start */
+/* A host fault (a lifted function's stray access): where, the guest
+ * function, its last indirect calls and the host frames (addr2line them) */
+static void crash(int sig, siginfo_t* si, void* uc) {
+    void* bt[32];
+    int n = backtrace(bt, 32);
+    fprintf(stderr, "\n[ntposix] signal %d at %p (host eip %08X) in sub_%08X, esp %08X\n", sig, si->si_addr,
+            (unsigned)((ucontext_t*)uc)->uc_mcontext.gregs[REG_EIP], g_cur_func, g_esp);
+    for (uint32_t i = 0; i < 8 && i < g_icall_count; i++) {
+        uint32_t k = (g_icall_trace_idx - 1 - i) & (ICALL_TRACE_SIZE - 1);
+        fprintf(stderr, "  icall 0x%08X from 0x%08X\n", g_icall_trace[k], g_icall_from[k]);
+    }
+    for (int i = 0; i < n; i++) fprintf(stderr, "  host %p\n", bt[i]);
+    fflush(NULL);
+    _exit(128 + sig);
+}
+
 void ntp_init(void) {
     g_trace = getenv("NATIVE32_SYSCALLS") != NULL;
+    {
+        struct sigaction sa;
+        static uint8_t alt[64 << 10];
+        stack_t st = { alt, 0, sizeof alt };
+        sigaltstack(&st, NULL);
+        memset(&sa, 0, sizeof sa);
+        sa.sa_sigaction = crash;
+        sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        sigaction(SIGSEGV, &sa, NULL);
+        sigaction(SIGBUS, &sa, NULL);
+        sigaction(SIGILL, &sa, NULL);
+    }
     g_ndisp = recomp_dispatch_count;
     g_disp = malloc(sizeof *g_disp * g_ndisp);
     memcpy(g_disp, recomp_dispatch_table, sizeof *g_disp * g_ndisp);
