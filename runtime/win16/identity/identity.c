@@ -64,13 +64,21 @@ static void ok(CPU *c) { c->flags &= (uint16_t)~FLAG_CF; }
 static uint32_t d_base(const uint8_t *d) { return d[2] | d[3] << 8 | d[4] << 16 | (uint32_t)d[7] << 24; }
 static void d_set_base(uint8_t *d, uint32_t b) { d[2] = (uint8_t)b; d[3] = (uint8_t)(b >> 8); d[4] = (uint8_t)(b >> 16); d[7] = (uint8_t)(b >> 24); }
 
-/* Real-mode memory: the first megabyte a DOS box would have, as a host
- * buffer. KRNL386 starts as a DOS program (PSP, then its load module at
- * PSP+10h) and maps paragraphs with int 31h 0002. */
-static uint8_t *g_rm;
+/* Real-mode memory: the first megabyte a DOS box would have, at host
+ * linear = paragraph * 16 (KRNL386's GlobalInit takes paragraph*16 as a
+ * linear address: its conventional arena runs from its own DOS-loaded
+ * segments up to a paragraph). A 32-bit Win11 process can map 0x10000 up
+ * at a fixed address; the first 64 KB (paragraphs 0-0FFFh: the IVT, BIOS
+ * data, DOS) stays unmapped. KRNL386's PSP is at 1000h. */
+static int g_rm;
 uint32_t w16_real_base(void) {
-    if (!g_rm) g_rm = VirtualAlloc(NULL, 0x110000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    return (uint32_t)(uintptr_t)g_rm;
+    /* the launcher holds the range (native32_hold_range) before this
+     * process's loader can put its own mappings there */
+    if (!g_rm && !VirtualAlloc((void *)0x10000, 0x100000, MEM_COMMIT, PAGE_READWRITE) &&
+        !VirtualAlloc((void *)0x10000, 0x100000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))
+        w16_stop("real-mode memory at 0x10000 is taken (native32_hold_range not called?)", GetLastError(), 0);
+    g_rm = 1;
+    return 0;
 }
 static uint16_t g_rm_sel[0x10000];   /* 0002 hands out one selector per paragraph */
 static uint16_t rm_sel(uint16_t para) {
@@ -150,6 +158,30 @@ static void host_far(CPU *c, uint16_t off) {
         if (c->ax == 0x100) { c->ax = native32_w9x_ldt_alias(); ok(c); return; }   /* LDT alias */
         break;
     }
+    if (off == H_VXD + 0x2A) switch (c->ah) {   /* VWIN32's PM API, KRNL386's calls through DGROUP:1A80 */
+    case 0x00: c->ax = 0x040A; ok(c); return;   /* version: KRNL386 wants >= 100h (4.10, Win98) */
+    case 0x08: c->al = 0; ok(c); return;         /* -> DGROUP:1417, a flag read as "nonzero?" (ponytail: 0 until a caller needs 1) */
+    case 0x03: {   /* VMM page services: args on the 16-bit stack, ecx bytes of them, which
+                    * the entry removes (KRNL386 seg001_1FF7 pops what it pushed before them);
+                    * result in eax */
+        const uint32_t *a = (const uint32_t *)(uintptr_t)(recomp_sel_base(c->ss) + c->sp);
+        void *p;
+        c->sp = (uint16_t)(c->sp + c->cx);
+        if (getenv("W16_TRACE")) fprintf(stderr, "[w16] VMM page service %u (%08X %08X %08X)\n", c->al, a[0], a[1], a[2]);
+        switch (c->al) {
+        case 0x00:   /* _PageReserve(page, npages, flags): PR_PRIVATE/SHARED/SYSTEM = anywhere */
+            p = VirtualAlloc(a[0] >= 0x80000000u ? NULL : (void *)(uintptr_t)(a[0] << 12), a[1] << 12, MEM_RESERVE, PAGE_READWRITE);
+            c->eax = p ? (uint32_t)(uintptr_t)p : 0xFFFFFFFFu; ok(c); return;
+        case 0x01:   /* _PageCommit(page, npages, hpd, pagerdata, flags) */
+            c->eax = VirtualAlloc((void *)(uintptr_t)(a[0] << 12), a[1] << 12, MEM_COMMIT, PAGE_READWRITE) != NULL; ok(c); return;
+        case 0x02:   /* _PageDecommit(page, npages, flags) */
+            c->eax = VirtualFree((void *)(uintptr_t)(a[0] << 12), a[1] << 12, MEM_DECOMMIT) != 0; ok(c); return;
+        case 0x03:   /* _PageFree(laddr, flags) */
+            c->eax = VirtualFree((void *)(uintptr_t)a[0], 0, MEM_RELEASE) != 0; ok(c); return;
+        }
+        break;
+    }
+    }
     if (off >= H_VXD) w16_stop("VxD entry called, id:ax", off - H_VXD, c->ax);
     w16_stop("host entry, off:ax", off, c->ax);
 }
@@ -167,7 +199,7 @@ static void int2f(CPU *c) {
     case 0x1684: { /* VxD protected-mode API for bx, named from the call site */
         static const struct { uint16_t id; const char *name; int present; } vxd[] = {
             { 0x0021, "PAGEFILE", 0 },   /* KRNL386 seg001_BEF9: paging-file info (ax=1), optional */
-            { 0x002A, "VWIN32", 0 },     /* KRNL386 seg001_7293: ah=0, then ah=8 -> al into DGROUP:1417; skipped when absent */
+            { 0x002A, "VWIN32", 1 },     /* KRNL386 seg001_7293: ah=0, then ah=8 -> al into DGROUP:1417; GlobalInit's caller needs it */
         };
         for (unsigned i = 0; i < sizeof vxd / sizeof *vxd; i++)
             if (vxd[i].id == c->bx) {   /* absent: 0:0; present: a tagged entry that stops when called */
@@ -197,6 +229,13 @@ void dos_int21(CPU *c) {
         c->es = (uint16_t)(g_vec[c->al] >> 16); c->bx = (uint16_t)g_vec[c->al]; ok(c); return;
     case 0x33: if (c->al == 0) c->dl = 0; ok(c); return;    /* ctrl-break flag: off */
     case 0x34: c->es = rm_sel(0x50); c->bx = 0; ok(c); return;   /* InDOS flag: a zero byte at 0050:0000 */
+    case 0x09: {                                              /* print $-string (KRNL386's fatal messages) */
+        const char *s = (const char *)(uintptr_t)(recomp_sel_base(c->ds) + c->dx);
+        fprintf(stderr, "[w16] int 21h 09: %.*s\n", (int)strcspn(s, "$\r\n"), s);
+        return;
+    }
+    case 0x47:   /* current directory of drive dl at ds:si, no drive or leading '\': the root */
+        *(char *)(uintptr_t)(recomp_sel_base(c->ds) + c->si) = 0; ok(c); return;
     case 0x50: ok(c); return;                                 /* set PSP */
     case 0x51: case 0x62: c->bx = rm_sel(W16_PSP_PARA); ok(c); return;
     }
@@ -222,6 +261,7 @@ void int_handler(CPU *cpu, int vec) {
     if (vec == 0x21) { dos_int21(cpu); return; }
     if (vec == 0x11) { cpu->ax = 0x0022; return; }   /* BIOS equipment: FPU, 80x25 colour, no floppies */
     if (vec == 0x12) { cpu->ax = 640; return; }      /* BIOS base memory, KB */
+    if (vec == 0x10) return;   /* BIOS video (KRNL386's fatal exit sets mode 3 before its message): no screen */
     if (vec == 0x41) return;   /* kernel debugger (WDEB386) calls: none present, ax stays (not F386h) */
     w16_stop("int, ax", (unsigned)vec << 8 | (cpu->ax >> 8), cpu->ax);
 }

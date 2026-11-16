@@ -364,6 +364,8 @@ int native32_in_guest(uint32_t va) {
  * variable, so it never launches again; the standard handles are passed on
  * explicitly, so a harness reading a pipe sees the child's output. */
 #define NATIVE32_HELD_ENV "NATIVE32_HELD"
+static uint32_t g_hold_range[2];   /* native32_hold_range: one more span the relaunch reserves */
+void native32_hold_range(uint32_t base, uint32_t size) { g_hold_range[0] = base; g_hold_range[1] = size; }
 
 int native32_hold_image(const char* path, uint32_t base) {
     char flag[16], me[MAX_PATH];
@@ -390,20 +392,29 @@ int native32_hold_image(const char* path, uint32_t base) {
     for (int i = 0; i < 3; i++)
         if (std[i] && std[i] != INVALID_HANDLE_VALUE) SetHandleInformation(std[i], HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
     GetModuleFileNameA(NULL, me, MAX_PATH);
-    SetEnvironmentVariableA(NATIVE32_HELD_ENV, "1");
-    BOOL made = CreateProcessA(me, GetCommandLineA(), NULL, NULL, TRUE, CREATE_SUSPENDED, NULL, NULL, &si, &pi);
-    SetEnvironmentVariableA(NATIVE32_HELD_ENV, NULL);
-    if (!made) {
-        fprintf(stderr, "[native32] cannot start the host again (error %lu)\n", GetLastError());
-        return 0;
-    }
-    if (!VirtualAllocEx(pi.hProcess, (void*)(uintptr_t)base, span, MEM_RESERVE, PAGE_NOACCESS)) {
-        fprintf(stderr, "[native32] 0x%08X+0x%X is taken at process start (error %lu): link the host "
-                "with a small /STACK and run the lifted code on a thread with a large one\n",
-                base, span, GetLastError());
+    /* With an ASLR host, bottom-up randomization can put the suspended
+     * child's first allocations in a span we hold: start it again (a few
+     * tries; a /DYNAMICBASE:NO host puts them at the bottom every time). */
+    for (int tries = 0;; tries++) {
+        SetEnvironmentVariableA(NATIVE32_HELD_ENV, "1");
+        BOOL made = CreateProcessA(me, GetCommandLineA(), NULL, NULL, TRUE, CREATE_SUSPENDED, NULL, NULL, &si, &pi);
+        SetEnvironmentVariableA(NATIVE32_HELD_ENV, NULL);
+        if (!made) {
+            fprintf(stderr, "[native32] cannot start the host again (error %lu)\n", GetLastError());
+            return 0;
+        }
+        int held = VirtualAllocEx(pi.hProcess, (void*)(uintptr_t)base, span, MEM_RESERVE, PAGE_NOACCESS) != NULL;
+        if (held && g_hold_range[1])
+            held = VirtualAllocEx(pi.hProcess, (void*)(uintptr_t)g_hold_range[0], g_hold_range[1], MEM_RESERVE, PAGE_NOACCESS) != NULL;
+        if (held) break;
+        DWORD err = GetLastError();
         TerminateProcess(pi.hProcess, 1);
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
+        if (tries < 8) continue;
+        fprintf(stderr, "[native32] 0x%08X+0x%X (or the native32_hold_range span) is taken at process start "
+                "(error %lu): link the host with a small /STACK and run the lifted code on a thread with a large one\n",
+                base, span, err);
         return 0;
     }
     HANDLE job = CreateJobObjectA(NULL, NULL);
