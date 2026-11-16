@@ -277,6 +277,15 @@ static COLORREF sys_color(int i) {
     }
     return GetSysColor(i);
 }
+static HFONT g_capfont, g_msgfont;   /* +0x854 / +0x858, given guest handles once gdi32's table exists */
+static void msg_fonts(void) {
+    uint8_t* psi = native32_user_psi;
+    if (!psi || !g_msgfont || *(uint32_t*)(psi + 0x858)) return;
+    uint32_t c = native32_gdi_handle((uint32_t)(uintptr_t)g_capfont), m = native32_gdi_handle((uint32_t)(uintptr_t)g_msgfont);
+    if (m == (uint32_t)(uintptr_t)g_msgfont) return;             /* (no table yet) */
+    *(uint32_t*)(psi + 0x854) = c;
+    *(uint32_t*)(psi + 0x858) = m;
+}
 static void server_info(void) {
     static int done;
     uint8_t* psi = native32_user_psi;
@@ -300,6 +309,43 @@ static void server_info(void) {
     /* +0x800 / +0x804 the system font's character size (GetDialogBaseUnits) */
     *(uint16_t*)(psi + 0x800) = (uint16_t)LOWORD(GetDialogBaseUnits());
     *(uint16_t*)(psi + 0x804) = (uint16_t)HIWORD(GetDialogBaseUnits());
+    /* +0x808 / +0x80C cxMsgFontChar / cyMsgFontChar, +0x854 hCaptionFont,
+     * +0x858 hMsgFont (msg_fonts): SoftModalMessageBox sizes its text and buttons by
+     * them (all 0: every message box laid out at 16x39). The host's
+     * NONCLIENTMETRICS fonts, as the guest's SPI query answers;
+     * character size as win32k's GetCharDimensions */
+    {
+        NONCLIENTMETRICSW nm = { sizeof nm };
+        if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof nm, &nm, 0)) {
+            HFONT msg = CreateFontIndirectW(&nm.lfMessageFont);
+            g_capfont = CreateFontIndirectW(&nm.lfCaptionFont), g_msgfont = msg;
+            HDC s = GetDC(NULL);
+            HGDIOBJ o = SelectObject(s, msg);
+            TEXTMETRICW tm;
+            SIZE z = { 0, 0 };
+            GetTextMetricsW(s, &tm);
+            GetTextExtentPoint32W(s, L"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ", 52, &z);
+            SelectObject(s, o);
+            ReleaseDC(NULL, s);
+            *(int32_t*)(psi + 0x808) = (tm.tmPitchAndFamily & TMPF_FIXED_PITCH) ? (z.cx / 26 + 1) / 2 : tm.tmAveCharWidth;
+            *(int32_t*)(psi + 0x80C) = tm.tmHeight;
+            /* +0x1D8 wMaxBtnSize: a message box button's width. ponytail:
+             * 50 dialog units (75 pixels at 6), not widened for a long
+             * localized button string */
+            *(int32_t*)(psi + 0x1D8) = 50 * *(int32_t*)(psi + 0x808) / 4;
+        }
+    }
+    /* +0x1DC MBStrings[11] { WCHAR szName[16]; UINT uID; UINT uStr; }: a
+     * message box's button texts and ids, OK .. Continue (empty: blank
+     * buttons). ponytail: Windows 2000's English strings; uStr unused */
+    {
+        static const wchar_t* mb[11] = { L"OK", L"Cancel", L"&Abort", L"&Retry", L"&Ignore", L"&Yes", L"&No",
+                                         L"&Close", L"Help", L"&Try Again", L"&Continue" };
+        for (int i = 0; i < 11; i++) {
+            wcsncpy((wchar_t*)(psi + 0x1DC + 0x28 * i), mb[i], 15);
+            *(uint32_t*)(psi + 0x1DC + 0x28 * i + 0x20) = (uint32_t)i + 1;
+        }
+    }
     /* +0xE50 the UserPreferencesMask: 0x80000000 UI effects, 0x20 keyboard
      * cues always shown. A dialog hides its underlines and focus rectangle
      * (WM_CHANGEUISTATE UIS_INITIALIZE) when effects are on and cues are
@@ -386,6 +432,7 @@ static void (*g_prev_pre)(void);
 static void user_pre(void) {        /* before every win32k service */
     server_info();
     sys_brushes();
+    msg_fonts();
     if (native32_user_ahe) {
         thread_setup();
         /* DESKTOPINFO +8 spwnd: user32's GetDesktopWindow reads it */
@@ -758,14 +805,45 @@ static const wchar_t* ustr_or_null(uint32_t u, wchar_t* buf) {
 }
 static uint32_t s_enum_devices(uint32_t* a) {
     wchar_t n[64];
-    return a[2] && EnumDisplayDevicesW(ustr_or_null(a[0], n), a[1], (DISPLAY_DEVICEW*)(uintptr_t)a[2], a[3]) ? 0 : 0xC0000001u;
+    DISPLAY_DEVICEW* d = (DISPLAY_DEVICEW*)(uintptr_t)a[2];
+    const wchar_t* dev = ustr_or_null(a[0], n);
+    if (!d) return 0xC0000001u;
+    if (!g_screen) return EnumDisplayDevicesW(dev, a[1], d, a[3]) ? 0 : 0xC0000001u;
+    /* a virtual screen is one display: the host's primary adapter (and its
+     * first monitor), nothing more (Display took the host's other, detached
+     * adapters as drivers with no modes) */
+    if (a[1]) return 0xC0000001u;
+    if (dev) return EnumDisplayDevicesW(dev, 0, d, a[3]) ? 0 : 0xC0000001u;
+    for (DWORD i = 0; EnumDisplayDevicesW(NULL, i, d, a[3]); i++)
+        if (d->StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) return 0;
+    return 0xC0000001u;
 }
 static uint32_t s_enum_settings(uint32_t* a) {
     wchar_t n[64];
     DEVMODEW* d = (DEVMODEW*)(uintptr_t)a[2];
-    if (!d || !EnumDisplaySettingsExW(ustr_or_null(a[0], n), a[1], d, a[3])) return 0xC0000001u;
-    if (g_screen && (a[1] == ENUM_CURRENT_SETTINGS || a[1] == ENUM_REGISTRY_SETTINGS))
-        d->dmPelsWidth = (DWORD)g_scx, d->dmPelsHeight = (DWORD)g_scy;
+    /* on a virtual screen the guest's own modes: its size first, then a
+     * Windows 2000 list, at the host's depth, 60 Hz (the host's 4K list with
+     * an 800x600 current mode: Display's "configuration parameters ...
+     * invalid"). ponytail: one depth */
+    static const uint16_t modes[][2] = { { 640, 480 }, { 800, 600 }, { 1024, 768 }, { 1152, 864 }, { 1280, 1024 } };
+    const int nm = (int)(sizeof modes / sizeof modes[0]);
+    uint32_t m = a[1];
+    if (g_screen && m != ENUM_CURRENT_SETTINGS && m != ENUM_REGISTRY_SETTINGS && m >= (uint32_t)nm + 1) return 0xC0000001u;
+    if (!d || !EnumDisplaySettingsExW(ustr_or_null(a[0], n), g_screen ? ENUM_CURRENT_SETTINGS : m, d, a[3])) return 0xC0000001u;
+    if (g_screen) {
+        int i = m == ENUM_CURRENT_SETTINGS || m == ENUM_REGISTRY_SETTINGS || m == 0 ? -1 : (int)m - 1;
+        d->dmPelsWidth = i < 0 ? (DWORD)g_scx : modes[i][0];
+        d->dmPelsHeight = i < 0 ? (DWORD)g_scy : modes[i][1];
+        d->dmDisplayFrequency = 60;
+        d->dmPosition.x = d->dmPosition.y = 0;
+        /* a Windows 2000 driver's fields: Display takes a mode with any
+         * other (the host's orientation, fixed output) as invalid */
+        d->dmFields = DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFLAGS | DM_DISPLAYFREQUENCY |
+                      (m == ENUM_CURRENT_SETTINGS || m == ENUM_REGISTRY_SETTINGS ? DM_POSITION : 0);
+        d->dmDisplayFlags = 0;
+        d->dmDisplayOrientation = d->dmDisplayFixedOutput = 0;
+        d->dmDriverExtra = 0;
+    }
     return 0;
 }
 static int own_thread(uint32_t tid) {
@@ -1244,6 +1322,8 @@ static uint32_t s_call_oneparam(uint32_t* a) {
     /* 0x24 MessageBeep, 0x26 PostQuitMessage, 0x2D ShowCursor, 0x33
      * GetProcessDefaultLayout (param: the DWORD* it fills) */
     if (a[1] == 0x24) return getenv("PCRECOMP_MUTE") ? 1 : MessageBeep(a[0]);   /* (muted runs stay silent) */
+    /* 0x25 PlayEventSound(USER_SOUND_*): a message box's sound. ponytail: silent */
+    if (a[1] == 0x25) return 1;
     if (a[1] == 0x26) { PostQuitMessage((int)a[0]); return 1; }
     if (a[1] == 0x2D) return (uint32_t)ShowCursor(a[0]);
     if (a[1] == 0x1E) return (uint32_t)(uintptr_t)GetKeyboardLayout(0);   /* (a guest tid: this thread's) */
