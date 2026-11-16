@@ -110,6 +110,7 @@ static uint32_t client_connect(uint32_t data, uint32_t capture) {
             ahe = native32_user_ahe = (uint8_t*)VirtualAlloc(NULL, 0xC0000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             disp = native32_user_disp = (uint8_t*)VirtualAlloc(NULL, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             *(uint32_t*)(psi + 8) = 0x10000;                  /* cHandleEntries */
+            *(uint32_t*)(psi + 0x864) = 1;                    /* cCaptures: never 0, so GetCapture asks NtUserGetThreadState(2) */
         }
         MEM32(ci + 0x04) = MEM32(ci + 0x00);
         MEM32(ci + 0x0C) = (uint32_t)(uintptr_t)psi;

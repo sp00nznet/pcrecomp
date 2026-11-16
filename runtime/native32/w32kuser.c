@@ -639,6 +639,7 @@ static void screen_frame(HWND h) {
     if (settheme) settheme(h, L"", L"");
     SetWindowPos(h, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
 }
+static LRESULT CALLBACK cbt_noactivate(int c, WPARAM w, LPARAM l) { return c == HCBT_ACTIVATE ? 1 : CallNextHookEx(NULL, c, w, l); }
 /* NtUserCreateWindowEx(exstyle, LARGE_STRING* class, LARGE_STRING* name, style,
  * x, y, cx, cy, parent, menu, hInstance, lpParam, flags) */
 static uint32_t s_create_window(uint32_t* a) {
@@ -664,7 +665,12 @@ static uint32_t s_create_window(uint32_t* a) {
                              (void*)(uintptr_t)a[11]);
     if (!h) fprintf(stderr, "[user] CreateWindowExW %08X %ls failed: %lu (style %08X ex %08X parent %08X menu %08X inst %08X)\n", a[1], (uintptr_t)lstr_name(a[1]) < 0x10000 ? L"(atom)" : lstr_name(a[1]), GetLastError(), a[3], a[0], a[8], a[9], a[10]);
     if (h && g_screen && !(a[3] & WS_CHILD)) {   /* a top-level window: on the screen */
+        /* the host activates a top-level window it makes a child; win32k never
+         * activates at create (the tray lost activation to each hidden window
+         * explorer made, and the Start menu's message filter disengaged) */
+        HHOOK hk = SetWindowsHookExW(WH_CBT, cbt_noactivate, NULL, GetCurrentThreadId());
         SetParent(h, g_screen);
+        if (hk) UnhookWindowsHookEx(hk);
         if ((a[3] & WS_CAPTION) == WS_CAPTION) screen_frame(h);
     }
     /* a window of a host class (a dialog's #32770) never calls the guest
@@ -718,18 +724,19 @@ static int own_thread(uint32_t tid) {
 static uint32_t s_post_thread(uint32_t* a) {
     return own_thread(a[0]) ? PostThreadMessageW(a[0], a[1], a[2], a[3]) : 0;
 }
-/* NtUserAttachThreadInput(idAttach, idAttachTo, fAttach): this process's threads only */
-static uint32_t s_attach_input(uint32_t* a) {
-    return own_thread(a[0]) && own_thread(a[1]) && AttachThreadInput(a[0], a[1], (BOOL)a[2]);
-}
+/* NtUserAttachThreadInput(idAttach, idAttachTo, fAttach): this process's
+ * threads only, and answered without merging the host queues: merged, the Run
+ * dialog's thread (attached to the tray's) hung in SetActiveWindow on a send
+ * to the tray thread, which was waiting for that dialog.
+ * ponytail: SetFocus/active across attached threads is then per-thread */
+static uint32_t s_attach_input(uint32_t* a) { return own_thread(a[0]) && own_thread(a[1]); }
 /* The shell hook, inside the virtual screen only (never the host's
  * RegisterShellHookWindow): win32k tells explorer's tray of top-level windows
  * with a posted "SHELLHOOK" message (HSHELL_WINDOWCREATED 1, DESTROYED 2,
  * ACTIVATED 4). The screen's other programs (a runner explorer started) are
  * other processes, so the screen polls its children (a timer, 250 ms): a
- * visible, unowned window of another process is a task. ponytail: explorer's
- * own top-level windows (a folder window) are not reported; add them with a
- * caption test when explorer opens one */
+ * visible, unowned window of another process is a task, and so is one of
+ * explorer's own with a caption (own_task) */
 #define MAX_TASKS 64
 static HWND g_shellhook, g_tasks[MAX_TASKS], g_task_top;
 static int g_ntasks;
@@ -741,12 +748,17 @@ static void shell_post(WPARAM code, HWND h) {
     if (code != HSHELL_WINDOWACTIVATED) fprintf(stderr, "[user] shell hook %u: %p\n", (unsigned)code, (void*)h);
     PostMessageW(g_shellhook, msg, code, (LPARAM)h);
 }
+/* explorer's own top-level window is a task when captioned and not a tool
+ * window (a folder window; not the tray, the desktop or the Start menu) */
+static int own_task(HWND h) {
+    return (GetWindowLongW(h, GWL_STYLE) & WS_CAPTION) == WS_CAPTION && !(GetWindowLongW(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW);
+}
 static void shell_poll(void) {
     HWND now[MAX_TASKS], top = NULL;
     int n = 0;
     if (!g_shellhook || !IsWindow(g_shellhook)) return;
     for (HWND c = GetWindow(g_screen, GW_CHILD); c && n < MAX_TASKS; c = GetWindow(c, GW_HWNDNEXT))
-        if (IsWindowVisible(c) && !GetWindow(c, GW_OWNER) && !own_window((uint32_t)(uintptr_t)c)) {
+        if (IsWindowVisible(c) && !GetWindow(c, GW_OWNER) && (!own_window((uint32_t)(uintptr_t)c) || own_task(c))) {
             if (!top) top = c;
             now[n++] = c;
         }
@@ -861,7 +873,8 @@ static uint32_t s_spi(uint32_t* a) {
         if (g_mon) memcpy(g_mon + 0x20, &g_work, sizeof g_work);
         return 1;
     }
-    /* SPI_GETMENUANIMATION / SPI_GETMENUFADE: no. The virtual screen's
+    /* SPI_GETMENUANIMATION / SPI_GETMENUFADE / SPI_GETSELECTIONFADE (the chosen
+     * menu item fading out on a thread of its own, which spun): no. The virtual screen's
      * top-level windows are host child windows, which cannot be
      * WS_EX_LAYERED (not without a Windows 8 manifest), so AnimateWindow's
      * AW_BLEND failed and the Start menu never showed; its slide times
@@ -869,7 +882,7 @@ static uint32_t s_spi(uint32_t* a) {
      * TickCountLow (0 on Windows 10/11) and spun forever. ponytail: menus
      * appear without animation; a moving guest tick is the upgrade (it sent
      * ole32 into the COM+ catalog at start, not looked at) */
-    if (g_screen && (a[0] == SPI_GETMENUANIMATION || a[0] == SPI_GETMENUFADE) && a[2]) { MEM32(a[2]) = 0; return 1; }
+    if (g_screen && (a[0] == SPI_GETMENUANIMATION || a[0] == SPI_GETMENUFADE || a[0] == SPI_GETSELECTIONFADE) && a[2]) { MEM32(a[2]) = 0; return 1; }
     if (!spi_get(a[0], a[2])) {
         fprintf(stderr, "[user] SystemParametersInfo 0x%X (a SET) refused\n", a[0]);
         return 0;
@@ -1487,7 +1500,16 @@ static uint32_t s_setactive(uint32_t* a) { return (uint32_t)(uintptr_t)SetActive
 static uint32_t s_waitmessage(uint32_t* a) { (void)a; return WaitMessage(); }
 
 #define HW(x) ((HWND)(uintptr_t)(x))
-static uint32_t s_thread_state(uint32_t* a) { return a[0] == 0x11 ? 1 : 0; }
+/* GetThreadState: focus (0), active (1), capture (2) are the host's per-thread answers (guest HWNDs are host HWNDs) */
+static uint32_t s_thread_state(uint32_t* a) {
+    switch (a[0]) {
+    case 0: return (uint32_t)(uintptr_t)GetFocus();
+    case 1: return (uint32_t)(uintptr_t)GetActiveWindow();
+    case 2: return (uint32_t)(uintptr_t)GetCapture();
+    case 0x11: return 1;
+    }
+    return 0;
+}
 /* ponytail: a guest that resizes from its own GetWindowRect grows by the pad each time; none on the screen does yet */
 static uint32_t s_move(uint32_t* a) {
     int p = screen_pad(HW(a[0]));
