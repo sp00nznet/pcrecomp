@@ -41,6 +41,8 @@ typedef struct { const char* name; recomp_func_t fn; uint32_t va; } native32_shi
 
 /* Call once, before anything else. */
 void native32_init(void);
+void native32_veh_first(void);   /* after loading a DLL that brings its own handler */
+int native32_direct_calls(void* module);   /* a DLL's direct calls to guest functions skip the fault */
 
 /* Keep a guest image's range free from process start. The process's first
  * thread stack (its /STACK reserve), heaps and the locale files are placed

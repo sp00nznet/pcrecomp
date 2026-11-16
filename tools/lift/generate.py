@@ -44,7 +44,8 @@ COND_JUMPS = {
 class LinearInstruction:
     """Lightweight instruction wrapper matching the Lifter's expected interface."""
     __slots__ = ['address', 'size', 'mnemonic', 'op_str', 'bytes', 'operands',
-                 'is_call', 'is_ret', 'is_cond_jump', 'is_uncond_jump', 'is_jump']
+                 'is_call', 'is_ret', 'is_cond_jump', 'is_uncond_jump', 'is_jump',
+                 'disp_offset', 'disp_size', 'imm_offset', 'imm_size']
 
     def __init__(self, insn):
         self.address = insn.address
@@ -53,6 +54,11 @@ class LinearInstruction:
         self.op_str = insn.op_str
         self.bytes = bytes(insn.bytes)
         self.operands = list(insn.operands) if insn.operands else []
+        # where each operand's bytes sit (lift32's patch sites inside an instruction)
+        self.disp_offset = getattr(insn, 'disp_offset', 0)
+        self.disp_size = getattr(insn, 'disp_size', 0)
+        self.imm_offset = getattr(insn, 'imm_offset', 0)
+        self.imm_size = getattr(insn, 'imm_size', 0)
         self.is_call = insn.mnemonic == 'call'
         self.is_ret = insn.mnemonic.split()[-1] in ('ret', 'retn', 'retf')   # and `repz ret`
         self.is_cond_jump = insn.mnemonic in COND_JUMPS

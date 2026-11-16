@@ -846,6 +846,55 @@ static __declspec(naked) void cb_tramp(void) {
     }
 }
 
+/* A native DLL that calls guest functions by their address (a game mod's
+ * hooks) faults on every call, and the fault is the cost: XWA's per-vertex
+ * hooks spent most of each frame in exception dispatch. Each `call rel32` in
+ * the DLL's code that lands exactly on a lifted function is pointed at a thunk
+ * instead, `mov eax, va; jmp cb_tramp`, which is the state the VEH sets up.
+ * Returns how many calls were redirected. */
+int native32_direct_calls(void* module) {
+    uint8_t* b = (uint8_t*)module;
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(b + ((IMAGE_DOS_HEADER*)b)->e_lfanew);
+    IMAGE_SECTION_HEADER* s = IMAGE_FIRST_SECTION(nt);
+    static uint8_t* pool;
+    static int used;
+    enum { THUNK = 10, POOL = 0x10000 };
+    int n = 0;
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++, s++) {
+        if (!(s->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        uint8_t* p = b + s->VirtualAddress;
+        uint32_t size = s->Misc.VirtualSize;
+        DWORD old;
+        if (!VirtualProtect(p, size, PAGE_EXECUTE_READWRITE, &old)) continue;
+        for (uint32_t k = 0; k + 5 <= size; k++) {
+            /* `call rel32`, or `mov reg, imm32` with a `call reg` within the next
+             * few bytes (MSVC's call through a constant function pointer) */
+            int rel = p[k] == 0xE8, reg = p[k] >= 0xB8 && p[k] <= 0xBF;
+            if (!rel && !reg) continue;
+            uint32_t to = rel ? (uint32_t)(uintptr_t)(p + k + 5) + *(int32_t*)(p + k + 1) : *(uint32_t*)(p + k + 1);
+            if (reg) {
+                int called = 0;
+                for (uint32_t j = k + 5; j + 2 <= size && j < k + 5 + 16 && !called; j++)
+                    called = p[j] == 0xFF && p[j + 1] == (0xD0 | (p[k] & 7));
+                if (!called) continue;
+            }
+            if (!native32_in_guest(to) || !recomp_lookup(to)) continue;
+            if (!pool || used + THUNK > POOL) pool = VirtualAlloc(NULL, POOL, MEM_COMMIT, PAGE_EXECUTE_READWRITE), used = 0;
+            if (!pool) break;
+            uint8_t* t = pool + used;
+            used += THUNK;
+            t[0] = 0xB8; *(uint32_t*)(t + 1) = to;                                       /* mov eax, va */
+            t[5] = 0xE9; *(int32_t*)(t + 6) = (int32_t)((uint8_t*)cb_tramp - (t + 10));  /* jmp cb_tramp */
+            *(int32_t*)(p + k + 1) = rel ? (int32_t)(t - (p + k + 5)) : (int32_t)(uintptr_t)t;
+            n++;
+            k += 4;
+        }
+        VirtualProtect(p, size, old, &old);
+    }
+    FlushInstructionCache(GetCurrentProcess(), NULL, 0);
+    return n;
+}
+
 /* Native code reaching a function of a native module that runs lifted
  * (native32_lift_in_native). cb_tramp is the Windows -> guest path: stack
  * arguments and ecx in, eax out, everything else put back, which is the C ABI
@@ -900,6 +949,7 @@ static __declspec(naked) void lin_tramp(void) {
     }
 }
 
+static PVOID g_veh;
 static LONG CALLBACK native32_veh(EXCEPTION_POINTERS* ep) {
     EXCEPTION_RECORD* er = ep->ExceptionRecord;
     uint32_t pc = (uint32_t)(uintptr_t)er->ExceptionAddress;
@@ -941,7 +991,14 @@ void native32_init(void) {
     g_mach_tls = TlsAlloc();
     g_tslot_fls = FlsAlloc(tslot_free);
     g_shim_page = (uint32_t)(uintptr_t)VirtualAlloc(NULL, 0x10000, MEM_RESERVE, PAGE_NOACCESS);
-    AddVectoredExceptionHandler(1, native32_veh);
+    g_veh = AddVectoredExceptionHandler(1, native32_veh);
+}
+
+/* Put the callback handler back in front: a runtime loaded later (.NET's, by
+ * a mod's DLL) adds its own first, and it then runs before every callback. */
+void native32_veh_first(void) {
+    if (g_veh) RemoveVectoredExceptionHandler(g_veh);
+    g_veh = AddVectoredExceptionHandler(1, native32_veh);
 }
 
 void native32_call_guest(uint32_t va, int nargs, const uint32_t* args) {
