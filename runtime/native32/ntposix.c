@@ -198,7 +198,13 @@ recomp_func_t recomp_lookup_import(uint32_t va) {
 }
 
 /* the hardware's other gates: not used by an NT userland */
-void recomp_int(int n) { fprintf(stderr, "[ntposix] int %02Xh in sub_%08X\n", n, g_cur_func); }
+void recomp_int(int n) {
+    if (n == 0x2D && g_eax == 1 && g_ecx) {                 /* DbgPrint: ecx the text, edx its length */
+        fprintf(stderr, "[dbgprint] %.*s", (int)(g_edx & 0xFFFF), (const char*)(uintptr_t)g_ecx);
+        return;
+    }
+    fprintf(stderr, "[ntposix] int %02Xh in sub_%08X\n", n, g_cur_func);
+}
 
 void ntp_call(uint32_t va, int nargs, const uint32_t* args) {
     recomp_func_t f = recomp_lookup_manual(va);
@@ -2167,6 +2173,7 @@ int ntp_boot(uint32_t ntdll, uint32_t exe, const char* image, const char* cmdlin
     MEM32(peb + 0x08) = exe;
     MEM32(peb + 0x10) = pp;
     MEM32(peb + 0x64) = 1;                                   /* NumberOfProcessors */
+    if (getenv("NTP_GLOBALFLAG")) MEM32(peb + 0x68) = (uint32_t)strtoul(getenv("NTP_GLOBALFLAG"), NULL, 0);  /* e.g. 0x470: ntdll's heap checks */
     *(int64_t*)(uintptr_t)(peb + 0x70) = -(int64_t)2592000 * 10000000;
     MEM32(peb + 0x78) = 0x100000;
     MEM32(peb + 0x7C) = 0x2000;
