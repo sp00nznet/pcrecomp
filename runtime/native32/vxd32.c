@@ -629,7 +629,9 @@ static void start_thread(uint32_t r0) {
     if (MEM32(r0 + R0T_PARKED)) return;
     native32_on_enter = w9x_on_enter;
     MEM32(r0 + R0T_PARKED) = (uint32_t)(uintptr_t)CreateEventA(NULL, FALSE, FALSE, NULL);
-    CloseHandle(CreateThread(NULL, 1u << 20, guest_thread, (LPVOID)(uintptr_t)r0, 0, NULL));
+    /* 16 MB reserved: lifted loops that cross function blocks recurse (GDI seg 5 2DBE/2DE9
+     * walks a 1024-slot table as a call per empty slot) */
+    CloseHandle(CreateThread(NULL, 16u << 20, guest_thread, (LPVOID)(uintptr_t)r0, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL));
 }
 
 /* A ready thread starts on its host thread at once; it waits for the

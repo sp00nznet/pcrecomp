@@ -135,7 +135,15 @@ typedef struct CPU {
 
     /* Halt flag */
     int halted;
+
+    /* Win16 identity mode: the offset the last near ret or retf popped. A near
+     * call site that pushed another one was returned past (a callee that pops
+     * its return address and returns to its caller's caller, GDI seg 5
+     * AC05/AC24): it returns too. */
+    uint16_t  ret_ip;
 } CPU;
+void w16_retpast(CPU *c, uint16_t ip, const char *fn);   /* identity.c: W16_TRACE logs it */
+#define W16_RETPAST(c, ip) w16_retpast((c), (ip), __func__)
 
 /* Print the guest call stack. Defined in main.c. */
 void dump_guest_stack(CPU *cpu, int max);

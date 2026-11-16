@@ -50,6 +50,7 @@ void recomp_sel_write(uint16_t seg, uint16_t off, uint16_t val) { (void)seg; (vo
 extern uint32_t g_eax, g_ecx, g_edx, g_ebx, g_esp, g_ebp, g_esi, g_edi;
 extern uint32_t g_ss_base;
 extern uint16_t g_seg_cs, g_seg_ss, g_seg_ds, g_seg_es, g_seg_fs, g_seg_gs;
+extern uint32_t g_ds_base, g_es_base;
 
 static void w16_stop(const char *what, unsigned a, unsigned b) {
     fprintf(stderr, "\n[w16] %s %04X:%04X; last functions:", what, a, b);
@@ -59,10 +60,14 @@ static void w16_stop(const char *what, unsigned a, unsigned b) {
     }
     fprintf(stderr, "\n");
     fflush(stderr);
+    { const char *h = getenv("W16_HOLD"); if (h) Sleep((DWORD)atoi(h) * 1000); }   /* the display window stays up for a screenshot */
     exit(5);
 }
 
 void w16_drv_stop(const char *what, unsigned a, unsigned b) { w16_stop(what, a, b); }
+void w16_retpast(CPU *c, uint16_t ip, const char *fn) {
+    if (getenv("W16_TRACE")) fprintf(stderr, "[w16] %s: returned past (pushed %04X, ret popped %04X, sp %04X)\n", fn, ip, c->ret_ip, c->sp);
+}
 void recomp_unreachable(const char *seg, unsigned off) { w16_stop("unlifted target", (unsigned)strtoul(seg, NULL, 10), off); }
 void recomp_div0(const char *kind) { (void)kind; w16_stop("divide error", 0, 0); }
 
@@ -246,7 +251,10 @@ static void host_far(CPU *c, uint16_t off) {
         c->ax = 0x040A; c->edx = 0xBFF70000u;
         if (!memcmp((void *)(uintptr_t)0xBFF71000u, "KEXP", 4)) memcpy(g_w16_low + 0x1000, (void *)(uintptr_t)0xBFF71000u, 0x100);
         ok(c); return;
-    case 0x04: c->eax = 0; ok(c); return;        /* seg001_7898 -> dx:ax into DGROUP:12EC (ponytail: 0 until a reader needs it) */
+    case 0x04:   /* KERNEL.442 VWIN32_EventCreate (seg001_7898, shld into dx:ax): KRNL386 keeps one at
+                  * DGROUP:12EC, USER's LibEntry one at es:[0FAEh] and fails on 0. A host event;
+                  * ponytail: auto-reset, unsignaled (Set/Wait come as their own functions when called) */
+        c->eax = (uint32_t)(uintptr_t)CreateEventA(NULL, FALSE, FALSE, NULL); ok(c); return;
     case 0x0C:   /* KRNL386 registers with VWIN32 once kernel32 is up (seg001_6F7B): es = its code,
                   * bx/cx/dx/di/bp entry offsets in it (8D71, 0ACE, 0C2B, 7C44, 7CAA), esi =
                   * DGROUP:1338. eax comes back and goes (seg001_53FF) into the table at
@@ -358,6 +366,7 @@ void dos_int21(CPU *c) {
     }
     uint32_t s[8] = { g_eax, g_ecx, g_edx, g_ebx, g_esp, g_ebp, g_esi, g_edi };
     uint16_t sds = g_seg_ds, ses = g_seg_es;
+    uint32_t sdb = g_ds_base, seb = g_es_base;   /* kernel32's handler may load ds/es: the 32-bit caller's come back too */
     uint32_t in_dx = recomp_sel_base(c->ds) + c->dx, in_si = recomp_sel_base(c->ds) + c->si,
              in_di = recomp_sel_base(c->es) + c->di, in_bx = c->bx, in_cx = c->cx;
     /* cx is a count and dx a value, not ds:dx, for seek (42h cx:dx), ioctl (44h) and file times (57h) */
@@ -370,7 +379,7 @@ void dos_int21(CPU *c) {
     if (g_edx != in_dx) c->dx = (uint16_t)g_edx;
     if (cf) c->flags |= FLAG_CF; else c->flags &= (uint16_t)~FLAG_CF;
     g_eax = s[0]; g_ecx = s[1]; g_edx = s[2]; g_ebx = s[3]; g_esp = s[4]; g_ebp = s[5]; g_esi = s[6]; g_edi = s[7];
-    g_seg_ds = sds; g_seg_es = ses;
+    g_seg_ds = sds; g_seg_es = ses; g_ds_base = sdb; g_es_base = seb;
 }
 
 void int_handler(CPU *cpu, int vec) {
@@ -438,7 +447,11 @@ static uint16_t w16_rebind(uint16_t sel, uint16_t want) {
              * of its code runs). Other segments may hold a handle before
              * their bytes are loaded (C597 allocates all of KERNEL's at
              * once; the flags say nothing), so they wait for their own call. */
-            if (!h || ((ns | 7) != (sel | 7) && n != rm->dgroup && n != want)) continue;
+            /* and its other data segments once loaded (flags 1|4): code reads them by
+             * selector constant (USER's seg 33, its cursor/monitor table, is written
+             * through DGROUP:[508] and read as SEG_84) */
+            uint16_t fl = *(uint16_t *)(st + s * 10 + 4);
+            if (!h || ((ns | 7) != (sel | 7) && n != rm->dgroup && n != want && (fl & 5) != 5)) continue;
             if (g_w16_segsel[n] != ns && getenv("W16_TRACE"))
                 fprintf(stderr, "[w16] %s seg %u (lifted %u): selector %04X -> %04X\n", rm->name, s + 1, n, g_w16_segsel[n], ns);
             g_w16_segsel[n] = ns; g_alias[ns >> 3] = n;

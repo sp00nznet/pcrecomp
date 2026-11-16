@@ -236,6 +236,14 @@ class NELifter(Lifter):
         prev, self._prev_inst = getattr(self, '_prev_inst', None), inst
         # An o32 retf pops eip and a 32-bit cs: KRNL386's call into flat
         # 32-bit code (identity.c w16_far32).
+        # A near ret, and a far one, record the offset they pop (cpu->ret_ip)
+        # for the near call sites below.
+        if _IDENTITY and m == 'ret':
+            n = (op1.disp if op1 else 0) + 2
+            self._emit(f'cpu->ret_ip = mem_read16(cpu, cpu->ss, cpu->sp); cpu->sp += 0x{n:X}; return;', orig)
+            return
+        if _IDENTITY and m == 'retf' and not (op1 is None and inst.raw[:1] == b'\x66'):
+            self._emit('cpu->ret_ip = mem_read16(cpu, cpu->ss, cpu->sp);', 'the offset this far return pops')
         if _IDENTITY and m == 'retf' and op1 is None and inst.raw[:1] == b'\x66':
             self._emit('w16_retf32(cpu); return;',
                        orig + ' (o32: into flat code)')
@@ -388,6 +396,12 @@ class NELifter(Lifter):
             # second time on a stack that is already unwound. Tail-call it.
             if target in getattr(self, 'popret_offsets', ()):
                 self._emit(f'{func_name}(cpu); return;', orig + ' (pops its return address)')
+                return
+            if _IDENTITY and not os.environ.get('NE_NO_RETPAST') and target in getattr(self, 'popsret_offsets', ()):
+                # returned past (the last ret popped another offset than this
+                # call pushed): return too. By value, not slot: KRNL386 seg1
+                # 3B5C pops its return, builds a frame and pushes it back.
+                self._emit(f'{func_name}(cpu); if (cpu->ret_ip != 0x{local_off + inst.length:04X}) {{ W16_RETPAST(cpu, 0x{local_off + inst.length:04X}); return; }}', orig)
                 return
             self._emit(f'{func_name}(cpu);', orig)
             return
@@ -916,6 +930,43 @@ def lift_segment(ne: NEHeader, seg_num: int, func_offset: int = -1, xmod=None):
         if any(i.mnemonic == 'jmp' and i.op1 and i.op1.type == OpType.REG16 and i.op1.reg == i0.op1.reg
                for o, i in _by_off.items() if f.offset < o < f.end):
             lifter.popret_offsets.add(f.offset)
+
+    # Functions that pop their return address before pushing anything, on
+    # their own straight line or a branch into another such function (GDI seg
+    # 5 AC05 -> AC24: `pop ax`, then return to the caller's caller). Their
+    # near call sites check what the last ret popped (cpu->ret_ip).
+    lifter.popsret_offsets = set()
+    if _IDENTITY:
+        _starts = {f.offset for f in functions}
+        _ends = {f.offset: f.end for f in functions}
+        _succ = {}
+        for f in functions:
+            o, nxt = f.offset, set()
+            while o in _by_off and o < _ends[f.offset] + 16:
+                i = _by_off[o]
+                mn = i.mnemonic
+                if mn == 'pop' and i.op1 is not None and i.op1.type == OpType.REG16:
+                    lifter.popsret_offsets.add(f.offset)
+                    break
+                if mn in ('push', 'pusha', 'pushad', 'pushf', 'call', 'enter', 'ret', 'retf', 'iret', 'jmp', 'leave'):
+                    if mn == 'jmp' and i.op1 is not None and i.op1.type in (OpType.REL8, OpType.REL16) and i.op1.disp in _starts:
+                        nxt.add(i.op1.disp)
+                    break
+                if mn.startswith('j') or mn in ('loop', 'jcxz'):
+                    if i.op1 is not None and i.op1.type in (OpType.REL8, OpType.REL16) and i.op1.disp in _starts:
+                        nxt.add(i.op1.disp)
+                o += i.length
+                if o in _starts and o != f.offset:   # falls into the next function
+                    nxt.add(o)
+                    break
+            _succ[f.offset] = nxt
+        _grew = True
+        while _grew:
+            _grew = False
+            for f in functions:
+                if f.offset not in lifter.popsret_offsets and _succ[f.offset] & lifter.popsret_offsets:
+                    lifter.popsret_offsets.add(f.offset)
+                    _grew = True
 
     target_funcs = functions
     if func_offset >= 0:
