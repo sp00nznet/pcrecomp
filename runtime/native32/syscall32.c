@@ -151,10 +151,13 @@ void recomp_syscall(int vector) {
             fprintf(stderr, "[syscall] t%lu waits in %s(%08X) from sub_%08X  stack %08X %08X %08X %08X %08X %08X %08X %08X\n",
                     GetCurrentThreadId(), g_svc[svc].name, args[0], g_cur_func, args[3], args[4], args[5], args[6], args[7],
                     args[8], args[9], args[10]);
-        mach_leave();                                 /* a wait must not hold the machine */
+        /* a wait must not hold the machine at ANY level: inside a window procedure (depth 2)
+         * one mach_leave kept it, and the thread waited for (explorer's tray thread, holding
+         * the loader and heap locks) could never run again */
+        int held = mach_release();
         r = call_std(g_svc[svc].host, args, g_svc[svc].argc);
         if (g_trace && strstr(g_svc[svc].name, "Wait")) fprintf(stderr, "[syscall] t%lu woke from %08X\n", GetCurrentThreadId(), args[0]);
-        mach_enter();
+        mach_reacquire(held);
     } else {
         fprintf(stderr, "[syscall] %s: no host counterpart\n", g_svc[svc].name);
         r = 0xC0000002u;
