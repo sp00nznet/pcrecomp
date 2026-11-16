@@ -147,6 +147,13 @@ void recomp_syscall(int vector) {
         fprintf(stderr, "[syscall] %-32s(", g_svc[svc].name);
         for (int i = 0; i < g_svc[svc].argc && i < 10; i++) fprintf(stderr, i ? " %08X" : "%08X", args[i]);
         fprintf(stderr, ") -> %08X  from sub_%08X", r, g_cur_func);
+        /* the region a Nt{Allocate,Free,Protect}VirtualMemory ended up with: *Base, *Size */
+        if (strstr(g_svc[svc].name, "VirtualMemory") && g_svc[svc].argc >= 4 && args[1] > 0x10000 &&
+            !IsBadReadPtr((void*)(uintptr_t)args[1], 4)) {
+            uint32_t sz = strstr(g_svc[svc].name, "Allocate") ? args[3] : args[2];
+            if (sz > 0x10000 && !IsBadReadPtr((void*)(uintptr_t)sz, 4))
+                fprintf(stderr, "  [%08X +%X]", MEM32(args[1]), MEM32(sz));
+        }
         /* The object's name, for an Open/Create whose third argument is
          * OBJECT_ATTRIBUTES (Length 0x18) */
         if (g_svc[svc].argc >= 3 && args[2] > 0x10000 && !IsBadReadPtr((void*)(uintptr_t)args[2], 0x18) &&
@@ -223,8 +230,35 @@ static uint32_t ovr_open_section(uint32_t* a) {
  *     host's never runs (the guard: no original Windows 2000 binary is ever
  *     started natively). Process creation is refused the same way. */
 #define MAX_IMAGES 64
-static struct { HANDLE h; uint32_t base, size; } g_img[MAX_IMAGES];
+static struct { HANDLE h; uint32_t base, size; uint8_t* snap; int gone; } g_img[MAX_IMAGES];
 static int g_nimg;
+
+/* A lifted image is never really unmapped (its code is in the host), so a
+ * DLL the loader unloads and loads again kept the data its DllMain left at
+ * PROCESS_DETACH: oleaut32's CRT released its small-block heap region, was
+ * loaded again (clbcatq's failed load, twice) and wrote into the freed
+ * region. NT maps a fresh copy, so the writable sections are saved at the
+ * first map and put back on a map after an unmap. */
+static void img_writable(int i, int restore) {
+    uint32_t b = g_img[i].base, n = 0, o = 0;
+    IMAGE_NT_HEADERS32* nt = (IMAGE_NT_HEADERS32*)(uintptr_t)(b + MEM32(b + 0x3C));
+    IMAGE_SECTION_HEADER* sh = IMAGE_FIRST_SECTION(nt);
+    for (int k = 0; k < nt->FileHeader.NumberOfSections; k++)
+        if (sh[k].Characteristics & IMAGE_SCN_MEM_WRITE) n += sh[k].Misc.VirtualSize;
+    if (!restore) g_img[i].snap = (uint8_t*)malloc(n ? n : 1);
+    for (int k = 0; k < nt->FileHeader.NumberOfSections; k++) {
+        uint32_t v = sh[k].Misc.VirtualSize;
+        uint8_t* m = (uint8_t*)(uintptr_t)(b + sh[k].VirtualAddress);
+        DWORD old;
+        if (!(sh[k].Characteristics & IMAGE_SCN_MEM_WRITE)) continue;
+        if (restore) {
+            VirtualProtect(m, v, PAGE_READWRITE, &old);
+            memcpy(m, g_img[i].snap + o, v);
+            VirtualProtect(m, v, old, &old);
+        } else memcpy(g_img[i].snap + o, m, v);
+        o += v;
+    }
+}
 
 static int img_by_handle(uint32_t h) {
     for (int i = g_nimg - 1; i >= 0; i--)        /* newest first: handle values are reused */
@@ -462,10 +496,11 @@ static uint32_t ovr_create_section(uint32_t* a) {
         fprintf(stderr, "[guard] %ls is neither lifted nor the host's: not mapped\n", path);
         return 0xC0000022u;                                                  /* STATUS_ACCESS_DENIED */
     }
-    g_img[g_nimg].h = CreateEventA(NULL, FALSE, FALSE, NULL);
-    g_img[g_nimg].base = base;
-    g_img[g_nimg].size = size;
-    MEM32(a[0]) = (uint32_t)(uintptr_t)g_img[g_nimg++].h;
+    int i = 0;
+    while (i < g_nimg && g_img[i].base != base) i++;     /* the same image loaded again */
+    if (i == g_nimg) g_nimg++, g_img[i].base = base, g_img[i].size = size;
+    g_img[i].h = CreateEventA(NULL, FALSE, FALSE, NULL);
+    MEM32(a[0]) = (uint32_t)(uintptr_t)g_img[i].h;
     return 0;
 }
 
@@ -473,6 +508,9 @@ static uint32_t ovr_create_section(uint32_t* a) {
 static uint32_t ovr_map_view(uint32_t* a) {
     int i = img_by_handle(a[0]);
     if (i < 0) return native32_nt_forward("NtMapViewOfSection", a);
+    if (!g_img[i].snap) img_writable(i, 0);
+    else if (g_img[i].gone) img_writable(i, 1);
+    g_img[i].gone = 0;
     MEM32(a[2]) = g_img[i].base;
     MEM32(a[6]) = g_img[i].size;
     return 0;
@@ -489,7 +527,7 @@ static uint32_t ovr_close(uint32_t* a) {
 /* NtUnmapViewOfSection(Process, Base): a guest image or proxy stays mapped. */
 static uint32_t ovr_unmap_view(uint32_t* a) {
     for (int i = 0; i < g_nimg; i++)
-        if (g_img[i].base == a[1]) return 0;
+        if (g_img[i].base == a[1]) return g_img[i].gone = 1, 0;
     return native32_nt_forward("NtUnmapViewOfSection", a);
 }
 
