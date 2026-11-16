@@ -135,6 +135,8 @@ static int recomp_eh_jump(uint32_t va) {
  * stub is `mov eax, FuncInfo; jmp __CxxFrameHandler`, after a /GS cookie
  * check in VC8 and later, so the mov is looked for in its first 40 bytes. */
 static uint32_t funcinfo(uint32_t handler) {
+    /* mov eax, FuncInfo; jmp __CxxFrameHandler. With /GS the stub checks the
+     * frame's cookies first, so the mov can sit a few dozen bytes in. */
     const uint8_t* h = (const uint8_t*)(uintptr_t)handler;
     if (handler < 0x10000u || IsBadReadPtr(h, 47)) return 0;
     for (int k = 0; k < 40; k++) {
@@ -322,3 +324,30 @@ static struct recomp_ehframe* eh32_frames(void) { return t_frames; }
 
 /* Set once, before any guest code runs (native32_init). */
 static void eh32_init(void) { recomp_eh_jump_hook = recomp_eh_jump; recomp_trap_hook = seh_trap; }
+
+/* std::rethrow_exception: MSVCP140's __ExceptionPtrRethrow(const exception_ptr*),
+ * cdecl. A pplx task's get() rethrows what a native worker stored, from
+ * native code, so it would walk the host's SEH chain past every guest catch
+ * (Rise of Nations EE aborted in SteamAPI_Init's neighbourhood on a cpprest
+ * failure the game catches). exception_ptr is {EXCEPTION_RECORD*, refcount};
+ * a C++ one carries the object and ThrowInfo in ExceptionInformation[1..2]. */
+typedef void (__cdecl *ptr_rethrow_t)(const void*);
+
+void native32_shim_ExceptionPtrRethrow(void) {
+    uint32_t p = MEM32(g_esp + 4);
+    EXCEPTION_RECORD* er = p ? (EXCEPTION_RECORD*)(uintptr_t)MEM32(p) : NULL;
+    if (eh_trace < 0) eh_trace = getenv("NATIVE32_TRACE_EH") != NULL;
+    if (er && er->ExceptionCode == 0xE06D7363u && er->NumberParameters >= 3) {
+        uint32_t obj = (uint32_t)er->ExceptionInformation[1], info = (uint32_t)er->ExceptionInformation[2];
+        if (eh_trace)
+            fprintf(stderr, "[eh32] rethrow_exception %s 0x%08X from sub_%08X\n", throw_type(info), obj, g_cur_func);
+        uint32_t ret_esp = g_esp;
+        g_esp += 4;
+        dispatch(obj, info);
+        g_esp = ret_esp;
+        if (eh_trace) fprintf(stderr, "[eh32] %s: no guest frame catches it\n", throw_type(info));
+    }
+    static ptr_rethrow_t real;
+    if (!real) real = (ptr_rethrow_t)GetProcAddress(LoadLibraryA("msvcp140.dll"), "?__ExceptionPtrRethrow@@YAXPBX@Z");
+    real((const void*)(uintptr_t)p);
+}

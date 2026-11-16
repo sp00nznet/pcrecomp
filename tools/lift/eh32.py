@@ -168,6 +168,9 @@ def _selftest():
     put(0x1100, bytes.fromhex('b850100000' 'c3'))
     insns = list(md.disasm(read(0x1000, 24), 0x1000))
     assert resume_points(md, read, insns) == {0x1050}, resume_points(md, read, insns)
+    # A /GS stub: cookie checks before the mov (Rise of Nations EE, VS2015).
+    put(0x2000, bytes.fromhex('8b5424088d420c8b8a94fdffff33c8e800000000' 'b800300000' 'e900000000'))
+    assert resume_points(md, read, insns) == {0x1050}, resume_points(md, read, insns)
     # A plain function.
     assert resume_points(md, read, list(md.disasm(bytes.fromhex('558bec33c05dc3'), 0x4000))) is None
     # The same frame, frame-pointer omitted: the handlers' ebp is entry esp.

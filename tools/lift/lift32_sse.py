@@ -210,11 +210,24 @@ def lift_sse(L, m, ops, comment):
         idx = f"_k + {n}" if m == 'psrldq' else f"_k - {n}"
         return one(f"{{ xmm_t _s = _xmm[{di}]; for (int _k = 0; _k < 16; _k++) "
                    f"_xmm[{di}].u8[_k] = ({idx} >= 0 && {idx} < 16) ? _s.u8[{idx}] : 0; }}")
-    if m in ('paddd', 'psubd', 'paddq', 'psubq') and di is not None:
-        k, n = ('u32', 4) if m.endswith('d') else ('u64', 2)
+    if m in ('paddb', 'psubb', 'paddw', 'psubw', 'paddd', 'psubd', 'paddq', 'psubq') and di is not None:
+        k, n = {'b': ('u8', 16), 'w': ('u16', 8), 'd': ('u32', 4), 'q': ('u64', 2)}[m[-1]]
         o = '+' if m.startswith('padd') else '-'
         return one(f"{{ xmm_t _s = {X(s)}; for (int _k = 0; _k < {n}; _k++) "
                    f"_xmm[{di}].{k}[_k] {o}= _s.{k}[_k]; }}")
+    if m in ('paddusb', 'psubusb', 'paddusw', 'psubusw') and di is not None:
+        k, n, top = ('u8', 16, 255) if m[-1] == 'b' else ('u16', 8, 65535)
+        v = (f"_xmm[{di}].{k}[_k] + _s.{k}[_k]" if m.startswith('padd')
+             else f"_xmm[{di}].{k}[_k] - _s.{k}[_k]")
+        return one(f"{{ xmm_t _s = {X(s)}; for (int _k = 0; _k < {n}; _k++) {{ int _v = {v}; "
+                   f"_xmm[{di}].{k}[_k] = ({_CT[k]})(_v < 0 ? 0 : _v > {top} ? {top} : _v); }} }}")
+    # Interleave the low (or high) halves' lanes of dest and source.
+    if m in ('punpcklbw', 'punpckhbw', 'punpcklwd', 'punpckhwd', 'punpckldq', 'punpckhdq') and di is not None:
+        k, n = {'bw': ('u8', 16), 'wd': ('u16', 8), 'dq': ('u32', 4)}[m[-2:]]
+        base = 0 if m[6] == 'l' else n // 2
+        return one(f"{{ xmm_t _s = {X(s)}, _d = _xmm[{di}]; for (int _k = 0; _k < {n // 2}; _k++) {{ "
+                   f"_xmm[{di}].{k}[2 * _k] = _d.{k}[{base} + _k]; "
+                   f"_xmm[{di}].{k}[2 * _k + 1] = _s.{k}[{base} + _k]; }} }}")
     # Lane shifts. The count is an immediate or the low quadword of an xmm or
     # memory operand, and a count at or past the lane width zeroes the lane
     # (all sign bits for psra*), where C calls the shift undefined.
@@ -284,6 +297,13 @@ def lift_sse(L, m, ops, comment):
     if m == 'cvtdq2pd':
         return one(f"{{ int32_t _a = (int32_t){lane(s, 0, 'u32')}, _b = (int32_t){lane(s, 1, 'u32')}; "
                    f"_xmm[{di}].f64[0] = _a; _xmm[{di}].f64[1] = _b; }}")
+    # Two doubles to two int32s in the low half, the high half zeroed. Rise of
+    # Nations builds its fixed-point sine table this way: lifted as a no-op it
+    # stored the raw double bits, and every map's start positions went wild.
+    if m in ('cvtpd2dq', 'cvttpd2dq'):
+        trunc = 1 if m.startswith('cvtt') else 0
+        return one(f"{{ xmm_t _s = {X(s)}; _xmm[{di}].i32[0] = sse_cvt_i32(_s.f64[0], {trunc}); "
+                   f"_xmm[{di}].i32[1] = sse_cvt_i32(_s.f64[1], {trunc}); _xmm[{di}].u64[1] = 0; }}")
     # Anything else with an xmm operand is counted, never handed back: lift32's
     # MMX forms share these mnemonics (psrlq, pcmpeqd) and would lift the xmm
     # register as "unknown reg", a silent wrong value instead of a counted gap.
