@@ -69,6 +69,25 @@ _PROLOGUES = [re.compile(p, re.S) for p in (
 )]
 
 
+def _retf_target(recent):
+    """The offset of a `push <sel>; push <off>; retf` far jump, when <off> is
+    an immediate: `push imm16`, or `mov r16, imm16; push r16` (not o32)."""
+    if len(recent) < 3 or recent[-2].mnemonic != 'push' or recent[-2].raw[:1] == b'\x66':
+        return None
+    p = recent[-2].op1
+    if p is None:
+        return None
+    if p.type in (OpType.IMM8, OpType.IMM16):
+        return p.disp & 0xFFFF
+    if p.type != OpType.REG16:
+        return None
+    for i in recent[-3:-6:-1]:   # the nearest write to that register
+        o1, o2 = i.op1, i.op2
+        if o1 is not None and o1.type == OpType.REG16 and o1.reg == p.reg:
+            return o2.disp & 0xFFFF if i.mnemonic == 'mov' and o2 is not None and o2.type == OpType.IMM16 else None
+    return None
+
+
 class _Bad(Exception):
     """A speculative seed reached something that is not code."""
 
@@ -254,6 +273,14 @@ class CodeMap:
                                 for t in sorted({t for _, t in tgts}, reverse=True))
                     break
                 elif m in _STOP or (m == 'int' and op is not None and (op.disp & 0xFF) == 0x20):
+                    # `push <selector>; push imm16; retf` is a far jump whose
+                    # selector is data (KRNL386 BootStrap: push [259A]; push
+                    # B711h; retf into segment 1 as it reloaded it): the
+                    # offset is taken to be in this segment.
+                    # (or `push ax; mov ax, imm16; push ax; retf`).
+                    t = _retf_target(recent) if m == 'retf' and op is None else None
+                    if t is not None and t < len(s.data):
+                        work.append((sidx, t, True))
                     break
                 off = nxt
 

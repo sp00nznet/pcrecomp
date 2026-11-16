@@ -229,6 +229,12 @@ class NELifter(Lifter):
         # dispatch (seg035_03B2: mov sp,bx; push dx; push ax; retf) works as a
         # return under patch_borland_eh, and changing it is untested there.
         prev, self._prev_inst = getattr(self, '_prev_inst', None), inst
+        # An o32 retf pops eip and a 32-bit cs: KRNL386's call into flat
+        # 32-bit code (identity.c w16_far32).
+        if _IDENTITY and m == 'retf' and op1 is None and inst.raw[:1] == b'\x66':
+            self._emit('w16_retf32(cpu); return;',
+                       orig + ' (o32: into flat code)')
+            return
         if _IDENTITY and m == 'retf' and op1 is None and prev is not None and prev.mnemonic == 'push' and \
                 prev.address >= 0 and prev.address + prev.length == inst.address:
             self._emit('{ uint16_t _o = pop16(cpu); uint16_t _s = pop16(cpu); dispatch_far(cpu, _s, _o); return; }',
@@ -267,6 +273,11 @@ class NELifter(Lifter):
             if func_name and not func_name.startswith('/*'):
                 self._emit(f'push16(cpu, cpu->cs); push16(cpu, 0x{local_off + inst.length:04X});',
                            'far call return addr')
+                # Identity mode: the fixup KRNL386's loader patched names the
+                # target segment's block; bind SEG_n to it before its code runs.
+                tn = re.match(r'seg(\d+)_', func_name)
+                if _IDENTITY and tn and int(tn.group(1)) != self.seg.index:
+                    self._emit(f'W16_SEGIN({int(tn.group(1))});', 'target segment bound')
                 self._emit(f'{func_name}(cpu);', orig)
             elif func_name:
                 self._emit(func_name, orig)

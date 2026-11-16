@@ -197,12 +197,19 @@ extern unsigned g_ds_run;
  * shares memory with lifted 32-bit code, as Win9x's USER.EXE and user32 do. */
 #ifdef RECOMP_W16_IDENTITY
 uint32_t recomp_sel_base(uint32_t sel);
+/* Linear 0-FFFFh (IVT, BIOS data, what Win98 keeps at 1000h) cannot be
+ * mapped in a Win11 process: those addresses go to a host block instead
+ * (identity.c g_w16_low). */
+extern uint8_t g_w16_low[0x10000];
+static inline uint32_t w16_lin(uint32_t a) { return a < 0x10000u ? (uint32_t)(uintptr_t)(g_w16_low + a) : a; }
 #define W16_SEL_BASE(cpu, sel) ((void)(cpu), recomp_sel_base(sel))
+#define W16_LIN(a) w16_lin(a)
 #else
 #define W16_SEL_BASE(cpu, sel) ((cpu)->sel_base[sel])
+#define W16_LIN(a) (a)
 #endif
 static inline uint32_t seg_off(CPU *cpu, uint16_t seg, uint16_t off) {
-    return W16_SEL_BASE(cpu, seg) + off;
+    return W16_LIN(W16_SEL_BASE(cpu, seg) + off);
 }
 
 /* LAR/LSL: protected-mode selector queries the engine uses to validate a far
@@ -359,7 +366,7 @@ static inline void mem_write32(CPU *cpu, uint16_t seg, uint16_t off, uint32_t va
  * a big limit does under 386 Enhanced mode. */
 #define ADDR32(x) ((uint32_t)(x))
 static inline uint8_t mem_read8_32(CPU *cpu, uint16_t seg, uint32_t off) {
-    uint32_t a = W16_SEL_BASE(cpu, seg) + off;
+    uint32_t a = W16_LIN(W16_SEL_BASE(cpu, seg) + off);
 #ifdef RECOMP_MEM_HOOK
     uint8_t v;
     if (recomp_mem_read8(cpu, a, &v)) return v;
@@ -367,7 +374,7 @@ static inline uint8_t mem_read8_32(CPU *cpu, uint16_t seg, uint32_t off) {
     return cpu->mem[a];
 }
 static inline void mem_write8_32(CPU *cpu, uint16_t seg, uint32_t off, uint8_t v) {
-    uint32_t a = W16_SEL_BASE(cpu, seg) + off;
+    uint32_t a = W16_LIN(W16_SEL_BASE(cpu, seg) + off);
 #ifdef RECOMP_MEM_HOOK
     if (recomp_mem_write8(cpu, a, v)) return;
 #endif
@@ -390,12 +397,24 @@ static inline void mem_write32_32(CPU *cpu, uint16_t seg, uint32_t off, uint32_t
 
 /* ── Stack operations ──────────────────────────────────────── */
 
+/* A big (B-bit) stack: KRNL386 switches to a flat 32-bit stack to call
+ * kernel32 (seg001_6500); push/pop then move esp. Checked only when esp's
+ * high half is set, so a 16-bit stack pays one compare. */
+#ifdef RECOMP_W16_IDENTITY
+int w16_ss_big(uint16_t ss);
+#define W16_BIGSTACK(cpu) (((cpu)->esp >> 16) && w16_ss_big((cpu)->ss))
+#else
+#define W16_BIGSTACK(cpu) 0
+#endif
+
 static inline void push16(CPU *cpu, uint16_t val) {
+    if (W16_BIGSTACK(cpu)) { cpu->esp -= 2; mem_write16_32(cpu, cpu->ss, cpu->esp, val); return; }
     cpu->sp -= 2;
     mem_write16(cpu, cpu->ss, cpu->sp, val);
 }
 
 static inline uint16_t pop16(CPU *cpu) {
+    if (W16_BIGSTACK(cpu)) { uint16_t v = mem_read16_32(cpu, cpu->ss, cpu->esp); cpu->esp += 2; return v; }
     uint16_t val = mem_read16(cpu, cpu->ss, cpu->sp);
     cpu->sp += 2;
     return val;
@@ -403,11 +422,13 @@ static inline uint16_t pop16(CPU *cpu) {
 
 /* 32-bit stack ops (operand-size 0x66 prefix). SP is still 16-bit. */
 static inline void push32(CPU *cpu, uint32_t val) {
+    if (W16_BIGSTACK(cpu)) { cpu->esp -= 4; mem_write32_32(cpu, cpu->ss, cpu->esp, val); return; }
     cpu->sp -= 4;
     mem_write32(cpu, cpu->ss, cpu->sp, val);
 }
 
 static inline uint32_t pop32(CPU *cpu) {
+    if (W16_BIGSTACK(cpu)) { uint32_t v = mem_read32_32(cpu, cpu->ss, cpu->esp); cpu->esp += 4; return v; }
     uint32_t val = mem_read32(cpu, cpu->ss, cpu->sp);
     cpu->sp += 4;
     return val;

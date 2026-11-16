@@ -38,7 +38,7 @@ void recomp_sel_write(uint16_t seg, uint16_t off, uint16_t val) { (void)seg; (vo
 /* native32's registers (recomp32/recomp_types.h) and Win9x segment state (vxd32.c) */
 extern uint32_t g_eax, g_ecx, g_edx, g_ebx, g_esp, g_ebp, g_esi, g_edi;
 extern uint32_t g_ss_base;
-extern uint16_t g_seg_ss, g_seg_ds, g_seg_es;
+extern uint16_t g_seg_ss, g_seg_ds, g_seg_es, g_seg_fs, g_seg_gs;
 
 static void w16_stop(const char *what, unsigned a, unsigned b) {
     fprintf(stderr, "\n[w16] %s %04X:%04X; last functions:", what, a, b);
@@ -72,12 +72,41 @@ static void d_set_base(uint8_t *d, uint32_t b) { d[2] = (uint8_t)b; d[3] = (uint
  * at a fixed address; the first 64 KB (paragraphs 0-0FFFh: the IVT, BIOS
  * data, DOS) stays unmapped. KRNL386's PSP is at 1000h. */
 static int g_rm;
+uint8_t g_w16_low[0x10000];   /* linear 0-FFFFh (cpu.h w16_lin) */
+static uint32_t g_w16_ret;   /* the flat return of the innermost w16_enter on a big stack */
+
+/* What a PC's first megabyte holds before DOS: every IVT vector at an iret
+ * in the BIOS, a BIOS data area for a VGA colour text screen, 640 KB, no
+ * serial ports, LPT1 at 378h, an empty keyboard buffer; option-ROM space
+ * C0000-EFFFF reads FFh (no adapter ROMs: no 55AAh signature to find); the
+ * BIOS segment has its reset jump, date and model byte (FCh: AT). Nothing
+ * here is a real machine's; it only has to be believable. */
+static void w16_bios(void) {
+    uint8_t *lo = g_w16_low, *hi = (uint8_t *)(uintptr_t)0;
+    for (int v = 0; v < 256; v++) *(uint32_t *)(lo + v * 4) = 0xF000FF53u;
+    uint8_t *bda = lo + 0x400;
+    *(uint16_t *)(bda + 0x08) = 0x378;                 /* LPT1 */
+    *(uint16_t *)(bda + 0x10) = 0x0026;                /* equipment: FPU, PS/2 mouse, 80x25 colour */
+    *(uint16_t *)(bda + 0x13) = 640;                   /* conventional memory, KB */
+    *(uint16_t *)(bda + 0x1A) = *(uint16_t *)(bda + 0x1C) = 0x1E;   /* keyboard buffer empty */
+    *(uint16_t *)(bda + 0x80) = 0x1E; *(uint16_t *)(bda + 0x82) = 0x3E;
+    bda[0x49] = 3; *(uint16_t *)(bda + 0x4A) = 80; *(uint16_t *)(bda + 0x4C) = 4096;
+    *(uint16_t *)(bda + 0x63) = 0x3D4; bda[0x65] = 0x29; bda[0x84] = 24; *(uint16_t *)(bda + 0x85) = 16;
+    bda[0x87] = 0x60; bda[0x88] = 0x09; bda[0x89] = 0x11;   /* EGA/VGA flags */
+    memset(hi + 0xC0000, 0xFF, 0x30000);               /* no option ROMs */
+    memset(hi + 0xF0000, 0xFF, 0x10000);
+    hi[0xFFF53] = 0xCF;                                /* iret */
+    memcpy(hi + 0xFFFF0, "\xEA\x5B\xE0\x00\xF0" "06/23/99", 13);
+    hi[0xFFFFE] = 0xFC;
+}
+
 uint32_t w16_real_base(void) {
     /* the launcher holds the range (native32_hold_range) before this
      * process's loader can put its own mappings there */
     if (!g_rm && !VirtualAlloc((void *)0x10000, 0x100000, MEM_COMMIT, PAGE_READWRITE) &&
         !VirtualAlloc((void *)0x10000, 0x100000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))
         w16_stop("real-mode memory at 0x10000 is taken (native32_hold_range not called?)", GetLastError(), 0);
+    if (!g_rm) w16_bios();
     g_rm = 1;
     return 0;
 }
@@ -184,9 +213,17 @@ static void host_far(CPU *c, uint16_t off) {
         if (c->ax == 0x100) { c->ax = native32_w9x_ldt_alias(); ok(c); return; }   /* LDT alias */
         break;
     }
+    if (off == H_VXD + 0x442 && c->ax == 9) { c->ax = 0; ok(c); return; }   /* ponytail: 0 until a reader needs more */
     if (off == H_VXD + 0x2A) switch (c->ah) {   /* VWIN32's PM API, KRNL386's calls through DGROUP:1A80 */
-    case 0x00: c->ax = 0x040A; ok(c); return;   /* version: KRNL386 wants >= 100h (4.10, Win98) */
-    case 0x08: c->al = 0; ok(c); return;         /* -> DGROUP:1417, a flag read as "nonzero?" (ponytail: 0 until a caller needs 1) */
+    case 0x00:   /* version: KRNL386 wants >= 100h (4.10, Win98); edx nonzero (seg001_6A63: the
+                  * Win32 kernel is there: kernel32's base, ponytail: a guess, only tested != 0).
+                  * KRNL386 then finds kernel32's export block ('KEXP', its first section) at flat
+                  * 1000h and stores its DGROUP:1AC7 through the pointer at +4, into kernel32. */
+        c->ax = 0x040A; c->edx = 0xBFF70000u;
+        if (!memcmp((void *)(uintptr_t)0xBFF71000u, "KEXP", 4)) memcpy(g_w16_low + 0x1000, (void *)(uintptr_t)0xBFF71000u, 0x100);
+        ok(c); return;
+    case 0x04: c->eax = 0; ok(c); return;        /* seg001_7898 -> dx:ax into DGROUP:12EC (ponytail: 0 until a reader needs it) */
+    case 0x08: c->al = 0; ok(c); return;        /* -> DGROUP:1417, a flag read as "nonzero?" (ponytail: 0 until a caller needs 1) */
     case 0x03: {   /* VMM page services: args on the 16-bit stack, ecx bytes of them, which
                     * the entry removes (KRNL386 seg001_1FF7 pops what it pushed before them);
                     * result in eax */
@@ -217,6 +254,13 @@ static void host_far(CPU *c, uint16_t off) {
 
 static void int2f(CPU *c) {
     switch (c->ax) {
+    case 0x4A16: case 0x4A17: case 0x4A18:   /* IO.SYS boot log open/write/close (KRNL386 seg002_4B5C): no BOOTLOG.TXT, ax unchanged */
+        return;
+    case 0x168D:   /* es:di into the table KRNL386 hands VWIN32 0Ch (seg001_6B2A, unchecked): kernel32
+                    * is the host's already, so nothing reads it: 0:0 */
+        c->es = 0; c->di = 0; return;
+    case 0xFE03:   /* Norton Utilities TSR check (si:di 'CF','NU', CF set; KRNL386 seg001_8436): none, CF stays set */
+        return;
     case 0x1687:   /* DPMI present: 32-bit clients, 386, v0.90, no private data, entry es:di */
         c->ax = 0; c->bx = 1; c->cl = 3; c->dx = 0x005A; c->si = 0;
         c->es = host_sel(); c->di = H_DPMI_SWITCH; return;
@@ -229,7 +273,8 @@ static void int2f(CPU *c) {
         static const struct { uint16_t id; const char *name; int present; } vxd[] = {
             { 0x0001, "VMM", 0 },        /* KRNL386 seg001_B83D (after BootStrap's reload): ax=26Dh/26Eh into DGROUP:1450, optional */
             { 0x0021, "PAGEFILE", 0 },   /* KRNL386 seg001_BEF9: paging-file info (ax=1), optional */
-            { 0x002A, "VWIN32", 1 },     /* KRNL386 seg001_7293: ah=0, then ah=8 -> al into DGROUP:1417; GlobalInit's caller needs it */
+            { 0x002A, "VWIN32", 1 },
+            { 0x0442, "VTDAPI", 1 },     /* KRNL386 seg001_6E8D: ax=9 -> DGROUP:1A88 and the table it hands kernel32, unchecked */     /* KRNL386 seg001_7293: ah=0, then ah=8 -> al into DGROUP:1417; GlobalInit's caller needs it */
         };
         for (unsigned i = 0; i < sizeof vxd / sizeof *vxd; i++)
             if (vxd[i].id == c->bx) {   /* absent: 0:0; present: a tagged entry that stops when called */
@@ -317,8 +362,10 @@ static uint16_t g_alias[8192];
  * (NE header in memory: +1C segment count, +22 segment table of 10-byte
  * entries {.., +4 flags (4 = loaded), +8 handle}, +26 resident names with
  * the module name first). Returns sel's segment, or 0. */
-static uint16_t w16_rebind(uint16_t sel) {
-    uint16_t dgs = *(uint16_t *)(uintptr_t)(recomp_sel_base(g_w16_segsel[1]) + 2);   /* KERNEL cs:[2] */
+static uint16_t w16_rebind(uint16_t sel, uint16_t want) {
+    /* KERNEL's DGROUP: its bound selector, or cs:[2] before the first bind */
+    uint16_t kd = RECOMP_MODULES[0].dgroup, dgs = g_w16_segsel[kd];
+    if (dgs == (uint16_t)(kd << 3 | 7)) dgs = *(uint16_t *)(uintptr_t)(recomp_sel_base(g_w16_segsel[1]) + 2);
     uint32_t dg = recomp_sel_base(dgs);
     if (!dg) return 0;
     uint32_t bm = recomp_sel_base(*(uint16_t *)(uintptr_t)(dg + 0x121E));
@@ -331,7 +378,7 @@ static uint16_t w16_rebind(uint16_t sel) {
     const uint8_t *ne = (const uint8_t *)(uintptr_t)recomp_sel_base(own | 1);
     if (!ne) return 0;   /* no 'NE' check: KERNEL's own reads 0 there during BootStrap */
     const uint8_t *nm = ne + *(uint16_t *)(ne + 0x26);
-    if (getenv("W16_TRACE")) { const uint8_t *st = ne + *(uint16_t *)(ne + 0x22); fprintf(stderr, "[w16] rebind %04X: owner %04X %.*s, %u segments, flags:handle %04X:%04X %04X:%04X %04X:%04X %04X:%04X\n", sel, own, nm[0], nm + 1, *(uint16_t *)(ne + 0x1C), *(uint16_t *)(st + 4), *(uint16_t *)(st + 8), *(uint16_t *)(st + 14), *(uint16_t *)(st + 18), *(uint16_t *)(st + 24), *(uint16_t *)(st + 28), *(uint16_t *)(st + 34), *(uint16_t *)(st + 38)); }
+    if (getenv("W16_TRACE")) { const uint8_t *st = ne + *(uint16_t *)(ne + 0x22); fprintf(stderr, "[w16] rebind %04X: owner %04X @%p %.*s, %u segments, flags:handle %04X:%04X %04X:%04X %04X:%04X %04X:%04X\n", sel, own, (void *)ne, nm[0], nm + 1, *(uint16_t *)(ne + 0x1C), *(uint16_t *)(st + 4), *(uint16_t *)(st + 8), *(uint16_t *)(st + 14), *(uint16_t *)(st + 18), *(uint16_t *)(st + 24), *(uint16_t *)(st + 28), *(uint16_t *)(st + 34), *(uint16_t *)(st + 38)); }
     uint16_t hit = 0;
     for (int m = 0; m < RECOMP_NUM_MODULES; m++) {
         const RecompModule *rm = &RECOMP_MODULES[m];
@@ -345,7 +392,7 @@ static uint16_t w16_rebind(uint16_t sel) {
              * of its code runs). Other segments may hold a handle before
              * their bytes are loaded (C597 allocates all of KERNEL's at
              * once; the flags say nothing), so they wait for their own call. */
-            if (!h || ((ns | 7) != (sel | 7) && n != rm->dgroup)) continue;
+            if (!h || ((ns | 7) != (sel | 7) && n != rm->dgroup && n != want)) continue;
             if (g_w16_segsel[n] != ns && getenv("W16_TRACE"))
                 fprintf(stderr, "[w16] %s seg %u (lifted %u): selector %04X -> %04X\n", rm->name, s + 1, n, g_w16_segsel[n], ns);
             g_w16_segsel[n] = ns; g_alias[ns >> 3] = n;
@@ -366,9 +413,72 @@ static uint16_t seg_of(uint16_t sel) {
         uint32_t b = recomp_sel_base(sel);
         for (uint16_t n = 1; n <= RECOMP_NUM_SEG; n++)
             if (recomp_sel_base(g_w16_segsel[n]) == b) { g_alias[i] = n; break; }
-        if (!g_alias[i]) w16_rebind(sel);
+        if (!g_alias[i]) w16_rebind(sel, 0);
     }
     return g_alias[i];
+}
+/* An o32 retf (66 CB) to sel:eip. KRNL386 calls into kernel32 this way
+ * (seg001_6500, "call KEXP entry bx"): it switches to a flat stack, puts
+ * the kernel32 function and the flat code selector on it, with a flat
+ * return to its own 32-bit stub (seg 1 +656C), and does a 32-bit retf. The
+ * function runs as lifted 32-bit code on that stack; the stub it returns
+ * to is not lifted (32-bit code in a 16-bit segment), so its effect is
+ * done here: ss = di, sp = esp - esi, push ss, push FFFFh, push ebx (the
+ * 16:16 return), and a 16-bit retf to the sel:off it names (8E D7 2B E6
+ * 66 16 66 68 FF FF 53 66 68 sel 66 68 off 66 CB). */
+typedef void (*w16_fn32)(void);
+w16_fn32 recomp_lookup(uint32_t va);
+void dispatch_far(CPU *cpu, uint16_t sel, uint16_t off);
+/* A flat 32-bit stack: B bit and base 0 (KRNL386's __FLATDS). ponytail: the host gives every
+ * data selector it allocates the B bit (QT_Thunk's alias stack too), so B alone is not enough. */
+int w16_ss_big(uint16_t ss) { return (ss & 4) && (native32_w9x_desc(ss)[6] & 0x40) && !recomp_sel_base(ss); }
+void w16_retf32(CPU *c) {
+    /* eip and a 32-bit cs from ss:esp when ss is a big (B) segment, else ss:sp */
+    uint32_t sb = recomp_sel_base(c->ss);
+    int big = w16_ss_big(c->ss);
+    uint32_t sp = big ? c->esp : c->sp;
+    uint32_t eip = *(uint32_t *)(uintptr_t)w16_lin(sb + sp);
+    uint16_t sel = *(uint16_t *)(uintptr_t)w16_lin(sb + sp + 4);
+    if (big) c->esp += 8; else c->sp = (uint16_t)(c->sp + 8);
+    if (getenv("W16_TRACE")) fprintf(stderr, "[w16] far32 %04X:%08X ss:esp %04X:%08X\n", sel, eip, c->ss, c->esp);
+    if (g_w16_ret && eip == g_w16_ret) return;   /* back to kernel32: w16_enter unwinds */
+    w16_fn32 f = (sel & 4) && !recomp_sel_base(sel) ? recomp_lookup(eip) : NULL;   /* a flat code selector */
+    if (!f) w16_stop("o32 retf to", sel, eip);
+    uint32_t ret = *(uint32_t *)(uintptr_t)(sb + c->esp);
+    static const uint8_t stub[] = { 0x66, 0x8E, 0xD7, 0x2B, 0xE6, 0x66, 0x16, 0x66, 0x68, 0xFF, 0xFF, 0x53, 0x66, 0x68 };
+    const uint8_t *r = (const uint8_t *)(uintptr_t)ret;
+    if (memcmp(r, stub, sizeof stub) || r[16] != 0x66 || r[17] != 0x68 || r[20] != 0x66 || r[21] != 0xCB)
+        w16_stop("flat return is not KRNL386's 32->16 stub", ret >> 16, ret & 0xFFFF);
+    uint32_t se[8] = { g_eax, g_ecx, g_edx, g_ebx, g_esp, g_ebp, g_esi, g_edi };
+    uint16_t sss = g_seg_ss, sds = g_seg_ds, ses = g_seg_es; uint32_t ssb = g_ss_base;
+    g_eax = c->eax; g_ecx = c->ecx; g_edx = c->edx; g_ebx = c->ebx;
+    g_ebp = c->ebp; g_esi = c->esi; g_edi = c->edi;
+    g_seg_ss = c->ss; g_ss_base = sb; g_esp = c->esp;
+    g_seg_ds = c->ds; g_seg_es = c->es;
+    f();
+    c->eax = g_eax; c->ecx = g_ecx; c->edx = g_edx; c->ebx = g_ebx;
+    c->ebp = g_ebp; c->esi = g_esi; c->edi = g_edi;
+    uint32_t lin = g_esp + g_ss_base;   /* past the return the function popped */
+    g_eax = se[0]; g_ecx = se[1]; g_edx = se[2]; g_ebx = se[3]; g_esp = se[4]; g_ebp = se[5]; g_esi = se[6]; g_edi = se[7];
+    g_seg_ss = sss; g_seg_ds = sds; g_seg_es = ses; g_ss_base = ssb;
+    c->ss = c->di; c->esp = lin - c->esi;
+    push16(c, c->ss); push16(c, 0xFFFF); push32(c, c->ebx);
+    dispatch_far(c, *(const uint16_t *)(r + 14), *(const uint16_t *)(r + 18));
+}
+
+/* W16_SEGIN: lifted code makes a direct far call into segment n, whose
+ * fixup KRNL386's loader patched with the block it loaded n into. Bind n
+ * through a segment of the same module that is already bound (its module
+ * database is the one to read). ponytail: a module with nothing bound yet
+ * stays on its placeholder until a dispatched far call reaches it. */
+void w16_segin(uint16_t n) {
+    if (getenv("W16_TRACE")) fprintf(stderr, "[w16] segin %u\n", n);
+    for (int m = 0; m < RECOMP_NUM_MODULES; m++) {
+        const RecompModule *rm = &RECOMP_MODULES[m];
+        if (n < rm->first_seg || n > rm->last_seg) continue;
+        for (uint16_t k = rm->first_seg; k <= rm->last_seg; k++)
+            if (k != n && g_w16_segsel[k] != (uint16_t)(k << 3 | 7)) { w16_rebind(g_w16_segsel[k], n); return; }
+    }
 }
 void dispatch_far(CPU *cpu, uint16_t sel, uint16_t off) {
     if (getenv("W16_TRACE")) fprintf(stderr, "[w16] far %04X:%04X (seg %u) ss:sp %04X:%04X\n", sel, off, seg_of(sel), cpu->ss, cpu->sp);
@@ -405,6 +515,8 @@ void dispatch_near(CPU *cpu, uint16_t seg, uint16_t off) {   /* seg: the segment
 
 static CPU g_w16;
 static int g_w16_ready;
+static uint16_t seg_of(uint16_t sel);
+int w16_ss_big(uint16_t ss);
 
 int w16_enter(uint32_t target) {
     uint16_t sel = (uint16_t)(target >> 16), off = (uint16_t)target;
@@ -412,17 +524,38 @@ int w16_enter(uint32_t target) {
     CPU saved = g_w16, *c = &g_w16;
     c->eax = g_eax; c->ecx = g_ecx; c->edx = g_edx; c->ebx = g_ebx;
     c->esi = g_esi; c->edi = g_edi; c->ebp = g_ebp; c->esp = g_esp;
-    c->ss = g_seg_ss; c->ds = g_seg_ds; c->es = g_seg_es; c->cs = sel;
-    /* the far return the callee's retf will pop: a stub's `jmp far 32:off` */
-    uint32_t ret = mem_read32(c, c->ss, c->sp);
-    if (getenv("W16_TRACE")) fprintf(stderr, "[w16] enter %04X:%04X ss:sp %04X:%04X ds %04X ret %08X\n", sel, off, c->ss, c->sp, c->ds, ret);
-    const uint8_t *stub = (const uint8_t *)(uintptr_t)(recomp_sel_base(ret >> 16) + (ret & 0xFFFF));
-    if (stub[0] != 0x66 || stub[1] != 0xEA) w16_stop("thunk return is not a jmp far 32", ret >> 16, ret & 0xFFFF);
-    uint32_t cont;
-    memcpy(&cont, stub + 2, 4);
-    if (!recomp_dispatch_lookup(c, (uint16_t)(sel >> 3), off)) w16_stop("no lifted function at", sel, off);
+    c->ss = g_seg_ss; c->ds = g_seg_ds; c->es = g_seg_es; c->fs = g_seg_fs; c->gs = g_seg_gs; c->cs = sel;
+    /* On a flat (big) stack the caller is kernel32 calling KRNL386's own
+     * 32->16 entry (seg 1 +6582, through the table at KEXP+4): [esp] is its
+     * flat return, and the 16-bit side comes back by an o32 retf to it
+     * (w16_retf32 sees g_w16_ret and unwinds). Otherwise it is QT_Thunk's
+     * 16-bit alias stack: the far return the callee's retf pops names a
+     * stub's `jmp far 32:off`. */
+    uint32_t cont, prev = g_w16_ret;
+    int big = w16_ss_big(c->ss);
+    if (big) {
+        cont = *(uint32_t *)(uintptr_t)(recomp_sel_base(c->ss) + c->esp);
+        if (getenv("W16_TRACE")) fprintf(stderr, "[w16] enter %04X:%04X ss:esp %04X:%08X ds %04X fs %04X@%08X (+C %04X +E %04X +18 %08X +1C %04X) flat ret %08X\n", sel, off, c->ss, c->esp, c->ds, c->fs, recomp_sel_base(c->fs),
+            mem_read16(c, c->fs, 0xC), mem_read16(c, c->fs, 0xE), mem_read32(c, c->fs, 0x18), mem_read16(c, c->fs, 0x1C), cont);
+        g_w16_ret = cont;
+    } else {
+        uint32_t ret = mem_read32(c, c->ss, c->sp);
+        if (getenv("W16_TRACE")) fprintf(stderr, "[w16] enter %04X:%04X ss:sp %04X:%04X ds %04X ret %08X\n", sel, off, c->ss, c->sp, c->ds, ret);
+        const uint8_t *stub = (const uint8_t *)(uintptr_t)(recomp_sel_base(ret >> 16) + (ret & 0xFFFF));
+        if (stub[0] != 0x66 || stub[1] != 0xEA) w16_stop("thunk return is not a jmp far 32", ret >> 16, ret & 0xFFFF);
+        memcpy(&cont, stub + 2, 4);
+    }
+    if (!recomp_dispatch_lookup(c, seg_of(sel), off)) w16_stop("no lifted function at", sel, off);
+    g_w16_ret = prev;
     g_eax = c->eax; g_ecx = c->ecx; g_edx = c->edx; g_ebx = c->ebx;
     g_esi = c->esi; g_edi = c->edi; g_ebp = c->ebp;
+    if (big) {   /* the o32 retf popped cont and cs: put cont back for the lifted retf that called us */
+        g_esp = c->esp - 8;
+        *(uint32_t *)(uintptr_t)(g_ss_base + g_esp) = cont;
+        *(uint32_t *)(uintptr_t)(g_ss_base + g_esp + 4) = 0;
+        g_w16 = saved;
+        return 1;
+    }
     /* back at the stub's target, as its jmp would land: esp keeps the 16-bit
      * sp (QT_Thunk's tail rebuilds the flat esp from sp itself), and the
      * lifted retf that called us pops [esp] as the place to go next. */

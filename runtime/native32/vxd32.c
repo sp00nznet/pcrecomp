@@ -1117,6 +1117,7 @@ static uint32_t vwin32_int21(const uint32_t* a) {
     case 0xEA:                                                 /* AX=EA00, kernel32 _INIT (0xBFFC6F47): BX -> 0xBFFC9CCC, */
         if (al == 0) { SET16(g_ebx, 0); return g_eax; }        /* tested before a 'NETQ' check (0xBFF7FC9B): no network */
         break;
+    case 0x0D: return g_eax;                                   /* disk reset (KRNL386 at boot): nothing cached */
     case 0x0E: SET8L(g_eax, 26); return g_eax;                 /* select drive: 26 letters */
     case 0x19: SET8L(g_eax, 2); return g_eax;                  /* current drive: C: */
     case 0x2A: { SYSTEMTIME t; GetLocalTime(&t);
@@ -1426,6 +1427,10 @@ uint32_t recomp_sel_base(uint32_t sel) {
 /* A data selector on [base, base+limit] in the host's LDT: what VWIN32 or
  * KRNL386 would have allocated. */
 uint16_t native32_w9x_alloc_sel(uint32_t base, uint32_t limit) {
+    /* KRNL386 writes the LDT itself (its alias from int 2Fh 168Ah): skip
+     * descriptors it holds, including its free chain (nonzero bytes) */
+    while (g_next_sel > 7 && (*(uint32_t*)(g_ldt + (g_next_sel & ~7u)) || *(uint32_t*)(g_ldt + (g_next_sel & ~7u) + 4)))
+        g_next_sel += 8;
     uint16_t sel = g_next_sel;
     uint8_t* d = g_ldt + (sel & ~7u);
     g_next_sel += 8;

@@ -70,6 +70,9 @@ def main():
     if ident:   # the selector KRNL386's loader gave segment n (identity.c w16_rebind)
         L += ["extern uint16_t g_w16_segsel[];"]
         L += [f"#define SEG_{n} (g_w16_segsel[{n}])" for n in range(1, max_seg + 1)]
+        L += ["void w16_retf32(CPU *cpu);   /* an o32 retf (into flat 32-bit code) */"]
+        L += ["void w16_segin(uint16_t n);   /* a direct far call into segment n: bind it first */",
+              "#define W16_SEGIN(n) do { if (g_w16_segsel[n] == (uint16_t)((n) << 3 | 7)) w16_segin(n); } while (0)"]
     else:
         L += [f"#define SEG_{n} ((uint16_t){n})" for n in range(1, max_seg + 1)]
     L.append("")
