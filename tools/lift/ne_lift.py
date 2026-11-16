@@ -269,6 +269,18 @@ class NELifter(Lifter):
                 return i.op1.disp if i.op1 is not None else 0
         return None
 
+    @staticmethod
+    def _pushed_cs_imm(run):
+        """The offset of a `push cs; push imm16` (or `push cs; mov r, imm16;
+        push r`) that ends the straight run before this instruction, or None."""
+        b = [bytes(i.raw) for i in run[:-1]]
+        if len(b) >= 2 and b[-2] == b'\x0e' and b[-1][:1] == b'\x68' and len(b[-1]) == 3:
+            return int.from_bytes(b[-1][1:3], 'little')
+        if len(b) >= 3 and b[-3] == b'\x0e' and len(b[-2]) == 3 and 0xB8 <= b[-2][0] <= 0xBF and \
+                len(b[-1]) == 1 and b[-1][0] == 0x50 + b[-2][0] - 0xB8:
+            return int.from_bytes(b[-2][1:3], 'little')
+        return None
+
     def _pushes_cs_cont(self, run):
         """True when the straight run before a retf pushes `cs`, then an
         immediate offset (push imm, or `mov reg, imm16` just before the push
@@ -463,7 +475,14 @@ class NELifter(Lifter):
             if (target not in self.valid_addrs
                     and target in getattr(self, 'seg_func_offsets', ())):
                 callee = f'seg{self.seg.index:03d}_{target:04X}'
-                if m == 'jmp':
+                cont = self._pushed_cs_imm(self._run) if _IDENTITY and m == 'jmp' else None
+                if cont is not None:
+                    # `push cs; push imm; jmp near f` (or `mov ax, imm; push ax`):
+                    # a far call to f, back at imm (KRNL386 seg1 C113, BootStrap
+                    # into its scheduler at 5E13). As a tail call f's retf left.
+                    self._emit(f'{callee}(cpu); if (cpu->ret_ip == 0x{cont:04X}) dispatch_near(cpu, {self.seg.index}, 0x{cont:04X}); return;',
+                               orig + ' (a far call, back to the pushed cs:continuation)')
+                elif m == 'jmp':
                     self._emit(f'{callee}(cpu); return;', orig)
                 else:
                     self._emit(f'if ({_CC[m]}(cpu)) {{ {callee}(cpu); return; }}', orig)
@@ -513,6 +532,14 @@ class NELifter(Lifter):
             # second time on a stack that is already unwound. Tail-call it.
             if target in getattr(self, 'popret_offsets', ()):
                 self._emit(f'{func_name}(cpu); return;', orig + ' (pops its return address)')
+                return
+            if _IDENTITY and target in getattr(self, 'retjump_offsets', ()):
+                # its near `ret` pops an address it pushed (KRNL386 seg1 852A,
+                # the int 21h hook: `xchg [bp-4], bx; ...; ret` into the
+                # handler, whose `retf 2` comes back here): run what it
+                # returned into until something returns to this call.
+                r = local_off + inst.length
+                self._emit(f"{func_name}(cpu); if (cpu->ret_ip != 0x{r:04X}) w16_retjump(cpu, {self.seg.index}, 0x{r:04X});", orig + ' (returns into a pushed address)')
                 return
             if _IDENTITY and not os.environ.get('NE_NO_RETPAST') and target in getattr(self, 'popsret_offsets', ()):
                 # returned past (the last ret popped another offset than this
@@ -1090,6 +1117,49 @@ def lift_segment(ne: NEHeader, seg_num: int, func_offset: int = -1, xmod=None):
         for f in functions:
             if _pops_past(f.offset):
                 lifter.popsret_offsets.add(f.offset)
+
+    # Functions whose near `ret` is reached with words of their own still on
+    # the stack: it pops an address they pushed, a jump (KRNL386 seg1 852A).
+    # ponytail: same path walk limits as _pops_past (enter/calls/sp end a path).
+    lifter.retjump_offsets = set()
+    if _IDENTITY:
+        def _ret_jumps(start):
+            work, seen, steps = [(start, 0)], set(), 0
+            while work and steps < 400:
+                o, d = work.pop()
+                while o in _by_off and (o, d) not in seen and steps < 400:
+                    seen.add((o, d)); steps += 1
+                    i = _by_off[o]
+                    mn = i.mnemonic
+                    w = 4 if 0x66 in bytes(i.raw[:2]) else 2
+                    if mn == 'ret':
+                        if d > 0:
+                            return True
+                        break
+                    if mn in ('push', 'pushf'):
+                        d += w
+                    elif mn in ('pop', 'popf'):
+                        d -= w
+                        if d < 0:
+                            break
+                    elif mn in ('call', 'enter', 'leave', 'retf', 'iret', 'int', 'pusha', 'pushad', 'popa', 'popad'):
+                        break
+                    elif i.op1 is not None and i.op1.type == OpType.REG16 and REG16_NAMES[i.op1.reg] == 'sp' and mn not in ('cmp', 'test'):
+                        break
+                    if mn == 'jmp' or mn.startswith('j') or mn.startswith('loop'):
+                        if i.op1 is None or i.op1.type not in (OpType.REL8, OpType.REL16):
+                            break
+                        if mn == 'jmp':
+                            o = i.op1.disp
+                            continue
+                        work.append((i.op1.disp, d))
+                    o += i.length
+            return False
+        for f in functions:
+            if f.offset not in lifter.popsret_offsets and _ret_jumps(f.offset):
+                lifter.retjump_offsets.add(f.offset)
+        if lifter.retjump_offsets:
+            print(f'  seg {seg.index}: ret-jump functions ' + ' '.join(f'{o:04X}' for o in sorted(lifter.retjump_offsets)), file=sys.stderr)
 
     target_funcs = functions
     if func_offset >= 0:

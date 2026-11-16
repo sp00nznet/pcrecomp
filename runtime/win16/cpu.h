@@ -144,6 +144,7 @@ typedef struct CPU {
 } CPU;
 void w16_retpast(CPU *c, uint16_t ip, const char *fn);   /* identity.c: W16_TRACE logs it */
 #define W16_RETPAST(c, ip) w16_retpast((c), (ip), __func__)
+void w16_retjump(CPU *c, uint16_t seg, uint16_t ip);    /* identity.c: run what a ret-jump returned into */
 
 /* Print the guest call stack. Defined in main.c. */
 void dump_guest_stack(CPU *cpu, int max);

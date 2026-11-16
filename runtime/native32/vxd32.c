@@ -723,6 +723,26 @@ static uint32_t vwin32_block(const uint32_t* a) {
  * share everything already. */
 static uint32_t vwin32_link_thread(const uint32_t* a) { (void)a; return 0; }
 
+/* VWIN32's 16-bit API 01 (ebx = r0 thread, ecx): KRNL386's task switch
+ * (seg1 73BA, from Reschedule 5F54 and the boot thread's idle loop 7404):
+ * after leaving the Win16 lock it hands the CPU to the next task's thread
+ * and sleeps until a switch comes back to it. A thread not yet run (a new
+ * task's, created suspended by kernel32) starts here.
+ * ponytail: ecx (0 or F01h) is not read; every switch blocks the caller
+ * until woken, which the callers' loops re-check. */
+void native32_w9x_switch_to(uint32_t r0) {
+    if (g_trace > 0) fprintf(stderr, "[vxd] switch from %08X to r0 %08X (thread %08X)\n", g_cur[0], r0, r0 ? MEM32(r0 + R0T_THREAD) : 0);
+    if (!r0 || r0 == (t_r0 ? t_r0 : g_boot_r0)) return;   /* to itself: nothing to switch */
+    {
+        if (!MEM32(r0 + R0T_PARKED)) { MEM32(r0 + R0T_READY) = 1; start_thread(r0); }
+        else {
+            if (!MEM32(r0 + R0T_WAKE)) MEM32(r0 + R0T_WAKE) = (uint32_t)(uintptr_t)CreateEventA(NULL, FALSE, FALSE, NULL);
+            SetEvent((HANDLE)(uintptr_t)MEM32(r0 + R0T_WAKE));
+        }
+    }
+    w9x_wait(thread_wake(), INFINITE);
+}
+
 /* VCOND (VxD 38h), the console. 23 (6, &info, sysdir): kernel32's service
  * thread (0xBFF91450) introduces itself once, with the system directory
  * (where CONAGENT.EXE lives); nothing reads the info block (0xBFFC9D30)
@@ -912,6 +932,17 @@ static uint32_t vwin32_thread_starting(const uint32_t* a) { (void)a; return 0; }
  * twin and return the field's offset there: CreateThread keeps r0thread +
  * the result as the TIB's pCurrentPriority (thread+2C, 0xBFF86850). */
 #define R0T_PRIORITY 0x10
+/* VWIN32 13 (r0 thread, 1000h): kernel32 0xBFF91A8E, right after it creates
+ * its own service thread (proc 0xBFF91AC5, 4 KB stack) for the first Win16
+ * task; the result is not read. ponytail: unknown meaning (a stack/commit
+ * size for the thread?); answered 0 and nothing kept. */
+static uint32_t vwin32_13(const uint32_t* a) { (void)a; return 0; }
+
+/* REBOOT (VxD 9) 0 (proc 0xBFFAA127, r0 thread): kernel32's service thread
+ * (0xBFF91B3D) hands it its Ctrl+Alt+Del ("close program") callback. The
+ * host has no such key path: ponytail: kept nowhere, 0. */
+static uint32_t reboot_0(const uint32_t* a) { (void)a; return 0; }
+
 static uint32_t vwin32_set_thread_priority(const uint32_t* a) {
     if (a[0]) MEM32(a[0] + R0T_PRIORITY) = a[1];
     return R0T_PRIORITY;
@@ -1164,6 +1195,22 @@ static uint32_t vwin32_int21(const uint32_t* a) {
     case 0x59:                                                 /* extended error: AX code, BH class, BL action, CH locus */
         SET16(g_eax, g_dos_err); SET16(g_ebx, 0x0D01); g_ecx = (g_ecx & 0xFFFF00FFu) | 0x0200; return g_eax;
     case 0x30: SET16(g_eax, 0x0A07); SET16(g_ebx, 0xFF00); return g_eax;   /* DOS 7.10 */
+    case 0x41:   /* delete DS:DX (boxed) */
+        if (!host_path(g_edx, path)) { dos_fail(3); return g_eax; }
+        if (getenv("W16_TRACE")) fprintf(stderr, "[int21] delete %s\n", path);
+        if (!DeleteFileA(path)) dos_fail(host_err());
+        return g_eax;
+    case 0x55: {   /* create child PSP at DX (KRNL386's LoadModule of a task, MSGSRV32): a copy of
+                    * the current one, SI its memory top, parent = current; it becomes current.
+                    * ponytail: the job file table is shared, not duplicated (no inheritance counts). */
+        uint32_t np = recomp_sel_base((uint16_t)g_edx), op = recomp_sel_base(g_cur_psp);
+        if (!np) { dos_fail(8); return g_eax; }
+        if (op) memmove((void*)(uintptr_t)np, (void*)(uintptr_t)op, 0x100);
+        MEM16(np + 2) = (uint16_t)g_esi; MEM16(np + 0x16) = g_cur_psp;
+        if (g_trace > 0) fprintf(stderr, "[int21] child PSP %04X of %04X\n", (uint16_t)g_edx, g_cur_psp);
+        g_cur_psp = (uint16_t)g_edx;
+        return g_eax;
+    }
     case 0x69:   /* AL 0: BL drive -> DS:DX {+0 level, +2 serial, +6 label[11], +11h fs[8]} (GetVolumeInformationA) */
         if (al == 0) {
             uint8_t d = (uint8_t)g_ebx;
@@ -1395,6 +1442,8 @@ static const vxd_service_t g_services[] = {
     { 0x002A001E, 1, vwin32_crst_wake, "VWIN32_WakeCrst" },
     { 0x002A0020, 1, vwin32_fpu_info, "VWIN32_GetCoprocessor" },
     { 0x002A0021, 2, vwin32_set_thread_priority, "VWIN32_SetThreadPriority" },
+    { 0x002A0013, 2, vwin32_13, "VWIN32_13" },
+    { 0x00090000, 2, reboot_0, "REBOOT_0" },
     { 0x002A0030, 2, vwin32_wait_block_destroy, "VWIN32_DestroyWaitBlock" },
     { 0x002A0060, 1, vwin32_set_event, "VWIN32_SetEvent" },
     { 0x002A0061, 1, vwin32_pulse_event, "VWIN32_PulseEvent" },

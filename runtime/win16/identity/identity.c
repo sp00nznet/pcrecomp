@@ -262,6 +262,12 @@ static void host_far(CPU *c, uint16_t off) {
                   * entries exists here */
         if (getenv("W16_TRACE")) fprintf(stderr, "[w16] VWIN32 0C: es %04X bx %04X cx %04X dx %04X di %04X bp %04X esi %08X\n", c->es, c->bx, c->cx, c->dx, c->di, c->bp, c->esi);
         c->eax = 0; ok(c); return;
+    case 0x01: {   /* task switch (seg1 73BA): ebx = the next task's r0 thread; back when switched to */
+        void native32_w9x_switch_to(uint32_t r0);
+        CPU sv = *c;
+        native32_w9x_switch_to(c->ebx);
+        *c = sv; ok(c); return;
+    }
     case 0x08: c->al = 0; ok(c); return;        /* -> DGROUP:1417, a flag read as "nonzero?" (ponytail: 0 until a caller needs 1) */
     case 0x03: {   /* VMM page services: args on the 16-bit stack, ecx bytes of them, which
                     * the entry removes (KRNL386 seg001_1FF7 pops what it pushed before them);
@@ -706,6 +712,17 @@ void w16_retf_call(CPU *c) {
 
 void dispatch_near(CPU *cpu, uint16_t seg, uint16_t off) {   /* seg: the segment index */
     if (!recomp_dispatch_lookup(cpu, seg, off)) w16_stop("near call miss", seg, off);
+}
+/* A near call to a function whose `ret` pops an address it pushed (KRNL386
+ * seg1 852A rets into its int 21h handler): run each place it returned
+ * into, in the caller's segment, until something returns to the call's ip.
+ * ponytail: 256 hops, then a stop (no handler chains that long yet). */
+void w16_retjump(CPU *c, uint16_t seg, uint16_t ip) {
+    for (int n = 0; c->ret_ip != ip; n++) {
+        if (getenv("W16_TRACE")) fprintf(stderr, "[w16] ret-jump into %u:%04X (for %04X, sp %04X)\n", seg, c->ret_ip, ip, c->sp);
+        if (n == 256) w16_stop("ret-jump never came back, seg:ip", seg, ip);
+        dispatch_near(c, seg, c->ret_ip);
+    }
 }
 
 

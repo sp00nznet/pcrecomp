@@ -1298,7 +1298,8 @@ class Lifter:
                 # does it); a bare return leaves those 6 bytes on the stack.
                 # Opt-in: a runtime that calls an ISR directly must push a
                 # FLAGS/CS/IP frame first, like the CPU does.
-                self._emit('cpu->sp += 4; cpu->flags = pop16(cpu); return;', orig)
+                # ret_ip: the offset it pops (a ret-jump's caller waits for it)
+                self._emit('cpu->ret_ip = pop16(cpu); cpu->sp += 2; cpu->flags = pop16(cpu); return;', orig)
             else:
                 self._emit('/* iret - return from interrupt */', orig)
                 self._emit('return;')
