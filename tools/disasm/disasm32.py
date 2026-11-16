@@ -414,6 +414,27 @@ class Disassembler:
         data = self.read_bytes(va, size)
         if not data:
             return False
+        # Three aligned code addresses in a row are a table, not code: a
+        # vtable in a code section (Windows 2000's binaries merge .rdata into
+        # .text) whose address `mov [esi], offset vtbl` stores. Decoded as a
+        # body it covered the slots, and the data scan then skipped the
+        # functions they name (mspaint's 0x0101E404, reached from MFC).
+        if va % 4 == 0 and len(data) >= 12 and all(
+                bounds[0] <= int.from_bytes(data[k:k + 4], 'little') < sec_end for k in (0, 4, 8)):
+            return False
+        # A NUL-terminated ASCII name is not code either: `push offset
+        # "GetLayout"` ahead of GetProcAddress (mspaint), whose bytes decode
+        # and ran on into the vtable after it.
+        n = 0
+        while n < len(data) and 0x20 <= data[n] < 0x7F:
+            n += 1
+        if n >= 4 and n < len(data) and data[n] == 0:
+            return False
+        n = 0      # and UTF-16 (L"gdi32.dll" right after it)
+        while 2 * n + 1 < len(data) and 0x20 <= data[2 * n] < 0x7F and data[2 * n + 1] == 0:
+            n += 1
+        if n >= 4 and data[2 * n:2 * n + 2] == b'\0\0':
+            return False
 
         end = va
         zeros = 0
@@ -759,12 +780,21 @@ class Disassembler:
                 # no decoded instruction covers: a hand-written renderer's
                 # table of span routines between its functions (Sim Theme
                 # Park's assembler `cseg`, reached by `jmp [table + eax*4]`).
+                # Or one 24 bytes on: MFC's AFX_MSGMAP_ENTRY { msg, code, id,
+                # lastId, sig, pfn } array, the only reference to a handler
+                # (mspaint, in Windows 2000's merged .text).
                 if s.is_code:
                     at = base + off
+                    def ptr(o):
+                        return 0 <= o <= len(data) - 4 and code_start <= int.from_bytes(data[o:o + 4], 'little') < code_end
+                    # Three in a row are a table even where a body decoded
+                    # from bad evidence claims the bytes (a vtable in
+                    # Windows 2000's merged .text, run over by data decoded
+                    # as code).
+                    run3 = ptr(off - 4) and ptr(off + 4)
                     if off % 4 or interior is None or not (code_start <= at and at + 4 <= code_end) \
-                            or any(interior[at - code_start + k] for k in range(4)) \
-                            or not any(0 <= o <= len(data) - 4 and code_start <= int.from_bytes(data[o:o + 4], 'little') < code_end
-                                       for o in (off - 4, off + 4)):
+                            or (not run3 and any(interior[at - code_start + k] for k in range(4))) \
+                            or not any(ptr(o) for o in (off - 4, off + 4, off - 24, off + 24)):
                         continue
                     in_code += 1
                 if va in queued or va in found:

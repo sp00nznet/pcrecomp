@@ -104,6 +104,18 @@ static int class_index(HWND h) {
 static uint32_t class_proc(HWND h) { int i = class_index(h); return i < 0 ? 0 : g_cls[i].proc; }
 /* registered by RegisterClass(Ex)A: its procedure takes ANSI text */
 static int class_ansi(HWND h) { int i = class_index(h); return i >= 0 && g_cls[i].ansi; }
+/* A top-level window's parent is the desktop: IsWindowVisible walks
+ * spwndParent up to a visible WND whose fnid (+0x2A) is 0x29D. Only those
+ * two fields; the desktop's own children are not entered. */
+static uint32_t desktop_wnd(void) {
+    static uint8_t* d;
+    if (!d && (d = desk_alloc(0x100)) != NULL) {
+        memset(d, 0, 0x100);
+        *(uint32_t*)(d + 0x20) = WS_VISIBLE;
+        *(uint16_t*)(d + 0x2A) = 0x29D;
+    }
+    return (uint32_t)(uintptr_t)d;
+}
 static void wnd_sync(HWND h, uint8_t* w) {
     RECT r;
     POINT o = { 0, 0 };
@@ -116,7 +128,7 @@ static void wnd_sync(HWND h, uint8_t* w) {
     ClientToScreen(h, &o);
     OffsetRect(&r, o.x, o.y);
     memcpy(w + 0x4C, &r, sizeof r);
-    *(uint32_t*)(w + 0x30) = p && p != GetDesktopWindow() ? (uint32_t)(uintptr_t)native32_user_wnd(p) : 0;
+    *(uint32_t*)(w + 0x30) = p && p != GetDesktopWindow() ? (uint32_t)(uintptr_t)native32_user_wnd(p) : desktop_wnd();
     *(uint32_t*)(w + 0x38) = own ? (uint32_t)(uintptr_t)native32_user_wnd(own) : 0;
     /* +0x34 spwndChild, and for a child +0x2C spwndNext and +0x74 its ID
      * (spmenu's place): GetDlgItem walks them client-side. A top-level
@@ -155,6 +167,14 @@ uint8_t* native32_user_wnd(void* hv) {
     /* +0x88 cbwndExtra (a dialog's must be DLGWINDOWEXTRA); the extra bytes
      * follow the WND at +0x9C (a dialog's: its DIALOG structure) */
     *(uint32_t*)(w + 0x88) = (uint32_t)GetClassLongW(h, GCL_CBWNDEXTRA);
+    /* +0x60 pcls: GetWindowLong(GWL_WNDPROC) reads the class's fnid (+6)
+     * to map a server-side procedure back; a zeroed CLS has none. ponytail:
+     * one shared CLS, the class's own fields when something reads them */
+    {
+        static uint8_t* cls;
+        if (!cls && (cls = desk_alloc(0x80)) != NULL) memset(cls, 0, 0x80);
+        *(uint32_t*)(w + 0x60) = (uint32_t)(uintptr_t)cls;
+    }
     MEM32(e) = (uint32_t)(uintptr_t)w;
     MEM32(e + 4) = 0;
     MEM8(e + 8) = 1;                                                            /* TYPE_WINDOW */
@@ -273,6 +293,7 @@ static void cb_in(uint32_t* a) {             /* a window the guest is about to h
 /* NtUserRegisterClassExWOW(WNDCLASSEXW*, PUNICODE_STRING class, CLSMENUNAME*,
  * WORD fnid, DWORD flags, DWORD* wow): the host class, with the guest's
  * window procedure and the host's background brush. */
+static uint32_t cur_host(uint32_t h);
 static uint32_t s_register_class(uint32_t* a) {
     WNDCLASSEXW w = *(WNDCLASSEXW*)(uintptr_t)a[0];
     w.cbSize = sizeof w;
@@ -280,6 +301,9 @@ static uint32_t s_register_class(uint32_t* a) {
     if (a[2]) w.lpszMenuName = (LPCWSTR)(uintptr_t)MEM32(a[2] + 4);   /* pwszClientUnicodeMenuName */
     if ((uintptr_t)w.hbrBackground > 0x40 && native32_gdi_host((uint32_t)(uintptr_t)w.hbrBackground))
         w.hbrBackground = (HBRUSH)(uintptr_t)native32_gdi_host((uint32_t)(uintptr_t)w.hbrBackground);
+    w.hIcon = (HICON)(uintptr_t)cur_host((uint32_t)(uintptr_t)w.hIcon);
+    w.hIconSm = (HICON)(uintptr_t)cur_host((uint32_t)(uintptr_t)w.hIconSm);
+    w.hCursor = (HCURSOR)(uintptr_t)cur_host((uint32_t)(uintptr_t)w.hCursor);
     if (getenv("NATIVE32_SYSCALLS"))
         fprintf(stderr, "[user] class background %p (guest %08X)\n", w.hbrBackground, ((WNDCLASSEXW*)(uintptr_t)a[0])->hbrBackground);
     uint32_t guest_proc = (uint32_t)(uintptr_t)w.lpfnWndProc;
@@ -564,13 +588,54 @@ static uint32_t s_call_noparam(uint32_t* a) {
     if (a[0] == 0) return menu(CreateMenu());
     if (a[0] == 1) return menu(CreatePopupMenu());
     if (a[0] == 8) return ReleaseCapture();
+    if (a[0] == 5) return GetMessagePos();
     fprintf(stderr, "[user] NtUserCallNoParam %u not answered\n", a[0]);
     return 0;
 }
+/* Cursors built client-side: NtUserCallOneParam 0x19 (CreateIcon,
+ * CreateIconIndirect, LookupIconIdFromDirectoryEx, LoadCursorFromFile) asks for
+ * an empty cursor object, NtUserSetCursorIconData then fills it. The host
+ * cannot fill an HICON after the fact, so the empty object is a placeholder
+ * host icon (a real, unique handle) and the filled host icon is kept beside
+ * it; cur_host() turns one into the other where a cursor reaches the host.
+ * ponytail: 64 built cursors, a table if a program makes more */
+#define MAX_CURS 64
+static uint32_t g_cur[MAX_CURS][2];
+static int g_ncur;
+static uint32_t cur_host(uint32_t h) {
+    for (int i = 0; i < g_ncur; i++) if (g_cur[i][0] == h && g_cur[i][1]) return g_cur[i][1];
+    return h;
+}
+static uint32_t cur_new(void) {
+    static const BYTE and1[4] = { 0xFF, 0xFF, 0xFF, 0xFF }, xor1[4] = { 0 };
+    HICON p = CreateIcon(NULL, 1, 1, 1, 1, and1, xor1);
+    if (!p || g_ncur >= MAX_CURS) return (uint32_t)(uintptr_t)p;
+    g_cur[g_ncur][0] = (uint32_t)(uintptr_t)p, g_cur[g_ncur++][1] = 0;
+    user_object((uint32_t)(uintptr_t)p, 3, 0x80);
+    return (uint32_t)(uintptr_t)p;
+}
+/* NtUserSetCursorIconData(hcur, UNICODE_STRING* module, UNICODE_STRING*
+ * resource, CURSORDATA*). CURSORDATA (0x54 bytes, read off CreateIconIndirect):
+ * +0 lpName, +4 lpModName, +8 rt (WORD: 3 icon, 1 cursor), +0x10/+0x12 the
+ * hotspot (SHORTs), +0x14 hbmMask (the mask, cy doubled when there is no
+ * colour), +0x18 hbmColor, +0x30 bpp, +0x34 cx, +0x38 cy * 2 */
+static uint32_t s_set_cursor_data(uint32_t* a) {
+    uint32_t cd = a[3], m = MEM32(cd + 0x14), c = MEM32(cd + 0x18);
+    ICONINFO ii = { MEM16(cd + 8) != 1, (int16_t)MEM16(cd + 0x10), (int16_t)MEM16(cd + 0x12),
+                    (HBITMAP)(uintptr_t)(native32_gdi_host(m) ? native32_gdi_host(m) : m),
+                    (HBITMAP)(uintptr_t)(c && native32_gdi_host(c) ? native32_gdi_host(c) : c) };
+    HICON h = CreateIconIndirect(&ii);
+    if (getenv("NATIVE32_SYSCALLS"))
+        fprintf(stderr, "[user] SetCursorIconData %08X rt %u mask %08X color %08X -> %p\n", a[0], MEM16(cd + 8), m, c, h);
+    for (int i = 0; i < g_ncur; i++) if (g_cur[i][0] == a[0]) g_cur[i][1] = (uint32_t)(uintptr_t)h;
+    return h != NULL;
+}
+
 /* NtUserCallOneParam(param, index): 0x29 ReleaseDC; the rest read off the
- * user32 exports that call them. ponytail: 0x19 (CreateIcon's empty cursor
- * object, then NtUserSetCursorIconData) not answered */
+ * user32 exports that call them */
 static uint32_t s_call_oneparam(uint32_t* a) {
+    if (a[1] == 0x19) return cur_new();
+    if (a[1] == 0x16) return (uint32_t)(uintptr_t)BeginDeferWindowPos((int)a[0]);
     /* 0x24 MessageBeep, 0x26 PostQuitMessage, 0x2D ShowCursor, 0x33
      * GetProcessDefaultLayout (param: the DWORD* it fills) */
     if (a[1] == 0x24) return getenv("PCRECOMP_MUTE") ? 1 : MessageBeep(a[0]);   /* (muted runs stay silent) */
@@ -641,7 +706,7 @@ static uint32_t s_find_icon(uint32_t* a) {
 }
 
 /* NtUserSetCursor(hcursor) */
-static uint32_t s_setcursor(uint32_t* a) { return (uint32_t)(uintptr_t)SetCursor((HCURSOR)(uintptr_t)a[0]); }
+static uint32_t s_setcursor(uint32_t* a) { return (uint32_t)(uintptr_t)SetCursor((HCURSOR)(uintptr_t)cur_host(a[0])); }
 
 /* NtUserSetTimer(hwnd, id, elapse, TIMERPROC) / NtUserKillTimer(hwnd, id):
  * the host's (a TIMERPROC is guest code: the host calls it through the
@@ -769,6 +834,70 @@ static uint32_t s_hwnd_lock(uint32_t* a) {
     fprintf(stderr, "[user] NtUserCallHwndLock index 0x%X not answered\n", a[1]);
     return 0;
 }
+/* NtUserSetWindowsHookEx(hmod, UNICODE_STRING* dll, tid, idHook, proc, bAnsi):
+ * a host hook on the guest's procedure (MFC's WH_CBT, which subclasses each
+ * window as it is made, and WH_MSGFILTER). The host calls it like any other
+ * guest callback. ponytail: thread hooks only; a global one (tid 0, a dll)
+ * would need the dll in every process */
+/* WH_CBT goes through cbt_thunk: HCBT_CREATEWND (3) comes before any message,
+ * so the window has no WND yet and MFC's hook, which subclasses it there
+ * (SetWindowLong GWL_WNDPROC), would fail ValidateHwnd. ponytail: one CBT
+ * hook procedure per process (MFC's) */
+static uint32_t g_cbt;
+static LRESULT CALLBACK cbt_thunk(int c, WPARAM w, LPARAM l) {
+    if (c == HCBT_CREATEWND) native32_user_wnd((void*)w);
+    return ((HOOKPROC)(uintptr_t)g_cbt)(c, w, l);
+}
+static uint32_t s_sethook(uint32_t* a) {
+    (void)a[2];   /* the guest TEB's thread id, not the host's: this thread */
+    if ((int)a[3] == WH_CBT) g_cbt = a[4];
+    return (uint32_t)(uintptr_t)SetWindowsHookExW((int)a[3], (int)a[3] == WH_CBT ? cbt_thunk : (HOOKPROC)(uintptr_t)a[4],
+                                                  NULL, GetCurrentThreadId());
+}
+/* NtUserCallNextHookEx(nCode, wParam, lParam, bAnsi) */
+static uint32_t s_nexthook(uint32_t* a) { return (uint32_t)CallNextHookEx(NULL, (int)a[0], a[1], a[2]); }
+static uint32_t s_unhook(uint32_t* a) { return UnhookWindowsHookEx((HHOOK)(uintptr_t)a[0]); }
+/* NtUserDestroyCursor(hcur, force) */
+static uint32_t s_destroy_cursor(uint32_t* a) { (void)a; return 1; }   /* ponytail: shared host icons are never freed */
+/* NtUserGetClassInfo(hInstance, UNICODE_STRING* class, WNDCLASSEXW*, LPWSTR* menu, bAnsi):
+ * the atom, as GetClassInfoEx's result */
+static uint32_t s_classinfo(uint32_t* a) {
+    WNDCLASSEXW* w = (WNDCLASSEXW*)(uintptr_t)a[2];
+    w->cbSize = sizeof *w;
+    ATOM r = (ATOM)GetClassInfoExW((HINSTANCE)(uintptr_t)a[0], ustr_name(a[1]), w);
+    if (!r) r = (ATOM)GetClassInfoExW(NULL, ustr_name(a[1]), w);
+    if (r) {
+        for (int i = 0; i < g_ncls; i++) if (g_cls[i].atom == r) w->lpfnWndProc = (WNDPROC)(uintptr_t)g_cls[i].proc;
+        if (a[3]) MEM32(a[3]) = (uint32_t)(uintptr_t)w->lpszMenuName;
+    }
+    return r;
+}
+static uint32_t s_setplacement(uint32_t* a) { return SetWindowPlacement((HWND)(uintptr_t)a[0], (WINDOWPLACEMENT*)(uintptr_t)a[1]); }
+static uint32_t s_getplacement(uint32_t* a) { return GetWindowPlacement((HWND)(uintptr_t)a[0], (WINDOWPLACEMENT*)(uintptr_t)a[1]); }
+/* NtUserDeferWindowPos(hdwp, hwnd, after, x, y, cx, cy, flags) /
+ * NtUserEndDeferWindowPosEx(hdwp, async) */
+static uint32_t s_deferpos(uint32_t* a) {
+    return (uint32_t)(uintptr_t)DeferWindowPos((HDWP)(uintptr_t)a[0], (HWND)(uintptr_t)a[1], (HWND)(uintptr_t)a[2],
+                                               (int)a[3], (int)a[4], (int)a[5], (int)a[6], a[7]);
+}
+static uint32_t s_enddeferpos(uint32_t* a) { return EndDeferWindowPos((HDWP)(uintptr_t)a[0]); }
+/* NtUserSetProp(hwnd, atom, data) / NtUserRemoveProp(hwnd, atom): the host's
+ * (the guest's GetProp, which reads the WND's list, is answered by the host's
+ * GetProp in the program's host) */
+static uint32_t s_setprop(uint32_t* a) { return SetPropW((HWND)(uintptr_t)a[0], MAKEINTATOM(a[1]), (HANDLE)(uintptr_t)a[2]); }
+static uint32_t s_removeprop(uint32_t* a) { return (uint32_t)(uintptr_t)RemovePropW((HWND)(uintptr_t)a[0], MAKEINTATOM(a[1])); }
+/* NtUserSelectPalette(hdc, hpal, bForceBackground) */
+static uint32_t s_selectpal(uint32_t* a) {
+    uint32_t d = native32_gdi_host(a[0]), p = native32_gdi_host(a[1]);
+    return native32_gdi_handle((uint32_t)(uintptr_t)SelectPalette((HDC)(uintptr_t)(d ? d : a[0]), (HPALETTE)(uintptr_t)(p ? p : a[1]), a[2]));
+}
+static uint32_t s_setparent(uint32_t* a) { return (uint32_t)(uintptr_t)SetParent((HWND)(uintptr_t)a[0], (HWND)(uintptr_t)a[1]); }
+/* NtUserSetScrollInfo(hwnd, bar, SCROLLINFO*, redraw); the guest's
+ * GetScrollInfo and friends read the WND's SBINFO, answered by the host's */
+static uint32_t s_setscroll(uint32_t* a) { return (uint32_t)SetScrollInfo((HWND)(uintptr_t)a[0], (int)a[1], (SCROLLINFO*)(uintptr_t)a[2], a[3]); }
+/* NtUserWindowFromPoint(POINT by value) / NtUserSetActiveWindow(hwnd) */
+static uint32_t s_frompoint(uint32_t* a) { POINT p = { (LONG)a[0], (LONG)a[1] }; return (uint32_t)(uintptr_t)WindowFromPoint(p); }
+static uint32_t s_setactive(uint32_t* a) { return (uint32_t)(uintptr_t)SetActiveWindow((HWND)(uintptr_t)a[0]); }
 static uint32_t s_waitmessage(uint32_t* a) { (void)a; return WaitMessage(); }
 
 #define HW(x) ((HWND)(uintptr_t)(x))
@@ -808,7 +937,11 @@ void native32_user_install(void) {
         { "NtUserBeginPaint", s_beginpaint }, { "NtUserEndPaint", s_endpaint },
         { "NtUserThunkedMenuItemInfo", s_menu_item }, { "NtUserDestroyMenu", s_destroy_menu },
         { "NtUserCheckMenuItem", s_check_menu }, { "NtUserEnableMenuItem", s_enable_menu },
-        { "NtUserGetMenuItemRect", s_menu_rect }, { "NtUserFindExistingCursorIcon", s_find_icon },
+        { "NtUserGetMenuItemRect", s_menu_rect }, { "NtUserFindExistingCursorIcon", s_find_icon }, { "NtUserSetCursorIconData", s_set_cursor_data },
+        { "NtUserSetWindowsHookEx", s_sethook }, { "NtUserCallNextHookEx", s_nexthook }, { "NtUserUnhookWindowsHookEx", s_unhook },
+        { "NtUserDestroyCursor", s_destroy_cursor }, { "NtUserDeferWindowPos", s_deferpos }, { "NtUserEndDeferWindowPosEx", s_enddeferpos },
+        { "NtUserSetProp", s_setprop }, { "NtUserSelectPalette", s_selectpal }, { "NtUserSetParent", s_setparent }, { "NtUserSetScrollInfo", s_setscroll },
+        { "NtUserWindowFromPoint", s_frompoint }, { "NtUserSetActiveWindow", s_setactive }, { "NtUserRemoveProp", s_removeprop }, { "NtUserSetWindowPlacement", s_setplacement }, { "NtUserGetWindowPlacement", s_getplacement }, { "NtUserGetClassInfo", s_classinfo },
         { "NtUserSetCursor", s_setcursor }, { "NtUserSetTimer", s_settimer }, { "NtUserKillTimer", s_killtimer },
         { "NtUserCallHwndParamLock", s_hwnd_param_lock }, { "NtUserCallHwndParam", s_hwnd_param },
         { "NtUserDestroyWindow", s_destroy }, { "NtUserSetWindowFNID", s_set_fnid }, { "NtUserSetFocus", s_setfocus },

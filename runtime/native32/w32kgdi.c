@@ -204,6 +204,16 @@ static void batch(void) {
             s_delete((uint32_t*)(uintptr_t)(e + 4));
         } else if (cmd == 4) {                                 /* SetBrushOrg { x, y } */
             SetBrushOrgEx((HDC)(uintptr_t)HOST(hdc), (int)MEM32(e + 4), (int)MEM32(e + 8), NULL);
+        } else if (cmd == 3) {                                 /* ExtTextOut with no text: an opaque fill { bk colour, options, RECT, ... } */
+            HDC h = dc(hdc);
+            COLORREF old = SetBkColor(h, MEM32(e + 4));
+            ExtTextOutW(h, 0, 0, MEM32(e + 8), (RECT*)(uintptr_t)(e + 0xC), NULL, 0, NULL);
+            SetBkColor(h, old);
+        } else if (cmd == 5) {                                 /* ExtSelectClipRgn { mode, RECT }; mode bit 31: no rect (NULL region) */
+            uint32_t m = MEM32(e + 4);
+            HRGN r = (m & 0x80000000u) ? NULL : CreateRectRgn((int)MEM32(e + 8), (int)MEM32(e + 0xC), (int)MEM32(e + 0x10), (int)MEM32(e + 0x14));
+            ExtSelectClipRgn((HDC)(uintptr_t)HOST(hdc), r, (int)(m & 0xFF));
+            if (r) DeleteObject(r);
         } else if (cmd == 6) {                                 /* select a font: DC_ATTR's is current */
             uint8_t* a = native32_gdi_attr(hdc);
             if (a) AT32(a, 0x90) = MEM32(e + 4);
@@ -314,6 +324,28 @@ static uint32_t s_dibitmap(uint32_t* a) {
 /* NtGdiGetRegionData(hrgn, count, RGNDATA*). NtGdiGetDeviceWidth stays
  * unanswered (0): answered with HORZRES, gdisol looped in gdi32 */
 static uint32_t s_rgndata(uint32_t* a) { return GetRegionData((HRGN)(uintptr_t)HOST(a[0]), a[1], (RGNDATA*)(uintptr_t)a[2]); }
+/* NtGdiCreateDIBSection(hdc, hSection, offset, BITMAPINFO*, usage, cjHeader,
+ * fl, colorspace, void** bits): the host's, its bits in this address space.
+ * ponytail: a file-mapping section (hSection) is not passed on */
+static uint32_t s_dibsection(uint32_t* a) {
+    void* bits = NULL;
+    HBITMAP b = CreateDIBSection(a[0] ? (HDC)(uintptr_t)HOST(a[0]) : NULL, (BITMAPINFO*)(uintptr_t)a[3], a[4], &bits, NULL, 0);
+    if (a[8]) MEM32(a[8]) = (uint32_t)(uintptr_t)bits;
+    return GUEST(b);
+}
+/* NtGdiGetDCObject(hdc, type << 16): 5 bitmap, 8 palette, 0xA font, 0x10 brush, 0x30 pen */
+static uint32_t s_dcobject(uint32_t* a) {
+    UINT t = 0;
+    switch (a[1] >> 16) { case 5: t = OBJ_BITMAP; break; case 8: t = OBJ_PAL; break; case 0xA: t = OBJ_FONT; break;
+                          case 0x10: t = OBJ_BRUSH; break; case 0x30: t = OBJ_PEN; break; }
+    return t ? GUEST(GetCurrentObject(dc(a[0]), t)) : 0;
+}
+static uint32_t s_excludeclip(uint32_t* a) { return (uint32_t)ExcludeClipRect(dc(a[0]), (int)a[1], (int)a[2], (int)a[3], (int)a[4]); }
+/* NtGdiCreatePatternBrushInternal(hbm, bPen, b8x8) */
+static uint32_t s_patbrush(uint32_t* a) {
+    uint32_t b = HOST(a[0]);
+    return GUEST(CreatePatternBrush((HBITMAP)(uintptr_t)(b ? b : a[0])));
+}
 /* NtGdiCreateBitmap(cx, cy, planes, bpp, bits) */
 static uint32_t s_bitmap(uint32_t* a) {
     return GUEST(CreateBitmap((int)a[0], (int)a[1], a[2], a[3], (void*)(uintptr_t)a[4]));
@@ -560,7 +592,8 @@ void native32_gdi_install(void) {
     static const struct { const char* name; native32_syscall_fn fn; } svc[] = {
         { "NtGdiInit", s_init }, { "NtGdiQueryFontAssocInfo", s_zero }, { "NtGdiGetStockObject", s_stock },
         { "NtGdiCreateCompatibleDC", s_compat_dc }, { "NtGdiCreateCompatibleBitmap", s_compat_bitmap },
-        { "NtGdiCreatePen", s_pen }, { "NtGdiCreateRectRgn", s_rectrgn }, { "NtGdiCreateDIBitmapInternal", s_dibitmap }, { "NtGdiCreateBitmap", s_bitmap },
+        { "NtGdiCreatePen", s_pen }, { "NtGdiCreateRectRgn", s_rectrgn }, { "NtGdiCreateDIBitmapInternal", s_dibitmap }, { "NtGdiCreateBitmap", s_bitmap }, { "NtGdiCreatePatternBrushInternal", s_patbrush }, { "NtGdiCreateDIBSection", s_dibsection },
+        { "NtGdiGetDCObject", s_dcobject }, { "NtGdiExcludeClipRect", s_excludeclip },
         { "NtGdiGetRegionData", s_rgndata }, { "NtGdiGetDCforBitmap", s_dcforbitmap }, { "NtGdiSaveDC", s_savedc }, { "NtGdiRestoreDC", s_restoredc },
         { "NtGdiGetRandomRgn", s_randomrgn }, { "NtGdiIntersectClipRect", s_intersectclip }, { "NtGdiExtSelectClipRgn", s_selectcliprgn }, { "NtGdiCreateSolidBrush", s_brush },
         { "NtGdiSelectBitmap", s_select_bitmap }, { "NtGdiSelectBrush", s_select }, { "NtGdiSelectPen", s_select },
