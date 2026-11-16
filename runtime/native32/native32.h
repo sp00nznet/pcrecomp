@@ -145,6 +145,12 @@ void native32_call_guest(uint32_t va, int nargs, const uint32_t* args);
 void mach_enter(void);
 void mach_leave(void);
 
+/* Block a guest thread from inside a host answer (a VxD service, an
+ * import): its registers are kept, the machine lock is released however deep
+ * this thread holds it, h is waited on (WaitForSingleObject), and the lock
+ * and registers come back. Other guest threads run meanwhile. */
+DWORD native32_wait(HANDLE h, DWORD ms);
+
 /* A lifted function answered by the host instead, wherever its address is
  * resolved (indirect calls, snapped imports); and a built-in shim by name.
  * A lifted ntdll's RtlUnwind ends in NtContinue, a resume the lift cannot

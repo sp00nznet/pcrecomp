@@ -217,6 +217,20 @@ void mach_leave(void) {
     LeaveCriticalSection(&g_mach);
 }
 
+DWORD native32_wait(HANDLE h, DWORD ms) {
+    mstate* m = (mstate*)TlsGetValue(g_mach_tls);
+    int depth = m ? m->depth : 0;
+    regs_t r;
+    uint32_t fk = g_flag_k, fa = g_flag_a, fb = g_flag_b, fc = g_flag_cf;
+    regs_save(&r);
+    for (int i = 0; i < depth; i++) LeaveCriticalSection(&g_mach);
+    DWORD rc = WaitForSingleObject(h, ms);
+    for (int i = 0; i < depth; i++) EnterCriticalSection(&g_mach);
+    regs_load(&r);
+    g_flag_k = fk; g_flag_a = fa; g_flag_b = fb; g_flag_cf = fc;
+    return rc;
+}
+
 /* RECOMP_BACKEDGE's hand-over: let another guest thread take the machine.
  * Only the outermost claim can give it up; inside a callback the lock is
  * still held further out, and the loop simply runs on. */

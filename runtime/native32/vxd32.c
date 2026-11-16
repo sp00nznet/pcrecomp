@@ -24,6 +24,8 @@
 void recomp_trace_flush(void);   /* recomp_trace.c: --calltrace before we end */
 
 static int g_trace = -1;          /* NATIVE32_VXD */
+static uint16_t g_cur_psp;         /* the current PSP selector (a TDBX points at it) */
+static uint32_t g_cur[3];          /* VWIN32's current thread, process, TDBX (0xBFFC9CE0 points here) */
 typedef struct { uint32_t id; int nargs; uint32_t (*fn)(const uint32_t* a); const char* name; } vxd_service_t;
 
 /* VWIN32 3: kernel32's boot hands VWIN32 its code and data selectors (args
@@ -33,7 +35,18 @@ static uint32_t vwin32_boot_sels(const uint32_t* a) { (void)a; return 0; }
 /* VWIN32 4A (crit, level): the kernel side of a critical section kernel32
  * just initialised (its type-4 object). Returns VWIN32's own object for it;
  * kernel32 keeps it in the section. A zeroed block of our own stands in. */
-static uint32_t vwin32_crst_create(const uint32_t* a) { (void)a; return (uint32_t)(uintptr_t)calloc(1, 0x40); }
+/* The object's first dword is read as a pointer to a list head: kernel32
+ * walks [[obj]] up to a zero dword (0xBFF7D61A, 0xBFF89796, for the heap's
+ * section that _INIT keeps at 0xBFFC9230). An empty list here.
+ * ponytail: what the entries are (12 at most, {?, value} pairs copied into
+ * a new thread at +DC) is open until one is needed. */
+static uint32_t vwin32_crst_create(const uint32_t* a) {
+    uint32_t* o = calloc(1, 0x40);
+    (void)a;
+    o[0] = (uint32_t)(uintptr_t)&o[1];
+    o[1] = (uint32_t)(uintptr_t)&o[2];
+    return (uint32_t)(uintptr_t)o;
+}
 
 /* VMM's Win32 memory services (DDK _PageReserve/_PageCommit/_PageDecommit),
  * in pages. page: a page number, or PR_PRIVATE 0x80000400 / PR_SHARED
@@ -186,6 +199,14 @@ static void krnl386_thunk(void) {
         g_eax = (uint32_t)len; g_edx = 0;
         if (g_trace > 0) fprintf(stderr, "[krnl386] thunk %02X GetSystemDirectory(%08X, %u) = %u\n", n, buf, cb, (unsigned)len);
         break; }
+    case 0x30:   /* (hTask:16, lpszName:16:16): _INIT passes the boot task and
+                  * "KERNEL32.DLL" (0xBFFC6F68), CreateProcess a new process's
+                  * task (PDB+38) and its module name (0xBFF8B4BF). The task's
+                  * name for KRNL386. ponytail: not kept; nothing on the host
+                  * reads Win16 task names yet. */
+        if (g_trace > 0) fprintf(stderr, "[krnl386] thunk 30 task %04X name \"%s\"\n", MEM16(sp + 4), (const char*)(uintptr_t)lin16(MEM32(sp)));
+        g_eax = 0; g_edx = 0;
+        break;
     default:
         fprintf(stderr, "\n[krnl386] unknown thunk %02Xh from sub_%08X: 16-bit args at esp %04X %04X %04X %04X %04X %04X\n",
                 n, g_cur_func, MEM16(sp), MEM16(sp + 2), MEM16(sp + 4), MEM16(sp + 6), MEM16(sp + 8), MEM16(sp + 10));
@@ -251,6 +272,12 @@ static uint32_t vmm_page_decommit(const uint32_t* a) {
     return VirtualFree((void*)(uintptr_t)(a[0] << 12), a[1] << 12, MEM_DECOMMIT);
 }
 
+/* VMM 0D (page, n, and, or): _PageModifyPermissions, the old permissions
+ * back (-1 fails). kernel32 reads them with (and 0, or 20060000h) and puts
+ * them back with or 20000000h, the writable bit (0xBFF85ACB, copy-on-write).
+ * Every host page stays read/write/execute: report them writable, user. */
+static uint32_t vmm_page_modify(const uint32_t* a) { (void)a; return 0x20060000u; }
+
 /* VMM 0A (base, flags): release a whole reservation. VirtualFree's
  * MEM_RELEASE path calls it with (base, 0) (0xBFF84200); kernel32's module
  * and heap teardown with flags 10h. */
@@ -300,6 +327,131 @@ static uint32_t vwin32_obj_release(const uint32_t* a) { (void)a; return 0; }
  * threads keep their own priority. */
 static uint32_t vwin32_set_priorities(const uint32_t* a) { (void)a; return 0; }
 
+/* VWIN32 8 (thread, process, ctx, flags, sel, entry, sel, esp, &tdbx): a
+ * new thread's ring-0 twin (0xBFF86828; the result -> thread+54, and the
+ * TDBX goes to *a[8] = thread+58). kernel32 has built the thread's first
+ * frame at esp for entry 0xBFF72170: ds es fs gs, popad, popfd, VWIN32
+ * 9(-1), then ret to 0xBFF868EC with the start address and parameter.
+ * The twin keeps entry and esp (R0T_ENTRY/ESP) for when it is run.
+ * It runs on a host thread from VWIN32 36 (below). */
+#define R0T_ENTRY 0x20
+#define R0T_ESP   0x24
+#define R0T_THREAD 0x28
+#define R0T_PROCESS 0x38
+#define R0T_TDBX   0x3C
+static uint32_t new_tdbx(void) {
+    uint8_t* tdbx = calloc(1, 0x100);
+    *(uint32_t*)(tdbx + 0x50) = (uint32_t)(uintptr_t)&g_cur_psp;
+    return (uint32_t)(uintptr_t)tdbx;
+}
+static uint32_t vwin32_create_thread(const uint32_t* a) {
+    uint8_t* r0 = calloc(1, 0x100);
+    *(uint32_t*)(r0 + R0T_ENTRY) = a[5];
+    *(uint32_t*)(r0 + R0T_ESP) = a[7];
+    *(uint32_t*)(r0 + R0T_THREAD) = a[0];
+    MEM32(a[8]) = new_tdbx();
+    *(uint32_t*)(r0 + R0T_PROCESS) = a[1];
+    *(uint32_t*)(r0 + R0T_TDBX) = MEM32(a[8]);
+    if (g_trace > 0) fprintf(stderr, "[vxd] new thread %08X: entry %08X esp %08X\n", a[0], a[5], a[7]);
+    return (uint32_t)(uintptr_t)r0;
+}
+
+/* Guest threads. Each runs on a host thread under native32's machine lock;
+ * a guest thread that blocks in a service (w9x_wait) gives the machine up.
+ * VWIN32 A (r0thread, 0) makes a created thread runnable (0xBFF72151,
+ * right after CreateThread / CreateProcess build one); it starts on the
+ * first VWIN32 36 (r0thread), with which the creator lets it run until it
+ * blocks (_INIT does that for its service thread, 0xBFFC7014).
+ * The thread's first frame (VWIN32 8) is popped by 0xBFF72170, whose `ret`
+ * returns here (lifted code returns in C): the frame's next word is where
+ * it was going (0xBFF868EC), entered as a jump. */
+#define R0T_READY  0x2C
+#define R0T_PARKED 0x30      /* host event: the thread blocked or ended */
+static __declspec(thread) uint32_t t_r0;   /* this host thread's guest r0 twin, 0 for the boot thread */
+
+static DWORD w9x_wait(HANDLE h, DWORD ms) {
+    uint16_t sds = g_seg_ds, ses = g_seg_es, sfs = g_seg_fs, sgs = g_seg_gs;
+    uint32_t bds = g_ds_base, bes = g_es_base, bgs = g_gs_base;
+    uint32_t cur[3] = { g_cur[0], g_cur[1], g_cur[2] };
+    if (t_r0) SetEvent((HANDLE)(uintptr_t)MEM32(t_r0 + R0T_PARKED));
+    DWORD rc = native32_wait(h, ms);
+    g_seg_ds = sds; g_seg_es = ses; g_seg_fs = sfs; g_seg_gs = sgs;
+    g_ds_base = bds; g_es_base = bes; g_gs_base = bgs;
+    g_cur[0] = cur[0]; g_cur[1] = cur[1]; g_cur[2] = cur[2];   /* this thread is VWIN32's current one again */
+    return rc;
+}
+
+static DWORD WINAPI guest_thread(LPVOID p) {
+    t_r0 = (uint32_t)(uintptr_t)p;
+    mach_enter();
+    g_cur[0] = MEM32(t_r0 + R0T_THREAD); g_cur[1] = MEM32(t_r0 + R0T_PROCESS); g_cur[2] = MEM32(t_r0 + R0T_TDBX);
+    g_esp = MEM32(t_r0 + R0T_ESP);
+    recomp_func_t f = recomp_lookup(MEM32(t_r0 + R0T_ENTRY));
+    if (f) {
+        f();
+        uint32_t next = MEM32(g_esp - 4);
+        if (g_trace > 0) fprintf(stderr, "[vxd] thread %08X: on to %08X\n", MEM32(t_r0 + R0T_THREAD), next);
+        if ((f = recomp_lookup(next)) != NULL) f();
+    }
+    if (g_trace > 0) fprintf(stderr, "[vxd] thread %08X ended\n", MEM32(t_r0 + R0T_THREAD));
+    mach_leave();
+    SetEvent((HANDLE)(uintptr_t)MEM32(t_r0 + R0T_PARKED));
+    return 0;
+}
+
+static uint32_t vwin32_ready_thread(const uint32_t* a) {
+    if (a[0]) MEM32(a[0] + R0T_READY) = 1;
+    if (g_trace > 0) fprintf(stderr, "[vxd] thread %08X ready\n", a[0] ? MEM32(a[0] + R0T_THREAD) : 0);
+    return 0;
+}
+
+static uint32_t vwin32_run_thread(const uint32_t* a) {
+    uint32_t r0 = a[0];
+    if (!r0 || !MEM32(r0 + R0T_READY)) return 0;
+    HANDLE parked = (HANDLE)(uintptr_t)MEM32(r0 + R0T_PARKED);
+    if (!parked) {
+        parked = CreateEventA(NULL, FALSE, FALSE, NULL);
+        MEM32(r0 + R0T_PARKED) = (uint32_t)(uintptr_t)parked;
+        CloseHandle(CreateThread(NULL, 1u << 20, guest_thread, (LPVOID)(uintptr_t)r0, 0, NULL));
+    }
+    w9x_wait(parked, INFINITE);
+    return 0;
+}
+
+/* VWIN32 26 (r0thread, r0other): ties a thread's ring-0 twin to another
+ * thread's of the same process: a starting thread to its process's first
+ * (0xBFF8697A), a new thread to the boot thread (0xBFF89B55). Host threads
+ * share everything already. */
+static uint32_t vwin32_link_thread(const uint32_t* a) { (void)a; return 0; }
+
+/* ---- VCOND (VxD 38h), the console ----------------------------------------
+ * 23 (6, &info, sysdir): kernel32's service thread (0xBFF91450) introduces
+ * itself to VCOND once, with the system directory (where CONAGENT.EXE
+ * lives); nothing reads the info block (0xBFFC9D30) back. The host's
+ * console needs no agent. */
+static uint32_t vcond_init(const uint32_t* a) { (void)a; return 0; }
+
+/* VWIN32 2D (ms, alertable): block this thread (SleepEx, 0xBFF88BB0):
+ * C0h when woken for an APC, 102h on timeout. The thread gives up the
+ * machine meanwhile; its wake event (R0T_WAKE, the boot thread's own) is
+ * what a queued APC will set. */
+#define R0T_WAKE 0x34
+static HANDLE thread_wake(void) {
+    static HANDLE boot;
+    if (!t_r0) { if (!boot) boot = CreateEventA(NULL, FALSE, FALSE, NULL); return boot; }
+    if (!MEM32(t_r0 + R0T_WAKE)) MEM32(t_r0 + R0T_WAKE) = (uint32_t)(uintptr_t)CreateEventA(NULL, FALSE, FALSE, NULL);
+    return (HANDLE)(uintptr_t)MEM32(t_r0 + R0T_WAKE);
+}
+static uint32_t vwin32_block(const uint32_t* a) {
+    if (g_trace > 0) fprintf(stderr, "[vxd] thread %08X blocks (%d ms)\n", g_cur[0], (int)a[0]);
+    DWORD rc = w9x_wait(thread_wake(), a[0]);
+    return rc == WAIT_TIMEOUT ? 0x102 : 0xC0;
+}
+
+/* VWIN32 9 (-1): a new thread's first call, from its start frame
+ * (0xBFF72178) before it goes to its start routine. Nothing to wait for. */
+static uint32_t vwin32_thread_starting(const uint32_t* a) { (void)a; return 0; }
+
 /* VWIN32 21 (r0thread, priority): set a thread's priority in its ring-0
  * twin and return the field's offset there: CreateThread keeps r0thread +
  * the result as the TIB's pCurrentPriority (thread+2C, 0xBFF86850). */
@@ -321,6 +473,12 @@ static uint32_t vwin32_wait_block_60(const uint32_t* a) { (void)a; return 0; }
  * (0xBFF92D19: then it frees +0C and, for type 3, more), e.g. when a file
  * handle closes. No ring-0 wait state on the host: nothing to release. */
 static uint32_t vwin32_wait_block_destroy(const uint32_t* a) { (void)a; return 0; }
+
+/* VWIN32 20 (&type) -> ax: the coprocessor. _INIT (0xBFFC70DF) keeps the
+ * type at 0xBFFC9CF0; 0 (none) and 2 skip, anything else gets
+ * HKLM\HARDWARE\...\FloatingPointProcessor\0 (boxed).
+ * The host's x87: 3, a 387-class unit; ax its reset control word. */
+static uint32_t vwin32_fpu_info(const uint32_t* a) { MEM32(a[0]) = 3; return 0x037F; }
 
 /* VMM service 0B (context): switch to a memory context. One address space. */
 static uint32_t vmm_context_switch(const uint32_t* a) { (void)a; return 0; }
@@ -376,8 +534,6 @@ static uint32_t nls_block(void) {
     return (uint32_t)(uintptr_t)b;
 }
 
-static uint32_t g_cur[3];          /* VWIN32's current thread, process, TDBX */
-static uint16_t g_cur_psp;
 uint16_t g_w9x_psp_sel;            /* the host's boot PSP (k32host sets it) */
 static uint32_t vwin32_first_thread(const uint32_t* a) {
     uint32_t* blk = (uint32_t*)(uintptr_t)a[0];
@@ -646,6 +802,14 @@ static const vxd_service_t g_services[] = {
     { 0x002A0010, 2, vwin32_int21, "VWIN32_Int21Dispatch" },
     { 0x002A000C, 1, vwin32_first_thread, "VWIN32_CreateFirstThread" },
     { 0x0001000B, 1, vmm_context_switch, "VMM_ContextSwitch" },
+    { 0x002A0008, 9, vwin32_create_thread, "VWIN32_CreateThread" },
+    { 0x002A000A, 2, vwin32_ready_thread, "VWIN32_ReadyThread" },
+    { 0x002A0036, 1, vwin32_run_thread, "VWIN32_RunThreadUntilBlocked" },
+    { 0x002A0009, 1, vwin32_thread_starting, "VWIN32_ThreadStarting" },
+    { 0x002A0026, 2, vwin32_link_thread, "VWIN32_LinkThread" },
+    { 0x00380023, 3, vcond_init, "VCOND_Init" },
+    { 0x002A002D, 2, vwin32_block, "VWIN32_BlockThread" },
+    { 0x002A0020, 1, vwin32_fpu_info, "VWIN32_GetCoprocessor" },
     { 0x002A0021, 2, vwin32_set_thread_priority, "VWIN32_SetThreadPriority" },
     { 0x002A0030, 2, vwin32_wait_block_destroy, "VWIN32_DestroyWaitBlock" },
     { 0x002A0060, 1, vwin32_wait_block_60, "VWIN32_60_WaitBlock" },
@@ -661,6 +825,7 @@ static const vxd_service_t g_services[] = {
     { 0x00010001, 5, vmm_page_commit, "VMM_PageCommit" },
     { 0x00010002, 3, vmm_page_decommit, "VMM_PageDecommit" },
     { 0x0001000A, 2, vmm_page_free, "VMM_PageFree" },
+    { 0x0001000D, 4, vmm_page_modify, "VMM_PageModifyPermissions" },
     { 0x00010003, 1, vmm_pager_register, "VMM_PagerRegister" },
     { 0x002A0001, 10, vwin32_r0_file_entries, "VWIN32_GetRing0FileEntries" },
     { 0x00010011, 3, vmm_reg_open, "VMM_RegOpenKey" },

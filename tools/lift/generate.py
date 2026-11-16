@@ -383,6 +383,25 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
     leaders = set(leaders) | {a for a in gaps.values() if a in addrs}
     body_addrs = addrs
 
+    # LIFT32_W9X: `push L; ...; ret` with L in this body is a jump to L, not a
+    # return (Windows 98 kernel32 runs an inline finally that way: 0xBFF850F4
+    # pushes 0xBFF85117 and the block ends in a bare `ret`). A lifted `ret`
+    # returns from the C function, so it left the frame on the stack and the
+    # service thread's APC loop overflowed its stack. Each such L gets a label,
+    # and every bare `ret` here first checks the stack top against them.
+    push_ret, push_ret_far = set(), set()
+    if lift32.W9X:
+        for k, i in enumerate(instructions):
+            nxt_i = instructions[k + 1] if k + 1 < len(instructions) else None
+            if i.mnemonic == 'push' and not (nxt_i is not None and nxt_i.mnemonic == 'jmp'):
+                t = i.get_branch_target()
+                if t is not None and t in addrs and t != i.end_address:
+                    push_ret.add(t)
+                elif t is not None and lifter.lifted is not None and t in lifter.lifted and t > va:
+                    push_ret_far.add(t)   # the catalog made the continuation its own entry
+    leaders = set(leaders) | push_ret
+    targets |= push_ret
+
     skip = False
     for k, insn in enumerate(instructions):
         if label_all or insn.address in leaders:
@@ -410,6 +429,11 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
         tgt = insn.get_branch_target() if insn.is_jump else None
         if tgt is not None and tgt <= insn.address and tgt in addrs:
             lines.append('    RECOMP_BACKEDGE();')
+        if (push_ret or push_ret_far) and insn.mnemonic in ('ret', 'retn') and not insn.op_str:
+            for t in sorted(push_ret):
+                lines.append(f'    if (MEM32(esp) == 0x{t:08X}u) {{ esp += 4; goto L_{t:08X}; }} /* push 0x{t:08X}; ret */')
+            for t in sorted(push_ret_far):
+                lines.append(f'    if (MEM32(esp) == 0x{t:08X}u) {{ esp += 4; RECOMP_FLAGS_OUT(); RECOMP_ITAIL(0x{t:08X}u); return; }} /* push 0x{t:08X}; ret */')
         for line in lifter.lift_instruction(insn):
             lines.append(f'    {line}')
         if k in gaps:
