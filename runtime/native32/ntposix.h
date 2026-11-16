@@ -34,5 +34,23 @@ typedef struct { const char* name; int argc; recomp_func_t fn; } ntp_stub_t;
 /* a DLL the guest may load that is answered by host stubs */
 void ntp_proxy(const char* dll, const ntp_stub_t* stubs, int n);
 uint32_t ntp_alloc(uint32_t size);   /* committed guest memory */
+uint32_t ntp_module(const char* name);   /* a mapped module's base (0: none) */
+uint32_t ntp_peb(void);
+
+/* win32k: services from 0x1000, numbered by the guest's user32/gdi32 stubs,
+ * named from a "0xNNNN Name" file; answered by name (w32kposix.c) */
+int ntp_win32k(const uint32_t* bases, int nbases, const char* names_file);
+void ntp_win32k_override(const char* name, uint32_t (*fn)(uint32_t*));
+extern void (*ntp_win32k_pre)(void);      /* before every win32k service */
+/* win32k's user-mode callback: KiUserCallbackDispatcher(api, in, len) */
+uint32_t ntp_callback(uint32_t api, uint32_t in, uint32_t len, uint32_t* out, uint32_t* outlen);
+/* csrss ClientConnect for a server other than consrv (usersrv is 3) */
+extern void (*ntp_csr_connect)(uint32_t index, uint32_t info, uint32_t len);
+
+/* the virtual clock: the guest's tick count, time and sleeps move only by
+ * ntp_clock_advance (and the guest's own sleeps), so scripted runs repeat */
+void ntp_clock_virtual(void);
+void ntp_clock_advance(uint32_t ms);
+uint32_t ntp_clock_ms(void);
 
 #endif

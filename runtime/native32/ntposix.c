@@ -435,6 +435,7 @@ static int module_by_name(const char* n) {
     for (int i = 0; i < g_nmod; i++) if (!strcasecmp(g_mod[i].name, n)) return i;
     return -1;
 }
+uint32_t ntp_module(const char* name) { int i = module_by_name(name); return i < 0 ? 0 : g_mod[i].base; }
 
 void ntp_proxy(const char* dll, const ntp_stub_t* stubs, int n) {
     if (g_nproxy >= MAX_PROXY) return;
@@ -1084,6 +1085,9 @@ static int signaled(uint32_t h, int consume) {
     return s;
 }
 
+static int g_virtual;                              /* the virtual clock (ntp_clock_virtual) */
+static uint64_t g_vms;
+void ntp_clock_advance(uint32_t ms);
 static uint32_t wait_timeout(uint32_t to, const char* what) {
     if (!to) {
         fprintf(stderr, "[ntposix] %s waits forever with one guest thread: returning a timeout (from sub_%08X)\n", what, g_cur_func);
@@ -1093,6 +1097,7 @@ static uint32_t wait_timeout(uint32_t to, const char* what) {
     if (t < 0) {
         int64_t ns = -t * 100;
         if (ns > 2000000000ll) ns = 2000000000ll;
+        if (g_virtual) { ntp_clock_advance((uint32_t)(ns / 1000000)); return ST_TIMEOUT; }
         struct timespec d = { (time_t)(ns / 1000000000), (long)(ns % 1000000000) };
         nanosleep(&d, NULL);
     }
@@ -1592,8 +1597,11 @@ static uint32_t base_static_server_data(void) {
 
 typedef uint32_t (*csr_fn)(uint32_t data);
 /* csrsrv 0 ClientConnect: consrv's CONSOLE_INFO names our std handles */
+void (*ntp_csr_connect)(uint32_t index, uint32_t info, uint32_t len);
 static uint32_t csr_client_connect(uint32_t data) {
     uint32_t index = MEM32(data), ci = MEM32(data + 4);
+    if (g_trace) fprintf(stderr, "[csr] client connect, server %u, info %08X len %u\n", index, ci, MEM32(data + 8));
+    if (index != 2 && ntp_csr_connect && ci) ntp_csr_connect(index, ci, MEM32(data + 8));
     if (index == 2 && ci) {
         uint32_t e;
         MEM32(ci + 0x00) = 0x0C0Eu;
@@ -1664,6 +1672,102 @@ static uint32_t s_request_wait_reply(uint32_t* a) {
     return 0;
 }
 
+/* ------------------------------------------------------------- win32k
+ * user32 and gdi32 call win32k through the same gate, services from
+ * 0x1000; numbers and argument counts from their stubs, names from a
+ * "0xNNNN Name" file (win2000's tools/w32k_names.py), as syscall32.c. A
+ * window manager answers them by name (w32kposix.c). */
+#define W32K_MAX 0x400
+static struct { char name[64]; uint8_t argc, seen; uint32_t (*fn)(uint32_t*); } g_w32k[W32K_MAX];
+void (*ntp_win32k_pre)(void);
+
+int ntp_win32k(const uint32_t* bases, int nbases, const char* names_file) {
+    int stubs = 0, named = 0;
+    for (int m = 0; m < nbases; m++) {
+        uint32_t base = bases[m], size = image_size(base);
+        for (uint32_t p = base + 0x1000; p + 16 < base + size; p++) {
+            const uint8_t* b = (const uint8_t*)(uintptr_t)p;
+            if (b[0] != 0xB8 || b[5] != 0x8D || b[6] != 0x54 || b[7] != 0x24 || b[8] != 0x04 || b[9] != 0xCD || b[10] != 0x2E) continue;
+            uint32_t svc = *(const uint32_t*)(b + 1);
+            if (svc < 0x1000 || svc >= 0x1000 + W32K_MAX) continue;
+            g_w32k[svc - 0x1000].argc = b[11] == 0xC2 ? (uint8_t)(*(const uint16_t*)(b + 12) / 4) : 0;
+            stubs++;
+        }
+    }
+    FILE* f = names_file ? fopen(names_file, "r") : NULL;
+    if (f) {
+        char line[128], name[64];
+        unsigned num;
+        while (fgets(line, sizeof line, f))
+            if (sscanf(line, "%x %63s", &num, name) == 2 && num >= 0x1000 && num < 0x1000 + W32K_MAX) {
+                strcpy(g_w32k[num - 0x1000].name, name);
+                named++;
+            }
+        fclose(f);
+    } else fprintf(stderr, "[win32k] %s: missing (services unnamed)\n", names_file ? names_file : "(none)");
+    fprintf(stderr, "[win32k] %d stubs in the guest's user32/gdi32, %d names\n", stubs, named);
+    return stubs;
+}
+
+void ntp_win32k_override(const char* name, uint32_t (*fn)(uint32_t*)) {
+    for (int i = 0; i < W32K_MAX; i++)
+        if (!strcmp(g_w32k[i].name, name)) { g_w32k[i].fn = fn; return; }
+    fprintf(stderr, "[win32k] no service named %s\n", name);
+}
+
+static uint32_t win32k_call(uint32_t svc, uint32_t* args) {
+    int i = (int)(svc - 0x1000);
+    if (ntp_win32k_pre) ntp_win32k_pre();
+    if (i < 0 || i >= W32K_MAX) return 0xC000001Cu;                       /* STATUS_INVALID_SYSTEM_SERVICE */
+    uint32_t r = g_w32k[i].fn ? g_w32k[i].fn(args) : 0;
+    if (g_trace || (!g_w32k[i].fn && !g_w32k[i].seen)) {
+        fprintf(stderr, "[win32k] %-34s(", g_w32k[i].name[0] ? g_w32k[i].name : "?");
+        for (int k = 0; k < g_w32k[i].argc && k < 16; k++) fprintf(stderr, k ? " %08X" : "%08X", args[k]);
+        fprintf(stderr, ") -> %08X%s  0x%X from sub_%08X\n", r, g_w32k[i].fn ? "" : "  NOT ANSWERED", svc, g_cur_func);
+    }
+    g_w32k[i].seen = 1;
+    return r;
+}
+
+/* win32k's calls back into user32 (a window procedure, a hook):
+ * KiUserCallbackDispatcher(ApiNumber, Input, Length) runs
+ * Peb->KernelCallbackTable[ApiNumber](Input, Length), which ends in
+ * NtCallbackReturn(Output, Length, Status) or returns into the dispatcher's
+ * int 2Bh. Neither unwinds: the result is kept, the routine returns, and the
+ * dispatcher's trailing int3 (lifted as a return) comes back here. The
+ * caller's registers are kept across it (only eax is the service's). */
+#define CB_DEPTH 64
+static struct { uint32_t out, outlen, status, done; } g_cb[CB_DEPTH];
+static int g_cbn;
+static void callback_return(uint32_t out, uint32_t outlen, uint32_t status) {
+    if (g_cbn <= 0 || g_cb[g_cbn - 1].done) return;
+    g_cb[g_cbn - 1].out = out, g_cb[g_cbn - 1].outlen = outlen, g_cb[g_cbn - 1].status = status;
+    g_cb[g_cbn - 1].done = 1;
+}
+static uint32_t s_callback_return(uint32_t* a) {
+    if (g_cbn <= 0) return 0xC0000258u;                                    /* STATUS_NO_CALLBACK_ACTIVE */
+    callback_return(a[0], a[1], a[2]);
+    return 0;
+}
+uint32_t ntp_callback(uint32_t api, uint32_t in, uint32_t len, uint32_t* out, uint32_t* outlen) {
+    static uint32_t kucd;
+    if (!kucd) kucd = ntp_export(ntp_module("ntdll.dll"), "KiUserCallbackDispatcher");
+    if (!kucd || g_cbn >= CB_DEPTH) return 0xC0000258u;
+    uint32_t args[3] = { api, in, len };
+    uint32_t sv[8] = { g_ebx, g_ecx, g_edx, g_esi, g_edi, g_ebp, g_esp, g_cur_func };
+    g_cb[g_cbn].done = 0;
+    g_cbn++;
+    g_esp -= 16;
+    ntp_call(kucd, 3, args);
+    g_cbn--;
+    if (!g_cb[g_cbn].done) g_cb[g_cbn].status = g_eax, g_cb[g_cbn].out = 0, g_cb[g_cbn].outlen = 0;
+    g_ebx = sv[0], g_ecx = sv[1], g_edx = sv[2], g_esi = sv[3], g_edi = sv[4], g_ebp = sv[5], g_esp = sv[6], g_cur_func = sv[7];
+    if (out) *out = g_cb[g_cbn].out;
+    if (outlen) *outlen = g_cb[g_cbn].outlen;
+    return g_cb[g_cbn].status;
+}
+uint32_t ntp_peb(void) { return g_peb; }
+
 /* ------------------------------------------------------------- the table */
 static const struct { const char* name; uint32_t (*fn)(uint32_t*); } g_impl[] = {
     { "NtAllocateVirtualMemory", s_alloc_vm }, { "NtFreeVirtualMemory", s_free_vm },
@@ -1706,7 +1810,7 @@ static const struct { const char* name; uint32_t (*fn)(uint32_t*); } g_impl[] = 
     { "NtRaiseException", s_raise_exception }, { "NtContinue", s_continue },
     { "NtSecureConnectPort", s_secure_connect }, { "NtConnectPort", s_connect },
     { "NtRequestWaitReplyPort", s_request_wait_reply }, { "NtRequestPort", s_ok },
-    { "NtRegisterThreadTerminatePort", s_ok },
+    { "NtRegisterThreadTerminatePort", s_ok }, { "NtCallbackReturn", s_callback_return },
 };
 
 #define MAX_SVC 0x400
@@ -1740,20 +1844,28 @@ static void ksystime(uint32_t at, uint64_t v) {      /* KSYSTEM_TIME: High2, Low
     MEM32(at) = (uint32_t)v;
     MEM32(at + 4) = (uint32_t)(v >> 32);
 }
+static uint64_t g_vft;                              /* the virtual clock's start, as a FILETIME */
 static void kuser_update(void) {
     static uint64_t t0;
     uint64_t ms = mono_ms();
     if (!t0) t0 = ms;
-    MEM32(KUSER + 0x00) = (uint32_t)(ms - t0 + 60000);  /* TickCountLow (ms; the multiplier is 1.0) */
-    ksystime(KUSER + 0x08, (ms - t0 + 60000) * 10000);
-    ksystime(KUSER + 0x14, now_ft());
+    uint64_t up = g_virtual ? g_vms : ms - t0;
+    MEM32(KUSER + 0x00) = (uint32_t)(up + 60000);       /* TickCountLow (ms; the multiplier is 1.0) */
+    ksystime(KUSER + 0x08, (up + 60000) * 10000);
+    ksystime(KUSER + 0x14, g_virtual ? g_vft + up * 10000 : now_ft());
 }
+/* The virtual clock: from here on the guest's time (tick count, system
+ * time, its sleeps) moves only when the host says so, so a scripted run
+ * (w32kposix.c) is the same every time. */
+void ntp_clock_virtual(void) { g_vft = now_ft(); g_vms = 0; g_virtual = 1; kuser_update(); }
+void ntp_clock_advance(uint32_t ms) { g_vms += ms; kuser_update(); }
+uint32_t ntp_clock_ms(void) { return (uint32_t)g_vms; }
 static void* kuser_thread(void* unused) {
     (void)unused;
     for (;;) {
         struct timespec d = { 0, 10000000 };
         nanosleep(&d, NULL);
-        kuser_update();
+        if (!g_virtual) kuser_update();
     }
     return NULL;
 }
@@ -1778,7 +1890,8 @@ static void kuser_init(void) {
 /* ------------------------------------------------------------- the gate */
 void recomp_syscall(int vector) {
     uint32_t svc = g_eax, *args = (uint32_t*)(uintptr_t)g_edx, r;
-    if (vector == 0x2B) return;                          /* NtCallbackReturn's gate: no callbacks yet */
+    if (vector == 0x2B) { callback_return(g_ecx, g_edx, g_eax); return; }   /* the callback dispatcher's own return */
+    if (vector == 0x2E && svc >= 0x1000) { g_eax = win32k_call(svc, args); return; }
     if (vector != 0x2E || svc >= MAX_SVC || !g_svc[svc].name) {
         fprintf(stderr, "[syscall] int %02Xh service 0x%X: not in the table (from sub_%08X)\n", vector, svc, g_cur_func);
         g_eax = ST_NOT_IMPLEMENTED;
