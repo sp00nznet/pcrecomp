@@ -44,6 +44,7 @@
 #include "w32kposix.h"
 
 static int g_trace;
+static uint32_t g_cbt;                        /* the WH_CBT hook procedure (s_sethook) */
 #define TRACE(...) do { if (g_trace) fprintf(stderr, __VA_ARGS__); } while (0)
 
 typedef struct { int l, t, r, b; } rc_t;
@@ -688,8 +689,33 @@ static int dib_parse(uint32_t bmi, uint32_t usage, dib_t* o) {
             o->pal[i] = (q >> 16 & 0xFF) | (q & 0xFF00) | (q & 0xFF) << 16;   /* RGBQUAD -> COLORREF */
         }
     }
-    if (o->comp == 1 || o->comp == 2) { fprintf(stderr, "[gdi] RLE DIB not drawn\n"); return 0; }
     return o->w > 0 && o->h > 0;
+}
+/* BI_RLE8 (1) / BI_RLE4 (2) bits unpacked to plain bottom-up rows (one
+ * buffer, reused); other bits as they are */
+static uint32_t dib_plain(const dib_t* d, uint32_t bits) {
+    static uint8_t* buf;
+    static size_t cap;
+    if (d->comp != 1 && d->comp != 2) return bits;
+    size_t n = (size_t)d->stride * d->h;
+    if (n > cap) free(buf), buf = malloc(n), cap = n;
+    memset(buf, 0, n);
+    const uint8_t* p = (const uint8_t*)(uintptr_t)bits;
+    int x = 0, y = 0, four = d->comp == 2;
+#define PUT(v) do { if (x < d->w && y < d->h) { uint8_t* q = buf + (size_t)y * d->stride; \
+        if (four) q[x >> 1] |= (uint8_t)(((v) & 0xF) << (x & 1 ? 0 : 4)); else q[x] = (uint8_t)(v); } x++; } while (0)
+    while (y < d->h) {
+        int c = *p++, v = *p++;
+        if (c) { for (int i = 0; i < c; i++) PUT(four ? (i & 1 ? v : v >> 4) : v); continue; }
+        if (v == 0) { x = 0, y++; continue; }
+        if (v == 1) break;
+        if (v == 2) { x += p[0], y += p[1], p += 2; continue; }
+        int nb = four ? (v + 1) / 2 : v;
+        for (int i = 0; i < v; i++) PUT(four ? (i & 1 ? p[i >> 1] : p[i >> 1] >> 4) : p[i]);
+        p += (nb + 1) & ~1;
+    }
+#undef PUT
+    return (uint32_t)(uintptr_t)buf;
 }
 static uint32_t field(uint32_t v, uint32_t m) {
     if (!m) return 0;
@@ -719,6 +745,7 @@ static void dib_draw(gobj_t* d, int x, int y, int w, int h, int sx, int sy, int 
                      uint32_t bits, uint32_t bmi, uint32_t usage, int start, int num, uint32_t rop) {
     dib_t D;
     if (!bits || !dib_parse(bmi, usage, &D)) return;
+    bits = dib_plain(&D, bits);
     if (num <= 0) num = D.h;
     bmp_t tmpb;
     bm_init(&tmpb, sw, sh, 0);
@@ -1090,6 +1117,7 @@ static uint32_t s_stretchdib(uint32_t* a) {
 static void dib_into(bmp_t* b, int start, int num, uint32_t bits, uint32_t bmi, uint32_t usage) {
     dib_t D;
     if (!bits || !dib_parse(bmi, usage, &D)) return;
+    bits = dib_plain(&D, bits);
     if (num <= 0) num = D.h;
     for (int s = start; s < start + num && s < D.h; s++) {
         int top = D.topdown ? s : D.h - 1 - s;
@@ -1297,6 +1325,19 @@ static uint32_t s_restoredc(uint32_t* a) {
     return 1;
 }
 static uint32_t s_getcharset(uint32_t* a) { (void)a; return 1252u << 16; }   /* ANSI_CHARSET, cp 1252 */
+static uint32_t s_nearest(uint32_t* a) { return a[1] & 0xFFFFFF; }   /* NtGdiGetNearestColor: true colour, itself */
+static uint32_t s_charsetinfo(uint32_t* a) {     /* NtGdiGetTextCharsetInfo(hdc, FONTSIGNATURE*, flags): ANSI_CHARSET */
+    if (a[1]) { for (int i = 0; i < 24; i += 4) MEM32(a[1] + i) = 0; MEM32(a[1] + 16) = 1; }   /* fsCsb[0]: Latin 1 */
+    return 0;
+}
+static rc_t* rgn_get(gobj_t* o);
+static uint32_t rgn_set(gobj_t* o, rc_t r, uint32_t cplx);
+static uint32_t s_randomrgn(uint32_t* a) {       /* NtGdiGetRandomRgn(hdc, hrgn, SYSRGN 4): the visible region, screen coordinates */
+    gobj_t* d = DCH(a[0]), *r = G(a[1], GDI_RGN);
+    if (!d || !r) return (uint32_t)-1;
+    rgn_set(r, d->vis, 2);
+    return 1;
+}
 static uint32_t s_dcpoint(uint32_t* a) {         /* NtGdiGetDCPoint(hdc, 6 the origin, POINTL*) */
     gobj_t* d = DCH(a[0]);
     if (!d || a[1] != 6 || !a[2]) return 0;
@@ -2195,6 +2236,16 @@ static uint32_t s_create_window(uint32_t* a) {
     uint16_t cn[64], wn[128];
     uint32_t cname = lstr(a[1], cn, 64), wname = a[2] ? lstr(a[2], wn, 128) : 0;
     int ci = cls_find(cname);
+    if (g_trace) {
+        char b[64] = "#atom";
+        if (cname >= 0x10000) { int i = 0; for (const uint16_t* p = UNI(cname); i < 63 && p[i]; i++) b[i] = (char)p[i]; b[i] = 0; }
+        else snprintf(b, sizeof b, "#%X", cname);
+        char t[80] = ""; int i = 0;
+        if (wname >= 0x10000) for (const uint16_t* p = UNI(wname); i < 79 && p[i]; i++) t[i] = p[i] < 0x80 ? (char)p[i] : '?';
+        t[i] = 0;
+        fprintf(stderr, "[user] CreateWindowEx %s \"%s\" style %08X ex %08X at %d,%d %dx%d parent %X menu %X\n", b, t, a[3], a[0],
+                (int)a[4], (int)a[5], (int)a[6], (int)a[7], a[8], a[9]);
+    }
     if (ci < 0) {
         fprintf(stderr, "[user] CreateWindowEx: no class %s\n", cname < 0x10000 ? "(atom)" : "(name)");
         return 0;
@@ -2242,6 +2293,20 @@ static uint32_t s_create_window(uint32_t* a) {
         send(u->h, 0x24, 0, (uint32_t)(uintptr_t)mm);
     }
     uint32_t h = u->h;
+    if (g_cbt) {                                  /* HCBT_CREATEWND(hwnd, CBT_CREATEWND { lpcs, hwndInsertAfter }) */
+        uint32_t cbt[2] = { (uint32_t)(uintptr_t)cs, 0 }, ha[3] = { 3, h, (uint32_t)(uintptr_t)cbt };
+        /* CallNextHookEx reads CLIENTINFO's phkCurrent (TEB +0x6EC, less the
+         * client delta at +0x6E8): a HOOK with no next (+0x14) and flag 1 (+0x20)
+         * makes it return 0 */
+        static uint32_t hk;
+        if (!hk) hk = ntp_alloc(0x40), MEM8(hk + 0x20) = 1;
+        uint32_t teb = MEM32(g_fs_base + 0x18), svk = MEM32(teb + 0x6EC), svc = MEM32(teb + 0x6FC);
+        MEM32(teb + 0x6EC) = hk + MEM32(teb + 0x6E8), MEM32(teb + 0x6FC) = 5u << 16;
+        uint32_t r = ntp_guest(g_cbt, 3, ha);
+        MEM32(teb + 0x6EC) = svk, MEM32(teb + 0x6FC) = svc;
+        if (r) { if (W(h)) destroy(W(h)); return 0; }
+        if (!W(h)) return 0;
+    }
     if (!send(h, 0x81, 0, (uint32_t)(uintptr_t)cs)) { TRACE("[user] WM_NCCREATE refused\n"); if (W(h)) destroy(W(h)); return 0; }
     if (!W(h)) return 0;
     calcsize(u);
@@ -2250,10 +2315,11 @@ static uint32_t s_create_window(uint32_t* a) {
     if (!W(h)) return 0;
     u->sizemove = 1;                              /* (WM_SIZE, WM_MOVE: when it is first shown) */
     if (st & WS_VISIBLE) show(u, 1);
+    TRACE("[user]   -> %X %d,%d-%d,%d style %08X\n", h, u->wrel.l, u->wrel.t, u->wrel.r, u->wrel.b, u->style);
     return h;
 }
 static uint32_t s_destroy(uint32_t* a) { uobj_t* u = W(a[0]); if (!u) return 0; destroy(u); return 1; }
-static uint32_t s_show(uint32_t* a) { uobj_t* u = W(a[0]); return u ? show(u, (int)a[1]) : 0; }
+static uint32_t s_show(uint32_t* a) { uobj_t* u = W(a[0]); TRACE("[user] ShowWindow %X %d\n", a[0], (int)a[1]); return u ? show(u, (int)a[1]) : 0; }
 static uint32_t s_move(uint32_t* a) {            /* NtUserMoveWindow(hwnd, x, y, cx, cy, repaint) */
     uobj_t* u = W(a[0]);
     return u ? (uint32_t)setpos(u, (int)a[1], (int)a[2], (int)a[3], (int)a[4], a[5] ? 0 : SWP_NOREDRAW) : 0;
@@ -2264,6 +2330,20 @@ static uint32_t s_setpos(uint32_t* a) {          /* NtUserSetWindowPos(hwnd, aft
     setpos(u, (int)a[2], (int)a[3], (int)a[4], (int)a[5], a[6]);
     if ((a[6] & SWP_SHOWWINDOW) && !(a[6] & 0x10) && !(u->style & WS_CHILD)) activate(u);
     return 1;
+}
+/* NtUserDeferWindowPos(hdwp, hwnd, after, x, y, cx, cy, flags): done at once,
+ * so NtUserEndDeferWindowPosEx has nothing left. ponytail: not batched */
+static uint32_t s_deferpos(uint32_t* a) { s_setpos(a + 1); return a[0]; }
+/* NtUserSetParent(hwnd, parent): the old parent */
+static void invalidate(uobj_t* u, int erase);
+static uint32_t s_setparent(uint32_t* a) {
+    uobj_t* u = W(a[0]), *p = a[1] ? W(a[1]) : NULL;
+    if (!u) return 0;
+    uint32_t old = u->parent;
+    u->parent = p ? p->h : g_desktop;
+    wnd_sync(u);
+    invalidate(u, 1);
+    return old;
 }
 static uint32_t s_invalidate(uint32_t* a) {      /* NtUserInvalidateRect(hwnd, RECT*, erase) */
     uobj_t* u = W(a[0]);
@@ -2561,6 +2641,7 @@ static uint32_t s_call_oneparam(uint32_t* a) {
     switch (a[1]) {
     case 0x19: { uobj_t* c = unew(W2K_TYPE_CURSOR, 0x80); return c ? c->h : 0; }
     case 0x24: return 1;                         /* MessageBeep: no sound here */
+    case 0x25: return 1;                         /* PlayEventSound (SoftModalMessageBox's): no sound either */
     case 0x26: g_quit = 1, g_quitcode = (int)a[0]; return 1;   /* PostQuitMessage */
     case 0x29: dc_release(a[0]); return 1;       /* ReleaseDC */
     case 0x2D: return 1;                         /* ShowCursor */
@@ -2575,6 +2656,17 @@ static uint32_t s_call_twoparam(uint32_t* a) {
     if (a[2] == 0x5E) { g_caret.x = (int)a[0], g_caret.y = (int)a[1], g_caret.t0 = host_ms(); return 1; }   /* SetCaretPos */
     fprintf(stderr, "[user] NtUserCallTwoParam(%08X, %08X, 0x%X) not answered\n", a[0], a[1], a[2]);
     return 0;
+}
+static uint32_t s_call_hwnd(uint32_t* a) {       /* NtUserCallHwnd(hwnd, index) */
+    if (a[1] == 0x3D) return 1;                   /* SetMsgBox: the dialog is a message box (win32k only marks it) */
+    fprintf(stderr, "[user] NtUserCallHwnd index 0x%X not answered\n", a[1]);
+    return 0;
+}
+/* NtUserGetCursorFrameInfo(hcur, step, &jiffies, &frames): one frame, not animated */
+static uint32_t s_cursorframe(uint32_t* a) {
+    if (a[2]) MEM32(a[2]) = 0;
+    if (a[3]) MEM32(a[3]) = 1;
+    return a[0];
 }
 static uint32_t s_hwnd_lock(uint32_t* a) {       /* NtUserCallHwndLock(hwnd, index) */
     uobj_t* u = W(a[0]);
@@ -2647,6 +2739,7 @@ static uint32_t s_setactive(uint32_t* a) { uint32_t o = g_active; uobj_t* u = W(
 static uint32_t s_foreground(uint32_t* a) { (void)a; return g_active; }
 static uint32_t s_threaddesk(uint32_t* a) { (void)a; return 0x128; }
 static uint32_t s_one_u(uint32_t* a) { (void)a; return 1; }
+static uint32_t s_selpal(uint32_t* a) { (void)a; return g_stock[15]; }   /* NtUserSelectPalette: the default palette stays */
 static uint32_t s_zero_u(uint32_t* a) { (void)a; return 0; }
 static uint32_t s_deftext(uint32_t* a) {        /* NtUserDefSetText(hwnd, LARGE_STRING*): DefWindowProc's WM_SETTEXT */
     uobj_t* u = W(a[0]);
@@ -2713,7 +2806,15 @@ static uint32_t s_translate_accel(uint32_t* a) {
     }
     return 0;
 }
-static uint32_t s_sethook(uint32_t* a) { (void)a; return 0x00010001u + 0x100; }   /* ponytail: hooks are never called */
+/* NtUserSetWindowsHookEx(hmod, lib, thread, id, proc, ansi). Only WH_CBT's
+ * HCBT_CREATEWND is called (MFC subclasses its windows there), straight into
+ * the hook procedure. ponytail: one CBT hook, no chain, no other hooks or codes */
+
+static uint32_t s_sethook(uint32_t* a) {
+    if (a[3] == 5) { g_cbt = a[4]; return 0x00010001u + 0x105; }
+    return 0x00010001u + 0x100;
+}
+static uint32_t s_unhook(uint32_t* a) { if (a[0] == 0x00010001u + 0x105) g_cbt = 0; return 1; }
 static uint32_t s_fill_window(uint32_t* a) {     /* NtUserFillWindow(hwndBrush, hwnd, hdc, hbr) */
     uobj_t* u = W(a[1]);
     gobj_t* d = DCH(a[2]);
@@ -3171,11 +3272,12 @@ void w2kx_install(int cx, int cy, const char* fontdir) {
         { "NtGdiGetDCDword", s_getdword }, { "NtGdiGetAndSetDCDword", s_getsetdword }, { "NtGdiOpenDCW", s_opendc },
         { "NtGdiGetRgnBox", s_getrgnbox }, { "NtGdiGetAppClipBox", s_cliprect }, { "NtGdiFlushUserBatch", s_flushbatch },
         { "NtGdiFlush", s_one }, { "NtGdiComputeXformCoefficients", s_one }, { "NtGdiSetLayout", s_zero }, { "NtGdiGetLayout", s_zero },
-        { "NtGdiEnumFontClose", s_one },
+        { "NtGdiEnumFontClose", s_one }, { "NtGdiGetTextCharsetInfo", s_charsetinfo }, { "NtGdiGetRandomRgn", s_randomrgn }, { "NtGdiRectVisible", s_one }, { "NtGdiGetNearestColor", s_nearest },
         /* USER */
         { "NtUserRegisterClassExWOW", s_register_class }, { "NtUserGetClassInfo", s_classinfo },
         { "NtUserCreateWindowEx", s_create_window }, { "NtUserDestroyWindow", s_destroy }, { "NtUserShowWindow", s_show },
-        { "NtUserMoveWindow", s_move }, { "NtUserSetWindowPos", s_setpos }, { "NtUserInvalidateRect", s_invalidate },
+        { "NtUserMoveWindow", s_move }, { "NtUserDeferWindowPos", s_deferpos }, { "NtUserEndDeferWindowPosEx", s_one_u },
+        { "NtUserSetParent", s_setparent }, { "NtUserSelectPalette", s_selpal }, { "NtUserSetWindowPos", s_setpos }, { "NtUserInvalidateRect", s_invalidate },
         { "NtUserRedrawWindow", s_redraw }, { "NtUserBeginPaint", s_beginpaint }, { "NtUserEndPaint", s_endpaint },
         { "NtUserGetDC", s_getdc }, { "NtUserGetDCEx", s_getdcex }, { "NtUserGetWindowDC", s_getwindowdc }, { "NtUserSetMenu", s_setmenu },
         { "NtUserPostMessage", s_post }, { "NtUserMessageCall", s_message_call }, { "NtUserGetMessage", s_getmessage },
@@ -3186,13 +3288,13 @@ void w2kx_install(int cx, int cy, const char* fontdir) {
         { "NtUserGetSystemMenu", s_sysmenu }, { "NtUserFindExistingCursorIcon", s_find_cursor }, { "NtUserSetCursorIconData", s_set_cursor_data },
         { "NtUserDrawIconEx", s_drawicon }, { "NtUserDestroyCursor", s_one_u }, { "NtUserSetCursor", s_zero_u },
         { "NtUserCallNoParam", s_call_noparam }, { "NtUserCallOneParam", s_call_oneparam }, { "NtUserCallTwoParam", s_call_twoparam },
-        { "NtUserCallHwndLock", s_hwnd_lock }, { "NtUserCallHwndParam", s_hwnd_param }, { "NtUserCallHwndParamLock", s_hwnd_param_lock },
+        { "NtUserCallHwndLock", s_hwnd_lock }, { "NtUserCallHwnd", s_call_hwnd }, { "NtUserGetCursorFrameInfo", s_cursorframe }, { "NtUserCallHwndParam", s_hwnd_param }, { "NtUserCallHwndParamLock", s_hwnd_param_lock },
         { "NtUserSetWindowFNID", s_set_fnid }, { "NtUserDefSetText", s_deftext }, { "NtUserSetScrollInfo", s_setscroll }, { "NtUserQueryWindow", s_query_window }, { "NtUserSetWindowLong", s_setlong },
         { "NtUserSetFocus", s_setfocus }, { "NtUserSetCapture", s_setcapture }, { "NtUserSetActiveWindow", s_setactive },
         { "NtUserGetForegroundWindow", s_foreground }, { "NtUserGetThreadState", s_threadstate }, { "NtUserGetIconSize", s_iconsize }, { "NtUserGetThreadDesktop", s_threaddesk },
         { "NtUserModifyUserStartupInfoFlags", s_one_u }, { "NtUserGetDoubleClickTime", s_dblclick },
         { "NtUserRegisterWindowMessage", s_register_msg }, { "NtUserCreateAcceleratorTable", s_accel },
-        { "NtUserTranslateAccelerator", s_translate_accel }, { "NtUserSetWindowsHookEx", s_sethook }, { "NtUserUnhookWindowsHookEx", s_one_u },
+        { "NtUserTranslateAccelerator", s_translate_accel }, { "NtUserSetWindowsHookEx", s_sethook }, { "NtUserUnhookWindowsHookEx", s_unhook },
         { "NtUserCallNextHookEx", s_zero_u }, { "NtUserSetProp", s_one_u }, { "NtUserRemoveProp", s_zero_u },
         { "NtUserFillWindow", s_fill_window }, { "NtUserWindowFromPoint", s_frompoint }, { "NtUserGetWindowPlacement", s_getplacement },
         { "NtUserSetWindowPlacement", s_one_u }, { "NtUserSystemParametersInfo", s_spi }, { "NtUserGetKeyState", s_keystate },

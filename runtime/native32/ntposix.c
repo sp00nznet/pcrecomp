@@ -1884,6 +1884,16 @@ uint32_t ntp_callback(uint32_t api, uint32_t in, uint32_t len, uint32_t* out, ui
     if (outlen) *outlen = g_cb[g_cbn].outlen;
     return g_cb[g_cbn].status;
 }
+/* a guest stdcall function called from a service (a hook procedure), the
+ * caller's registers kept */
+uint32_t ntp_guest(uint32_t va, int nargs, const uint32_t* args) {
+    uint32_t sv[8] = { g_ebx, g_ecx, g_edx, g_esi, g_edi, g_ebp, g_esp, g_cur_func };
+    g_esp -= 16;
+    ntp_call(va, nargs, args);
+    uint32_t r = g_eax;
+    g_ebx = sv[0], g_ecx = sv[1], g_edx = sv[2], g_esi = sv[3], g_edi = sv[4], g_ebp = sv[5], g_esp = sv[6], g_cur_func = sv[7];
+    return r;
+}
 uint32_t ntp_peb(void) { return g_peb; }
 
 /* ------------------------------------------------------------- the table */

@@ -44,6 +44,8 @@ void ntp_win32k_override(const char* name, uint32_t (*fn)(uint32_t*));
 extern void (*ntp_win32k_pre)(void);      /* before every win32k service */
 /* win32k's user-mode callback: KiUserCallbackDispatcher(api, in, len) */
 uint32_t ntp_callback(uint32_t api, uint32_t in, uint32_t len, uint32_t* out, uint32_t* outlen);
+/* a guest stdcall function called from a service, registers kept: its eax */
+uint32_t ntp_guest(uint32_t va, int nargs, const uint32_t* args);
 /* csrss ClientConnect for a server other than consrv (usersrv is 3) */
 extern void (*ntp_csr_connect)(uint32_t index, uint32_t info, uint32_t len);
 
