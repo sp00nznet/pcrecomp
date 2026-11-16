@@ -51,7 +51,7 @@ enum { W2K_TYPE_FREE, W2K_TYPE_WINDOW, W2K_TYPE_MENU, W2K_TYPE_CURSOR, W2K_TYPE_
 
 /* SERVERINFO */
 #define SI_CHANDLES     0x008
-#define SI_ATOMSYSCLASS 0x1A0  /* WORDs: Button, Edit, Static, ListBox, ScrollBar, ComboBox */
+#define SI_ATOMSYSCLASS 0x1A0  /* WORDs: Button, Edit, Static, ListBox, ScrollBar, ComboBox, MDIClient, ComboLBox */
 #define SI_METRICS      0x59C  /* aiSysMet[0x53] */
 #define SI_COLORS       0x6E8  /* argbSystem[0x1D] */
 #define SI_BRUSHES      0x75C  /* ahbrSystem[0x1D] */

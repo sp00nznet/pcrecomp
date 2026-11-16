@@ -2206,8 +2206,8 @@ static uint32_t s_register_class(uint32_t* a) {
      * the way a missed indirect call is, for seed_from_log.py */
     if (c->proc && !recomp_lookup(c->proc) && !recomp_lookup_manual(c->proc))
         fprintf(stderr, "ICALL: unresolved VA 0x%08X from 0x%08X (a class's window procedure)\n", c->proc, MEM32(g_esp));
-    static const char* sys[] = { "Button", "Edit", "Static", "ListBox", "ScrollBar", "ComboBox" };
-    for (int k = 0; k < 6; k++) {
+    static const char* sys[] = { "Button", "Edit", "Static", "ListBox", "ScrollBar", "ComboBox", "MDIClient", "ComboLBox" };   /* ICLS_ order */
+    for (int k = 0; k < 8; k++) {
         uint16_t s[16];
         a2u(s, sys[k], 16);
         if (name >= 0x10000 && !u16icmp(c->name, s)) MEM16(g_psi + SI_ATOMSYSCLASS + 2 * k) = c->atom;

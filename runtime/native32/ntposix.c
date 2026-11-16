@@ -1152,6 +1152,8 @@ static uint32_t s_create_thread(uint32_t* a) {
     t->ctx[8] = MEM32(c + 0xC4);
     t->teb = ntp_alloc(0x2000);
     memcpy((void*)(uintptr_t)t->teb, (void*)(uintptr_t)g_teb, 0x2000);   /* (the first thread's, USER's thread info with it) */
+    memset((void*)(uintptr_t)(t->teb + 0xE10), 0, 64 * 4);              /* but its own TlsSlots, empty (MFC keeps each thread's state there) */
+    MEM32(t->teb + 0xF94) = 0;                                           /* TlsExpansionSlots */
     t->tid = g_tid + 4 * ++next;
     MEM32(t->teb + 0x00) = 0xFFFFFFFFu;
     MEM32(t->teb + 0x04) = MEM32(a[6] + 8), MEM32(t->teb + 0x08) = MEM32(a[6] + 12);
