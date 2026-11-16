@@ -99,6 +99,9 @@ def _mem_addr(op: Operand) -> tuple:
     # to 16. ADDR32(...) marks the offset for _read/_write, which use the
     # 32-bit-offset accessors; anywhere else it is just the value.
     a32 = any(r and str(r).startswith('e') for r in (op.base, op.index))
+    # a 67h [disp32] / moffs32 past 64K (GDI's `mov ebx, ds:[10060h]` into
+    # its Local32 header) is a 32-bit offset too
+    a32 = a32 or (not parts and op.disp > 0xFFFF)
     mask, cast, u = (0xFFFFFFFF, 'uint32_t', 'u') if a32 else (0xFFFF, 'uint16_t', '')
     if op.disp:
         if op.disp < 0:
@@ -108,7 +111,7 @@ def _mem_addr(op: Operand) -> tuple:
         if parts:
             off = f'({cast})({" + ".join(parts)} {disp_str})'
         else:
-            off = f'0x{op.disp & 0xFFFF:X}'
+            off = f'0x{op.disp & mask:X}{u}'
     elif parts:
         if len(parts) == 1:
             off = parts[0]
@@ -1193,17 +1196,20 @@ class Lifter:
             w = int(_wsz(op1))
             seg, off = _mem_addr(op1)
             sh = 4 if w == 16 else 5
+            # a 32-bit address (GDI's `btr word ds:[edi], dx`) stays 32-bit
+            a32 = off.startswith('ADDR32(')
+            _at, _sf = ('uint32_t', '_32') if a32 else ('uint16_t', '')
             setexpr = {'bt': None,
                        'bts': f'_v | ((uint{w}_t)1 << _b)',
                        'btr': f'_v & ~((uint{w}_t)1 << _b)',
                        'btc': f'_v ^ ((uint{w}_t)1 << _b)'}[m]
             body = (f'{{ int{w}_t _i = (int{w}_t){_read(op2)}; '
-                    f'uint16_t _a = (uint16_t)(({off}) + (_i >> {sh}) * {w // 8}); '
+                    f'{_at} _a = ({_at})(({off}) + (_i >> {sh}) * {w // 8}); '
                     f'uint8_t _b = (uint8_t)(_i & {w - 1}); '
-                    f'uint{w}_t _v = mem_read{w}(cpu, {seg}, _a); '
+                    f'uint{w}_t _v = mem_read{w}{_sf}(cpu, {seg}, _a); '
                     f'cpu->flags = (cpu->flags & ~FLAG_CF) | (((_v >> _b) & 1) ? FLAG_CF : 0); ')
             if setexpr:
-                body += f'mem_write{w}(cpu, {seg}, _a, (uint{w}_t)({setexpr})); '
+                body += f'mem_write{w}{_sf}(cpu, {seg}, _a, (uint{w}_t)({setexpr})); '
             self._emit(body + '}', orig)
 
         elif m in ('bt', 'bts', 'btr', 'btc'):

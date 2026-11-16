@@ -334,6 +334,10 @@ def parse_ne(filepath: str) -> NEHeader:
             alloc = seg.alloc_size or 0x10000
             if len(seg.data) < need <= alloc:
                 seg.data = seg.data + bytes(need - len(seg.data))
+        # So may an instruction: GDI seg 11 ends in `ret 2` whose last 00 is
+        # past file_size 2EEEh (alloc 2EEFh). A code segment gets its tail.
+        if seg.data and seg.is_code and seg.alloc_size and len(seg.data) < seg.alloc_size:
+            seg.data = seg.data + bytes(seg.alloc_size - len(seg.data))
 
         ne.segments.append(seg)
 
