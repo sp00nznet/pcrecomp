@@ -94,7 +94,7 @@ static LRESULT CALLBACK wnd_thunk(HWND h, UINT m, WPARAM w, LPARAM l);
 /* the guest's window procedure of each class registered (the host class has
  * wnd_thunk in its place) */
 #define MAX_CLASSES 256
-static struct { ATOM atom; uint32_t proc; int ansi; } g_cls[MAX_CLASSES];
+static struct { ATOM atom; uint32_t proc; int ansi; HINSTANCE inst; } g_cls[MAX_CLASSES];
 static int g_ncls;
 static int class_index(HWND h) {
     ATOM a = (ATOM)GetClassWord(h, GCW_ATOM);
@@ -104,11 +104,49 @@ static int class_index(HWND h) {
 static uint32_t class_proc(HWND h) { int i = class_index(h); return i < 0 ? 0 : g_cls[i].proc; }
 /* registered by RegisterClass(Ex)A: its procedure takes ANSI text */
 static int class_ansi(HWND h) { int i = class_index(h); return i >= 0 && g_cls[i].ansi; }
+/* ---- the virtual screen (W2K_SCREEN=WxH) ----------------------------------
+ * One host window is Windows 2000's screen and desktop window: WS_POPUP at
+ * host (0,0), so its coordinates are the host's and nothing is translated.
+ * Guest top-level windows are SetParent'ed into it (still popups to the
+ * host: menus stay) and PrintWindow of it is the whole screen. A runner
+ * started by a guest in it gets W2K_SCREEN_HWND and joins the same one. */
+static HWND g_screen;
+static int g_scx, g_scy;
+static RECT g_work;
+static void screen_init(void) {
+    const char* e = getenv("W2K_SCREEN_HWND"), *s = getenv("W2K_SCREEN");
+    RECT r;
+    if (e && IsWindow((HWND)(uintptr_t)strtoul(e, NULL, 16))) g_screen = (HWND)(uintptr_t)strtoul(e, NULL, 16);
+    else if (s && sscanf(s, "%dx%d", &g_scx, &g_scy) == 2 && g_scx > 0 && g_scy > 0) {
+        WNDCLASSW wc = { 0 };
+        wc.lpfnWndProc = DefWindowProcW;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.hbrBackground = (HBRUSH)(COLOR_BACKGROUND + 1);
+        wc.lpszClassName = L"pcrecomp.screen";
+        RegisterClassW(&wc);
+        g_screen = CreateWindowExW(0, wc.lpszClassName, L"Windows 2000", WS_POPUP | WS_CLIPCHILDREN | WS_VISIBLE,
+                                   0, 0, g_scx, g_scy, NULL, NULL, wc.hInstance, NULL);
+    }
+    if (!g_screen) return;
+    GetClientRect(g_screen, &r);
+    g_scx = r.right, g_scy = r.bottom;
+    SetRect(&g_work, 0, 0, g_scx, g_scy);
+    {
+        char v[16];
+        _snprintf(v, sizeof v, "%lx", (unsigned long)(uintptr_t)g_screen);
+        v[15] = 0;
+        SetEnvironmentVariableA("W2K_SCREEN_HWND", v);
+    }
+    fprintf(stderr, "[user] virtual screen %dx%d: host window %p\n", g_scx, g_scy, (void*)g_screen);
+}
+HWND native32_user_screen(void) { return g_screen; }
+
 /* A top-level window's parent is the desktop: IsWindowVisible walks
  * spwndParent up to a visible WND whose fnid (+0x2A) is 0x29D. Only those
  * two fields; the desktop's own children are not entered. */
 static uint32_t desktop_wnd(void) {
     static uint8_t* d;
+    if (g_screen) return (uint32_t)(uintptr_t)native32_user_wnd(g_screen);
     if (!d && (d = desk_alloc(0x100)) != NULL) {
         memset(d, 0, 0x100);
         *(uint32_t*)(d + 0x20) = WS_VISIBLE;
@@ -129,6 +167,10 @@ static void wnd_sync(HWND h, uint8_t* w) {
     OffsetRect(&r, o.x, o.y);
     memcpy(w + 0x4C, &r, sizeof r);
     *(uint32_t*)(w + 0x30) = p && p != GetDesktopWindow() ? (uint32_t)(uintptr_t)native32_user_wnd(p) : desktop_wnd();
+    if (h == g_screen) {            /* the desktop: no parent, the desktop's fnid */
+        *(uint32_t*)(w + 0x30) = 0;
+        *(uint16_t*)(w + 0x2A) = 0x29D;
+    }
     *(uint32_t*)(w + 0x38) = own ? (uint32_t)(uintptr_t)native32_user_wnd(own) : 0;
     /* +0x34 spwndChild, and for a child +0x2C spwndNext and +0x74 its ID
      * (spmenu's place): GetDlgItem walks them client-side. A top-level
@@ -198,12 +240,26 @@ static void wnd_sync_all(void) {
 
 /* SERVERINFO, once: +0x59C aiSysMet[0x53] (GetSystemMetrics), +0x6E8
  * argbSystem[0x1D] (GetSysColor), from the host's */
+static uint8_t* g_mon;      /* the primary MONITOR, for the work area */
 static void server_info(void) {
     static int done;
     uint8_t* psi = native32_user_psi;
     if (done || !psi) return;
     done = 1;
     for (int i = 0; i < 0x53; i++) *(int32_t*)(psi + 0x59C + 4 * i) = GetSystemMetrics(i);
+    if (g_screen) {                 /* the virtual screen's size, not the host's */
+        int32_t* m = (int32_t*)(psi + 0x59C);
+        int dx = m[SM_CXMAXIMIZED] - m[SM_CXSCREEN], dy = m[SM_CYMAXIMIZED] - m[SM_CYSCREEN];
+        m[SM_CXSCREEN] = m[SM_CXVIRTUALSCREEN] = g_scx;
+        m[SM_CYSCREEN] = m[SM_CYVIRTUALSCREEN] = g_scy;
+        m[SM_XVIRTUALSCREEN] = m[SM_YVIRTUALSCREEN] = 0;
+        m[SM_CXFULLSCREEN] = g_scx;
+        m[SM_CYFULLSCREEN] = g_scy - m[SM_CYCAPTION];
+        m[SM_CXMAXIMIZED] = g_scx + (dx > 0 ? dx : 0);
+        m[SM_CYMAXIMIZED] = g_scy + (dy > 0 ? dy : 0);
+        m[SM_CXMAXTRACK] = m[SM_CXMAXIMIZED] + 4 * GetSystemMetrics(SM_CXFRAME);
+        m[SM_CYMAXTRACK] = m[SM_CYMAXIMIZED] + 4 * GetSystemMetrics(SM_CYFRAME);
+    }
     for (int i = 0; i < 0x1D; i++) *(uint32_t*)(psi + 0x6E8 + 4 * i) = GetSysColor(i);
     /* +0x800 / +0x804 the system font's character size (GetDialogBaseUnits) */
     *(uint16_t*)(psi + 0x800) = (uint16_t)LOWORD(GetDialogBaseUnits());
@@ -244,6 +300,8 @@ static void server_info(void) {
         POINT o = { 0, 0 };
         GetMonitorInfoW(MonitorFromPoint(o, MONITOR_DEFAULTTOPRIMARY), &mi);
         *(uint32_t*)(mon + 0x0C) = 1;
+        if (g_screen) SetRect(&mi.rcMonitor, 0, 0, g_scx, g_scy), mi.rcWork = g_work;
+        g_mon = mon;
         memcpy(mon + 0x10, &mi.rcMonitor, sizeof(RECT));
         memcpy(mon + 0x20, &mi.rcWork, sizeof(RECT));
         *(uint32_t*)(native32_user_disp + 0x2C) = 1;
@@ -268,7 +326,12 @@ static void (*g_prev_pre)(void);
 static void user_pre(void) {        /* before every win32k service */
     server_info();
     sys_brushes();
-    if (native32_user_ahe) { thread_setup(); wnd_sync_all(); }
+    if (native32_user_ahe) {
+        thread_setup();
+        /* DESKTOPINFO +8 spwnd: user32's GetDesktopWindow reads it */
+        if (g_screen && !*(uint32_t*)(g_deskinfo + 8)) *(uint32_t*)(g_deskinfo + 8) = desktop_wnd();
+        wnd_sync_all();
+    }
     if (g_prev_pre) g_prev_pre();
     /* win32k calls a thread back at __ClientThreadSetup (KernelCallbackTable
      * 74) when it becomes a GUI thread: user32's ClientThreadSetup makes its
@@ -312,10 +375,24 @@ static uint32_t s_register_class(uint32_t* a) {
     /* flags (a[4]) bit 1 is CSF_ANSIPROC: RegisterClassExA passes 2 (0x82
      * past 3.10), the W form 0 (0x80) */
     if (r && g_ncls < MAX_CLASSES)
-        g_cls[g_ncls].atom = r, g_cls[g_ncls].ansi = (a[4] & 2) != 0, g_cls[g_ncls++].proc = guest_proc;
+        g_cls[g_ncls].atom = r, g_cls[g_ncls].inst = w.hInstance, g_cls[g_ncls].ansi = (a[4] & 2) != 0, g_cls[g_ncls++].proc = guest_proc;
     if (!r) fprintf(stderr, "[user] RegisterClassExW %ls failed: %lu\n",
                     (uintptr_t)w.lpszClassName < 0x10000 ? L"(atom)" : w.lpszClassName, GetLastError());
     return r;
+}
+
+/* NtUserUnregisterClass(UNICODE_STRING* name or atom, hInstance, CLSMENUNAME*):
+ * the host's (ole32 unregisters OleMainThreadWndClass at CoUninitialize and
+ * registers it again at the next CoInitialize) */
+static uint32_t s_unregister_class(uint32_t* a) {
+    const wchar_t* n = a[0] < 0x10000 ? (const wchar_t*)(uintptr_t)a[0] : ustr_name(a[0]);
+    ATOM at = 0;
+    WNDCLASSEXW wc = { sizeof wc };
+    if (n) at = (ATOM)GetClassInfoExW((HINSTANCE)(uintptr_t)a[1], n, &wc);
+    if (!n || !UnregisterClassW(n, (HINSTANCE)(uintptr_t)a[1])) return 0;
+    for (int i = 0; i < g_ncls; i++)
+        if (g_cls[i].atom == at) { g_cls[i] = g_cls[--g_ncls]; break; }
+    return 1;
 }
 
 /* ---- messages: win32k's callback ------------------------------------------
@@ -452,11 +529,20 @@ static uint32_t s_create_window(uint32_t* a) {
         AdjustWindowRectEx(&r, a[3], FALSE, a[0]);
         if (-r.left > b) { cx += 2 * (-r.left - b); cy += 2 * (-r.left - b); }
     }
+    /* No instance: win32k finds a DLL's local class anyway (ole32's
+     * OleMainThreadWndClass); the host only under the instance it was
+     * registered with, so that one. */
+    if (!a[10])
+        for (int i = 0; i < g_ncls; i++) {
+            WNDCLASSEXW wc = { sizeof wc };
+            if (g_cls[i].inst && GetClassInfoExW(g_cls[i].inst, lstr_name(a[1]), &wc)) { a[10] = (uint32_t)(uintptr_t)g_cls[i].inst; break; }
+        }
     /* 0x80000000 WS_EX_ANSICREATOR: CreateWindowExA's mark for win32k, not the host's */
     HWND h = CreateWindowExW(a[0] & ~0x80000000u, lstr_name(a[1]), lstr_name(a[2]), a[3], (int)a[4], (int)a[5], cx, cy,
                              (HWND)(uintptr_t)a[8], (HMENU)(uintptr_t)a[9], (HINSTANCE)(uintptr_t)a[10],
                              (void*)(uintptr_t)a[11]);
-    if (!h) fprintf(stderr, "[user] CreateWindowExW failed: %lu\n", GetLastError());
+    if (!h) fprintf(stderr, "[user] CreateWindowExW %08X %ls failed: %lu (style %08X ex %08X parent %08X menu %08X inst %08X)\n", a[1], (uintptr_t)lstr_name(a[1]) < 0x10000 ? L"(atom)" : lstr_name(a[1]), GetLastError(), a[3], a[0], a[8], a[9], a[10]);
+    if (h && g_screen && !(a[3] & WS_CHILD)) SetParent(h, g_screen);   /* a top-level window: on the screen */
     /* a window of a host class (a dialog's #32770) never calls the guest
      * while it is made, so its WND is entered here */
     if (h) native32_user_wnd(h);
@@ -514,6 +600,14 @@ static int spi_get(uint32_t act, uint32_t pv) {
     return 0;
 }
 static uint32_t s_spi(uint32_t* a) {
+    /* the virtual screen's work area: the taskbar sets it, kept here only */
+    if (g_screen && a[0] == SPI_GETWORKAREA && a[2]) { memcpy((void*)(uintptr_t)a[2], &g_work, sizeof g_work); return 1; }
+    if (g_screen && a[0] == SPI_SETWORKAREA) {
+        if (a[2]) memcpy(&g_work, (void*)(uintptr_t)a[2], sizeof g_work);
+        else SetRect(&g_work, 0, 0, g_scx, g_scy);
+        if (g_mon) memcpy(g_mon + 0x20, &g_work, sizeof g_work);
+        return 1;
+    }
     if (!spi_get(a[0], a[2])) {
         fprintf(stderr, "[user] SystemParametersInfo 0x%X (a SET) refused\n", a[0]);
         return 0;
@@ -1031,6 +1125,7 @@ void native32_user_install(void) {
     };
     for (int i = 0; i < (int)(sizeof svc / sizeof svc[0]); i++) native32_nt_win32k_override(svc[i].name, svc[i].fn);
     (void)s_update;
+    screen_init();
     g_prev_pre = native32_win32k_pre;
     native32_win32k_pre = user_pre;
     native32_nt_win32k_override("NtUserMessageCall", s_message_call);
@@ -1061,4 +1156,5 @@ void native32_user_install(void) {
     native32_nt_win32k_override("NtUserScrollWindowEx", s_scrollwindow);
     native32_nt_win32k_override("NtUserIsClipboardFormatAvailable", s_clipfmt_avail);
     native32_nt_win32k_override("NtUserRegisterClassExWOW", s_register_class);
+    native32_nt_win32k_override("NtUserUnregisterClass", s_unregister_class);
 }

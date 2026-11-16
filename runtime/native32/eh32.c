@@ -121,6 +121,7 @@ static int eh_trace = -1;
  * ebp. Only an address the frame lists, so a genuinely unresolved target is
  * still reported as one. */
 static int recomp_eh_jump(uint32_t va) {
+    if (eh_trace < 0) eh_trace = getenv("NATIVE32_TRACE_EH") != NULL;
     if (eh_trace > 0 || seh_trace > 0)
         fprintf(stderr, "[eh32] miss at 0x%08X with ebp 0x%08X: is it a handler's continuation?\n", va, g_ebp);
     recomp_ehframe_t* f = recomp_eh_find(va, g_ebp);

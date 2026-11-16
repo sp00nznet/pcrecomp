@@ -297,8 +297,26 @@ static void* denied(const char* name) {
     return NULL;
 }
 
+/* Windows 2000 exports a modern host DLL no longer has: the guest's loader
+ * fails the whole image over one (ole32's advapi32 imports, the Safer/site
+ * SID calls of IE5). Each answers "none", in its own signature. Sorted by
+ * name within a DLL: the proxy's name table is binary-searched. */
+static void* WINAPI gone_site_sid(void* token) { (void)token; return NULL; }
+static long WINAPI gone_mangled_sid(void* sid, unsigned long n, void* out) {
+    (void)sid; (void)n;
+    if (out) *(void**)out = NULL;
+    return (long)0x80004005;                                     /* E_FAIL */
+}
+static BOOL WINAPI gone_restricted(void) { return FALSE; }
+static const struct { const char* dll, *name; void* fn; } g_gone[] = {
+    { "advapi32.dll", "GetMangledSiteSid", gone_mangled_sid },
+    { "advapi32.dll", "GetSiteSidFromToken", gone_site_sid },
+    { "advapi32.dll", "IsProcessRestricted", gone_restricted },
+};
+
 /* A PE image in memory whose export table is a host DLL's, by ordinal and
- * name; each export's RVA is (host function - proxy base), modulo 2^32. */
+ * name; each export's RVA is (host function - proxy base), modulo 2^32.
+ * Names in g_gone the host lacks are added after its functions. */
 static uint32_t proxy_image(const wchar_t* path) {
     HMODULE h = LoadLibraryW(path);
     if (!h) return 0;
@@ -307,10 +325,20 @@ static uint32_t proxy_image(const wchar_t* path) {
     IMAGE_DATA_DIRECTORY hd = hnt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
     if (!hd.VirtualAddress) return 0;
     IMAGE_EXPORT_DIRECTORY* he = (IMAGE_EXPORT_DIRECTORY*)(hb + hd.VirtualAddress);
-    uint32_t nf = he->NumberOfFunctions, nn = he->NumberOfNames, strs = 0;
+    uint32_t nf = he->NumberOfFunctions, nn = he->NumberOfNames, strs = 0, hnf, hnn;
     uint32_t* hnames = (uint32_t*)(hb + he->AddressOfNames);
     uint16_t* hords = (uint16_t*)(hb + he->AddressOfNameOrdinals);
+    const wchar_t* file = wcsrchr(path, L'\\') ? wcsrchr(path, L'\\') + 1 : path;
+    int gone[sizeof g_gone / sizeof g_gone[0]], ngone = 0;
+    for (int i = 0; i < (int)(sizeof g_gone / sizeof g_gone[0]); i++) {
+        wchar_t w[32];
+        MultiByteToWideChar(CP_ACP, 0, g_gone[i].dll, -1, w, 32);
+        if (!_wcsicmp(w, file) && !GetProcAddress(h, g_gone[i].name)) gone[ngone++] = i;
+    }
     for (uint32_t i = 0; i < nn; i++) strs += (uint32_t)strlen((char*)hb + hnames[i]) + 1;
+    for (int i = 0; i < ngone; i++) strs += (uint32_t)strlen(g_gone[gone[i]].name) + 1;
+    hnf = nf, hnn = nn;
+    nf += ngone, nn += ngone;
     uint32_t dir = 0x1000, funcs = dir + 40, names = funcs + 4 * nf, ords = names + 4 * nn, pool = ords + 2 * nn;
     uint32_t size = (pool + strs + 64 + 0xFFF) & ~0xFFFu;
     uint8_t* p = (uint8_t*)VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -342,16 +370,20 @@ static uint32_t proxy_image(const wchar_t* path) {
     e->AddressOfFunctions = funcs;
     e->AddressOfNames = names;
     e->AddressOfNameOrdinals = ords;
-    for (uint32_t i = 0; i < nf; i++) {
+    for (uint32_t i = 0; i < hnf; i++) {
         FARPROC f = GetProcAddress(h, (LPCSTR)(uintptr_t)(he->Base + i));
         ((uint32_t*)(p + funcs))[i] = f ? (uint32_t)(uintptr_t)f - base : 0;
     }
-    for (uint32_t i = 0; i < nn; i++) {
-        const char* s = (const char*)hb + hnames[i];
+    for (uint32_t i = 0, j = 0, k = 0; i < nn; i++) {   /* the host's names and g_gone's, merged in order */
+        int extra = k < (uint32_t)ngone && (j >= hnn || strcmp(g_gone[gone[k]].name, (const char*)hb + hnames[j]) < 0);
+        const char* s = extra ? g_gone[gone[k]].name : (const char*)hb + hnames[j];
+        uint16_t o = extra ? (uint16_t)(hnf + k) : hords[j];
+        if (extra) ((uint32_t*)(p + funcs))[o] = (uint32_t)(uintptr_t)g_gone[gone[k]].fn - base, k++;
+        else j++;
         strcpy((char*)p + pool, s);
         ((uint32_t*)(p + names))[i] = pool;
-        ((uint16_t*)(p + ords))[i] = hords[i];
-        if (denied(s)) ((uint32_t*)(p + funcs))[hords[i]] = (uint32_t)(uintptr_t)denied(s) - base;
+        ((uint16_t*)(p + ords))[i] = o;
+        if (denied(s)) ((uint32_t*)(p + funcs))[o] = (uint32_t)(uintptr_t)denied(s) - base;
         pool += (uint32_t)strlen(s) + 1;
     }
     e->Name = pool;
@@ -473,6 +505,70 @@ static uint32_t ovr_hard_error(uint32_t* a) {
     fprintf(stderr, "\n");
     if (a[5]) MEM32(a[5]) = 1;                        /* ResponseReturnToCaller */
     return 0;
+}
+
+/* ---- threads ------------------------------------------------------------
+ * NtCreateThread(Handle*, Access, ObjectAttributes, Process, ClientId*,
+ * Context*, InitialTeb*, CreateSuspended): the guest's kernel32 has made the
+ * stack and a CONTEXT that starts at BaseThreadStartThunk (eax = the start
+ * routine, ebx = its parameter). A host thread runs it: it enters the machine
+ * (its own guest TEB, made by mach_enter), takes the guest's stack and
+ * registers from the CONTEXT and calls the lifted Eip. ponytail: the loader's
+ * per-thread start (LdrInitializeThunk: DLL_THREAD_ATTACH) is not run; no DLL
+ * here has needed it. Only threads of this process. */
+typedef struct { uint8_t ctx[0x2CC]; uint32_t base, limit; } nt_thread_t;
+static DWORD WINAPI nt_thread(LPVOID p) {
+    nt_thread_t t = *(nt_thread_t*)p;
+    free(p);
+    recomp_func_t f = recomp_lookup(*(uint32_t*)(t.ctx + 0xB8));
+    if (t.base) {
+        /* The stack the guest made: reserved, its top committed, a guard
+         * page below. Its growth is the kernel's for a thread's own stack
+         * only; this host thread's is another, so the guard page faulted
+         * (a fatal STATUS_GUARD_PAGE_VIOLATION). All of it committed. */
+        MEMORY_BASIC_INFORMATION mb;
+        DWORD old;
+        if (VirtualQuery((void*)(uintptr_t)(t.base - 1), &mb, sizeof mb)) {
+            SIZE_T n = t.base - (uint32_t)(uintptr_t)mb.AllocationBase;
+            VirtualAlloc(mb.AllocationBase, n, MEM_COMMIT, PAGE_READWRITE);
+            VirtualProtect(mb.AllocationBase, n, PAGE_READWRITE, &old);
+            t.limit = (uint32_t)(uintptr_t)mb.AllocationBase;
+        }
+    }
+    mach_enter();
+    if (t.base) MEM32(g_fs_base + 4) = t.base, MEM32(g_fs_base + 8) = t.limit;
+    g_edi = *(uint32_t*)(t.ctx + 0x9C); g_esi = *(uint32_t*)(t.ctx + 0xA0);
+    g_ebx = *(uint32_t*)(t.ctx + 0xA4); g_edx = *(uint32_t*)(t.ctx + 0xA8);
+    g_ecx = *(uint32_t*)(t.ctx + 0xAC); g_eax = *(uint32_t*)(t.ctx + 0xB0);
+    g_ebp = *(uint32_t*)(t.ctx + 0xB4); g_esp = *(uint32_t*)(t.ctx + 0xC4);
+    if (f) f();
+    else fprintf(stderr, "[nt] thread start 0x%08X is not lifted\n", *(uint32_t*)(t.ctx + 0xB8));
+    mach_leave();
+    return 0;
+}
+static uint32_t ovr_create_thread(uint32_t* a) {
+    if (a[3] != 0xFFFFFFFFu && GetProcessId((HANDLE)(uintptr_t)a[3]) != GetCurrentProcessId()) {
+        fprintf(stderr, "[guard] a thread in another process: refused\n");
+        return 0xC0000022u;
+    }
+    nt_thread_t* t = (nt_thread_t*)calloc(1, sizeof *t);
+    DWORD tid;
+    memcpy(t->ctx, (void*)(uintptr_t)a[5], sizeof t->ctx);
+    if (a[6]) t->base = MEM32(a[6] + 8), t->limit = MEM32(a[6] + 12);    /* INITIAL_TEB StackBase, StackLimit */
+    HANDLE h = CreateThread(NULL, 16u << 20, nt_thread, t, STACK_SIZE_PARAM_IS_A_RESERVATION | (a[7] ? CREATE_SUSPENDED : 0), &tid);
+    if (!h) { free(t); return 0xC0000017u; }
+    MEM32(a[0]) = (uint32_t)(uintptr_t)h;
+    if (a[4]) MEM32(a[4]) = GetCurrentProcessId(), MEM32(a[4] + 4) = tid;
+    return 0;
+}
+/* NtTerminateThread(Thread, Status) on the calling thread: give up the
+ * machine first, or every other guest thread waits for it forever. */
+static uint32_t ovr_terminate_thread(uint32_t* a) {
+    if (!a[0] || a[0] == 0xFFFFFFFEu || GetThreadId((HANDLE)(uintptr_t)a[0]) == GetCurrentThreadId()) {
+        mach_leave();
+        ExitThread(a[1]);
+    }
+    return native32_nt_forward("NtTerminateThread", a);
 }
 
 static uint32_t ovr_no_process(uint32_t* a) {
@@ -696,12 +792,18 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
     native32_nt_override("NtRaiseException", ovr_raise_exception);
     native32_nt_override("NtContinue", ovr_continue);
     native32_nt_override("NtCreateProcess", ovr_no_process);
+    native32_nt_override("NtCreateThread", ovr_create_thread);
+    native32_nt_override("NtTerminateThread", ovr_terminate_thread);
     native32_nt_override("NtCreateProcessEx", ovr_no_process);
     csr32_install();
     /* RtlUnwind ends in NtContinue to its caller, which a lift cannot do:
      * native32's own (seh32.c) unwinds the guest's frames and returns. */
     if (native32_export(ntdll, "RtlUnwind") && native32_shim("RtlUnwind"))
         native32_replace(native32_export(ntdll, "RtlUnwind"), native32_shim("RtlUnwind"));
+    /* ...over the guest's chain (fs:[0] of the guest's TEB): the host's
+     * RtlUnwind walked the host's, found no target and ended the process with
+     * STATUS_UNWIND (ole32's RPC __except when epmapper is refused) */
+    native32_guest_seh = 1;
 
     /* PEB: the fields the kernel sets (NT 5 offsets). Ldr, the heap, the
      * locks and the TLS bitmap are the guest ntdll's to make. */

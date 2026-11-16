@@ -386,7 +386,30 @@ static UINT WINAPI g_GetPrivateProfileIntW(LPCWSTR sec, LPCWSTR key, INT def, LP
 }
 static UINT WINAPI g_GetProfileIntW(LPCWSTR sec, LPCWSTR key, INT def) { return g_GetPrivateProfileIntW(sec, key, def, NULL); }
 
+/* SystemParametersInfo from a host DLL in the process (a proxied desk.cpl
+ * rewrote HKCU\Control Panel\Desktop\WindowMetrics): queries only, as the
+ * guest's own (w32kuser.c s_spi). GETs below 0x62 by name; from there and in
+ * the 0x1000/0x2000 ranges they are even. */
+static int spi_is_get(UINT a, void* pv) {
+    static const UINT get[] = { 1, 3, 5, 0xA, 0xE, 0x10, 0x12, 0x16, 0x19, 0x1B, 0x1F, 0x23, 0x26, 0x29, 0x2B, 0x2D,
+        0x30, 0x32, 0x34, 0x36, 0x38, 0x3A, 0x3C, 0x3E, 0x40, 0x42, 0x44, 0x46, 0x48, 0x4A, 0x4F, 0x50, 0x53, 0x54,
+        0x59, 0x5E, 0x5F, 0x73 };
+    if (a == 0xD || a == 0x18) return pv != NULL;
+    if (a >= 0x62) return !(a & 1) || a == 0x73;
+    for (unsigned i = 0; i < sizeof get / sizeof get[0]; i++) if (get[i] == a) return 1;
+    return 0;
+}
+static BOOL WINAPI g_SystemParametersInfoW(UINT a, UINT u, void* pv, UINT w) {
+    if (!spi_is_get(a, pv)) { fprintf(stderr, "[regbox] host SystemParametersInfo 0x%X (a SET) refused\n", a); (void)w; return FALSE; }
+    return SystemParametersInfoW(a, u, pv, 0);
+}
+static BOOL WINAPI g_SystemParametersInfoA(UINT a, UINT u, void* pv, UINT w) {
+    if (!spi_is_get(a, pv)) { fprintf(stderr, "[regbox] host SystemParametersInfo 0x%X (a SET) refused\n", a); (void)w; return FALSE; }
+    return SystemParametersInfoA(a, u, pv, 0);
+}
+
 static const struct { const char* name; void* fn; } g_fns[] = {
+    { "SystemParametersInfoW", g_SystemParametersInfoW }, { "SystemParametersInfoA", g_SystemParametersInfoA },
     { "RegCreateKeyExW", g_RegCreateKeyExW }, { "RegCreateKeyExA", g_RegCreateKeyExA },
     { "RegCreateKeyW", g_RegCreateKeyW }, { "RegCreateKeyA", g_RegCreateKeyA },
     { "RegOpenKeyExW", g_RegOpenKeyExW }, { "RegOpenKeyExA", g_RegOpenKeyExA },
@@ -426,13 +449,13 @@ static const struct { const char* name; void* fn; } g_fns[] = {
  * sandbox's function. Modules loaded later are patched as they load
  * (LdrRegisterDllNotification). ponytail: a host DLL that finds these with
  * GetProcAddress is not covered. */
-static void* g_orig[96][3];
+static void* g_orig[96][4];
 static void patch_slot(void** slot, int delay_unbound, const char* name) {
     DWORD old;
     for (int i = 0; i < NFNS; i++) {
         if (!g_fns[i].fn) continue;
         int hit = delay_unbound ? name && !strcmp(name, g_fns[i].name) : 0;
-        for (int j = 0; !hit && j < 3; j++) hit = g_orig[i][j] && *slot == g_orig[i][j];
+        for (int j = 0; !hit && j < 4; j++) hit = g_orig[i][j] && *slot == g_orig[i][j];
         if (!hit) continue;
         if (VirtualProtect(slot, 4, PAGE_READWRITE, &old)) { *slot = g_fns[i].fn; VirtualProtect(slot, 4, old, &old); }
         return;
@@ -468,14 +491,14 @@ static VOID CALLBACK on_dll(ULONG reason, DLL_NOTE* d, PVOID ctx) {
     if (reason == 1 /* loaded */) patch_module((HMODULE)d->DllBase);
 }
 static void box_host_dlls(void) {
-    const char* dlls[3] = { "advapi32.dll", "kernelbase.dll", "kernel32.dll" };
+    const char* dlls[4] = { "advapi32.dll", "kernelbase.dll", "kernel32.dll", "user32.dll" };
     HMODULE ms[512];
     DWORD got;
     PVOID cookie;
     LONG (WINAPI* reg)(ULONG, void*, PVOID, PVOID*) =
         (void*)GetProcAddress(GetModuleHandleA("ntdll.dll"), "LdrRegisterDllNotification");
     for (int i = 0; i < NFNS && i < 96; i++)
-        for (int j = 0; j < 3; j++) {
+        for (int j = 0; j < 4; j++) {
             HMODULE h = GetModuleHandleA(dlls[j]);
             g_orig[i][j] = h ? (void*)GetProcAddress(h, g_fns[i].name) : NULL;
         }

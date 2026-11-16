@@ -95,7 +95,9 @@ def scope_table(read, table, levels):
         raw = read(table + 12 * k, 12)
         if not raw or len(raw) < 12:
             break
-        _enclosing, flt, handler = struct.unpack('<3I', raw)
+        enclosing, flt, handler = struct.unpack('<3I', raw)
+        if not (enclosing == 0xFFFFFFFF or enclosing < k) or not handler:
+            break                       # past the table (disasm32.seh_entries' rule)
         out.append((flt, handler))
     return out
 
@@ -133,7 +135,10 @@ def frame(md, read, insns):
                     out |= funclet_returns(md, read, f)
                 return out, depth - 12
             if len(imms) >= 2:          # SEH: ..., scope table, handler
-                out = {h for flt, h in scope_table(read, imms[-2], try_levels(insns)) if flt}
+                # Every level the table holds: the prologue alone sets none
+                # (`mov [ebp-4], N` comes later), so counting them there found
+                # no __except block in Windows 2000's rpcrt4.
+                out = {h for flt, h in scope_table(read, imms[-2], max(try_levels(insns), 64)) if flt}
                 return (out, depth - 16) if out else None
             return None
         elif not (m == 'mov' and (op == 'ebp, esp' or op.endswith('dword ptr fs:[0]'))):

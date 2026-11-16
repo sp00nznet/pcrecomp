@@ -767,6 +767,20 @@ class Disassembler:
         found = set()
         probed = rejected = mid = padded = in_run = 0
         in_code = 0
+        # Addresses code reads as a pointer: `call [abs]`, `jmp [abs]`,
+        # `mov reg, [abs]`. In a merged .text a lone slot is a function only
+        # with this evidence: Windows 2000's shell32/browseui/shdocvw lazy
+        # imports (a variable `mov esi, [slot]; call esi` whose first value
+        # is a stub that loads the DLL, patches the slot and jumps on).
+        import re
+        loads = set()
+        for s in self.sections:
+            if s.is_code:
+                cd = self.read_bytes(self.image_base + s.virtual_address, s.raw_size) or b''
+                for m in re.finditer(rb'(?:\xff[\x15\x25]|\x8b[\x05\x0d\x15\x1d\x2d\x35\x3d]|\xa1)', cd):
+                    o = m.end()
+                    if o + 4 <= len(cd):
+                        loads.add(int.from_bytes(cd[o:o + 4], 'little'))
         for s in self.sections:
             base = self.image_base + s.virtual_address
             data = self.read_bytes(base, s.raw_size)
@@ -807,13 +821,13 @@ class Disassembler:
                     run3 = ptr(off - 4) and ptr(off + 4)
                     if off % 4 or interior is None or not (code_start <= at and at + 4 <= code_end) \
                             or (not run3 and any(interior[at - code_start + k] for k in range(4))) \
-                            or not (ptr(off - 4) or ptr(off + 4)
+                            or not (ptr(off - 4) or ptr(off + 4) or at in loads
                                     or (msgmap(off) and (msgmap(off - 24) or msgmap(off + 24)
                                                          or data[off + 4:off + 28] == bytes(24)))):
                         continue
                     in_code += 1
                 table = s.is_code and run3
-                if va in queued or va in found:
+                if va in queued or va in found or va in getattr(self, 'seh_resume', ()):
                     continue
                 if va in covered:
                     # An instruction some body already decoded. Normally a
@@ -1219,7 +1233,7 @@ def eh_entries(read, code_start, code_end):
     return out
 
 
-def seh_entries(read, code_start, code_end):
+def seh_entries(read, code_start, code_end, resume=None):
     """__try/__except/__finally code (_except_handler3) that only a scope
     table names: entries to seed.
 
@@ -1245,6 +1259,8 @@ def seh_entries(read, code_start, code_end):
                 break
             if flt and code_start <= flt < code_end:
                 out.add(flt)
+                if resume is not None:
+                    resume.add(handler)
             elif not flt:
                 out.add(handler)
     return out
@@ -1572,6 +1588,8 @@ def close_dispatch_targets(read_va, functions, code_start, code_end,
             try:
                 code = read_va(addr, size)
             except Exception:
+                continue
+            if not code:        # outside every section (ole32: an extent past its end)
                 continue
             end = addr + size
             for ins in md.disasm(code, addr):
@@ -2157,6 +2175,29 @@ def main(argv=None):
         print(f"[*] {len(exported)} exports seeded")
     seeds |= exported
 
+    # A delay-load IAT slot holds, until its first call, the address of that
+    # import's load stub (push slot; jmp __delayLoadHelper): only the slot
+    # points at it, so no scan finds it (Windows 2000's shell32 calls
+    # CoUninitialize through one and the first call was an unresolved ICALL).
+    try:
+        import pefile
+        dpe = pefile.PE(data=pe_data, fast_load=True)
+        dpe.parse_data_directories([pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT']])
+        stubs = set()
+        for d in getattr(dpe, 'DIRECTORY_ENTRY_DELAY_IMPORT', []):
+            for imp in d.imports:
+                v = dpe.get_dword_at_rva(imp.address - info.image_base) if imp.address >= info.image_base \
+                    else dpe.get_dword_at_rva(imp.address)
+                if v and v < info.image_base:            # an RVA-based (VC7+) descriptor
+                    v += info.image_base
+                if v and info.code_start <= v < info.code_end:
+                    stubs.add(v)
+        if stubs:
+            print(f"[*] {len(stubs)} delay-load stubs seeded")
+        seeds |= stubs
+    except Exception as e:                               # (no pefile: no delay-load seeds)
+        print(f"[*] delay-load stubs not seeded: {e}")
+
     if args.seed_functions:
         with open(args.seed_functions) as f:
             doc = json.load(f)
@@ -2167,7 +2208,11 @@ def main(argv=None):
         print(f"[*] {len(doc)} seeds from {args.seed_functions}")
 
     dis = Disassembler(pe_data, info.image_base, info.sections)
-    seh = seh_entries(dis.read_bytes, info.code_start, info.code_end) - seeds
+    # The __except blocks (resume points, never entries): the data scan reads
+    # a scope table's (filter, block) pair as two code pointers and made
+    # rpcrt4's blocks functions, so _except_handler3's jump ran one as a call.
+    dis.seh_resume = set()
+    seh = seh_entries(dis.read_bytes, info.code_start, info.code_end, dis.seh_resume) - seeds
     if seh:
         print(f"[*] {len(seh)} SEH filters and __finally blocks seeded")
     seeds |= seh

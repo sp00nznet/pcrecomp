@@ -399,6 +399,34 @@ int native32_hold_image(const char* path, uint32_t base) {
         AssignProcessToJobObject(job, pi.hProcess);
     }
     ResumeThread(pi.hThread);
+    if (getenv("NATIVE32_DEBUG_CHILD") && DebugActiveProcess(pi.dwProcessId)) {
+        /* The held process debugged from here: an exception its own handlers
+         * never see (a second chance, an exit unwind's STATUS_UNWIND) is
+         * reported with the lifted function it died in (the same image at
+         * the same base: g_cur_func's address is ours). */
+        DEBUG_EVENT ev;
+        DebugSetProcessKillOnExit(TRUE);
+        while (WaitForDebugEvent(&ev, INFINITE)) {
+            DWORD cont = DBG_CONTINUE;
+            if (ev.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
+                EXCEPTION_RECORD* r = &ev.u.Exception.ExceptionRecord;
+                uint32_t cur = 0;
+                ReadProcessMemory(pi.hProcess, &g_cur_func, &cur, 4, NULL);
+                if (r->ExceptionCode != EXCEPTION_BREAKPOINT)
+                    fprintf(stderr, "[debug] exception %08lX at %p (%s chance) in sub_%08X\n", r->ExceptionCode,
+                            r->ExceptionAddress, ev.u.Exception.dwFirstChance ? "first" : "second", cur);
+                if (r->ExceptionCode != EXCEPTION_BREAKPOINT) cont = DBG_EXCEPTION_NOT_HANDLED;
+            } else if (ev.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT && ev.dwProcessId == pi.dwProcessId) {
+                ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE);
+                break;
+            } else if (ev.dwDebugEventCode == LOAD_DLL_DEBUG_EVENT && ev.u.LoadDll.hFile) {
+                CloseHandle(ev.u.LoadDll.hFile);
+            } else if (ev.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT && ev.u.CreateProcessInfo.hFile) {
+                CloseHandle(ev.u.CreateProcessInfo.hFile);
+            }
+            ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, cont);
+        }
+    }
     WaitForSingleObject(pi.hProcess, INFINITE);
     DWORD code = 1;
     GetExitCodeProcess(pi.hProcess, &code);
@@ -1854,6 +1882,7 @@ static void native32_mute(void) {
 }
 
 void native32_init(void) {
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);   /* no box on the real desktop; children inherit it */
     native32_mute();
     eh32_init();
     /* Every Windows -> guest call relies on the guest's code faulting when it
@@ -1882,7 +1911,6 @@ void native32_call_guest(uint32_t va, int nargs, const uint32_t* args) {
     mach_leave();
 }
 
-    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);   /* no box on the real desktop; children inherit it */
 void native32_dump_icalls(int n) {
     fprintf(stderr, "last indirect calls (newest first):\n");
     for (int i = 1; i <= n && i <= (int)g_icall_trace_idx; i++) {
