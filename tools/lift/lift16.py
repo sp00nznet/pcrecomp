@@ -56,6 +56,10 @@ def _sreg(op: Operand) -> str:
         return _cseg()
     return f'cpu->{SREG_NAMES[op.reg]}'
 
+# addr32 string ops lifted with 32-bit esi/edi: mnemonic -> (kind, width)
+_A32_STR = {f'{k}{c}': (k, w) for k in ('movs', 'stos', 'lods') for c, w in (('b', 8), ('w', 16), ('d', 32))}
+_A32_ACC = {8: 'cpu->al', 16: 'cpu->ax', 32: 'cpu->eax'}
+
 def _wsz(op: Operand) -> str:
     """Operand width suffix for flag/temp helpers: '8' | '16' | '32'."""
     if op is None:
@@ -88,29 +92,32 @@ def _mem_addr(op: Operand) -> tuple:
         scale = getattr(op, 'scale', 1)
         parts.append(f'cpu->{op.index}' + (f' * {scale}' if scale > 1 else ''))
 
+    # A 32-bit base or index (`es:[edi]`, an operand-size 386 routine in a
+    # 16-bit program) addresses past 64 KB of a selector whose limit allows it:
+    # Win16 games blit whole WinG surfaces that way, KRNL386 walks its arenas
+    # as `[eax+8]`. The sum and the displacement are then 32-bit, not wrapped
+    # to 16. ADDR32(...) marks the offset for _read/_write, which use the
+    # 32-bit-offset accessors; anywhere else it is just the value.
+    a32 = any(r and str(r).startswith('e') for r in (op.base, op.index))
+    mask, cast, u = (0xFFFFFFFF, 'uint32_t', 'u') if a32 else (0xFFFF, 'uint16_t', '')
     if op.disp:
         if op.disp < 0:
-            disp_str = f'- 0x{(-op.disp) & 0xFFFF:X}'
+            disp_str = f'- 0x{(-op.disp) & mask:X}{u}'
         else:
-            disp_str = f'+ 0x{op.disp & 0xFFFF:X}'
+            disp_str = f'+ 0x{op.disp & mask:X}{u}'
         if parts:
-            off = f'(uint16_t)({" + ".join(parts)} {disp_str})'
+            off = f'({cast})({" + ".join(parts)} {disp_str})'
         else:
             off = f'0x{op.disp & 0xFFFF:X}'
     elif parts:
         if len(parts) == 1:
             off = parts[0]
         else:
-            off = f'(uint16_t)({" + ".join(parts)})'
+            off = f'({cast})({" + ".join(parts)})'
     else:
         off = '0'
 
-    # A 32-bit base or index (`es:[edi]`, an operand-size 386 routine in a
-    # 16-bit program) addresses past 64 KB of a selector whose limit allows it:
-    # Win16 games blit whole WinG surfaces that way. ADDR32(...) marks the offset
-    # for _read/_write, which use the 32-bit-offset accessors; anywhere else it
-    # is just the value.
-    if any(r and str(r).startswith('e') for r in (op.base, op.index)):
+    if a32:
         off = f'ADDR32({off})'
     return seg, off
 
@@ -317,6 +324,17 @@ class Lifter:
 
         # 67h on a string op makes it walk ESI/EDI and count ECX, which the
         # forms below do not model. Say so rather than lift its 16-bit twin.
+        # movs/stos/lods are modelled: esi/edi step through the _32 accessors.
+        if getattr(inst, 'addr32', False) and m in _A32_STR:
+            k, w = _A32_STR[m]
+            n = w // 8
+            step = f'(df(cpu) ? -{n} : {n})'
+            src = f'mem_read{w}_32(cpu, {_ssg}, cpu->esi)'
+            body = {'movs': f'mem_write{w}_32(cpu, cpu->es, cpu->edi, {src}); cpu->esi += {step}; cpu->edi += {step};',
+                    'stos': f'mem_write{w}_32(cpu, cpu->es, cpu->edi, ({_A32_ACC[w]})); cpu->edi += {step};',
+                    'lods': f'{_A32_ACC[w]} = {src}; cpu->esi += {step};'}[k]
+            self._emit(body, orig)
+            return
         if getattr(inst, 'addr32', False) and (
                 m[:4] in ('movs', 'stos', 'lods', 'scas', 'cmps', 'outs') or m[:3] == 'ins'
                 or m == 'xlat'):
@@ -329,7 +347,7 @@ class Lifter:
             self._emit(_write(op1, _read(op2)), orig)
 
         elif m == 'xchg':
-            self._emit(f'{{ uint16_t _t = {_read(op1)}; '
+            self._emit(f'{{ uint{_wsz(op1)}_t _t = {_read(op1)}; '
                        f'{_write(op1, _read(op2))} '
                        f'{_write(op2, "_t")} }}', orig)
 
@@ -1589,7 +1607,8 @@ class Lifter:
         for inst in instructions:
             if inst.prefix == 'rep' and inst.mnemonic in ('movsb','movsw','movsd','stosb','stosw','stosd','outsb','outsw','insb','insw'):
                 self._emit_label(inst.address)
-                self._emit(f'while (cpu->cx != 0) {{ cpu->cx--;', f'rep {inst.mnemonic}')
+                _rc = 'cpu->ecx' if getattr(inst, 'addr32', False) else 'cpu->cx'   # 67h: rep counts ecx
+                self._emit(f'while ({_rc} != 0) {{ {_rc}--;', f'rep {inst.mnemonic}')
                 self.indent += 1
                 # Emit the string op body (set address to -1 to avoid duplicate label)
                 stripped = Instruction()

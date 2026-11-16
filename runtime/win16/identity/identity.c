@@ -113,7 +113,10 @@ static void dpmi(CPU *c) {
     }
     case 0x0501: {   /* allocate bx:cx bytes -> bx:cx linear, si:di handle (the same) */
         uint32_t n = (uint32_t)c->bx << 16 | c->cx;
-        void *p = VirtualAlloc(NULL, n, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        /* top down: KRNL386 lays its heap from its own segments up to the end
+         * of this block (seg001_C850), so the block must lie above them, as
+         * DPMI memory lies above a DOS-loaded KRNL386 on a real machine */
+        void *p = VirtualAlloc(NULL, n, MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN, PAGE_READWRITE);
         if (!p) { c->ax = 0x8013; c->flags |= FLAG_CF; return; }
         uint32_t a = (uint32_t)(uintptr_t)p;
         c->bx = c->si = (uint16_t)(a >> 16); c->cx = c->di = (uint16_t)a; ok(c); return;

@@ -853,6 +853,8 @@ def lift_segment(ne: NEHeader, seg_num: int, func_offset: int = -1, xmod=None):
     off_to_label = {f.offset: f.label for f in functions}
     valid_labels = {f.label for f in functions}
     TERMINATORS = ('ret', 'retf', 'iret', 'jmp')
+    _LOOP_BRANCHES = ('jmp', 'jo', 'jno', 'jb', 'jae', 'je', 'jne', 'jbe', 'ja', 'js', 'jns', 'jp', 'jnp',
+                      'jl', 'jge', 'jle', 'jg', 'loop', 'loopz', 'loopnz', 'jcxz')
 
     for func in target_funcs:
         # Get instructions for this function
@@ -867,8 +869,28 @@ def lift_segment(ne: NEHeader, seg_num: int, func_offset: int = -1, xmod=None):
             print('void ' + func.label + '(CPU *cpu)\n{\n' + '    TRACE_FN(\"' + func.label + '\");\n' + '    ' + _unreachable_name() + '(\"%03d\", 0x%04X);\n' % (seg.index, func.offset) + '}\n')
             continue
 
+        # A loop whose back-edge goes to an earlier function (the basic-block
+        # split makes every branch target a function) would be a tail call
+        # back up the chain: C recursion, one stack frame per iteration, and
+        # KRNL386's 64K-iteration descriptor loops overflow the C stack. Lift
+        # this function from the earliest such target instead, so the edge is
+        # an in-function goto, entered at its own start by a goto at the top.
+        # ponytail: bounded to 256 bytes back; the code in between is lifted
+        # twice (here and as its own functions).
+        entry = None
+        lo = func.offset
+        for i in func_insts:
+            o1 = i.op1
+            if (i.mnemonic in _LOOP_BRANCHES and o1 and o1.type in (OpType.REL8, OpType.REL16)
+                    and func.offset - 0x100 <= o1.disp < lo):
+                lo = o1.disp
+        if lo < func.offset:
+            run = [i for i in instructions if lo <= (i.offset - seg.file_offset) < func.end]
+            offs = {i.offset - seg.file_offset for i in run}
+            if lo in offs and func.offset in offs:
+                func_insts, entry = run, func.offset
         code = lifter.lift_function(
-            func.label, func_insts, seg.file_offset + func.offset, func.is_far)
+            func.label, func_insts, seg.file_offset + func.offset, func.is_far, entry_addr=entry)
         # Inject an entry-trace marker (compiles to nothing without -DELFISH_TRACE_FN)
         code = code.replace('{\n', '{\n    TRACE_FN("%s");\n' % func.label, 1)
 
