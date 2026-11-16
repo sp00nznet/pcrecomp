@@ -425,10 +425,14 @@ class Disassembler:
         # A NUL-terminated ASCII name is not code either: `push offset
         # "GetLayout"` ahead of GetProcAddress (mspaint), whose bytes decode
         # and ran on into the vtable after it.
+        # Unless it opens with two register pushes ('P'..'W'): `push ebx;
+        # push esi; push edi; push 0` reads "SVWj\0" (MPREXE's thread start
+        # 0x005010C3, pushed ahead of its CreateThread wrapper).
         n = 0
         while n < len(data) and 0x20 <= data[n] < 0x7F:
             n += 1
-        if n >= 4 and n < len(data) and data[n] == 0:
+        pushes = len(data) >= 2 and 0x50 <= data[0] <= 0x57 and 0x50 <= data[1] <= 0x57
+        if n >= 4 and n < len(data) and data[n] == 0 and not pushes:
             return False
         n = 0      # and UTF-16 (L"gdi32.dll" right after it)
         while 2 * n + 1 < len(data) and 0x20 <= data[2 * n] < 0x7F and data[2 * n + 1] == 0:

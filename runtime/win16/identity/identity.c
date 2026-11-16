@@ -914,7 +914,13 @@ int w16_enter(uint32_t target) {
         if (stub[0] != 0x66 || stub[1] != 0xEA) w16_stop("thunk return is not a jmp far 32", ret >> 16, ret & 0xFFFF);
         memcpy(&cont, stub + 2, 4);
     }
-    if (!w16_entry(c, seg_of(sel), off)) w16_stop("no lifted function at", sel, off);
+    if (!w16_entry(c, seg_of(sel), off)) {
+        const uint8_t *b = (const uint8_t *)(uintptr_t)(recomp_sel_base(sel) + off);
+        fprintf(stderr, "[w16] %04X:%04X (base %08X):", sel, off, recomp_sel_base(sel));
+        for (int i = 0; recomp_sel_base(sel) && i < 32; i++) fprintf(stderr, " %02X", b[i]);
+        fprintf(stderr, "\n");
+        w16_stop("no lifted function at", sel, off);
+    }
     g_w16_ret = prev;
     g_eax = c->eax; g_ecx = c->ecx; g_edx = c->edx; g_ebx = c->ebx;
     g_esi = c->esi; g_edi = c->edi; g_ebp = c->ebp;

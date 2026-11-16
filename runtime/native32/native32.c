@@ -374,8 +374,10 @@ int native32_in_guest(uint32_t va) {
  * variable, so it never launches again; the standard handles are passed on
  * explicitly, so a harness reading a pipe sees the child's output. */
 #define NATIVE32_HELD_ENV "NATIVE32_HELD"
-static uint32_t g_hold_range[2];   /* native32_hold_range: one more span the relaunch reserves */
-void native32_hold_range(uint32_t base, uint32_t size) { g_hold_range[0] = base; g_hold_range[1] = size; }
+static uint32_t g_hold_range[8][2];   /* native32_hold_range: more spans the relaunch reserves */
+void native32_hold_range(uint32_t base, uint32_t size) {
+    for (int i = 0; i < 8; i++) if (!g_hold_range[i][1]) { g_hold_range[i][0] = base; g_hold_range[i][1] = size; return; }
+}
 
 int native32_hold_image(const char* path, uint32_t base) {
     char flag[16], me[MAX_PATH];
@@ -414,8 +416,8 @@ int native32_hold_image(const char* path, uint32_t base) {
             return 0;
         }
         int held = VirtualAllocEx(pi.hProcess, (void*)(uintptr_t)base, span, MEM_RESERVE, PAGE_NOACCESS) != NULL;
-        if (held && g_hold_range[1])
-            held = VirtualAllocEx(pi.hProcess, (void*)(uintptr_t)g_hold_range[0], g_hold_range[1], MEM_RESERVE, PAGE_NOACCESS) != NULL;
+        for (int r = 0; held && r < 8 && g_hold_range[r][1]; r++)
+            held = VirtualAllocEx(pi.hProcess, (void*)(uintptr_t)g_hold_range[r][0], g_hold_range[r][1], MEM_RESERVE, PAGE_NOACCESS) != NULL;
         if (held) break;
         DWORD err = GetLastError();
         TerminateProcess(pi.hProcess, 1);

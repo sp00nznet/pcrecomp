@@ -109,7 +109,7 @@ static LONG CALLBACK resv_fault(EXCEPTION_POINTERS* e) {
     for (LONG i = 0; i < g_nresv; i++)
         if (at - g_resv[i].base < g_resv[i].size) {
             if (!VirtualQuery((void*)at, &mb, sizeof mb) || mb.State != MEM_RESERVE) break;
-            if (!VirtualAlloc((void*)(at & ~(uintptr_t)0xFFF), 0x1000, MEM_COMMIT, PAGE_EXECUTE_READWRITE)) break;
+            if (!VirtualAlloc((void*)(at & ~(uintptr_t)0xFFF), 0x1000, MEM_COMMIT, PAGE_READWRITE)) break;
             return EXCEPTION_CONTINUE_EXECUTION;
         }
     return EXCEPTION_CONTINUE_SEARCH;
@@ -127,7 +127,7 @@ static uint32_t vwin32_virtual_query(const uint32_t* a) {
 static uint32_t vwin32_in_context(const uint32_t* a) { return a[0]; }
 static uint32_t vmm_page_reserve(const uint32_t* a) {
     void* want = PR_ANY(a[0]) ? NULL : (void*)(uintptr_t)(a[0] << 12);
-    void* p = VirtualAlloc(want, a[1] << 12, MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    void* p = VirtualAlloc(want, a[1] << 12, MEM_RESERVE, PAGE_READWRITE);
     if (p) {
         if (!g_nresv) AddVectoredExceptionHandler(1, resv_fault);
         LONG i = InterlockedIncrement(&g_nresv) - 1;
@@ -173,6 +173,15 @@ static uint32_t vmm_reg_enum_value(const uint32_t* a) {
 }
 static uint32_t vmm_reg_query_value(const uint32_t* a) {
     return (uint32_t)REG("RegQueryValueExA", LONG(WINAPI*)(HKEY, LPCSTR, LPDWORD, LPDWORD, LPBYTE, LPDWORD))((HKEY)P(0), P(1), NULL, P(3), P(4), P(5));
+}
+/* 1D (hk, &subkeys, &maxsubkey, &values, &maxvaluename, &maxvalue): advapi32's
+ * RegQueryInfoKeyA (0xBFE81C2B); 15 (hk, sub, type, data, cb): RegSetValueA. */
+static uint32_t vmm_reg_query_info(const uint32_t* a) {
+    return (uint32_t)REG("RegQueryInfoKeyA", LONG(WINAPI*)(HKEY, LPSTR, LPDWORD, LPDWORD, LPDWORD, LPDWORD, LPDWORD, LPDWORD, LPDWORD, LPDWORD, LPDWORD, PFILETIME))(
+        (HKEY)P(0), NULL, NULL, NULL, P(1), P(2), NULL, P(3), P(4), P(5), NULL, NULL);
+}
+static uint32_t vmm_reg_set_value_sub(const uint32_t* a) {
+    return (uint32_t)REG("RegSetValueA", LONG(WINAPI*)(HKEY, LPCSTR, DWORD, LPCSTR, DWORD))((HKEY)P(0), P(1), a[2], P(3), a[4]);
 }
 static uint32_t vmm_reg_set_value(const uint32_t* a) {
     return (uint32_t)REG("RegSetValueExA", LONG(WINAPI*)(HKEY, LPCSTR, DWORD, DWORD, const BYTE*, DWORD))((HKEY)P(0), P(1), 0, a[3], P(4), a[5]);
@@ -458,7 +467,7 @@ static uint32_t vmm_pager_register(const uint32_t* a) {
  * pagein(&pagerdata, page address, 0), cdecl, pagerdata + i for page i. */
 static uint32_t vmm_page_commit(const uint32_t* a) {
     uint32_t page = a[0], n = a[1], hpd = a[2], data = a[3];
-    if (!VirtualAlloc((void*)(uintptr_t)(page << 12), n << 12, MEM_COMMIT, PAGE_EXECUTE_READWRITE)) return 0;
+    if (!VirtualAlloc((void*)(uintptr_t)(page << 12), n << 12, MEM_COMMIT, PAGE_READWRITE)) return 0;
     if (hpd >= 3 && hpd < (uint32_t)g_npd && g_pd[hpd][0]) {
         uint32_t saved[8] = { g_eax, g_ecx, g_edx, g_ebx, g_esp, g_ebp, g_esi, g_edi };
         for (uint32_t i = 0; i < n; i++) {
@@ -533,6 +542,10 @@ static uint32_t vmm_context_create(const uint32_t* a) { static uint32_t n; (void
 /* VMM 7 (ctx): a dead process's memory context (PDB+1C, 0xBFF8D3CA and
  * 0xBFF8D9B4) destroyed. A cookie: nothing to free. */
 static uint32_t vmm_context_destroy(const uint32_t* a) { (void)a; return 1; }
+/* VMM 8 (page, ctx, srcpage, n): _PageAttach, a module's pages mapped into a
+ * new process's context (kernel32 attaches MPR.DLL's for MPREXE). One address
+ * space: already there. */
+static uint32_t vmm_page_attach(const uint32_t* a) { (void)a; return 1; }
 
 /* VWIN32 4F (fn, handle, 0, 0): 33h registers a kernel32 object (a process) with
  * VWIN32's ring-0 side, 34h drops it. The host keeps no ring-0 twin. */
@@ -562,6 +575,7 @@ static uint32_t vwin32_set_priorities(const uint32_t* a) { (void)a; return 0; }
 #define R0T_TDBX   0x3C
 #define R0T_SS     0x54      /* the stack selector of esp (a[6]) */
 static void track_thread(uint32_t r0);
+static void note_tid(uint32_t r0);
 /* A TDBX: +0 its thread, +4 its process (ExitProcess reads it, 0xBFF89768),
  * +50 -> the current PSP selector. */
 static uint32_t new_tdbx(uint32_t thread, uint32_t process) {
@@ -631,6 +645,7 @@ static void w9x_on_enter(void) {
 }
 static DWORD WINAPI guest_thread(LPVOID p) {
     t_r0 = (uint32_t)(uintptr_t)p;
+    note_tid(t_r0);
     mach_enter();
     g_cur[0] = MEM32(t_r0 + R0T_THREAD); g_cur[1] = MEM32(t_r0 + R0T_PROCESS); g_cur[2] = MEM32(t_r0 + R0T_TDBX);
     g_esp = MEM32(t_r0 + R0T_ESP);
@@ -690,6 +705,8 @@ static uint32_t g_threads[MAXTHREADS];     /* every r0 twin, for vxd_wake */
 static int g_nthreads;
 static HANDLE thread_wake(void);
 static void track_thread(uint32_t r0) { if (g_nthreads < MAXTHREADS) g_threads[g_nthreads++] = r0; }
+static DWORD g_tids[MAXTHREADS];           /* the host thread each runs on, for the dump */
+static void note_tid(uint32_t r0) { for (int t = 0; t < g_nthreads; t++) if (g_threads[t] == r0) g_tids[t] = GetCurrentThreadId(); }
 static uint32_t g_console_obj;   /* VCOND 2's object: its input is the host's stdin */
 /* Mutexes (kernel32 type 3, 0xBFF8CAA2: 18h bytes, +4 0, +8 1): Win98's
  * WaitForSingleObject goes straight to ring 0 (0xBFF99B28), which owns
@@ -722,6 +739,40 @@ static uint32_t vwin32_release_mutex(const uint32_t* a) {
     }
     return 1;
 }
+/* Semaphores (kernel32 type 1, 0xBFF8F49D: 14h bytes, +8 the count, +10h
+ * the maximum): ReleaseSemaphore is VWIN32 5E (sem, n, &prev), 0xBFF92D4D.
+ * A wait takes one at once while the count is above 0; a release hands one
+ * to each waiter it can. FALSE past the maximum. */
+static int is_sem(uint32_t obj) { return obj && MEM8(obj) == 1; }
+static uint32_t vwin32_release_sem(const uint32_t* a) {
+    uint32_t s = a[0];
+    if (!is_sem(s) || MEM32(s + 8) + a[1] > MEM32(s + 0x10)) return 0;
+    if (a[2]) MEM32(a[2]) = MEM32(s + 8);
+    MEM32(s + 8) += a[1];
+    for (int t = 0; t < g_nthreads && MEM32(s + 8); t++) {
+        uint32_t r0 = g_threads[t], n = MEM32(r0 + R0T_WAITN);
+        for (uint32_t i = 0; i < n; i++)
+            if (MEM32(MEM32(r0 + R0T_WAITS) + 4 * i) == s) {
+                MEM32(s + 8)--;
+                MEM32(r0 + R0T_WOKEN) = i; MEM32(r0 + R0T_WAITN) = 0;
+                SetEvent((HANDLE)(uintptr_t)MEM32(r0 + R0T_WAKE));
+                break;
+            }
+    }
+    return 1;
+}
+/* For a watchdog: every ring-0 twin's thread, host thread and wait list, and
+ * each held mutex. */
+void native32_w9x_dump_threads(void) {
+    for (int t = 0; t < g_nthreads; t++) {
+        uint32_t r0 = g_threads[t], n = MEM32(r0 + R0T_WAITN);
+        fprintf(stderr, "  r0 %08X thread %08X process %08X host %lu waits", r0, MEM32(r0 + R0T_THREAD), MEM32(r0 + R0T_PROCESS), g_tids[t]);
+        for (uint32_t i = 0; i < n && i < 8; i++) fprintf(stderr, " %08X", MEM32(MEM32(r0 + R0T_WAITS) + 4 * i));
+        fprintf(stderr, "\n");
+    }
+    for (int m = 0; m < MAXMUTEX; m++)
+        if (g_mutex[m].obj && g_mutex[m].owner) fprintf(stderr, "  mutex %08X owner %08X x%u\n", g_mutex[m].obj, g_mutex[m].owner, g_mutex[m].n);
+}
 static uint32_t vwin32_wait_multiple(const uint32_t* a) {
     /* A wait on the console (ReadFile on a console handle, 0xBFF774E4)
      * waits for input: always ready, the read itself blocks on stdin. */
@@ -731,6 +782,13 @@ static uint32_t vwin32_wait_multiple(const uint32_t* a) {
         uint32_t o = MEM32(a[1] + 4 * i);
         int m = is_mutex(o) ? mutex_slot(o) : -1;
         if (m >= 0 && (!g_mutex[m].owner || g_mutex[m].owner == g_cur[0])) { g_mutex[m].owner = g_cur[0]; g_mutex[m].n++; return i; }
+    }
+    for (uint32_t i = 0; i < a[0]; i++) {   /* already signalled (an event set before the wait: MPREXE's for MPR) */
+        uint32_t o = MEM32(a[1] + 4 * i), w;
+        if (!o || is_mutex(o)) continue;
+        if (is_sem(o)) { if (MEM32(o + 8)) { MEM32(o + 8)--; return i; } continue; }
+        w = MEM32(o + 4) > 0xFFFFu ? MEM32(o + 4) : o;   /* an object's +4 is its wait block; a block's +4 its count */
+        if (MEM32(w + 4)) { if (!MEM32(w + 8)) MEM32(w + 4) = 0; return i; }
     }
     uint32_t r0 = t_r0 ? t_r0 : g_boot_r0;
     MEM32(r0 + R0T_WAITN) = a[0];
@@ -1518,6 +1576,7 @@ static const vxd_service_t g_services[] = {
     { 0x00090001, 2, reboot_0, "REBOOT_1" },
     { 0x002A0030, 2, vwin32_wait_block_destroy, "VWIN32_DestroyWaitBlock" },
     { 0x002A005F, 1, vwin32_release_mutex, "VWIN32_ReleaseMutex" },
+    { 0x002A005E, 3, vwin32_release_sem, "VWIN32_ReleaseSemaphore" },
     { 0x002A0060, 1, vwin32_set_event, "VWIN32_SetEvent" },
     { 0x002A0061, 1, vwin32_pulse_event, "VWIN32_PulseEvent" },
     { 0x002A0062, 1, vwin32_reset_event, "VWIN32_ResetEvent" },
@@ -1527,6 +1586,16 @@ static const vxd_service_t g_services[] = {
     { 0x00010005, 2, vmm_heap_alloc, "VMM_HeapAllocate" },
     { 0x00010006, 0, vmm_context_create, "VMM_ContextCreate" },
     { 0x00010007, 1, vmm_context_destroy, "VMM_ContextDestroy" },
+    { 0x00010008, 4, vmm_page_attach, "VMM_PageAttach" },
+    /* VxD 4B service 0: its Get_Version, which kernel32 compares with 100h
+     * before using it (DeviceIoControl/CreateFile on \\.\ names). Absent. */
+    { 0x004B0000, 0, vmm_28, "VxD4B_Get_Version (absent)" },
+    /* VxD 2B service 15 (name past "\\.\"): is it a device (0xBFF7FF9F, from
+     * CreateFileA)? No devices in the sandbox (MPRSERV asks for IFSMGR). */
+    { 0x002B0015, 1, vmm_28, "VxD2B_15_DeviceName (none)" },
+    /* VWIN32 1F (0, 0xBFF9CEEE, name, ...): CreateFileA on \\.\<vxd> opens a
+     * VxD (0xBFF7F7F9). 0 is ERROR_FILE_NOT_FOUND: no VxDs, no hardware. */
+    { 0x002A001F, 11, vmm_28, "VWIN32_OpenVxD (none)" },
     { 0x00010010, 2, vmm_heap_free, "VMM_HeapFree" },
     { 0x0001000C, 3, vmm_heap_realloc, "VMM_HeapReAllocate" },
     { 0x002A0047, 1, vwin32_set_env, "VWIN32_SetEnvironment" },
@@ -1547,6 +1616,8 @@ static const vxd_service_t g_services[] = {
     { 0x00010019, 8, vmm_reg_enum_value, "VMM_RegEnumValue" },
     { 0x0001001A, 6, vmm_reg_query_value, "VMM_RegQueryValueEx" },
     { 0x0001001B, 6, vmm_reg_set_value, "VMM_RegSetValueEx" },
+    { 0x0001001D, 6, vmm_reg_query_info, "VMM_RegQueryInfoKey" },
+    { 0x00010015, 5, vmm_reg_set_value_sub, "VMM_RegSetValue" },
     { 0x00010004, 2, vmm_pager_query, "VMM_PagerQuery" },
     { 0x002A004A, 2, vwin32_crst_create, "VWIN32_CreateCrst" },
     { 0x002A0003, 8, vwin32_boot_sels, "VWIN32_BootSelectors" },

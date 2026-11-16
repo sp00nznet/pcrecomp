@@ -107,7 +107,7 @@ int native32_hold_image(const char* path, uint32_t base);
  * (call it before native32_hold_image); the child commits it with
  * VirtualAlloc(MEM_COMMIT). Win16 identity mode holds 0x10000-0x10FFFF so
  * real-mode memory sits at linear = paragraph * 16. */
-void native32_hold_range(uint32_t base, uint32_t size);
+void native32_hold_range(uint32_t base, uint32_t size);   /* up to 8 spans, one per call */
 
 /* Give this process a 16-bit (or 8-bit) DirectDraw. On a 32-bit desktop
  * DirectDraw enumerates and sets only 32-bit modes, so a game that wants
