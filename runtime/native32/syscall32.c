@@ -231,7 +231,7 @@ static uint32_t fb_map(const wchar_t* s, int n, int relative, wchar_t* out, int*
         int k = (int)wcslen(pre[i]);
         if (n >= k && !_wcsnicmp(s, pre[i], k)) { s += k, n -= k; goto dos; }
     }
-    if (n >= 30 && !_wcsnicmp(s, L"\\Device\\NamedPipe\\Win32Pipes.", 30)) return 0;   /* CreatePipe's other end */
+    if (n >= 29 && !_wcsnicmp(s, L"\\Device\\NamedPipe\\Win32Pipes.", 29)) return 0;   /* CreatePipe's other end (29 characters) */
     return 0xC0000022u;                                       /* \Device\..., \SystemRoot, ...: refused */
 dos:
     if (n < 2 || n > MAX_PATH || s[1] != L':' || !iswalpha(s[0]) || (n > 2 && s[2] != L'\\'))
@@ -1266,11 +1266,17 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
          * the guest probing host directories. */
         wchar_t* e = GetEnvironmentStringsW();
         size_t n = 0, o = 0, dl = wcslen(dll_path);
+        wchar_t gp[MAX_PATH] = L"";
+        GetEnvironmentVariableW(L"PCRECOMP_GUEST_PATH", gp, MAX_PATH);
         while (e[n] || e[n + 1]) n++;
-        wchar_t* copy = (wchar_t*)VirtualAlloc(NULL, (n + dl + 8) * 2, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        wchar_t* copy = (wchar_t*)VirtualAlloc(NULL, (n + dl + MAX_PATH + 8) * 2, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         for (wchar_t* s = e; *s; s += wcslen(s) + 1)
             if (_wcsnicmp(s, L"Path=", 5)) { wcscpy(copy + o, s); if (fb_on) fb_guest_path(copy + o); o += wcslen(copy + o) + 1; }
-        wcscpy(copy + o, L"Path="), wcscpy(copy + o + 5, dll_path), o += 5 + dl + 1;
+        wcscpy(copy + o, L"Path="), wcscpy(copy + o + 5, dll_path), o += 5 + dl;
+        /* PCRECOMP_GUEST_PATH: more guest directories for a program search (cmd's
+         * `find` and `more`: the box's C:\WINNT\system32, where a runner puts names) */
+        if (gp[0]) _snwprintf(copy + o, 1 + wcslen(gp) + 1, L";%ls", gp), o += 1 + wcslen(gp);
+        o++;
         copy[o] = 0;
         FreeEnvironmentStringsW(e);
         *(uint32_t*)(pp + 0x48) = (uint32_t)(uintptr_t)copy;
