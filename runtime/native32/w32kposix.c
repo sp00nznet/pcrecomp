@@ -1330,6 +1330,75 @@ static uint32_t s_charsetinfo(uint32_t* a) {     /* NtGdiGetTextCharsetInfo(hdc,
     if (a[1]) { for (int i = 0; i < 24; i += 4) MEM32(a[1] + i) = 0; MEM32(a[1] + 16) = 1; }   /* fsCsb[0]: Latin 1 */
     return 0;
 }
+/* NtGdiGetTextFaceW(hdc, cChar, out, fAlias): the face that renders (a .fon's), with its length counting the NUL */
+static uint32_t s_textface(uint32_t* a) {
+    gobj_t* d = DCH(a[0]);
+    fnt_t* F = d ? dc_font(d, NULL) : NULL;
+    if (!F) return 0;
+    uint32_t n = (uint32_t)strlen(F->face) + 1;
+    if (!a[2]) return n;
+    if (n > a[1]) n = a[1];
+    if (!n) return 0;
+    for (uint32_t i = 0; i + 1 < n; i++) MEM16(a[2] + 2 * i) = (uint8_t)F->face[i];
+    MEM16(a[2] + 2 * (n - 1)) = 0;
+    return n;
+}
+/* Font enumeration: NtGdiEnumFontOpen(hdc, type, flWin31Compat, cwchMax, face, charset, &cb)
+ * gives an id and the size of the list; NtGdiEnumFontChunk(hdc, id, cb, &cbGot, buf) copies
+ * it. One ENUMFONTDATAW per face, as gdi32 walks it: +0 its size, +4 dpNtmi (the
+ * NEWTEXTMETRICEXW is at +8+dpNtmi), +8 the font type, +0xC ENUMLOGFONTEXDVW.
+ * The faces are the .fon faces w32kposix renders; a named face is answered as itself
+ * (any face renders, through fnt_pick), Western. ponytail: one enumeration at a time. */
+#define EFD_LF 0xC
+#define EFD_NTM 0x1B8                             /* after ENUMLOGFONTEXDVW (420 bytes) */
+#define EFD_SIZE (EFD_NTM + 100 + 72)
+static uint8_t* g_efd;
+static uint32_t g_efd_cb;
+static void a2u(uint16_t* d, const char* s, int cap) { int i = 0; for (; s[i] && i < cap - 1; i++) d[i] = (uint8_t)s[i]; d[i] = 0; }
+static void efd_put(uint8_t* e, const char* face, const fnt_t* F) {
+    uint32_t p = (uint32_t)(uintptr_t)e, lf = p + EFD_LF, tm = p + EFD_NTM;
+    memset(e, 0, EFD_SIZE);
+    MEM32(p) = EFD_SIZE, MEM32(p + 4) = EFD_NTM - 8, MEM32(p + 8) = 1;              /* RASTER_FONTTYPE */
+    MEM32(lf) = (uint32_t)(F ? F->h : 13), MEM32(lf + 4) = (uint32_t)(F ? F->avgw : 6);
+    MEM32(lf + 16) = F ? (uint32_t)F->weight : 400;
+    MEM8(lf + 23) = 0, MEM8(lf + 27) = (uint8_t)(F ? F->pitch : 0x22);              /* ANSI_CHARSET */
+    for (int i = 0; face[i] && i < 31; i++) MEM16(lf + 28 + 2 * i) = (uint8_t)face[i], MEM16(lf + 92 + 2 * i) = (uint8_t)face[i];
+    a2u((uint16_t*)(uintptr_t)(lf + 220), "Regular", 32);
+    a2u((uint16_t*)(uintptr_t)(lf + 284), "Western", 32);
+    if (F) {
+        MEM32(tm) = (uint32_t)F->h, MEM32(tm + 4) = (uint32_t)F->ascent, MEM32(tm + 8) = (uint32_t)(F->h - F->ascent);
+        MEM32(tm + 12) = (uint32_t)F->ilead, MEM32(tm + 16) = (uint32_t)F->elead;
+        MEM32(tm + 20) = (uint32_t)F->avgw, MEM32(tm + 24) = (uint32_t)F->maxw, MEM32(tm + 28) = (uint32_t)F->weight;
+        MEM16(tm + 44) = (uint16_t)F->first, MEM16(tm + 46) = (uint16_t)F->last;
+        MEM16(tm + 48) = (uint16_t)F->defch, MEM16(tm + 50) = (uint16_t)F->brk;
+        MEM8(tm + 55) = (uint8_t)F->pitch;
+    }
+    MEM32(tm + 36) = 96, MEM32(tm + 40) = 96, MEM32(tm + 92) = 1;                  /* fsCsb[0]: Latin 1 */
+}
+static uint32_t s_enumfont_open(uint32_t* a) {
+    char face[33] = "";
+    for (uint32_t i = 0; a[4] && i < 32 && MEM16(a[4] + 2 * i); i++) face[i] = (char)MEM16(a[4] + 2 * i), face[i + 1] = 0;
+    free(g_efd);
+    g_efd = calloc((size_t)(g_nfnt + 1), EFD_SIZE), g_efd_cb = 0;
+    if (face[0]) {
+        int k = fnt_pick(face, 0);
+        efd_put(g_efd, face, k >= 0 && g_nfnt ? &g_fnt[k] : NULL), g_efd_cb = EFD_SIZE;
+    } else
+        for (int i = 0; i < g_nfnt; i++) {
+            int dup = 0;
+            for (int j = 0; j < i; j++) dup |= !strcmp(g_fnt[j].face, g_fnt[i].face);
+            if (!dup) efd_put(g_efd + g_efd_cb, g_fnt[i].face, &g_fnt[i]), g_efd_cb += EFD_SIZE;
+        }
+    if (a[6]) MEM32(a[6]) = g_efd_cb;
+    return 0x4E554D45u;                           /* any non-zero id */
+}
+static uint32_t s_enumfont_chunk(uint32_t* a) {
+    uint32_t n = a[2] < g_efd_cb ? a[2] : g_efd_cb;
+    if (!g_efd || !a[4]) return 0;
+    memcpy((void*)(uintptr_t)a[4], g_efd, n);
+    if (a[3]) MEM32(a[3]) = n;
+    return 1;
+}
 static rc_t* rgn_get(gobj_t* o);
 static uint32_t rgn_set(gobj_t* o, rc_t r, uint32_t cplx);
 static uint32_t s_randomrgn(uint32_t* a) {       /* NtGdiGetRandomRgn(hdc, hrgn, SYSRGN 4): the visible region, screen coordinates */
@@ -1508,7 +1577,6 @@ static int u16icmp(const uint16_t* a, const uint16_t* b) {
 }
 static void u16cpy(uint16_t* d, const uint16_t* s, int cap) { int i = 0; for (; s && s[i] && i < cap - 1; i++) d[i] = s[i]; d[i] = 0; }
 static int u16len_(const uint16_t* s) { int n = 0; while (s && s[n]) n++; return n; }
-static void a2u(uint16_t* d, const char* s, int cap) { int i = 0; for (; s[i] && i < cap - 1; i++) d[i] = (uint8_t)s[i]; d[i] = 0; }
 /* a class by atom (a value below 0x10000) or name */
 static int cls_find(uint32_t name) {
     for (int i = 0; i < g_ncls; i++)
@@ -1998,6 +2066,7 @@ static void activate(uobj_t* u) {
     if (g_active == u->h) return;
     uint32_t old = g_active;
     g_active = u->h;
+    TRACE("[user] activate %08X (style %08X), was %08X\n", u->h, u->style, old);
     if (W(old)) { send(old, 0x86, 0, 0); send(old, 6, 0, u->h); }
     send(u->h, 0x86, 1, 0);                                           /* WM_NCACTIVATE */
     send(u->h, 6, 1, old);                                            /* WM_ACTIVATE WA_ACTIVE */
@@ -2349,7 +2418,7 @@ static uint32_t s_invalidate(uint32_t* a) {      /* NtUserInvalidateRect(hwnd, R
     uobj_t* u = W(a[0]);
     if (!a[0]) { for (int i = 2; i < MAXU; i++) if (g_u[i].type == W2K_TYPE_WINDOW) invalidate(&g_u[i], (int)a[2]); return 1; }
     if (!u) return 0;
-    u->dirty = 1, u->erase |= a[2] != 0;
+    invalidate(u, a[2] != 0);                     /* the rect is not kept, so the whole window, children too (painted over otherwise) */
     return 1;
 }
 /* NtUserRedrawWindow(hwnd, RECT*, hrgn, flags): RDW_INVALIDATE 1, RDW_ERASE 4, RDW_FRAME 0x400, RDW_UPDATENOW 0x100 */
@@ -2683,7 +2752,13 @@ static uint32_t s_hwnd_param(uint32_t* a) {      /* NtUserCallHwndParam(hwnd, pa
     if (a[2] == 0x43) { MEM32(u->obj + 0x9C) = a[1]; MEM8(u->obj + 0x16) |= 1; return 1; }   /* a dialog's DIALOG */
     if (a[2] == 0x46 && (a[1] >> 8) < 8) { MEM8(u->obj + 0x14 + (a[1] >> 8)) |= (uint8_t)a[1]; return 1; }   /* SetWindowState */
     if (a[2] == 0x41 && (a[1] >> 8) < 8) { MEM8(u->obj + 0x14 + (a[1] >> 8)) &= (uint8_t)~a[1]; return 1; }  /* ClearWindowState */
-    fprintf(stderr, "[user] NtUserCallHwndParam index 0x%X not answered\n", a[2]);
+    if ((a[2] == 0x41 || a[2] == 0x46) && (a[1] >> 8) < 0x10) {   /* the same on ExStyle (8..B) and style (C..F), kept in u */
+        uint32_t* f = (a[1] >> 8) < 0xC ? &u->ex : &u->style, m = (a[1] & 0xFFu) << (8 * ((a[1] >> 8) & 3));
+        if (a[2] == 0x46) *f |= m; else *f &= ~m;
+        wnd_sync(u);
+        return 1;
+    }
+    fprintf(stderr, "[user] NtUserCallHwndParam(%08X, %08X) index 0x%X not answered\n", a[0], a[1], a[2]);
     return 0;
 }
 static uint32_t s_hwnd_param_lock(uint32_t* a) { /* 0x53 EnableWindow */
@@ -2697,6 +2772,53 @@ static uint32_t s_hwnd_param_lock(uint32_t* a) { /* 0x53 EnableWindow */
     }
     fprintf(stderr, "[user] NtUserCallHwndParamLock index 0x%X not answered\n", a[2]);
     return 0;
+}
+/* NtUserScrollWindowEx(hwnd, dx, dy, prcScroll, prcClip, hrgnUpdate, prcUpdate, flags):
+ * ponytail: no bits moved, the whole client is repainted (the update rect is all of it);
+ * children not moved (SW_SCROLLCHILDREN) */
+static uint32_t s_scrollwindow(uint32_t* a) {
+    uobj_t* u = W(a[0]);
+    if (!u) return 0;
+    invalidate(u, 1);
+    if (a[6]) { rc_t r = { 0, 0, u->cr.r - u->cr.l, u->cr.b - u->cr.t }; rc_put(a[6], r); }
+    return 2;                                     /* SIMPLEREGION */
+}
+/* NtUserGetClassName(hwnd, bReal, UNICODE_STRING* out): the length copied, without the NUL */
+static uint32_t s_classname(uint32_t* a) {
+    uobj_t* u = W(a[0]);
+    uint32_t s = a[2];
+    if (!u || u->cls < 0 || !s) return 0;
+    const uint16_t* n = g_cls[u->cls].name;
+    uint32_t cap = MEM16(s + 2) / 2, b = MEM32(s + 4), i = 0;
+    if (!cap || !b) return 0;
+    for (; n[i] && i + 1 < cap; i++) MEM16(b + 2 * i) = n[i];
+    MEM16(b + 2 * i) = 0;
+    return i;
+}
+/* NtUserFindWindowEx(parent, after, UNICODE_STRING* class, UNICODE_STRING* name, type):
+ * class by atom (Buffer below 0x10000) or name, name exact; either may be absent */
+static uint32_t s_findwindow(uint32_t* a) {
+    uint32_t parent = a[0] ? a[0] : g_desktop, cb = a[2] ? MEM32(a[2] + 4) : 0, nb = a[3] ? MEM32(a[3] + 4) : 0;
+    int ci = -2, past = !a[1];
+    if (cb) { ci = cls_find(cb); if (ci < 0) return 0; }
+    uint16_t name[128] = { 0 };
+    if (nb) for (uint32_t i = 0; i < MEM16(a[3]) / 2u && i < 127; i++) name[i] = MEM16(nb + 2 * i);
+    for (int i = 2; i < MAXU; i++) {
+        uobj_t* u = &g_u[i];
+        if (u->type != W2K_TYPE_WINDOW || u->parent != parent) continue;
+        if (!past) { past = u->h == a[1]; continue; }
+        if ((ci == -2 || u->cls == ci) && (!nb || !u16icmp(u->text, name))) return u->h;
+    }
+    return 0;
+}
+/* NtUserUnregisterClass(UNICODE_STRING* name, hInstance, CLSMENUNAME* out): the
+ * class is forgotten (its windows keep their procedure); no menu names to hand back */
+static uint32_t s_unregister_class(uint32_t* a) {
+    int i = cls_find(MEM32(a[0] + 4));
+    if (i < 0) return 0;
+    g_cls[i].atom = 0, g_cls[i].name[0] = 0;
+    if (a[2]) MEM32(a[2]) = MEM32(a[2] + 4) = MEM32(a[2] + 8) = 0;
+    return 1;
 }
 static uint32_t s_set_fnid(uint32_t* a) { uobj_t* u = W(a[0]); if (u) MEM16(u->obj + WND_FNID) = (uint16_t)a[1]; return u != NULL; }
 static uint32_t s_query_window(uint32_t* a) {
@@ -2735,7 +2857,13 @@ static uint32_t s_setfocus(uint32_t* a) {
     return old;
 }
 static uint32_t s_setcapture(uint32_t* a) { uint32_t o = g_capture; g_capture = a[0]; return o; }
-static uint32_t s_setactive(uint32_t* a) { uint32_t o = g_active; uobj_t* u = W(a[0]); if (u) activate(u); return o; }
+static uint32_t s_setactive(uint32_t* a) {       /* a child is not activated (mspaint asks for its view's) */
+    uint32_t o = g_active;
+    uobj_t* u = W(a[0]);
+    if (u && (u->style & (WS_CHILD | 0x80000000u)) == WS_CHILD) return 0;
+    if (u) activate(u);
+    return o;
+}
 static uint32_t s_foreground(uint32_t* a) { (void)a; return g_active; }
 static uint32_t s_threaddesk(uint32_t* a) { (void)a; return 0x128; }
 static uint32_t s_one_u(uint32_t* a) { (void)a; return 1; }
@@ -3273,6 +3401,7 @@ void w2kx_install(int cx, int cy, const char* fontdir) {
         { "NtGdiGetRgnBox", s_getrgnbox }, { "NtGdiGetAppClipBox", s_cliprect }, { "NtGdiFlushUserBatch", s_flushbatch },
         { "NtGdiFlush", s_one }, { "NtGdiComputeXformCoefficients", s_one }, { "NtGdiSetLayout", s_zero }, { "NtGdiGetLayout", s_zero },
         { "NtGdiEnumFontClose", s_one }, { "NtGdiGetTextCharsetInfo", s_charsetinfo }, { "NtGdiGetRandomRgn", s_randomrgn }, { "NtGdiRectVisible", s_one }, { "NtGdiGetNearestColor", s_nearest },
+        { "NtGdiGetTextFaceW", s_textface }, { "NtGdiEnumFontOpen", s_enumfont_open }, { "NtGdiEnumFontChunk", s_enumfont_chunk },
         /* USER */
         { "NtUserRegisterClassExWOW", s_register_class }, { "NtUserGetClassInfo", s_classinfo },
         { "NtUserCreateWindowEx", s_create_window }, { "NtUserDestroyWindow", s_destroy }, { "NtUserShowWindow", s_show },
@@ -3300,7 +3429,8 @@ void w2kx_install(int cx, int cy, const char* fontdir) {
         { "NtUserSetWindowPlacement", s_one_u }, { "NtUserSystemParametersInfo", s_spi }, { "NtUserGetKeyState", s_keystate },
         { "NtUserGetAsyncKeyState", s_keystate }, { "NtUserShowCaret", s_showcaret }, { "NtUserHideCaret", s_hidecaret },
         { "NtUserCreateCaret", s_createcaret }, { "NtUserGetKeyboardLayoutList", s_zero_u },
-        { "NtUserGetControlBrush", s_ctlbrush }, { "NtUserGetControlColor", s_ctlcolor },
+        { "NtUserGetControlBrush", s_ctlbrush }, { "NtUserGetClassName", s_classname }, { "NtUserFindWindowEx", s_findwindow }, { "NtUserScrollWindowEx", s_scrollwindow },
+        { "NtUserUnregisterClass", s_unregister_class }, { "NtUserCountClipboardFormats", s_zero_u }, { "NtUserGetControlColor", s_ctlcolor },
     };
     for (unsigned i = 0; i < sizeof svc / sizeof svc[0]; i++) ntp_win32k_override(svc[i].name, svc[i].fn);
 }
