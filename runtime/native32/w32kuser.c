@@ -723,6 +723,51 @@ static uint32_t s_set_shell(uint32_t* a) {
 static uint32_t s_send_notify(uint32_t* a) {
     return own_window(a[0]) ? SendNotifyMessageW((HWND)(uintptr_t)a[0], a[1], a[2], a[3]) : 1;
 }
+/* NtUserSendMessageCallback(hwnd, msg, wParam, lParam, callback, data): to one
+ * of the guest's own windows, sent now and the guest's SENDASYNCPROC called
+ * with the result; a broadcast or another process's window stays in the guest
+ * (dropped, as SendNotifyMessage). ponytail: the callback runs before the call
+ * returns, not on the caller's next message wait; nothing has minded yet */
+static uint32_t s_send_callback(uint32_t* a) {
+    if (!own_window(a[0])) return 1;
+    uint32_t r = (uint32_t)SendMessageW((HWND)(uintptr_t)a[0], a[1], a[2], a[3]);
+    if (a[4]) {
+        uint32_t args[4] = { a[0], a[1], a[5], r };
+        native32_call_guest(a[4], 4, args);
+    }
+    return 1;
+}
+/* NtUserChangeDisplaySettings(device, devmode, hwnd, flags, lParam): the host's
+ * display mode never changes. A test (CDS_TEST) passes; anything else is
+ * DISP_CHANGE_FAILED, so Display's Apply says it could not (the box keeps the
+ * applet's registry writes) */
+static uint32_t s_change_display(uint32_t* a) {
+    if (a[3] & CDS_TEST) return DISP_CHANGE_SUCCESSFUL;
+    fprintf(stderr, "[user] ChangeDisplaySettings (flags %X): the host's display mode, refused\n", a[3]);
+    return (uint32_t)DISP_CHANGE_FAILED;
+}
+/* NtUserEnumDisplayDevices(UNICODE_STRING* device, index, DISPLAY_DEVICEW*, flags)
+ * and NtUserEnumDisplaySettings(UNICODE_STRING* device, mode, DEVMODEW*, flags):
+ * NTSTATUS on NT 5. Read-only host queries (Display's Settings page); the
+ * current/registry mode (-1/-2) is the virtual screen's size when there is one */
+static const wchar_t* ustr_or_null(uint32_t u, wchar_t* buf) {
+    if (!u || !MEM16(u)) return NULL;
+    memcpy(buf, (void*)(uintptr_t)MEM32(u + 4), MEM16(u) < 126 ? MEM16(u) : 126);
+    buf[(MEM16(u) < 126 ? MEM16(u) : 126) / 2] = 0;
+    return buf;
+}
+static uint32_t s_enum_devices(uint32_t* a) {
+    wchar_t n[64];
+    return a[2] && EnumDisplayDevicesW(ustr_or_null(a[0], n), a[1], (DISPLAY_DEVICEW*)(uintptr_t)a[2], a[3]) ? 0 : 0xC0000001u;
+}
+static uint32_t s_enum_settings(uint32_t* a) {
+    wchar_t n[64];
+    DEVMODEW* d = (DEVMODEW*)(uintptr_t)a[2];
+    if (!d || !EnumDisplaySettingsExW(ustr_or_null(a[0], n), a[1], d, a[3])) return 0xC0000001u;
+    if (g_screen && (a[1] == ENUM_CURRENT_SETTINGS || a[1] == ENUM_REGISTRY_SETTINGS))
+        d->dmPelsWidth = (DWORD)g_scx, d->dmPelsHeight = (DWORD)g_scy;
+    return 0;
+}
 static int own_thread(uint32_t tid) {
     HANDLE t = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
     DWORD pid = t ? GetProcessIdOfThread(t) : 0;
@@ -1717,6 +1762,10 @@ void native32_user_install(void) {
     native32_nt_win32k_override("NtUserUnregisterHotKey", s_one_u);
     native32_nt_win32k_override("NtUserSetShellWindowEx", s_set_shell);
     native32_nt_win32k_override("NtUserSendNotifyMessage", s_send_notify);
+    native32_nt_win32k_override("NtUserSendMessageCallback", s_send_callback);
+    native32_nt_win32k_override("NtUserChangeDisplaySettings", s_change_display);
+    native32_nt_win32k_override("NtUserEnumDisplayDevices", s_enum_devices);
+    native32_nt_win32k_override("NtUserEnumDisplaySettings", s_enum_settings);
     native32_nt_win32k_override("NtUserPostThreadMessage", s_post_thread);
     native32_nt_win32k_override("NtUserCallHwnd", s_callhwnd);
     native32_nt_win32k_override("NtUserCallHwndOpt", s_callhwnd_opt);

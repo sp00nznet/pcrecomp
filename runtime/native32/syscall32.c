@@ -258,19 +258,29 @@ dos:
 
 /* Open/Create: a[2] is OBJECT_ATTRIBUTES; ro checks on access a[1], the
  * create disposition and options (NtCreateFile a[7] a[8], NtOpenFile a[5]). */
+/* A loader directory's handle (FindFirstFile on an exact name: Control Panel's
+ * CPLs) answers NtQueryDirectoryFile for one name only, never a listing, and is
+ * never the root of a relative open (no create inside it). */
+#define FB_RODIR_MAX 32
+static volatile LONG fb_rodir[FB_RODIR_MAX];
+static int fb_is_rodir(uint32_t h) {
+    for (int i = 0; h && i < FB_RODIR_MAX; i++) if ((uint32_t)fb_rodir[i] == h) return 1;
+    return 0;
+}
 static uint32_t fb_open(uint32_t* a, const char* svc, uint32_t disp, uint32_t opts, int argc) {
     uint32_t oa = a[2], b[11], us[2], oa2[6];
     wchar_t out[MAX_PATH * 2 + 8];
-    int n, kind;
+    int n, kind, dir = 0;
     const wchar_t* s = oa_name(oa, &n);
-    uint32_t st = fb_map(s, n, oa && MEM32(oa + 4), out, &kind);
+    uint32_t st = oa && fb_is_rodir(MEM32(oa + 4)) ? 0xC0000022u : fb_map(s, n, oa && MEM32(oa + 4), out, &kind);
     if (fb_log < 0) fb_log = getenv("PCRECOMP_FILEBOX_LOG") != NULL;
+    if (st) kind = FB_ORIG;
     if (!st && kind == FB_RO &&
-        ((a[1] & 0x520D0056u) || disp != 1 || (opts & 0x1001)))   /* any write/delete/GENERIC_WRITE|ALL|MAX; create; dir; delete-on-close */
+        ((a[1] & 0x520D0056u) || disp != 1 || (opts & 0x1000)))   /* any write/delete/GENERIC_WRITE|ALL|MAX; create; delete-on-close */
         st = 0xC0000022u;
-    if (!st && kind == FB_RO) {                               /* opened without FILE_DIRECTORY_FILE, still a directory */
+    if (!st && kind == FB_RO) {                               /* a directory: exact-name queries only (below) */
         DWORD at = GetFileAttributesW(out + 4);
-        if (at != INVALID_FILE_ATTRIBUTES && (at & FILE_ATTRIBUTE_DIRECTORY)) st = 0xC0000022u;
+        dir = (opts & 1) || (at != INVALID_FILE_ATTRIBUTES && (at & FILE_ATTRIBUTE_DIRECTORY));
     }
     if (st || fb_log) fprintf(stderr, "[filebox] %s %.*ls%s%ls%s (access %08X disp %u opts %08X)\n", svc, n > 260 ? 260 : n, s,
                               kind >= FB_RO ? " -> " : "", kind >= FB_RO ? out : L"", st ? "  REFUSED" : "", a[1], disp, opts);
@@ -284,7 +294,28 @@ static uint32_t fb_open(uint32_t* a, const char* svc, uint32_t disp, uint32_t op
         oa2[2] = (uint32_t)(uintptr_t)us;
         b[2] = (uint32_t)(uintptr_t)oa2;
     }
-    return native32_nt_forward(svc, b);
+    st = native32_nt_forward(svc, b);
+    if (!st && dir) {
+        int i = 0;
+        while (i < FB_RODIR_MAX && InterlockedCompareExchange(&fb_rodir[i], (LONG)MEM32(a[0]), 0) != 0) i++;
+        if (i == FB_RODIR_MAX) { native32_nt_forward("NtClose", a); return 0xC0000022u; }
+    }
+    return st;
+}
+/* NtQueryDirectoryFile(h, event, apc, ctx, iosb, buf, len, class, single, FileName, restart) */
+static uint32_t ovr_fb_querydir(uint32_t* a) {
+    if (fb_is_rodir(a[0])) {
+        int n;
+        const wchar_t* p = a[9] ? (const wchar_t*)(uintptr_t)MEM32(a[9] + 4) : NULL;
+        n = a[9] ? MEM16(a[9]) / 2 : 0;
+        if (!n) return 0x80000006u;                           /* STATUS_NO_MORE_FILES: no listing */
+        for (int i = 0; i < n; i++)
+            if (wcschr(L"*?<>\"\\", p[i])) {
+                fprintf(stderr, "[filebox] a listing of a loader directory (%.*ls): refused\n", n, p);
+                return 0xC000000Fu;                           /* STATUS_NO_SUCH_FILE */
+            }
+    }
+    return native32_nt_forward("NtQueryDirectoryFile", a);
 }
 static uint32_t ovr_fb_create(uint32_t* a) { return fb_open(a, "NtCreateFile", a[7], a[8], 11); }
 static uint32_t ovr_fb_open(uint32_t* a) { return fb_open(a, "NtOpenFile", 1, a[5], 6); }
@@ -322,7 +353,7 @@ static uint32_t ovr_fb_setinfo(uint32_t* a) {
     int kind;
     if (nl > a[3] - 12) return 0xC000000Du;
     uint32_t st = fb_map((const wchar_t*)(uintptr_t)(in + 12), (int)nl / 2, MEM32(in + 4) != 0, out, &kind);
-    if (!st && kind == FB_RO) st = 0xC0000022u;
+    if (!st && (kind == FB_RO || fb_is_rodir(MEM32(in + 4)))) st = 0xC0000022u;
     if (st || fb_log > 0) fprintf(stderr, "[filebox] rename/link to %.*ls%s\n", (int)nl / 2, (wchar_t*)(uintptr_t)(in + 12), st ? "  REFUSED" : "");
     if (st) return st;
     if (kind != FB_BOX) return native32_nt_forward("NtSetInformationFile", a);
@@ -446,6 +477,7 @@ static int fb_install(const wchar_t* image_path, const wchar_t* dll_path, const 
     native32_nt_override("NtQueryVolumeInformationFile", ovr_fb_volume);
     native32_nt_override("NtFsControlFile", ovr_fb_fsctl);
     native32_nt_override("NtOpenSymbolicLinkObject", ovr_fb_symlink);
+    native32_nt_override("NtQueryDirectoryFile", ovr_fb_querydir);
     fprintf(stderr, "[filebox] the guest's drives are %ls\\<letter>; read-only loader files:", fb_root);
     for (int i = 0; i < fb_nro; i++) fprintf(stderr, " %ls", fb_ro[i]);
     fprintf(stderr, "\n");
@@ -820,6 +852,7 @@ static uint32_t ovr_map_view(uint32_t* a) {
  * mapping, and the host hands the same value to the next object. */
 static uint32_t ovr_close(uint32_t* a) {
     int i = img_by_handle(a[0]);
+    for (int k = 0; k < FB_RODIR_MAX; k++) InterlockedCompareExchange(&fb_rodir[k], 0, (LONG)a[0]);
     if (i >= 0) g_img[i].h = NULL;
     return native32_nt_forward("NtClose", a);
 }
@@ -940,6 +973,53 @@ static uint32_t ovr_terminate_thread(uint32_t* a) {
         ExitThread(a[1]);
     }
     return native32_nt_forward("NtTerminateThread", a);
+}
+
+/* The host's live, machine- or user-wide settings never change from the guest
+ * (Date/Time, Regional Options, power): NtSetSystemTime with a new time (NULL
+ * only reads the clock), every NtSetSystemInformation class (the time zone,
+ * the time adjustment, the file cache), the default locale and UI language,
+ * shutdown and power, drivers and firmware variables. STATUS_PRIVILEGE_NOT_HELD,
+ * as a user without the privilege gets. */
+static uint32_t host_setting(const char* svc) {
+    fprintf(stderr, "[guard] %s: a host setting, refused\n", svc);
+    return 0xC0000061u;
+}
+static uint32_t ovr_set_time(uint32_t* a) { return a[0] ? host_setting("NtSetSystemTime") : native32_nt_forward("NtSetSystemTime", a); }
+#define HOST_SETTING(n) static uint32_t ovr_##n(uint32_t* a) { (void)a; return host_setting(#n); }
+HOST_SETTING(NtSetSystemInformation) HOST_SETTING(NtSetDefaultLocale) HOST_SETTING(NtSetDefaultUILanguage)
+HOST_SETTING(NtShutdownSystem) HOST_SETTING(NtSetSystemPowerState) HOST_SETTING(NtInitiatePowerAction)
+HOST_SETTING(NtLoadDriver) HOST_SETTING(NtUnloadDriver) HOST_SETTING(NtSetSystemEnvironmentValue)
+
+/* NtSetInformationThread(ThreadZeroTlsCell = 10, &index): the guest's TlsFree
+ * clears that slot in every thread. Its slots are in the guest TIBs
+ * (native32.c make_tib), not the host TEBs: forwarded, the host zeroed its own
+ * slot of that number in every host thread (comdlg32's detach after Control
+ * Panel freed main.cpl: the runtime's state gone, a fault in TlsFree).
+ * ponytail: only this thread's guest slot is cleared; other guest threads
+ * keep a stale value until the index is reused and set */
+static uint32_t ovr_set_thread(uint32_t* a) {
+    if (a[1] != 10) return native32_nt_forward("NtSetInformationThread", a);
+    if (a[3] < 4 || !a[2]) return 0xC0000004u;
+    uint32_t i = MEM32(a[2]), x;
+    if (i < 64) MEM32(g_fs_base + 0xE10 + i * 4) = 0;
+    else if (i < 64 + 1024 && (x = MEM32(g_fs_base + 0xF94)) != 0) MEM32(x + (i - 64) * 4) = 0;
+    return 0;
+}
+
+/* NtAdjustPrivilegesToken(token, disableAll, newState, len, prev, retLen):
+ * Date/Time enables SeSystemtimePrivilege (12) before it opens, and says "you
+ * do not have the proper privilege" without it; the host's token (a normal,
+ * unelevated user) has none. Enabling only that one succeeds in the guest:
+ * the set itself, NtSetSystemTime, is refused above. Nothing changes on the
+ * host token beyond what the host itself allowed. */
+static uint32_t ovr_adjust_privs(uint32_t* a) {
+    uint32_t r = native32_nt_forward("NtAdjustPrivilegesToken", a);
+    if (r == 0x106u && !a[1] && a[2] && MEM32(a[2]) == 1 && MEM32(a[2] + 4) == 12 && MEM32(a[2] + 8) == 0) {
+        fprintf(stderr, "[guard] SeSystemtimePrivilege: enabled in the guest only (the time is never set)\n");
+        return 0;
+    }
+    return r;
 }
 
 static uint32_t ovr_no_process(uint32_t* a) {
@@ -1200,6 +1280,18 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
     native32_nt_override("NtCreateThread", ovr_create_thread);
     native32_nt_override("NtTerminateThread", ovr_terminate_thread);
     native32_nt_override("NtCreateProcessEx", ovr_no_process);
+    native32_nt_override("NtSetSystemTime", ovr_set_time);
+    native32_nt_override("NtSetInformationThread", ovr_set_thread);
+    native32_nt_override("NtAdjustPrivilegesToken", ovr_adjust_privs);
+    native32_nt_override("NtSetSystemInformation", ovr_NtSetSystemInformation);
+    native32_nt_override("NtSetDefaultLocale", ovr_NtSetDefaultLocale);
+    native32_nt_override("NtSetDefaultUILanguage", ovr_NtSetDefaultUILanguage);
+    native32_nt_override("NtShutdownSystem", ovr_NtShutdownSystem);
+    native32_nt_override("NtSetSystemPowerState", ovr_NtSetSystemPowerState);
+    native32_nt_override("NtInitiatePowerAction", ovr_NtInitiatePowerAction);
+    native32_nt_override("NtLoadDriver", ovr_NtLoadDriver);
+    native32_nt_override("NtUnloadDriver", ovr_NtUnloadDriver);
+    native32_nt_override("NtSetSystemEnvironmentValue", ovr_NtSetSystemEnvironmentValue);
     csr32_install();
     /* RtlUnwind ends in NtContinue to its caller, which a lift cannot do:
      * native32's own (seh32.c) unwinds the guest's frames and returns. */
@@ -1250,6 +1342,17 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
     wcscpy(curh, cur);
     if (fb_install(image_path, dll_path, nls_dir))           /* in the box: C:\ is the box's C */
         wcscpy(cur, L"C:\\"), _snwprintf(curh, MAX_PATH + 3, L"%ls\\C\\", fb_root);
+    {   /* a guest's child: its launcher's guest directory (the launch path sets it;
+         * a box drive path, X:\rest, never a host one while the box is on) */
+        wchar_t gc[MAX_PATH];
+        DWORD k = GetEnvironmentVariableW(L"PCRECOMP_GUEST_CWD", gc, MAX_PATH - 2);
+        if (k && k < MAX_PATH - 2) {
+            if (gc[k - 1] != L'\\') gc[k++] = L'\\', gc[k] = 0;
+            if (!fb_on) wcscpy(cur, gc), wcscpy(curh, gc);
+            else if (iswalpha(gc[0]) && gc[1] == L':' && gc[2] == L'\\' && !fb_dotdot(gc, (int)k) && wcslen(fb_root) + k + 2 < MAX_PATH)
+                wcscpy(cur, gc), _snwprintf(curh, MAX_PATH + 3, L"%ls\\%c%ls", fb_root, towupper(gc[0]), gc + 2);
+        }
+    }
     *(uint32_t*)(pp + 0x00) = 0x1000;
     *(uint32_t*)(pp + 0x04) = 0x2A0;
     *(uint32_t*)(pp + 0x08) = 1;                                      /* RTL_USER_PROC_PARAMS_NORMALIZED */
@@ -1273,21 +1376,29 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
          * host's (3.5 KB here, every tool's directory) overran Windows 2000
          * shell32's fixed buffers (a smashed frame in sub_20A13F31) and had
          * the guest probing host directories. */
-        wchar_t* e = GetEnvironmentStringsW();
+        wchar_t* e = GetEnvironmentStringsW(), *ge = NULL;
         size_t n = 0, o = 0, dl = wcslen(dll_path);
+        /* a guest's child: its launcher's guest environment (PCRECOMP_GUEST_ENV, the
+         * entries split by U+0001), not this runner's host one */
+        DWORD gl = GetEnvironmentVariableW(L"PCRECOMP_GUEST_ENV", NULL, 0);
+        if (gl > 1 && (ge = (wchar_t*)malloc((gl + 1) * 2)) && GetEnvironmentVariableW(L"PCRECOMP_GUEST_ENV", ge, gl) == gl - 1) {
+            ge[gl] = 0;
+            for (wchar_t* q = ge; *q; q++) if (*q == 1) *q = 0;
+            FreeEnvironmentStringsW(e), e = ge;
+        } else free(ge), ge = NULL;
         wchar_t gp[MAX_PATH] = L"";
         GetEnvironmentVariableW(L"PCRECOMP_GUEST_PATH", gp, MAX_PATH);
         while (e[n] || e[n + 1]) n++;
         wchar_t* copy = (wchar_t*)VirtualAlloc(NULL, (n + dl + MAX_PATH + 8) * 2, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         for (wchar_t* s = e; *s; s += wcslen(s) + 1)
-            if (_wcsnicmp(s, L"Path=", 5)) { wcscpy(copy + o, s); if (fb_on) fb_guest_path(copy + o); o += wcslen(copy + o) + 1; }
+            if (_wcsnicmp(s, L"Path=", 5) && _wcsnicmp(s, L"PCRECOMP_GUEST_", 15)) { wcscpy(copy + o, s); if (fb_on && !ge) fb_guest_path(copy + o); o += wcslen(copy + o) + 1; }
         wcscpy(copy + o, L"Path="), wcscpy(copy + o + 5, dll_path), o += 5 + dl;
         /* PCRECOMP_GUEST_PATH: more guest directories for a program search (cmd's
          * `find` and `more`: the box's C:\WINNT\system32, where a runner puts names) */
         if (gp[0]) _snwprintf(copy + o, 1 + wcslen(gp) + 1, L";%ls", gp), o += 1 + wcslen(gp);
         o++;
         copy[o] = 0;
-        FreeEnvironmentStringsW(e);
+        if (ge) free(ge); else FreeEnvironmentStringsW(e);
         *(uint32_t*)(pp + 0x48) = (uint32_t)(uintptr_t)copy;
     }
     ustr(pp + 0x70, image_path, &pool);                               /* WindowTitle */
