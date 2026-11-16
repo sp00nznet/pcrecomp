@@ -405,7 +405,7 @@ uint32_t native32_w9x_message_box(void) { return MBOX_TAG; }
 static void qt_stub(void) {
     g_ecx = MEM8(g_ebp - 4);
     g_edx = MEM32(MEM32(0xBFFC9ECCu) + g_ecx * 4);
-    if (g_trace > 0 || getenv("W16_TRACE")) fprintf(stderr, "[qt] thunk %02X -> %04X:%04X (esp %08X fs %04X)\n", g_ecx, g_edx >> 16, g_edx & 0xFFFF, g_esp, g_seg_fs);
+    if (g_trace > 0 || getenv("W16_TRACE")) fprintf(stderr, "[qt] thunk %02X -> %04X:%04X (ss %04X@%08X esp %08X fs %04X)\n", g_ecx, g_edx >> 16, g_edx & 0xFFFF, g_seg_ss, g_ss_base, g_esp, g_seg_fs);
     g_eax = 0xBFF727D9u;
     recomp_lookup(0xBFF727D9u)();
 }
@@ -1515,6 +1515,12 @@ int recomp_lar32(uint16_t sel, uint32_t* rights) {
     return 1;
 }
 
+/* ss is a 32-bit (B=1) stack: `mov sp, r16` keeps the top of esp only then (lift32 W9X). */
+int recomp_ss_big(void) {
+    uint32_t r;
+    return !recomp_lar32(g_seg_ss, &r) || (r & 0x00400000u);
+}
+
 void recomp_set_seg(int sreg, uint32_t sel) {
     if (sreg == 0) { g_seg_es = (uint16_t)sel; g_es_base = recomp_sel_base(sel); }
     if (sreg == 5) { g_seg_gs = (uint16_t)sel; g_gs_base = recomp_sel_base(sel); }
@@ -1537,7 +1543,7 @@ int recomp_retf32(uint32_t target) {
         uint32_t r;
         if (recomp_lar32((uint16_t)(target >> 16), &r) && (r & 0x0800)) return native32_w16_enter(target);
     }
-    if ((target & 0xFFFF0000u) != R0_TAG) return 0;
+    if ((target & 0xFFFF0000u) != R0_TAG) { if (getenv("W16_TRACE")) fprintf(stderr, "[retf32] flat %08X ss %04X@%08X esp %08X ebp %08X ebx %08X in sub_%08X\n", target, g_seg_ss, g_ss_base, g_esp, g_ebp, g_ebx, g_cur_func); return 0; }
     uint32_t off = target & 0xFFFF;
     if (g_trace < 0) g_trace = getenv("NATIVE32_VXD") != NULL;
     switch (off) {

@@ -851,7 +851,14 @@ class Lifter:
         if m == 'mov':
             if len(ops) == 2:
                 val = self._fmt_read(ops[1])
-                lines.append(f"{self._fmt_write(ops[0], val)}; {comment}")
+                if W9X and ops[0].type == X86_OP_REG and ops[0].reg == X86_REG_SP:
+                    # `mov ss, dx; mov sp, si` (kernel32's 16->32 return,
+                    # 0xBFF714AC): a 16-bit (B=0) stack uses sp alone, but
+                    # SS_BASE + esp reads all 32 bits, so the top goes then.
+                    # A 32-bit ss keeps it (the same code returns to one).
+                    lines.append(f"SET_LO16(esp, {val}); if (!recomp_ss_big()) esp &= 0xFFFFu; {comment}")
+                else:
+                    lines.append(f"{self._fmt_write(ops[0], val)}; {comment}")
 
         elif m == 'movzx':
             if len(ops) == 2:

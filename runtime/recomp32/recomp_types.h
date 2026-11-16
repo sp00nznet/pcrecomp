@@ -253,6 +253,7 @@ int      recomp_retf32(uint32_t target);
 /* lsl / lar on the host's LDT (LIFT32_W9X): nonzero (ZF) if the selector is valid */
 int      recomp_lsl32(uint16_t sel, uint32_t* limit);
 int      recomp_lar32(uint16_t sel, uint32_t* rights);
+int      recomp_ss_big(void);
 uint8_t  recomp_in8(uint32_t port);
 uint16_t recomp_in16(uint32_t port);
 uint32_t recomp_in32(uint32_t port);

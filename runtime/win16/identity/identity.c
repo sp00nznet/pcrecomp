@@ -49,7 +49,7 @@ void recomp_sel_write(uint16_t seg, uint16_t off, uint16_t val) { (void)seg; (vo
 /* native32's registers (recomp32/recomp_types.h) and Win9x segment state (vxd32.c) */
 extern uint32_t g_eax, g_ecx, g_edx, g_ebx, g_esp, g_ebp, g_esi, g_edi;
 extern uint32_t g_ss_base;
-extern uint16_t g_seg_ss, g_seg_ds, g_seg_es, g_seg_fs, g_seg_gs;
+extern uint16_t g_seg_cs, g_seg_ss, g_seg_ds, g_seg_es, g_seg_fs, g_seg_gs;
 
 static void w16_stop(const char *what, unsigned a, unsigned b) {
     fprintf(stderr, "\n[w16] %s %04X:%04X; last functions:", what, a, b);
@@ -153,7 +153,9 @@ static void dpmi(CPU *c) {
     case 0x0000: {   /* allocate cx descriptors (consecutive: the allocator bumps) */
         uint16_t first = 0;
         if ((0x10000u - native32_w9x_next_sel()) / 8 < c->cx) { c->ax = 0x8011; c->flags |= FLAG_CF; return; }   /* descriptor unavailable */
-        for (unsigned i = 0; i < c->cx; i++) { uint16_t s = native32_w9x_alloc_sel(0, 0); if (!i) first = s; }
+        /* a 16-bit client's descriptors are 16-bit (B=0): KRNL386's thread stacks (032F)
+         * are these, and kernel32's 16->32 return (`mov ss, dx; mov sp, si`) relies on it */
+        for (unsigned i = 0; i < c->cx; i++) { uint16_t s = native32_w9x_alloc_sel(0, 0); native32_w9x_desc(s)[6] &= (uint8_t)~0x40; if (!i) first = s; }
         c->ax = first; ok(c); return;
     }
     case 0x0001: memset(d, 0, 8); ok(c); return;                       /* free descriptor */
@@ -226,6 +228,9 @@ static void host_far(CPU *c, uint16_t off) {
         break;
     }
     if (off == H_VXD + 0x442 && c->ax == 9) { c->ax = 0; ok(c); return; }   /* ponytail: 0 until a reader needs more */
+    /* 0Ah: KRNL386 seg2 38F9, once per loaded code segment (flags&5004h == 4004h), cx = sel|1;
+     * the result is not read. ponytail: nothing to tell, no-op. */
+    if (off == H_VXD + 0x442 && c->ax == 0x0A) { ok(c); return; }
     if (off == H_VXD + 0x2A) switch (c->ah) {   /* VWIN32's PM API, KRNL386's calls through DGROUP:1A80 */
     case 0x00:   /* version: KRNL386 wants >= 100h (4.10, Win98); edx nonzero (seg001_6A63: the
                   * Win32 kernel is there: kernel32's base, ponytail: a guess, only tested != 0).
@@ -631,7 +636,17 @@ int w16_enter(uint32_t target) {
      * stub's `jmp far 32:off`. */
     uint32_t cont, prev = g_w16_ret;
     int big = w16_ss_big(c->ss);
-    if (big) {
+    /* kernel32's Call16 (0xBFF71414, gdi32's thunks) is the same o32 frame on the
+     * 16-bit stack: [sp] a flat return, [sp+4] kernel32's cs */
+    int flat16 = 0;
+    if (!big) {
+        uint32_t r = mem_read32(c, c->ss, c->sp);
+        const uint8_t *b = (r >> 16) & 4 ? (const uint8_t *)(uintptr_t)(recomp_sel_base(r >> 16) + (r & 0xFFFF)) : NULL;
+        flat16 = !(b && recomp_sel_base(r >> 16) && b[0] == 0x66 && b[1] == 0xEA)
+                 && mem_read16(c, c->ss, (uint16_t)(c->sp + 4)) == g_seg_cs;
+    }
+    if (flat16) c->esp = c->sp;
+    if (big || flat16) {
         cont = *(uint32_t *)(uintptr_t)(recomp_sel_base(c->ss) + c->esp);
         if (getenv("W16_TRACE")) fprintf(stderr, "[w16] enter %04X:%04X ss:esp %04X:%08X ds %04X fs %04X@%08X (+C %04X +E %04X +18 %08X +1C %04X) flat ret %08X\n", sel, off, c->ss, c->esp, c->ds, c->fs, recomp_sel_base(c->fs),
             mem_read16(c, c->fs, 0xC), mem_read16(c, c->fs, 0xE), mem_read32(c, c->fs, 0x18), mem_read16(c, c->fs, 0x1C), cont);
@@ -647,8 +662,8 @@ int w16_enter(uint32_t target) {
     g_w16_ret = prev;
     g_eax = c->eax; g_ecx = c->ecx; g_edx = c->edx; g_ebx = c->ebx;
     g_esi = c->esi; g_edi = c->edi; g_ebp = c->ebp;
-    if (big) {   /* the o32 retf popped cont and cs: put cont back for the lifted retf that called us */
-        g_esp = c->esp - 8;
+    if (big || flat16) {   /* the o32 retf popped cont and cs: put cont back for the lifted retf that called us */
+        g_esp = (big ? c->esp : c->sp) - 8;
         *(uint32_t *)(uintptr_t)(g_ss_base + g_esp) = cont;
         *(uint32_t *)(uintptr_t)(g_ss_base + g_esp + 4) = 0;
         g_w16 = saved;
