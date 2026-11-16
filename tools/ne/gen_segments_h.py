@@ -76,7 +76,8 @@ def main():
         L += ["void w16_farcall(CPU *cpu, void (*f)(CPU *));   /* a direct far call (w16_unwind lands here) */",
               "void w16_jmpf(CPU *cpu, uint16_t sel, uint16_t off);   /* push; retf: a far jump, or a return to a call site */"]
         L += ["void w16_segin(uint16_t n);   /* a direct far call into segment n: bind it first */",
-              "#define W16_SEGIN(n) do { if (g_w16_segsel[n] == (uint16_t)((n) << 3 | 7)) w16_segin(n); } while (0)"]
+              "extern __declspec(thread) uint16_t g_w16_callseg;   /* the segment of the far call being made (w16_farcall) */",
+              "#define W16_SEGIN(n) do { g_w16_callseg = (n); if (g_w16_segsel[n] == (uint16_t)((n) << 3 | 7)) w16_segin(n); } while (0)"]
     else:
         L += [f"#define SEG_{n} ((uint16_t){n})" for n in range(1, max_seg + 1)]
     L.append("")

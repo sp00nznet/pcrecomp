@@ -24,7 +24,7 @@ typedef void (*drv_fn)(CPU *c);
 typedef struct { const char *name; drv_fn fn[NORD + 1]; } drv_t;
 
 static uint16_t arg16(CPU *c, int i) { return mem_read16(c, c->ss, (uint16_t)(c->sp + 4 + 2 * i)); }
-static void ret_far(CPU *c, int argbytes) { c->sp = (uint16_t)(c->sp + 4 + argbytes); }
+static void ret_far(CPU *c, int argbytes) { c->ret_ip = mem_read16(c, c->ss, c->sp); c->sp = (uint16_t)(c->sp + 4 + argbytes); }   /* ret_ip: what a far return pops (w16_retf_call) */
 static void libentry(CPU *c) { c->ax = 1; ret_far(c, 0); }   /* LibEntry: success, nothing to set up */
 
 static uint32_t argfar(CPU *c, int i) { return (uint32_t)arg16(c, i + 1) << 16 | arg16(c, i); }
@@ -50,6 +50,18 @@ static void kb_xlat(CPU *c, UINT from, UINT to) {
 }
 static void kb_ansi_to_oem(CPU *c) { kb_xlat(c, 1252, 437); }
 static void kb_oem_to_ansi(CPU *c) { kb_xlat(c, 437, 1252); }
+/* 134 AnsiToOemBuff(lpSrc, lpDst, nLength) / 135 OemToAnsiBuff: the same over n bytes. */
+static void kb_xlat_buf(CPU *c, UINT from, UINT to) {
+    int n = arg16(c, 0);
+    cp_convert(farptr(argfar(c, 3)), farptr(argfar(c, 1)), n ? n : 65536, from, to);
+    ret_far(c, 10);
+}
+static void kb_ansi_to_oem_buf(CPU *c) { kb_xlat_buf(c, 1252, 437); }
+static void kb_oem_to_ansi_buf(CPU *c) { kb_xlat_buf(c, 437, 1252); }
+/* 132 GetKBCodePage() -> the OEM code page (437, as cp_convert); 136 EnableKBSysReq(f) -> 0
+ * (ponytail: the previous state is never kept; no SysReq key here). */
+static void kb_codepage(CPU *c) { c->ax = 437; ret_far(c, 0); }
+static void kb_sysreq(CPU *c) { c->ax = 0; ret_far(c, 2); }
 
 /* ---- DISPLAY.DRV: a 16-bit DIB framebuffer (pcrecomp's own, no hardware) ----
  * Entries are the Win 3.1 DDK display ordinals, named from GDI.EXE's call
@@ -100,6 +112,14 @@ static void disp_enable(CPU *c) {
     }
     if (getenv("W16_TRACE")) fprintf(stderr, "[drv] DISPLAY.Enable style %u -> %04X\n", style, c->ax);
     ret_far(c, 18);
+}
+
+/* DISPLAY.4 Disable(lpDestDev): the device goes away (USER's shutdown path, after KRNL386
+ * fails to start its first program). The framebuffer is left as it was, so a
+ * W16_HOLD shot still shows the last frame. */
+static void disp_disable(CPU *c) {
+    if (getenv("W16_TRACE")) fprintf(stderr, "[drv] DISPLAY.Disable\n");
+    c->ax = 1; ret_far(c, 4);
 }
 
 /* DISPLAY.3 Control(lpDevice, wFunction, lpInData, lpOutData): escapes (GDI seg005_2AB6
@@ -229,6 +249,21 @@ static void disp_exttextout(CPU *c) {
     }
     if (getenv("W16_TRACE")) fprintf(stderr, "[drv] DISPLAY.ExtTextOut %d,%d n %d \"%.*s\" -> %dx%d v%d\n", x0, y0, count, n, str, width, h, v3 ? 3 : 2);
     c->ax = (uint16_t)width; c->dx = (uint16_t)h; ret_far(c, 40);
+}
+
+/* DISPLAY.15 GetCharWidth(lpDestDev, lpBuffer, wFirst, wLast, lpFontInfo, lpDrawMode,
+ * lpTextXForm): the raster font's widths, one int16 per char (as ExtTextOut reads them). */
+static void disp_charwidth(CPU *c) {
+    const uint8_t *fi = (const uint8_t *)farptr(argfar(c, 4));
+    int last = arg16(c, 6), first = arg16(c, 7);
+    int16_t *out = (int16_t *)farptr(argfar(c, 8));
+    int f0 = fi[29], f1 = fi[30], dflt = fi[31];
+    int v3 = (*(const uint32_t *)(fi + 52) & 0x0F) != 0;
+    for (int ch = first; ch <= last; ch++) {
+        int k = (ch < f0 || ch > f1 ? dflt + f0 : ch) - f0;
+        *out++ = *(const int16_t *)(fi + (v3 ? 82 + 6 * k : 52 + 4 * k));
+    }
+    c->ax = 1; ret_far(c, 24);
 }
 
 /* Raster ops, bitwise over 16-bit pixels (a mono surface holds 0/FFFF per pixel):
@@ -426,11 +461,49 @@ static void disp_dibbits(CPU *c) {
     c->ax = (uint16_t)done; ret_far(c, 26);
 }
 
+/* SYSTEM.7 Get80x87SaveSize() -> the FNSAVE size; 8 Save80x87(lpBuf) / 9 Restore80x87(lpBuf).
+ * ponytail: lifted code keeps no x87 state in guest memory, so save/restore do nothing. */
+static void sys_fpu_size(CPU *c) { c->ax = 94; ret_far(c, 0); }
+static void sys_fpu_save(CPU *c) { ret_far(c, 4); }
+
+/* KEYBOARD.1 Inquire(lpKBINFO) -> its size: no DBCS lead ranges (FFh..FEh), no state, 12 F-keys;
+ * 2 Enable(lpEventProc, lpKeyState), 3 Disable(), 7 SetSpeed(rate) -> -1 (not settable).
+ * MOUSE.1 Inquire(lpMOUSEINFO): present, absolute, 2 buttons, 100 Hz; 2 Enable(lpEventProc), 3 Disable.
+ * SYSTEM.1 InquireSystem(wReq, wDrive) dx:ax; 2 CreateSystemTimer(rate, lpProc) -> 1;
+ * 3 KillSystemTimer(h); 4/5 Enable/DisableSystemTimers; 6 GetSystemMSecCount -> dx:ax.
+ * ponytail: no input events and no timer callbacks yet (the procs are kept nowhere). */
+static void kb_inquire(CPU *c) {
+    uint8_t *k = (uint8_t *)farptr(argfar(c, 0));
+    k[0] = 0xFF; k[1] = 0xFE; k[2] = 0xFF; k[3] = 0xFE; put16((char *)k, 4, 0); put16((char *)k, 6, 12);
+    c->ax = 8; ret_far(c, 4);
+}
+static void kb_enable(CPU *c) { c->ax = 1; ret_far(c, 8); }
+static void drv_disable(CPU *c) { c->ax = 1; ret_far(c, 0); }
+static void kb_setspeed(CPU *c) { c->ax = 0xFFFF; ret_far(c, 2); }
+static void ms_inquire(CPU *c) {
+    char *m = farptr(argfar(c, 0));
+    memset(m, 0, 14); m[0] = 1; put16(m, 2, 2); put16(m, 4, 100); put16(m, 6, 0); put16(m, 8, 0);
+    put16(m, 10, FB_W); put16(m, 12, FB_H);
+    c->ax = 14; ret_far(c, 4);
+}
+static void ms_enable(CPU *c) { c->ax = 1; ret_far(c, 4); }
+static void sys_inquire(CPU *c) {
+    uint16_t req = arg16(c, 1);
+    c->ax = 0; c->dx = 0;
+    if (req == 0) { c->ax = 1000; c->dx = 0; }    /* timer resolution in microseconds */
+    else if (req == 1) c->dx = 3;                 /* drive type: fixed */
+    ret_far(c, 4);
+}
+static void sys_createtimer(CPU *c) { c->ax = 1; ret_far(c, 6); }
+static void sys_killtimer(CPU *c) { c->ax = 0; ret_far(c, 2); }
+static void sys_timers(CPU *c) { ret_far(c, 0); }
+static void sys_msec(CPU *c) { DWORD t = GetTickCount(); c->ax = (uint16_t)t; c->dx = (uint16_t)(t >> 16); ret_far(c, 0); }
+
 static drv_t g_drv[] = {
-    { "SYSTEM",   { 0 } },
-    { "KEYBOARD", { [5] = kb_ansi_to_oem, [6] = kb_oem_to_ansi } },
-    { "MOUSE",    { 0 } },
-    { "DISPLAY",  { [1] = disp_bitblt, [8] = disp_output, [9] = disp_pixel, [2] = disp_colorinfo, [3] = disp_control, [5] = disp_enable, [10] = disp_realize, [14] = disp_exttextout, [19] = disp_dibbits,
+    { "SYSTEM",   { [1] = sys_inquire, [2] = sys_createtimer, [3] = sys_killtimer, [4] = sys_timers, [5] = sys_timers, [6] = sys_msec, [7] = sys_fpu_size, [8] = sys_fpu_save, [9] = sys_fpu_save } },
+    { "KEYBOARD", { [5] = kb_ansi_to_oem, [6] = kb_oem_to_ansi, [1] = kb_inquire, [2] = kb_enable, [3] = drv_disable, [7] = kb_setspeed, [132] = kb_codepage, [134] = kb_ansi_to_oem_buf, [135] = kb_oem_to_ansi_buf, [136] = kb_sysreq } },
+    { "MOUSE",    { [1] = ms_inquire, [2] = ms_enable, [3] = drv_disable } },
+    { "DISPLAY",  { [1] = disp_bitblt, [8] = disp_output, [9] = disp_pixel, [2] = disp_colorinfo, [3] = disp_control, [4] = disp_disable, [4] = disp_disable, [5] = disp_enable, [10] = disp_realize, [14] = disp_exttextout, [15] = disp_charwidth, [19] = disp_dibbits,
                     [101] = disp_inquire, [102] = disp_setcursor, [103] = disp_movecursor, [104] = disp_checkcursor } },
     { "MMSOUND",  { 0 } },   /* SlowBoot: sound.drv= default; makes no sound */
     { "COMM",     { 0 } },   /* comm.drv=: no ports */

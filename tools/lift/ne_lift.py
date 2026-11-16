@@ -114,6 +114,21 @@ class NELifter(Lifter):
         # Cross-module call resolution: {MODULE_UPPER: {ordinal: (seg, off)}}.
         # Set externally for the host module (CATZ.WAD -> CATZDLL exports).
         self.xmod = {}
+        # Identity mode: an iret pops its frame (guest ISRs are entered only by
+        # the guest's own `pushf; call far`: KRNL386's int 21h hook, seg1 8818).
+        self.iret_frame = _IDENTITY
+        # Export entries the loader patches to `mov ax, DGROUP` (see
+        # lift_instruction): a library's exported, shared-data (flags 3)
+        # entries that start `8C D8 90` or `1E 58 90`.
+        self._dgroup_prologs = set()
+        # ponytail: identity mode only; the host runtime's titles (civnet's
+        # SMEDSNET/TIMERDLL exports, 2 sites) keep the file bytes until a run checks them.
+        if _IDENTITY and (ne.flags & 0x8000) and ne.auto_data_seg:
+            for e in ne.entries:
+                if e.segment == seg.index and (e.flags & 3) == 3:
+                    b = bytes(seg.data[e.offset:e.offset + 3])
+                    if b in (b'\x8c\xd8\x90', b'\x1e\x58\x90'):
+                        self._dgroup_prologs.add(e.offset)
 
     def _resolve_far_call(self, inst: Instruction) -> Optional[str]:
         """Resolve a far call instruction using relocation data."""
@@ -227,6 +242,60 @@ class NELifter(Lifter):
                 break
         return n
 
+    def _callee_args(self, inst):
+        """Bytes a far call's callee pops (`retf n`), for a call into this
+        module's code; None when unknown (an import, a near call)."""
+        b = bytes(inst.raw)
+        if b[:1] != b'\x9a':
+            return None
+        ann = self._get_reloc_at(inst.offset - self.seg.file_offset + 3)
+        r = ann.reloc if ann else None
+        if r is None or (r.flags & 3) or r.src_type not in (2, 3):
+            return None
+        tgt = self.seg_by_index.get(r.target_seg)
+        off = r.target_off if r.src_type == 3 else int.from_bytes(b[1:3], 'little')
+        if tgt is None or not tgt.data:
+            return None
+        dec = Decoder(tgt.data, base_offset=0)
+        dec.pos = off
+        for _ in range(400):   # ponytail: the first retf on the straight decode names n
+            try:
+                i = dec.decode_one()
+            except (IndexError, KeyError):
+                return None
+            if i is None:
+                return None
+            if i.mnemonic == 'retf':
+                return i.op1.disp if i.op1 is not None else 0
+        return None
+
+    def _pushes_cs_cont(self, run):
+        """True when the straight run before a retf pushes `cs`, then an
+        immediate offset (push imm, or `mov reg, imm16` just before the push
+        cs), then exactly the 2-word target, counting what any far call into
+        this module pops: a return address the code pushed itself. A far
+        pointer argument (`push cs; push imm; call far`) is popped by its call."""
+        depth = None
+        for k, i in enumerate(run[:-1]):
+            b = bytes(i.raw)
+            if depth is not None:
+                if i.mnemonic == 'push':
+                    depth += 2 if b[:1] == b'\x66' else 1
+                elif i.mnemonic == 'call':
+                    n = self._callee_args(i)
+                    depth = None if n is None else depth - n // 2
+                    if depth is not None and depth < 0:
+                        depth = None
+                elif i.mnemonic in _NO_SP and not (i.op1 and 'sp' in repr(i.op1).lower()):
+                    pass
+                else:
+                    depth = None
+            if b == b'\x0e' and k + 1 < len(run) - 1:
+                n, p = bytes(run[k + 1].raw), (bytes(run[k - 1].raw) if k else b'')
+                if n[:1] in (b'\x68', b'\x6a') or (0x50 <= n[0] <= 0x57 and len(p) == 3 and p[0] == 0xB8 + n[0] - 0x50):
+                    depth = -1   # the offset push comes next and makes it 0
+        return depth == 2
+
     def lift_instruction(self, inst: Instruction, func_start: int):
         """Override to handle FPU instructions and NE-specific features."""
         m = inst.mnemonic
@@ -240,6 +309,19 @@ class NELifter(Lifter):
 
         # A fixup on a direct memory displacement must land on the ADDRESS.
         self._resolve_mem_disp(inst, m, op1, op2)
+
+        # The NE loader patches a library's shared-data export prologue
+        # (`mov ax, ds; nop` / `push ds; pop ax; nop`) to `mov ax, DGROUP` when
+        # it loads the segment; the C is lifted from the file bytes, so do it
+        # here. GDI.105 SelectVisRgn (seg1 137F) called from USER ran on
+        # USER's ds and read GDI's Local32 heap handle ds:[422] as 0.
+        if local_off in self._dgroup_prologs:
+            if m == 'mov':
+                self._emit(f'cpu->ax = SEG_{self.ne.auto_data_seg};', f'{orig} -- loader-patched to mov ax, DGROUP')
+                return
+            if m == 'push':
+                self._emit(f'push16(cpu, SEG_{self.ne.auto_data_seg});', f'{orig} -- loader-patched (DGROUP)')
+                return
 
         # `push x; retf` is a far jump to what was pushed (KRNL386's BootStrap
         # continues in its relocated copy: push cs; push [sel]; push B711h;
@@ -275,6 +357,13 @@ class NELifter(Lifter):
         # a far call whose return address the code pushed itself (KRNL386's
         # LibEntry call, seg2 0D3A, retfs into the DLL's entry and comes back
         # at 0D83). As a C return it skipped the entry and the continuation.
+        # The same with calls between: `mov bx, cont; push cs; push bx; ...;
+        # call far GetProcAddress; push dx; push ax; retf` (KRNL386 seg1 CD6A:
+        # SYSTEM.7, back at CD7D). A pushed `cs` then an immediate offset is a
+        # return address the code built; as a far jump it unwound KRNL386.
+        if _IDENTITY and m == 'retf' and op1 is None and inst.raw[:1] != b'\x66' and self._pushes_cs_cont(self._run):
+            self._emit('w16_retf_call(cpu); return;', orig + ' (a far call to what was pushed, back to the pushed cs:continuation)')
+            return
         if _IDENTITY and m == 'retf' and op1 is None and inst.raw[:1] != b'\x66' and \
                 prev is not None and prev.mnemonic != 'push' and self._pushed_words(self._run) >= 4:
             self._emit('w16_retf_call(cpu); return;', orig + ' (a far call to what was pushed, back to the pushed continuation)')
@@ -965,36 +1054,42 @@ def lift_segment(ne: NEHeader, seg_num: int, func_offset: int = -1, xmod=None):
     # near call sites check what the last ret popped (cpu->ret_ip).
     lifter.popsret_offsets = set()
     if _IDENTITY:
-        _starts = {f.offset for f in functions}
-        _ends = {f.offset: f.end for f in functions}
-        _succ = {}
+        # Walk each function's paths (jumps followed, calls/returns end a
+        # path) counting what it pushes; a pop past that is its own return
+        # address. GDI seg1 9658: `push edi ... pop esi; pop bx; jmp 964E`
+        # (the outer frame's epilogue), so a straight-line scan missed it.
+        # ponytail: `add/sub/mov sp` and pusha end a path (not counted).
+        def _pops_past(start):
+            work, seen, steps = [(start, 0)], set(), 0
+            while work and steps < 400:
+                o, d = work.pop()
+                while o in _by_off and (o, d) not in seen and steps < 400:
+                    seen.add((o, d)); steps += 1
+                    i = _by_off[o]
+                    mn = i.mnemonic
+                    w = 4 if 0x66 in bytes(i.raw[:2]) else 2
+                    if mn in ('push', 'pushf'):
+                        d += w
+                    elif mn in ('pop', 'popf'):
+                        d -= w
+                        if d < 0:
+                            return True
+                    elif mn in ('call', 'enter', 'leave', 'ret', 'retf', 'iret', 'int', 'pusha', 'pushad', 'popa', 'popad'):
+                        break
+                    elif i.op1 is not None and i.op1.type == OpType.REG16 and REG16_NAMES[i.op1.reg] == 'sp' and mn not in ('cmp', 'test'):
+                        break
+                    if mn == 'jmp' or mn.startswith('j') or mn.startswith('loop'):
+                        if i.op1 is None or i.op1.type not in (OpType.REL8, OpType.REL16):
+                            break
+                        if mn == 'jmp':
+                            o = i.op1.disp
+                            continue
+                        work.append((i.op1.disp, d))
+                    o += i.length
+            return False
         for f in functions:
-            o, nxt = f.offset, set()
-            while o in _by_off and o < _ends[f.offset] + 16:
-                i = _by_off[o]
-                mn = i.mnemonic
-                if mn == 'pop' and i.op1 is not None and i.op1.type == OpType.REG16:
-                    lifter.popsret_offsets.add(f.offset)
-                    break
-                if mn in ('push', 'pusha', 'pushad', 'pushf', 'call', 'enter', 'ret', 'retf', 'iret', 'jmp', 'leave'):
-                    if mn == 'jmp' and i.op1 is not None and i.op1.type in (OpType.REL8, OpType.REL16) and i.op1.disp in _starts:
-                        nxt.add(i.op1.disp)
-                    break
-                if mn.startswith('j') or mn in ('loop', 'jcxz'):
-                    if i.op1 is not None and i.op1.type in (OpType.REL8, OpType.REL16) and i.op1.disp in _starts:
-                        nxt.add(i.op1.disp)
-                o += i.length
-                if o in _starts and o != f.offset:   # falls into the next function
-                    nxt.add(o)
-                    break
-            _succ[f.offset] = nxt
-        _grew = True
-        while _grew:
-            _grew = False
-            for f in functions:
-                if f.offset not in lifter.popsret_offsets and _succ[f.offset] & lifter.popsret_offsets:
-                    lifter.popsret_offsets.add(f.offset)
-                    _grew = True
+            if _pops_past(f.offset):
+                lifter.popsret_offsets.add(f.offset)
 
     target_funcs = functions
     if func_offset >= 0:

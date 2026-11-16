@@ -362,6 +362,9 @@ void dos_int21(CPU *c) {
     case 0x47:   /* current directory of drive dl at ds:si, no drive or leading '\': the root */
         *(char *)(uintptr_t)(recomp_sel_base(c->ds) + c->si) = 0; ok(c); return;
     case 0x50: ok(c); return;                                 /* set PSP */
+    case 0x06:   /* direct console I/O; DL FFh reads without waiting: no console, no key (ZF set, AL 0). KRNL386 seg1 80D9 drains it at boot */
+        if (c->dl == 0xFF) { c->al = 0; c->flags |= FLAG_ZF; }
+        ok(c); return;
     case 0x51: case 0x62: c->bx = rm_sel(W16_PSP_PARA); ok(c); return;
     }
     uint32_t s[8] = { g_eax, g_ecx, g_edx, g_ebx, g_esp, g_ebp, g_esi, g_edi };
@@ -628,10 +631,22 @@ void w16_raise(CPU *c, int n, uint16_t cs, uint16_t ip) {
  * ponytail: direct far calls only (not dispatch_far's indirect ones, not
  * `push cs; call near`); add them when an unwind targets one. */
 #define W16_UNWIND_CODE 0xE0571601u
+/* A callee that ends in a near `ret` with its far return still on the stack
+ * jumped to an address it pushed (KRNL386's int 21h hook, seg1 852A: the
+ * handler's offset goes in a saved-register slot, 8624 `ret`s into it): run
+ * that continuation in the callee's segment, until the far return is popped. */
+__declspec(thread) uint16_t g_w16_callseg;
 void w16_farcall(CPU *c, void (*f)(CPU *)) {
     w16_ff fr = { g_ff, c->ss, c->sp };
+    uint16_t seg = g_w16_callseg; g_w16_callseg = 0;
     g_ff = &fr;
-    __try { f(c); }
+    __try {
+        f(c);
+        while (seg && c->ss == fr.ss && c->sp < fr.sp) {
+            if (getenv("W16_TRACE")) fprintf(stderr, "[w16] near ret into %u:%04X under a far call (sp %04X < %04X)\n", seg, c->ret_ip, c->sp, fr.sp);
+            if (!recomp_dispatch_lookup(c, seg, c->ret_ip)) w16_stop("near ret under a far call into, seg:off", seg, c->ret_ip);
+        }
+    }
     __except (GetExceptionCode() == W16_UNWIND_CODE && g_ff_to == &fr ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
         if (getenv("W16_TRACE")) fprintf(stderr, "[w16] unwound to the far call at ss:sp %04X:%04X (now %04X)\n", fr.ss, fr.sp, c->sp);
     }
