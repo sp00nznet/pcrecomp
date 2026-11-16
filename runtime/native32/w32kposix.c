@@ -709,10 +709,50 @@ static uint32_t s_patbrush(uint32_t* a) {        /* NtGdiCreatePatternBrushInter
     memcpy(o->pat->px, b->px, (size_t)b->w * b->h * 4);
     return o->h;
 }
+/* a region's rectangle: gdi32's SetRectRgn writes the RGN_ATTR (+0 flags,
+ * 0x20 dirty; +4 complexity; +8 the rect) without a call */
+static rc_t* rgn_get(gobj_t* o) {
+    if (o->attr && (MEM32(o->attr) & 0x20)) o->rgn = rc_get(o->attr + 8), MEM32(o->attr) &= ~0x20u;
+    return &o->rgn;
+}
+static uint32_t rgn_set(gobj_t* o, rc_t r, uint32_t cplx) {
+    if (rc_empty(&r)) r = (rc_t){ 0, 0, 0, 0 }, cplx = 1;
+    o->rgn = r;
+    if (o->attr) rc_put(o->attr + 8, r), MEM32(o->attr + 4) = cplx;
+    return cplx;
+}
 static uint32_t s_rectrgn(uint32_t* a) {
     gobj_t* o = gnew(GDI_RGN, 0);
-    if (o) o->rgn = (rc_t){ (int)a[0], (int)a[1], (int)a[2], (int)a[3] };
+    if (o) rgn_set(o, (rc_t){ (int)a[0], (int)a[1], (int)a[2], (int)a[3] }, 2);
     return o ? o->h : 0;
+}
+/* NtGdiCombineRgn(dst, a, b, mode): AND, OR, XOR, DIFF, COPY on rectangles.
+ * ponytail: a result that is not a rectangle is kept as its bounding box
+ * (COMPLEXREGION returned); real regions when something draws through one */
+static uint32_t s_combinergn(uint32_t* a) {
+    gobj_t* d = G(a[0], GDI_RGN), *x = G(a[1], GDI_RGN), *y = G(a[2], GDI_RGN);
+    if (!d || !x || (a[3] != 5 && !y)) return 0;
+    rc_t p = *rgn_get(x), q = y ? *rgn_get(y) : p, i = rc_and(p, q);
+    switch (a[3]) {
+    case 1: return rgn_set(d, i, 2);
+    case 2: case 3: return rgn_set(d, rc_empty(&p) ? q : rc_empty(&q) ? p : rc_or(p, q), 3);
+    case 4:
+        if (rc_empty(&i)) return rgn_set(d, p, 2);
+        if (i.l <= p.l && i.r >= p.r) {                                  /* a band across the full width */
+            if (i.t <= p.t) p.t = i.b < p.b ? i.b : p.b;
+            else if (i.b >= p.b) p.b = i.t;
+            else return rgn_set(d, p, 3);
+            return rgn_set(d, p, 2);
+        }
+        if (i.t <= p.t && i.b >= p.b) {
+            if (i.l <= p.l) p.l = i.r < p.r ? i.r : p.r;
+            else if (i.r >= p.r) p.r = i.l;
+            else return rgn_set(d, p, 3);
+            return rgn_set(d, p, 2);
+        }
+        return rgn_set(d, p, 3);
+    default: return rgn_set(d, p, 2);
+    }
 }
 static uint32_t s_select_bitmap(uint32_t* a) {
     gobj_t* d = DCH(a[0]), *b = G(a[1], GDI_BMP);
@@ -998,6 +1038,7 @@ static uint32_t s_excludeclip(uint32_t* a) { (void)a; return 2; }   /* ponytail:
 static uint32_t s_selectcliprgn(uint32_t* a) {   /* NtGdiExtSelectClipRgn(hdc, hrgn, mode) */
     gobj_t* d = DCH(a[0]), *r = G(a[1], GDI_RGN);
     if (!d) return 0;
+    if (r) rgn_get(r);
     if (!r) d->clip = d->vis;
     else {
         rc_t rr = { r->rgn.l + d->ox, r->rgn.t + d->oy, r->rgn.r + d->ox, r->rgn.b + d->oy };
@@ -1050,7 +1091,7 @@ static uint32_t s_opendc(uint32_t* a) { (void)a; gobj_t* d = dc_new(1); return d
 static uint32_t s_getrgnbox(uint32_t* a) {       /* NtGdiGetRgnBox(hrgn, RECT*) */
     gobj_t* r = G(a[0], GDI_RGN);
     if (!r || !a[1]) return 0;
-    rc_put(a[1], r->rgn);
+    rc_put(a[1], *rgn_get(r));
     return rc_empty(&r->rgn) ? 1 : 2;
 }
 static uint32_t s_cliprect(uint32_t* a) {        /* NtGdiGetAppClipBox(hdc, RECT*) */
@@ -1131,6 +1172,8 @@ typedef struct uobj {
     rc_t cin;                                     /* the client rect within the window rect */
     rc_t wr, cr;                                  /* both on the screen */
     int dirty, ncdirty, erase;
+    int sizemove;                                 /* WM_SIZE and WM_MOVE still to send, at the first show (as win32k's WFSENDSIZEMOVE) */
+    int sb[2][4];                                 /* WS_HSCROLL / WS_VSCROLL: min, max, page, pos */
     uint16_t text[128];
     /* a menu */
     item_t* items;
@@ -1227,6 +1270,8 @@ static int32_t g_met[0x53];
 #define WS_DLGFRAME 0x00400000u
 #define WS_SYSMENU 0x00080000u
 #define WS_THICKFRAME 0x00040000u
+#define WS_VSCROLL 0x00200000u
+#define WS_HSCROLL 0x00100000u
 #define WS_MINIMIZEBOX 0x00020000u
 #define WS_MAXIMIZEBOX 0x00010000u
 #define WS_EX_DLGMODALFRAME 0x1u
@@ -1419,6 +1464,38 @@ static void menubar_layout(uobj_t* u) {
     }
 }
 static void draw_icon(gobj_t* d, uobj_t* ic, int x, int y, int cx, int cy);
+/* a scroll bar, Windows 2000's way: two arrow buttons, the track in the
+ * 3D-highlight/face dither, the thumb when the range is more than a page
+ * (arrows greyed when it is not) */
+static void scrollbar(gobj_t* d, uobj_t* u, int v) {
+    rc_t r = v ? (rc_t){ u->cr.r, u->cr.t, u->cr.r + SM(2), u->cr.b } : (rc_t){ u->cr.l, u->cr.b, u->cr.r, u->cr.b + SM(3) };
+    int* i = u->sb[v], len = v ? r.b - r.t : r.r - r.l, a = v ? SM(2) : SM(3), range = i[1] - i[0] + 1;
+    int on = range > (i[2] ? i[2] : 1) && i[1] > i[0];
+    if (2 * a > len) a = len / 2;
+    for (int y = r.t; y < r.b; y++)
+        for (int x = r.l; x < r.r; x++) fill(d, (rc_t){ x, y, x + 1, y + 1 }, (x + y) & 1 ? C[15] : C[20]);
+    for (int k = 0; k < 2; k++) {                 /* the arrows: up/left, down/right */
+        rc_t b = v ? (rc_t){ r.l, k ? r.b - a : r.t, r.r, k ? r.b : r.t + a } : (rc_t){ k ? r.r - a : r.l, r.t, k ? r.r : r.l + a, r.b };
+        fill(d, b, C[15]);
+        edge(d, b, C[15], C[21], C[20], C[16]);
+        int cx = (b.l + b.r) / 2, cy = (b.t + b.b) / 2;
+        for (int g = on ? 0 : 1; g >= 0; g--)     /* (greyed: a white one under, one right and down) */
+            for (int j = 0; j < 4; j++) {
+                uint32_t c = on ? 0 : g ? C[20] : C[16];
+                int o = g, w = 7 - 2 * j, t = k ? j : 3 - j;   /* rows of 7, 5, 3, 1 from the base */
+                if (v) fill(d, (rc_t){ cx - 3 + j + o, cy - 2 + t + o, cx - 3 + j + w + o, cy - 1 + t + o }, c);
+                else fill(d, (rc_t){ cx - 2 + t + o, cy - 3 + j + o, cx - 1 + t + o, cy - 3 + j + w + o }, c);
+            }
+    }
+    if (!on) return;
+    int track = len - 2 * a, page = i[2] ? i[2] : 1, th = track * page / range;
+    if (th < 8) th = 8;
+    if (th > track) return;
+    int span = range - page, pos = span > 0 ? (i[3] - i[0]) * (track - th) / span : 0;
+    rc_t t = v ? (rc_t){ r.l, r.t + a + pos, r.r, r.t + a + pos + th } : (rc_t){ r.l + a + pos, r.t, r.l + a + pos + th, r.b };
+    fill(d, t, C[15]);
+    edge(d, t, C[15], C[21], C[20], C[16]);
+}
 static void ncpaint(uobj_t* u) {
     if (!visible(u)) return;
     gobj_t* d = window_dc(u, 1);
@@ -1429,8 +1506,13 @@ static void ncpaint(uobj_t* u) {
         for (int k = 2; k < b - (u->ex & WS_EX_CLIENTEDGE ? 2 : 0); k++)
             edge(d, (rc_t){ r.l + k, r.t + k, r.r - k, r.b - k }, C[15], C[15], C[15], C[15]);
     } else if (u->style & WS_BORDER) edge(d, r, C[6], C[6], C[6], C[6]);   /* (one pixel: only the outer ring is seen) */
+    rc_t sc = u->cr;                              /* the client with its scroll bars */
+    if (u->style & WS_VSCROLL) sc.r += SM(2);
+    if (u->style & WS_HSCROLL) sc.b += SM(3);
+    for (int v = 0; v < 2; v++) if (u->style & (v ? WS_VSCROLL : WS_HSCROLL)) scrollbar(d, u, v);
+    if ((u->style & WS_VSCROLL) && (u->style & WS_HSCROLL)) fill(d, (rc_t){ u->cr.r, u->cr.b, sc.r, sc.b }, C[15]);
     if (u->ex & WS_EX_CLIENTEDGE) {
-        rc_t c = u->cr;
+        rc_t c = sc;
         edge(d, (rc_t){ c.l - 2, c.t - 2, c.r + 2, c.b + 2 }, C[16], C[20], C[21], C[22]);
     }
     if (cap) {
@@ -1489,6 +1571,7 @@ static void ncpaint(uobj_t* u) {
  * item pushed in. ponytail: not tracked; it stays until the next click or
  * key, which closes it and repaints the window */
 static rc_t g_popup;
+static uint32_t g_popup_owner, g_popup_menu;      /* the window and the drop-down menu shown (for a live click in it) */
 static void invalidate(uobj_t* u, int erase);
 static void popup_draw(uobj_t* u, int k) {
     uobj_t* m = U(u->menu, W2K_TYPE_MENU), *p;
@@ -1536,7 +1619,7 @@ static void popup_draw(uobj_t* u, int k) {
         y += 17;
     }
     gfree(d);
-    g_popup = r;
+    g_popup = r, g_popup_owner = u->h, g_popup_menu = p->h;
 }
 static void popup_close(void) {
     if (rc_empty(&g_popup)) return;
@@ -1584,6 +1667,7 @@ static int setpos(uobj_t* u, int x, int y, int cx, int cy, uint32_t fl) {
     u->wrel = (rc_t){ (int)wp[2], (int)wp[3], (int)wp[2] + (int)wp[4], (int)wp[3] + (int)wp[5] };
     int moved = old.l != u->wrel.l || old.t != u->wrel.t, sized = old.r - old.l != u->wrel.r - u->wrel.l || old.b - old.t != u->wrel.b - u->wrel.t;
     if (fl & SWP_SHOWWINDOW) u->style |= WS_VISIBLE;
+    if ((fl & SWP_SHOWWINDOW) && u->parent == g_desktop && W(g_main) && !(W(g_main)->style & WS_VISIBLE)) g_main = u->h;
     if (fl & SWP_HIDEWINDOW) u->style &= ~WS_VISIBLE;
     if (sized || moved || (fl & SWP_FRAMECHANGED)) calcsize(u);
     wnd_sync(u);
@@ -1616,6 +1700,11 @@ static uint32_t show(uobj_t* u, int cmd) {
     if (!was) {
         send(u->h, 0x18, 1, 0);
         setpos(u, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        if (u->sizemove && W(u->h)) {
+            u->sizemove = 0;
+            send(u->h, 5, 0, (uint32_t)((u->cr.b - u->cr.t) << 16 | ((u->cr.r - u->cr.l) & 0xFFFF)));   /* WM_SIZE */
+            send(u->h, 3, 0, (uint32_t)((u->cin.t + u->wrel.t) << 16 | ((u->cin.l + u->wrel.l) & 0xFFFF)));   /* WM_MOVE */
+        }
     }
     if (!(u->style & WS_CHILD) && cmd != 4 && cmd != 7 && cmd != 8) activate(u);
     return (uint32_t)was;
@@ -1660,6 +1749,8 @@ static uint32_t defproc(uobj_t* u, uint32_t m, uint32_t w, uint32_t l) {
         rc_t r = rc_get(l);
         int b = borders(u->style, u->ex), cap = caption_h(u->style, u->ex), mb = menubar_h(u);
         r.l += b, r.t += b + cap + mb, r.r -= b, r.b -= b;
+        if (u->style & WS_VSCROLL) r.r -= SM(2);
+        if (u->style & WS_HSCROLL) r.b -= SM(3);
         rc_put(l, r);
         return 0;
     }
@@ -1689,6 +1780,7 @@ static uint32_t defproc(uobj_t* u, uint32_t m, uint32_t w, uint32_t l) {
     case 0x47:                                                       /* WM_WINDOWPOSCHANGED */
         if (!(MEM32(l + 24) & SWP_NOMOVE)) send(u->h, 3, 0, (uint32_t)((u->cr.t - (W(u->parent) ? W(u->parent)->cr.t : 0)) << 16 |
                                                            ((u->cr.l - (W(u->parent) ? W(u->parent)->cr.l : 0)) & 0xFFFF)));
+        if (!(MEM32(l + 24) & (SWP_NOSIZE | SWP_NOMOVE))) u->sizemove = 0;
         if (!(MEM32(l + 24) & SWP_NOSIZE)) send(u->h, 5, 0, (uint32_t)((u->cr.b - u->cr.t) << 16 | ((u->cr.r - u->cr.l) & 0xFFFF)));
         return 0;
     case 0x10: destroy(u); return 0;                                 /* WM_CLOSE */
@@ -1843,13 +1935,17 @@ static uint32_t s_create_window(uint32_t* a) {
     if (st & WS_CHILD) u->parent = parent->h, u->id = a[9];
     else {
         u->parent = g_desktop, u->owner = parent ? parent->h : 0, u->menu = a[9];
-        if (!u->menu && c->menu) TRACE("[user] class menu not loaded by user32\n");
+        if (!u->menu && c->menu) {                             /* the class menu: __ClientLoadMenu(hinst, name) */
+            uint32_t msg[9] = { sizeof msg, 0, 0, 0, 0, 0, a[10] ? a[10] : c->inst, 0, c->menu }, o = 0, olen = 0;
+            if (!ntp_callback(W2K_CB_LOADMENU, (uint32_t)(uintptr_t)msg, sizeof msg, &o, &olen) && o && olen >= 4) u->menu = MEM32(o);
+        }
     }
     if (wname >= 0x10000) u16cpy(u->text, UNI(wname), 128);
     int x = (int)a[4], y = (int)a[5], cx = (int)a[6], cy = (int)a[7];
     if (!(st & WS_CHILD)) {
         static int k;
-        if ((uint32_t)x == CW_USEDEFAULT) { x = y = 22 * (k % 8) + 22; k++; }
+        if ((uint32_t)x == CW_USEDEFAULT && !y) st &= ~WS_VISIBLE, u->style &= ~WS_VISIBLE;   /* y is the show command: SW_HIDE */
+        if ((uint32_t)x == CW_USEDEFAULT || x == 0x8000) { x = y = 22 * (k % 8) + 22; k++; }   /* (0x8000: win32k's CW2_USEDEFAULT, dialogs') */
         if ((uint32_t)cx == CW_USEDEFAULT) cx = g_cx * 3 / 4, cy = g_cy * 3 / 4;
     } else {
         if ((uint32_t)x == CW_USEDEFAULT) x = y = 0;
@@ -1860,7 +1956,7 @@ static uint32_t s_create_window(uint32_t* a) {
     MEM32(u->obj + WND_PCLS) = c->cls;
     MEM32(u->obj + WND_CBEXTRA) = c->extra;
     if (c->fnid) MEM16(u->obj + WND_FNID) = 0;                  /* (user32 sets it with NtUserSetWindowFNID) */
-    if (!g_main && !(st & WS_CHILD)) g_main = u->h;
+    if (!(st & WS_CHILD) && (!W(g_main) || !(W(g_main)->style & WS_VISIBLE))) g_main = u->h;   /* the first top-level window shown */
     wnd_sync(u);
     /* CREATESTRUCTW */
     uint32_t cs[12] = { a[11], a[10], a[9], a[8], (uint32_t)cy, (uint32_t)cx, (uint32_t)y, (uint32_t)x, st, wname, cname, ex };
@@ -1876,8 +1972,7 @@ static uint32_t s_create_window(uint32_t* a) {
     wnd_sync(u);
     if (send(h, 1, 0, (uint32_t)(uintptr_t)cs) == (uint32_t)-1) { if (W(h)) destroy(W(h)); return 0; }
     if (!W(h)) return 0;
-    send(h, 5, 0, (uint32_t)((u->cr.b - u->cr.t) << 16 | ((u->cr.r - u->cr.l) & 0xFFFF)));   /* WM_SIZE */
-    send(h, 3, 0, (uint32_t)((u->cin.t + u->wrel.t) << 16 | ((u->cin.l + u->wrel.l) & 0xFFFF)));   /* WM_MOVE */
+    u->sizemove = 1;                              /* (WM_SIZE, WM_MOVE: when it is first shown) */
     if (st & WS_VISIBLE) show(u, 1);
     return h;
 }
@@ -2023,9 +2118,12 @@ static uint32_t s_dispatch(uint32_t* a) {        /* NtUserDispatchMessage(MSG*) 
     }
     return send(MEM32(m), MEM32(m + 4), MEM32(m + 8), MEM32(m + 12));
 }
+static uint8_t g_keys[256];                       /* live: keys down (VK), and the character each one typed */
+static uint16_t g_keychar[256];
 static uint32_t s_translate(uint32_t* a) {       /* NtUserTranslateMessage(MSG*, flags): WM_KEYDOWN -> WM_CHAR */
     uint32_t m = a[0], k = MEM32(m + 8);
     if (MEM32(m + 4) != 0x100) return 0;
+    if (k < 256 && g_keychar[k]) { post(MEM32(m), 0x102, g_keychar[k], MEM32(m + 12)); return 1; }
     if ((k >= '0' && k <= '9') || k == ' ' || k == 13 || k == 8 || k == 27) post(MEM32(m), 0x102, k, MEM32(m + 12));
     else if (k >= 'A' && k <= 'Z') post(MEM32(m), 0x102, k + 32, MEM32(m + 12));
     return 1;
@@ -2122,6 +2220,18 @@ static uint32_t s_set_cursor_data(uint32_t* a) {
     c->mask = MEM32(cd + 0x14), c->color = MEM32(cd + 0x18);
     c->icx = (int)MEM32(cd + 0x34), c->icy = (int)MEM32(cd + 0x38) / 2;
     return 1;
+}
+/* NtUserFindExistingCursorIcon(module, resource, info): the system cursors
+ * and icons (LoadCursor(NULL, IDC_WAIT) and the like) exist from the start
+ * in win32k; here each is an empty object made the first time it is asked
+ * for. ponytail: never drawn (no cursor on the framebuffer); an icon drawn
+ * from one draws nothing */
+static uint32_t s_find_cursor(uint32_t* a) {
+    static uint32_t sys[256];
+    uint32_t id = a[1] ? MEM32(a[1] + 4) : 0;
+    if (id < 32512 || id >= 32512 + 256) return 0;
+    if (!sys[id - 32512]) { uobj_t* c = unew(W2K_TYPE_CURSOR, 0x80); sys[id - 32512] = c ? c->h : 0; }
+    return sys[id - 32512];
 }
 /* NtUserDrawIconEx(hdc, x, y, hicon, cx, cy, step, hbr, flags, bMeta, cursordata) */
 static uint32_t s_drawicon(uint32_t* a) {
@@ -2239,6 +2349,32 @@ static uint32_t s_foreground(uint32_t* a) { (void)a; return g_active; }
 static uint32_t s_threaddesk(uint32_t* a) { (void)a; return 0x128; }
 static uint32_t s_one_u(uint32_t* a) { (void)a; return 1; }
 static uint32_t s_zero_u(uint32_t* a) { (void)a; return 0; }
+static uint32_t s_deftext(uint32_t* a) {        /* NtUserDefSetText(hwnd, LARGE_STRING*): DefWindowProc's WM_SETTEXT */
+    uobj_t* u = W(a[0]);
+    if (!u) return 0;
+    uint32_t s = a[1], n = s ? MEM32(s) : 0, b = s ? MEM32(s + 8) : 0, ansi = s ? MEM32(s + 4) >> 31 : 0, i;
+    if (!b) n = 0;
+    n = ansi ? n : n / 2;
+    for (i = 0; i < n && i < 127; i++) u->text[i] = ansi ? MEM8(b + i) : MEM16(b + 2 * i);
+    u->text[i] = 0;
+    wnd_sync(u);
+    u->ncdirty = 1;
+    return 1;
+}
+static uint32_t s_setscroll(uint32_t* a) {      /* NtUserSetScrollInfo(hwnd, SB_HORZ/VERT, SCROLLINFO*, redraw) -> pos */
+    uobj_t* u = W(a[0]);
+    uint32_t si = a[2];
+    if (!u || a[1] > 1 || !si) return 0;
+    int* i = u->sb[a[1]], m = (int)MEM32(si + 4);
+    if (m & 1) i[0] = (int)MEM32(si + 8), i[1] = (int)MEM32(si + 12);
+    if (m & 2) i[2] = (int)MEM32(si + 16);
+    if (m & 4) i[3] = (int)MEM32(si + 20);
+    if (i[3] > i[1] - (i[2] ? i[2] - 1 : 0)) i[3] = i[1] - (i[2] ? i[2] - 1 : 0);
+    if (i[3] < i[0]) i[3] = i[0];
+    if (a[3]) u->ncdirty = 1;
+    return (uint32_t)i[3];
+}
+static uint32_t s_keystate(uint32_t* a) { return a[0] < 256 && g_keys[a[0]] ? 0xFF80u : 0; }
 static uint32_t s_dblclick(uint32_t* a) { (void)a; return 500; }
 static uint32_t s_register_msg(uint32_t* a) { (void)a; static uint32_t n = 0xC100; return n++; }
 static uint32_t s_accel(uint32_t* a) { (void)a; uobj_t* c = unew(W2K_TYPE_ACCEL, 0x20); return c ? c->h : 0; }
@@ -2342,6 +2478,7 @@ static void user_connect(uint32_t index, uint32_t ci, uint32_t len) {
         MEM16(g_psi + SI_CXSYSFONT) = 8, MEM16(g_psi + SI_CYSYSFONT) = 16;
         MEM16(g_psi + SI_LOGPIXELS) = 96;
         MEM32(g_psi + SI_PREFMASK) = 0;
+        MEM32(g_psi + SI_GCLBORDER) = 1;               /* the sizing border setting (AdjustWindowRect: 4-pixel thick frames) */
         w2k_monitor(g_disp, g_mon, g_cx, g_cy, g_cy - 28);
         /* the desktop window */
         uobj_t* d = unew(W2K_TYPE_WINDOW, WND_SIZE);
@@ -2374,6 +2511,7 @@ static ev_t g_ev[MAXEV];
 static int g_nev, g_iev;
 static char g_out[512] = "shot";
 static uint32_t g_secs_ms;
+static int g_live;                                /* --live: an X11 window, real input (W2K_X11) */
 static int ev_cmp(const void* a, const void* b) {
     const ev_t* x = a, *y = b;
     if (x->ms != y->ms) return x->ms < y->ms ? -1 : 1;
@@ -2382,6 +2520,7 @@ static int ev_cmp(const void* a, const void* b) {
 }
 int w2kx_script_arg(int argc, char** argv, int i) {
     static const char* k[] = { "--shot", "--click", "--command", "--post", "--dlgcommand", "--type" };
+    if (!strcmp(argv[i], "--live")) { g_live = 1; return 1; }
     if (i + 1 >= argc) return 0;
     if (!strcmp(argv[i], "--out")) { snprintf(g_out, sizeof g_out, "%s", argv[i + 1]); return 2; }
     if (!strcmp(argv[i], "--secs")) { g_secs_ms = (uint32_t)(atof(argv[i + 1]) * 1000); return 2; }
@@ -2458,11 +2597,13 @@ static void run_event(ev_t* e) {
 }
 /* nothing to deliver: the next scripted event, or the virtual clock on to
  * the next timer; with neither, the run is over */
+static int live_idle(uint32_t now, uint32_t next);
 static int script_idle(void) {
     uint32_t now = ntp_clock_ms(), next = UINT32_MAX;
     if (g_iev < g_nev && g_ev[g_iev].ms <= now) { run_event(&g_ev[g_iev++]); return 1; }
     if (g_iev < g_nev) next = g_ev[g_iev].ms;
     for (int i = 0; i < MAXT; i++) if (g_tm[i].on && g_tm[i].due < next) next = g_tm[i].due;
+    if (live_idle(now, next)) return 1;
     uint32_t end = g_secs_ms ? g_secs_ms : g_nev ? g_ev[g_nev - 1].ms + 1000 : 0;
     if (next == UINT32_MAX || (end && next > end)) {
         if (!g_nev) shot(now);
@@ -2473,6 +2614,176 @@ static int script_idle(void) {
     if (next > now) ntp_clock_advance(next - now);
     return 1;
 }
+
+/* ======================================================================
+ * Live: an X11 window over the same framebuffer, with the real mouse and
+ * keyboard (--live; built with -DW2K_X11 -lX11). The virtual clock follows
+ * the real one while it waits for input; scripted events and shots still
+ * run on it, so a live run can also be driven (xdotool) and shot.
+ * ====================================================================== */
+#ifdef W2K_X11
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/keysym.h>
+#include <sys/select.h>
+#include <time.h>
+static Display* g_xd;
+static Window g_xw;
+static XImage* g_xi;
+static GC g_xgc;
+static Atom g_xdel;
+static uint32_t g_xlast, g_xshown, g_xdown_ms, g_xdown_h;
+static int g_xdown_x, g_xdown_y;
+static uint32_t host_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint32_t)(t.tv_sec * 1000 + t.tv_nsec / 1000000); }
+static void x_open(void) {
+    if (!(g_xd = XOpenDisplay(NULL))) { fprintf(stderr, "[live] no X display (DISPLAY=%s)\n", getenv("DISPLAY") ? getenv("DISPLAY") : ""); exit(1); }
+    int sc = DefaultScreen(g_xd);
+    g_xw = XCreateSimpleWindow(g_xd, RootWindow(g_xd, sc), 0, 0, (unsigned)g_cx, (unsigned)g_cy, 0, 0, 0);
+    XStoreName(g_xd, g_xw, "Windows 2000");
+    XSelectInput(g_xd, g_xw, ExposureMask | KeyPressMask | KeyReleaseMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask);
+    g_xdel = XInternAtom(g_xd, "WM_DELETE_WINDOW", False);
+    XSetWMProtocols(g_xd, g_xw, &g_xdel, 1);
+    XMapWindow(g_xd, g_xw);
+    g_xgc = DefaultGC(g_xd, sc);
+    g_xi = XCreateImage(g_xd, DefaultVisual(g_xd, sc), 24, ZPixmap, 0, malloc((size_t)g_cx * g_cy * 4), (unsigned)g_cx, (unsigned)g_cy, 32, 0);
+    g_xlast = host_ms();
+    fprintf(stderr, "[live] X11 window 0x%lx, %dx%d\n", (unsigned long)g_xw, g_cx, g_cy);
+}
+static void x_present(void) {                    /* COLORREF (0x00BBGGRR) to the visual's 0x00RRGGBB */
+    uint32_t* o = (uint32_t*)g_xi->data;
+    for (int i = 0; i < g_cx * g_cy; i++) { uint32_t c = g_screen.px[i]; o[i] = (c & 0xFF) << 16 | (c & 0xFF00) | (c >> 16 & 0xFF); }
+    XPutImage(g_xd, g_xw, g_xgc, g_xi, 0, 0, 0, 0, (unsigned)g_cx, (unsigned)g_cy);
+    XFlush(g_xd);
+    g_xshown = host_ms();
+}
+static uint32_t x_vk(KeySym k) {
+    if (k >= XK_a && k <= XK_z) return (uint32_t)(k - XK_a + 'A');
+    if (k >= XK_0 && k <= XK_9) return (uint32_t)k;
+    if (k >= XK_F1 && k <= XK_F12) return (uint32_t)(0x70 + k - XK_F1);
+    if (k >= XK_KP_0 && k <= XK_KP_9) return (uint32_t)(0x60 + k - XK_KP_0);
+    static const struct { KeySym k; uint8_t vk; } t[] = {
+        { XK_Return, 13 }, { XK_KP_Enter, 13 }, { XK_BackSpace, 8 }, { XK_Tab, 9 }, { XK_Escape, 27 }, { XK_space, 32 },
+        { XK_Left, 37 }, { XK_Up, 38 }, { XK_Right, 39 }, { XK_Down, 40 }, { XK_Home, 36 }, { XK_End, 35 }, { XK_Prior, 33 },
+        { XK_Next, 34 }, { XK_Insert, 45 }, { XK_Delete, 46 }, { XK_Shift_L, 16 }, { XK_Shift_R, 16 }, { XK_Control_L, 17 },
+        { XK_Control_R, 17 }, { XK_Alt_L, 18 }, { XK_Alt_R, 18 }, { XK_KP_Add, 0x6B }, { XK_KP_Subtract, 0x6D },
+        { XK_KP_Multiply, 0x6A }, { XK_KP_Divide, 0x6F }, { XK_KP_Decimal, 0x6E }, { XK_semicolon, 0xBA }, { XK_equal, 0xBB },
+        { XK_comma, 0xBC }, { XK_minus, 0xBD }, { XK_period, 0xBE }, { XK_slash, 0xBF }, { XK_grave, 0xC0 },
+        { XK_bracketleft, 0xDB }, { XK_backslash, 0xDC }, { XK_bracketright, 0xDD }, { XK_apostrophe, 0xDE },
+    };
+    for (unsigned i = 0; i < sizeof t / sizeof t[0]; i++) if (t[i].k == k) return t[i].vk;
+    return 0;
+}
+static uint32_t top_of(uint32_t h) { uobj_t* u = W(h); while (u && W(u->parent) && u->parent != g_desktop) u = W(u->parent); return u ? u->h : 0; }
+/* a click in the dropped-down menu: its item's WM_COMMAND to the owner */
+static void x_popup_click(int x, int y) {
+    uobj_t* p = U(g_popup_menu, W2K_TYPE_MENU);
+    uint32_t owner = g_popup_owner, id = 0;
+    for (int i = 0, iy = g_popup.t + 3; p && i < p->nitems; i++) {
+        int h = p->items[i].type & 0x800 ? 9 : 17;
+        if (y >= iy && y < iy + h && !(p->items[i].type & 0x800) && !(p->items[i].state & 3) && !p->items[i].sub) id = p->items[i].id;
+        iy += h;
+    }
+    (void)x;
+    popup_close();
+    if (id) post(owner, 0x111, id, 0);
+}
+static void x_mouse(int type, int x, int y, unsigned button, unsigned state) {
+    uint32_t mk = (state & Button1Mask ? 1 : 0) | (state & Button3Mask ? 2 : 0) | (state & ShiftMask ? 4 : 0) | (state & ControlMask ? 8 : 0);
+    if (type != MotionNotify && button > 3) return;          /* the wheel */
+    if (type == ButtonPress && !rc_empty(&g_popup)) {
+        if (x >= g_popup.l && x < g_popup.r && y >= g_popup.t && y < g_popup.b) { x_popup_click(x, y); return; }
+        popup_close();
+    }
+    uint32_t pt[2] = { (uint32_t)x, (uint32_t)y }, h = g_capture ? g_capture : s_frompoint(pt);
+    uobj_t* u = W(h);
+    if (!u || h == g_desktop) return;
+    uint32_t sl = (uint32_t)(y << 16 | (x & 0xFFFF));
+    int client = g_capture || (x >= u->cr.l && x < u->cr.r && y >= u->cr.t && y < u->cr.b);
+    if (type == ButtonPress) {
+        uobj_t* t = W(top_of(h));
+        if (t && t->h != g_active) activate(t);
+    }
+    if (!client) {
+        if (type != ButtonPress || button != 1) return;
+        uint32_t ht = send(h, 0x84, 0, sl);                 /* WM_NCHITTEST */
+        uobj_t* m = ht == 5 ? U(u->menu, W2K_TYPE_MENU) : NULL;
+        if (m) {
+            menubar_layout(u);
+            for (int k = 0; k < m->nitems; k++)
+                if (x >= u->wr.l + m->items[k].x && x < u->wr.l + m->items[k].x + m->items[k].w) { popup_draw(u, k); return; }
+        }
+        post(h, 0xA1, ht, sl);                               /* WM_NCLBUTTONDOWN */
+        return;
+    }
+    uint32_t cl = (uint32_t)((y - u->cr.t) << 16 | ((x - u->cr.l) & 0xFFFF)), m = 0x200;   /* WM_MOUSEMOVE */
+    if (type == ButtonPress || type == ButtonRelease) {
+        uint32_t b = button == 3 ? 3 : button == 2 ? 6 : 0;  /* WM_LBUTTON*, WM_RBUTTON*, WM_MBUTTON* */
+        uint32_t bit = button == 1 ? 1 : button == 3 ? 2 : 0x10;
+        m = 0x201 + b + (type == ButtonRelease);
+        mk = type == ButtonPress ? mk | bit : mk & ~bit;
+        if (type == ButtonPress) {
+            uint32_t now = host_ms();
+            cls_t* c = u->cls >= 0 ? &g_cls[u->cls] : NULL;
+            if (c && (c->style & 8) && h == g_xdown_h && now - g_xdown_ms < 500 && abs(x - g_xdown_x) < 4 && abs(y - g_xdown_y) < 4)
+                m = 0x203 + b, now = 0;                       /* CS_DBLCLKS: the second click is a double click */
+            g_xdown_ms = now, g_xdown_h = h, g_xdown_x = x, g_xdown_y = y;
+        }
+    }
+    post(h, m, mk, cl);
+}
+static void x_key(XKeyEvent* e, int down) {
+    KeySym k = XLookupKeysym(e, 0), dummy;
+    char ch[8] = "";
+    int n = down ? XLookupString(e, ch, sizeof ch, &dummy, NULL) : 0;
+    uint32_t vk = x_vk(k), alt = (e->state & Mod1Mask) != 0;
+    if (!vk) return;
+    g_keys[vk] = (uint8_t)down;
+    if (down) g_keychar[vk] = n == 1 && !(e->state & ControlMask) ? (uint8_t)ch[0] : 0;
+    uint32_t lp = 1 | (uint32_t)(e->keycode - 8) << 16 | (down ? 0 : 0xC0000000u);
+    uint32_t to = W(g_focus) ? g_focus : g_active ? g_active : g_main;
+    if (down && !rc_empty(&g_popup)) { popup_close(); if (vk == 27) return; }
+    if (down && (vk == 0x79 || (alt && vk >= 'A' && vk <= 'Z'))) {   /* F10, Alt+letter: the menu */
+        post(top_of(to) ? top_of(to) : g_main, 0x112, 0xF100, vk == 0x79 ? 0 : vk + 32);
+        return;
+    }
+    if (vk == 18) return;
+    post(to, down ? 0x100 : 0x101, vk, lp);
+}
+static int live_idle(uint32_t now, uint32_t next) {
+    if (!g_live) return 0;
+    if (!g_xd) x_open();
+    if (host_ms() - g_xshown >= 15) x_present();
+    int wait = next == UINT32_MAX || next - now > 15 ? 15 : (int)(next - now);
+    if (!XPending(g_xd)) {
+        fd_set f;
+        FD_ZERO(&f);
+        FD_SET(ConnectionNumber(g_xd), &f);
+        struct timeval tv = { 0, wait * 1000 };
+        select(ConnectionNumber(g_xd) + 1, &f, NULL, NULL, &tv);
+    }
+    while (XPending(g_xd)) {
+        XEvent e;
+        XNextEvent(g_xd, &e);
+        switch (e.type) {
+        case Expose: g_xshown = 0; break;
+        case ButtonPress: case ButtonRelease: x_mouse(e.type, e.xbutton.x, e.xbutton.y, e.xbutton.button, e.xbutton.state); break;
+        case MotionNotify: x_mouse(e.type, e.xmotion.x, e.xmotion.y, 0, e.xmotion.state); break;
+        case KeyPress: case KeyRelease: x_key(&e.xkey, e.type == KeyPress); break;
+        case ClientMessage: if ((Atom)e.xclient.data.l[0] == g_xdel) { if (W(g_main)) post(g_main, 0x10, 0, 0); else exit(0); } break;
+        }
+    }
+    uint32_t t = host_ms(), d = t - g_xlast;
+    g_xlast = t;
+    if (d) ntp_clock_advance(d);
+    return 1;
+}
+#else
+static int live_idle(uint32_t now, uint32_t next) {
+    (void)now, (void)next;
+    if (g_live) { fprintf(stderr, "[live] built without X11 (-DW2K_X11 -lX11)\n"); exit(1); }
+    return 0;
+}
+#endif
 
 void w2kx_install(int cx, int cy, const char* fontdir) {
     char p[1024];
@@ -2489,7 +2800,7 @@ void w2kx_install(int cx, int cy, const char* fontdir) {
         { "NtGdiInit", s_gdi_init }, { "NtGdiQueryFontAssocInfo", s_zero }, { "NtGdiGetStockObject", s_stock },
         { "NtGdiCreateCompatibleDC", s_compat_dc }, { "NtGdiCreateCompatibleBitmap", s_compat_bitmap }, { "NtGdiCreateBitmap", s_bitmap },
         { "NtGdiCreatePen", s_pen }, { "NtGdiCreateSolidBrush", s_brush }, { "NtGdiCreateHatchBrushInternal", s_hatch },
-        { "NtGdiCreatePatternBrushInternal", s_patbrush }, { "NtGdiCreateRectRgn", s_rectrgn }, { "NtGdiCreateDIBitmapInternal", s_dibitmap },
+        { "NtGdiCreatePatternBrushInternal", s_patbrush }, { "NtGdiCreateRectRgn", s_rectrgn }, { "NtGdiCombineRgn", s_combinergn }, { "NtGdiCreateDIBitmapInternal", s_dibitmap },
         { "NtGdiCreateDIBSection", s_dibsection }, { "NtGdiGetDIBitsInternal", s_getdibits },
         { "NtGdiSelectBitmap", s_select_bitmap }, { "NtGdiSelectBrush", s_select }, { "NtGdiSelectPen", s_select }, { "NtGdiSelectFont", s_select },
         { "NtGdiGetDCforBitmap", s_dcforbitmap }, { "NtGdiDeleteObjectApp", s_delete }, { "NtGdiBitBlt", s_bitblt }, { "NtGdiStretchBlt", s_stretchblt },
@@ -2516,11 +2827,11 @@ void w2kx_install(int cx, int cy, const char* fontdir) {
         { "NtUserTranslateMessage", s_translate }, { "NtUserSetTimer", s_settimer }, { "NtUserKillTimer", s_killtimer },
         { "NtUserValidateTimerCallback", s_one_u }, { "NtUserThunkedMenuItemInfo", s_menu_item }, { "NtUserCheckMenuItem", s_check_menu },
         { "NtUserEnableMenuItem", s_enable_menu }, { "NtUserDestroyMenu", s_destroy_menu }, { "NtUserGetMenuItemRect", s_menu_rect },
-        { "NtUserGetSystemMenu", s_sysmenu }, { "NtUserFindExistingCursorIcon", s_zero_u }, { "NtUserSetCursorIconData", s_set_cursor_data },
+        { "NtUserGetSystemMenu", s_sysmenu }, { "NtUserFindExistingCursorIcon", s_find_cursor }, { "NtUserSetCursorIconData", s_set_cursor_data },
         { "NtUserDrawIconEx", s_drawicon }, { "NtUserDestroyCursor", s_one_u }, { "NtUserSetCursor", s_zero_u },
         { "NtUserCallNoParam", s_call_noparam }, { "NtUserCallOneParam", s_call_oneparam }, { "NtUserCallTwoParam", s_call_twoparam },
         { "NtUserCallHwndLock", s_hwnd_lock }, { "NtUserCallHwndParam", s_hwnd_param }, { "NtUserCallHwndParamLock", s_hwnd_param_lock },
-        { "NtUserSetWindowFNID", s_set_fnid }, { "NtUserQueryWindow", s_query_window }, { "NtUserSetWindowLong", s_setlong },
+        { "NtUserSetWindowFNID", s_set_fnid }, { "NtUserDefSetText", s_deftext }, { "NtUserSetScrollInfo", s_setscroll }, { "NtUserQueryWindow", s_query_window }, { "NtUserSetWindowLong", s_setlong },
         { "NtUserSetFocus", s_setfocus }, { "NtUserSetCapture", s_setcapture }, { "NtUserSetActiveWindow", s_setactive },
         { "NtUserGetForegroundWindow", s_foreground }, { "NtUserGetThreadDesktop", s_threaddesk },
         { "NtUserModifyUserStartupInfoFlags", s_one_u }, { "NtUserGetDoubleClickTime", s_dblclick },
@@ -2528,8 +2839,8 @@ void w2kx_install(int cx, int cy, const char* fontdir) {
         { "NtUserTranslateAccelerator", s_zero_u }, { "NtUserSetWindowsHookEx", s_sethook }, { "NtUserUnhookWindowsHookEx", s_one_u },
         { "NtUserCallNextHookEx", s_zero_u }, { "NtUserSetProp", s_one_u }, { "NtUserRemoveProp", s_zero_u },
         { "NtUserFillWindow", s_fill_window }, { "NtUserWindowFromPoint", s_frompoint }, { "NtUserGetWindowPlacement", s_getplacement },
-        { "NtUserSetWindowPlacement", s_one_u }, { "NtUserSystemParametersInfo", s_spi }, { "NtUserGetKeyState", s_zero_u },
-        { "NtUserGetAsyncKeyState", s_zero_u }, { "NtUserShowCaret", s_one_u }, { "NtUserHideCaret", s_one_u },
+        { "NtUserSetWindowPlacement", s_one_u }, { "NtUserSystemParametersInfo", s_spi }, { "NtUserGetKeyState", s_keystate },
+        { "NtUserGetAsyncKeyState", s_keystate }, { "NtUserShowCaret", s_one_u }, { "NtUserHideCaret", s_one_u },
         { "NtUserCreateCaret", s_one_u }, { "NtUserGetKeyboardLayoutList", s_zero_u },
         { "NtUserGetControlBrush", s_ctlbrush }, { "NtUserGetControlColor", s_ctlcolor },
     };

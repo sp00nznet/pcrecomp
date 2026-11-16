@@ -57,6 +57,7 @@ enum { W2K_TYPE_FREE, W2K_TYPE_WINDOW, W2K_TYPE_MENU, W2K_TYPE_CURSOR, W2K_TYPE_
 #define SI_BRUSHES      0x75C  /* ahbrSystem[0x1D] */
 #define SI_CXSYSFONT    0x800
 #define SI_CYSYSFONT    0x804
+#define SI_GCLBORDER    0x7E4  /* gclBorder */
 #define SI_LOGPIXELS    0xE4A
 #define SI_PREFMASK     0xE50
 #define SI_SIZE         0x10000
@@ -77,6 +78,7 @@ enum { W2K_TYPE_FREE, W2K_TYPE_WINDOW, W2K_TYPE_MENU, W2K_TYPE_CURSOR, W2K_TYPE_
 #define W2K_CB_INCNTOUTSTRING   7
 #define W2K_CB_INLPCREATESTRUCT 9
 #define W2K_CB_INSTRING        25
+#define W2K_CB_LOADMENU        65   /* __ClientLoadMenu { header, hinst, UNICODE_STRING name } -> hmenu */
 #define W2K_CB_THREADSETUP     74   /* __ClientThreadSetup */
 
 #define FNID_DESKTOP       0x29D
