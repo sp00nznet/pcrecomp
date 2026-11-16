@@ -25,6 +25,8 @@ void recomp_trace_flush(void);   /* recomp_trace.c: --calltrace before we end */
 
 static int g_trace = -1;          /* NATIVE32_VXD */
 static uint16_t g_cur_psp;         /* the current PSP selector (a TDBX points at it) */
+static char g_cwd[MAX_PATH];       /* the guest's current directory: no drive, no leading backslash */
+uint16_t native32_w9x_alloc_sel(uint32_t base, uint32_t limit);
 static uint32_t g_cur[3];          /* VWIN32's current thread, process, TDBX (0xBFFC9CE0 points here) */
 typedef struct { uint32_t id; int nargs; uint32_t (*fn)(const uint32_t* a); const char* name; } vxd_service_t;
 
@@ -57,6 +59,15 @@ static uint32_t vwin32_crst_create(const uint32_t* a) {
 static uint32_t vmm_page_reserve(const uint32_t* a) {
     void* want = PR_ANY(a[0]) ? NULL : (void*)(uintptr_t)(a[0] << 12);
     void* p = VirtualAlloc(want, a[1] << 12, MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    MEMORY_BASIC_INFORMATION mb;
+    /* kernel32's loader reserving a module at its own base, where native32
+     * already holds that image (the lifted code is for that address): the
+     * region is the guest's already, and the pager fills it with the same
+     * bytes. Anywhere else would be a relocated copy nothing lifted runs. */
+    if (!p && want && VirtualQuery(want, &mb, sizeof mb) && mb.AllocationBase == want && mb.State != MEM_FREE) {
+        if (g_trace > 0) fprintf(stderr, "[vxd] PageReserve %08X: the image native32 holds there\n", (uint32_t)(uintptr_t)want);
+        return (uint32_t)(uintptr_t)want;
+    }
     return p ? (uint32_t)(uintptr_t)p : 0xFFFFFFFFu;
 }
 /* VMM's registry (Windows 9x keeps it in ring 0). Named from kernel32's
@@ -208,6 +219,32 @@ static void krnl386_thunk(void) {
         if (g_trace > 0) fprintf(stderr, "[krnl386] thunk 30 task %04X name \"%s\"\n", MEM16(sp + 4), (const char*)(uintptr_t)lin16(MEM32(sp)));
         g_eax = 0; g_edx = 0;
         break;
+    case 0x32: { /* (psp:16, thread:32, tibsel:16): the new process's Win16 task
+                  * (CreateProcess, 0xBFF92F8F); the selector lands in PDB+38
+                  * and thread+14. A TDB like the boot task's (k32host): +16
+                  * flags (10h, a Win32 task), +60 its PSP, +66 the drive with
+                  * bit 7 (+100 holds the directory), 'TD' at +FA. */
+        uint8_t* tdb = calloc(1, 0x200);
+        tdb[0x16] = 0x10;
+        *(uint16_t*)(tdb + 0x60) = MEM16(sp + 6);
+        tdb[0x66] = 0x80 | 2;
+        tdb[0xFA] = 'T'; tdb[0xFB] = 'D';
+        _snprintf((char*)tdb + 0x100, 0x100, "\\%s", g_cwd);
+        g_eax = native32_w9x_alloc_sel((uint32_t)(uintptr_t)tdb, 0x1FF); g_edx = 0;
+        if (g_trace > 0) fprintf(stderr, "[krnl386] thunk 32 new task %04X (psp %04X, thread %08X)\n", g_eax, MEM16(sp + 6), MEM32(sp + 2));
+        break; }
+    case 0x2A: { /* (lpCmdLine:16:16, nCmdShow:16, ?:16) WinExec. A console
+                  * program's first thread starts the console agent
+                  * (0xBFFA205C: "<sysdir>\CONAGENT.EXE /new ..."), the DOS
+                  * box that runs a Win9x console. The host's console is that
+                  * console: say it started (an hInstance above 31). Anything
+                  * else would be a real 16-bit program: stop. */
+        const char* cmd = (const char*)(uintptr_t)lin16(MEM32(sp + 4));
+        if (g_trace > 0) fprintf(stderr, "[krnl386] thunk 2A WinExec(\"%s\", %u)\n", cmd, MEM16(sp + 2));
+        if (strstr(cmd, "CONAGENT") || strstr(cmd, "conagent")) { g_eax = 0x40; g_edx = 0; break; }
+        fprintf(stderr, "\n[krnl386] WinExec(\"%s\"): no 16-bit programs here\n", cmd);
+        fflush(stderr); recomp_trace_flush(); TerminateProcess(GetCurrentProcess(), 5);
+        break; }
     case 0x0D:   /* (drive:16, 0 = A:) GetDriveType: GetDriveTypeA (0xBFF74D33)
                   * asks for a drive it found real. Only C: (fixed, 3). */
         g_eax = MEM16(sp) == 2 ? 3 : 0; g_edx = 0;
@@ -229,9 +266,23 @@ static void krnl386_thunk(void) {
 }
 uint32_t native32_w9x_krnl386_thunk(void) { return K386_TAG; }
 
+/* USER32!UserSignalProc(signal, id, flags, hTask16), stdcall: kernel32 tells
+ * USER of every process and thread event (0xBFF815FB) through 0xBFFC95C0,
+ * which it fills when USER32 loads; Windows 98 always has USER32 loaded, so
+ * it never checks. Until a GUI guest brings its own user32, the host stands
+ * in: a console program has no windows to tidy. */
+#define USIG_TAG 0xFEEE9000u
+static void user_signal_proc(void) {
+    if (g_trace > 0) fprintf(stderr, "[user32] UserSignalProc(%08X, %08X, %08X, %04X)\n", MEM32(g_esp + 4), MEM32(g_esp + 8), MEM32(g_esp + 12), MEM16(g_esp + 16));
+    g_eax = 0;
+    g_esp += 4 + 16;
+}
+uint32_t native32_w9x_user_signal_proc(void) { return USIG_TAG; }
+
 /* The host's recomp_lookup_manual forwards here: VWIN32's entries above. */
 recomp_func_t native32_w9x_lookup(uint32_t va) {
     if (va == K386_TAG) return krnl386_thunk;
+    if (va == USIG_TAG) return user_signal_proc;
     if ((va & 0xFFFF0000u) == R0F_TAG && (va & 0xFFFF) < 4 * 11 && !(va & 3)) return g_r0f[(va & 0xFFFF) / 4];
     return NULL;
 }
@@ -281,6 +332,13 @@ static uint32_t vmm_page_commit(const uint32_t* a) {
 static uint32_t vmm_page_decommit(const uint32_t* a) {
     return VirtualFree((void*)(uintptr_t)(a[0] << 12), a[1] << 12, MEM_DECOMMIT);
 }
+
+/* VMM 28, through two inline gate calls (0xBFF9CA9A, 0xBFF9CAB9) that
+ * bracket it with pushal/popal and drop the result. The one reached, at a
+ * new process's start (0xBFF8B1AA), leaves a word under the return address
+ * (-1) that its own `pop eax` takes back: so no arguments. Nothing on the
+ * host. ponytail: named when a caller looks at what it did. */
+static uint32_t vmm_28(const uint32_t* a) { (void)a; return 0; }
 
 /* VMM 0D (page, n, and, or): _PageModifyPermissions, the old permissions
  * back (-1 fails). kernel32 reads them with (and 0, or 20060000h) and puts
@@ -349,6 +407,7 @@ static uint32_t vwin32_set_priorities(const uint32_t* a) { (void)a; return 0; }
 #define R0T_THREAD 0x28
 #define R0T_PROCESS 0x38
 #define R0T_TDBX   0x3C
+static void track_thread(uint32_t r0);
 static uint32_t new_tdbx(void) {
     uint8_t* tdbx = calloc(1, 0x100);
     *(uint32_t*)(tdbx + 0x50) = (uint32_t)(uintptr_t)&g_cur_psp;
@@ -356,6 +415,7 @@ static uint32_t new_tdbx(void) {
 }
 static uint32_t vwin32_create_thread(const uint32_t* a) {
     uint8_t* r0 = calloc(1, 0x100);
+    track_thread((uint32_t)(uintptr_t)r0);
     *(uint32_t*)(r0 + R0T_ENTRY) = a[5];
     *(uint32_t*)(r0 + R0T_ESP) = a[7];
     *(uint32_t*)(r0 + R0T_THREAD) = a[0];
@@ -377,6 +437,8 @@ static uint32_t vwin32_create_thread(const uint32_t* a) {
  * it was going (0xBFF868EC), entered as a jump. */
 #define R0T_READY  0x2C
 #define R0T_PARKED 0x30      /* host event: the thread blocked or ended */
+#define R0T_WAKE   0x34      /* host event: what a blocked thread sleeps on */
+static uint32_t g_boot_r0;          /* the first thread's twin (VWIN32 0C) */
 static __declspec(thread) uint32_t t_r0;   /* this host thread's guest r0 twin, 0 for the boot thread */
 
 static DWORD w9x_wait(HANDLE h, DWORD ms) {
@@ -409,23 +471,69 @@ static DWORD WINAPI guest_thread(LPVOID p) {
     return 0;
 }
 
+static void start_thread(uint32_t r0) {
+    if (MEM32(r0 + R0T_PARKED)) return;
+    MEM32(r0 + R0T_PARKED) = (uint32_t)(uintptr_t)CreateEventA(NULL, FALSE, FALSE, NULL);
+    CloseHandle(CreateThread(NULL, 1u << 20, guest_thread, (LPVOID)(uintptr_t)r0, 0, NULL));
+}
+
+/* A ready thread starts on its host thread at once; it waits for the
+ * machine until the running thread blocks. */
 static uint32_t vwin32_ready_thread(const uint32_t* a) {
-    if (a[0]) MEM32(a[0] + R0T_READY) = 1;
-    if (g_trace > 0) fprintf(stderr, "[vxd] thread %08X ready\n", a[0] ? MEM32(a[0] + R0T_THREAD) : 0);
+    if (!a[0]) return 0;
+    MEM32(a[0] + R0T_READY) = 1;
+    if (g_trace > 0) fprintf(stderr, "[vxd] thread %08X ready\n", MEM32(a[0] + R0T_THREAD));
+    start_thread(a[0]);
     return 0;
 }
 
 static uint32_t vwin32_run_thread(const uint32_t* a) {
     uint32_t r0 = a[0];
     if (!r0 || !MEM32(r0 + R0T_READY)) return 0;
-    HANDLE parked = (HANDLE)(uintptr_t)MEM32(r0 + R0T_PARKED);
-    if (!parked) {
-        parked = CreateEventA(NULL, FALSE, FALSE, NULL);
-        MEM32(r0 + R0T_PARKED) = (uint32_t)(uintptr_t)parked;
-        CloseHandle(CreateThread(NULL, 1u << 20, guest_thread, (LPVOID)(uintptr_t)r0, 0, NULL));
-    }
-    w9x_wait(parked, INFINITE);
+    start_thread(r0);
+    w9x_wait((HANDLE)(uintptr_t)MEM32(r0 + R0T_PARKED), INFINITE);
     return 0;
+}
+
+/* VWIN32 5D (n, objs, ms, all, alertable): block on n of kernel32's wait
+ * blocks (WaitForMultipleObjects' ring-0 half, 0xBFF99AE7; kernel32 has
+ * already found none signaled). The thread sleeps on its wake event until
+ * another thread wakes one of the blocks (see vxd_wake) or the time runs
+ * out: the result is the woken block's index, 102h on timeout, C0h for an
+ * APC. Waits are kept per thread (R0T_WAITS).
+ * ponytail: wait-all is treated as wait-any; kernel32 re-checks. */
+#define R0T_WAITN  0x40
+#define R0T_WAITS  0x44
+#define R0T_WOKEN  0x48
+#define MAXTHREADS 64
+static uint32_t g_threads[MAXTHREADS];     /* every r0 twin, for vxd_wake */
+static int g_nthreads;
+static HANDLE thread_wake(void);
+static void track_thread(uint32_t r0) { if (g_nthreads < MAXTHREADS) g_threads[g_nthreads++] = r0; }
+static uint32_t vwin32_wait_multiple(const uint32_t* a) {
+    uint32_t r0 = t_r0 ? t_r0 : g_boot_r0;
+    MEM32(r0 + R0T_WAITN) = a[0];
+    MEM32(r0 + R0T_WAITS) = a[1];
+    MEM32(r0 + R0T_WOKEN) = 0xFFFFFFFFu;
+    if (g_trace > 0) fprintf(stderr, "[vxd] thread %08X waits on %u blocks (%d ms)\n", g_cur[0], a[0], (int)a[2]);
+    DWORD rc = w9x_wait(thread_wake(), a[2]);
+    MEM32(r0 + R0T_WAITN) = 0;
+    if (rc == WAIT_TIMEOUT) return 0x102;
+    return MEM32(r0 + R0T_WOKEN) == 0xFFFFFFFFu ? 0xC0 : MEM32(r0 + R0T_WOKEN);
+}
+
+/* VWIN32 2D (ms, alertable): block this thread (SleepEx, 0xBFF88BB0):
+ * C0h when woken for an APC, 102h on timeout. The thread gives up the
+ * machine meanwhile, on its wake event (R0T_WAKE). */
+static HANDLE thread_wake(void) {
+    uint32_t r0 = t_r0 ? t_r0 : g_boot_r0;
+    if (!MEM32(r0 + R0T_WAKE)) MEM32(r0 + R0T_WAKE) = (uint32_t)(uintptr_t)CreateEventA(NULL, FALSE, FALSE, NULL);
+    return (HANDLE)(uintptr_t)MEM32(r0 + R0T_WAKE);
+}
+static uint32_t vwin32_block(const uint32_t* a) {
+    if (g_trace > 0) fprintf(stderr, "[vxd] thread %08X blocks (%d ms)\n", g_cur[0], (int)a[0]);
+    DWORD rc = w9x_wait(thread_wake(), a[0]);
+    return rc == WAIT_TIMEOUT ? 0x102 : 0xC0;
 }
 
 /* VWIN32 26 (r0thread, r0other): ties a thread's ring-0 twin to another
@@ -434,28 +542,55 @@ static uint32_t vwin32_run_thread(const uint32_t* a) {
  * share everything already. */
 static uint32_t vwin32_link_thread(const uint32_t* a) { (void)a; return 0; }
 
-/* ---- VCOND (VxD 38h), the console ----------------------------------------
- * 23 (6, &info, sysdir): kernel32's service thread (0xBFF91450) introduces
- * itself to VCOND once, with the system directory (where CONAGENT.EXE
- * lives); nothing reads the info block (0xBFFC9D30) back. The host's
- * console needs no agent. */
+/* VCOND (VxD 38h), the console. 23 (6, &info, sysdir): kernel32's service
+ * thread (0xBFF91450) introduces itself once, with the system directory
+ * (where CONAGENT.EXE lives); nothing reads the info block (0xBFFC9D30)
+ * back. The host's console needs no agent. */
 static uint32_t vcond_init(const uint32_t* a) { (void)a; return 0; }
 
-/* VWIN32 2D (ms, alertable): block this thread (SleepEx, 0xBFF88BB0):
- * C0h when woken for an APC, 102h on timeout. The thread gives up the
- * machine meanwhile; its wake event (R0T_WAKE, the boot thread's own) is
- * what a queued APC will set. */
-#define R0T_WAKE 0x34
-static HANDLE thread_wake(void) {
-    static HANDLE boot;
-    if (!t_r0) { if (!boot) boot = CreateEventA(NULL, FALSE, FALSE, NULL); return boot; }
-    if (!MEM32(t_r0 + R0T_WAKE)) MEM32(t_r0 + R0T_WAKE) = (uint32_t)(uintptr_t)CreateEventA(NULL, FALSE, FALSE, NULL);
-    return (HANDLE)(uintptr_t)MEM32(t_r0 + R0T_WAKE);
+/* VWIN32 1D (crst) / 1E (crst): a critical section's contention. kernel32's
+ * EnterCriticalSection (0xBFF741B4) calls 1D when another thread owns it
+ * and then returns as the owner, so the hand-over happens here: 1E, from
+ * LeaveCriticalSection when the count says someone waits (0xBFF74268),
+ * makes the first waiter the owner (+08 its TDBX, +04 recursion 1) and
+ * wakes it. A crst is {+04 recursion, +08 owner TDBX, +10 lock count}. */
+#define R0T_CRST 0x4C
+static uint32_t vwin32_crst_wait(const uint32_t* a) {
+    uint32_t r0 = t_r0 ? t_r0 : g_boot_r0;
+    MEM32(r0 + R0T_CRST) = a[0];
+    if (g_trace > 0) fprintf(stderr, "[vxd] thread %08X waits for crst %08X (owner %08X)\n", g_cur[0], a[0], MEM32(a[0] + 8));
+    while (MEM32(r0 + R0T_CRST)) w9x_wait(thread_wake(), INFINITE);
+    return 0;
 }
-static uint32_t vwin32_block(const uint32_t* a) {
-    if (g_trace > 0) fprintf(stderr, "[vxd] thread %08X blocks (%d ms)\n", g_cur[0], (int)a[0]);
-    DWORD rc = w9x_wait(thread_wake(), a[0]);
-    return rc == WAIT_TIMEOUT ? 0x102 : 0xC0;
+static uint32_t vwin32_crst_wake(const uint32_t* a) {
+    for (int t = 0; t < g_nthreads; t++) {
+        uint32_t r0 = g_threads[t];
+        if (MEM32(r0 + R0T_CRST) != a[0]) continue;
+        MEM32(r0 + R0T_CRST) = 0;
+        MEM32(a[0] + 8) = MEM32(r0 + R0T_TDBX);
+        MEM32(a[0] + 4) = 1;
+        if (!MEM32(r0 + R0T_WAKE)) MEM32(r0 + R0T_WAKE) = (uint32_t)(uintptr_t)CreateEventA(NULL, FALSE, FALSE, NULL);
+        SetEvent((HANDLE)(uintptr_t)MEM32(r0 + R0T_WAKE));
+        return 0;
+    }
+    return 0;
+}
+
+/* Wake every thread waiting on wait block obj; returns how many. */
+static int vxd_wake(uint32_t obj) {
+    int woke = 0;
+    for (int t = 0; t < g_nthreads; t++) {
+        uint32_t r0 = g_threads[t], n = MEM32(r0 + R0T_WAITN);
+        for (uint32_t i = 0; i < n; i++)
+            if (MEM32(MEM32(r0 + R0T_WAITS) + 4 * i) == obj) {
+                MEM32(r0 + R0T_WOKEN) = i;
+                MEM32(r0 + R0T_WAITN) = 0;
+                SetEvent((HANDLE)(uintptr_t)MEM32(r0 + R0T_WAKE));
+                woke++;
+                break;
+            }
+    }
+    return woke;
 }
 
 /* VWIN32 9 (-1): a new thread's first call, from its start frame
@@ -551,7 +686,11 @@ static uint32_t vwin32_first_thread(const uint32_t* a) {
     g_cur[0] = blk[0]; g_cur[1] = blk[1]; g_cur[2] = (uint32_t)(uintptr_t)tdbx;
     g_cur_psp = g_w9x_psp_sel;
     *(uint32_t*)(tdbx + 0x50) = (uint32_t)(uintptr_t)&g_cur_psp;
-    blk[0x0C / 4] = (uint32_t)(uintptr_t)calloc(1, 0x100);   /* ring-0 thread: nothing reads into it yet */
+    blk[0x0C / 4] = g_boot_r0 = (uint32_t)(uintptr_t)calloc(1, 0x100);   /* its ring-0 twin */
+    MEM32(g_boot_r0 + R0T_THREAD) = blk[0];
+    MEM32(g_boot_r0 + R0T_PROCESS) = blk[1];
+    MEM32(g_boot_r0 + R0T_TDBX) = g_cur[2];
+    track_thread(g_boot_r0);
     {   /* The boot process has no handle table (PDB+44): _INIT makes the
          * process with 0xBFF89CEB, which leaves it 0, and then at once opens
          * a handle to itself (0xBFFC6A72 -> 0xBFF7D747 reads [PDB+44] without
@@ -589,7 +728,7 @@ static void dos_fail(uint16_t err) { SET16(g_eax, err); set_cf(1); g_dos_err = e
 
 /* The sandbox: guest C:\ is this host directory, and no guest path may
  * leave it (".." is resolved first, then the prefix is checked). */
-static char g_root[MAX_PATH], g_cwd[MAX_PATH];   /* g_cwd: guest, no drive, no leading '\' */
+static char g_root[MAX_PATH];   /* g_cwd: guest, no drive, no leading '\' */
 static int host_path(uint32_t guest, char* out) {
     char g[MAX_PATH], full[2 * MAX_PATH], *p = g;
     size_t i = 0;
@@ -825,6 +964,9 @@ static const vxd_service_t g_services[] = {
     { 0x002A0026, 2, vwin32_link_thread, "VWIN32_LinkThread" },
     { 0x00380023, 3, vcond_init, "VCOND_Init" },
     { 0x002A002D, 2, vwin32_block, "VWIN32_BlockThread" },
+    { 0x002A005D, 5, vwin32_wait_multiple, "VWIN32_WaitMultiple" },
+    { 0x002A001D, 1, vwin32_crst_wait, "VWIN32_WaitCrst" },
+    { 0x002A001E, 1, vwin32_crst_wake, "VWIN32_WakeCrst" },
     { 0x002A0020, 1, vwin32_fpu_info, "VWIN32_GetCoprocessor" },
     { 0x002A0021, 2, vwin32_set_thread_priority, "VWIN32_SetThreadPriority" },
     { 0x002A0030, 2, vwin32_wait_block_destroy, "VWIN32_DestroyWaitBlock" },
@@ -842,6 +984,7 @@ static const vxd_service_t g_services[] = {
     { 0x00010002, 3, vmm_page_decommit, "VMM_PageDecommit" },
     { 0x0001000A, 2, vmm_page_free, "VMM_PageFree" },
     { 0x0001000D, 4, vmm_page_modify, "VMM_PageModifyPermissions" },
+    { 0x00010028, 0, vmm_28, "VMM_28" },
     { 0x00010003, 1, vmm_pager_register, "VMM_PagerRegister" },
     { 0x002A0001, 10, vwin32_r0_file_entries, "VWIN32_GetRing0FileEntries" },
     { 0x00010011, 3, vmm_reg_open, "VMM_RegOpenKey" },

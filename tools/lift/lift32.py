@@ -1565,9 +1565,13 @@ class Lifter:
                     # answers it (recomp_farcall32, native32 vxd32.c); nonzero
                     # means it returned to the caller's caller (the gate pops
                     # the service's arguments), so this body is done.
+                    # An inline gate call pushes its own continuation as that
+                    # return address (`push next; mov eax, id; call fword`,
+                    # kernel32 0xBFF9CAB4): then the body goes on after it.
                     addr = self._fmt_mem_addr(ops[0].mem)
-                    lines.append(f"RECOMP_REGS_OUT(); if (recomp_farcall32({addr})) {{ RECOMP_REGS_IN(); return; }}"
-                                 f" RECOMP_REGS_IN(); {comment}")
+                    nxt = insn.address + insn.size
+                    lines.append(f"RECOMP_REGS_OUT(); {{ uint32_t _gr = MEM32(esp); if (recomp_farcall32({addr})) {{ RECOMP_REGS_IN();"
+                                 f" if (_gr != 0x{nxt:08X}u) return; }} else RECOMP_REGS_IN(); }} {comment}")
                 elif ops and ops[0].type == X86_OP_MEM:
                     addr = self._fmt_mem_addr(ops[0].mem)
                     lines.append(f"RECOMP_ICALL(MEM32({addr})); {comment}")
