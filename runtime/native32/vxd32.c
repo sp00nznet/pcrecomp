@@ -185,19 +185,20 @@ static void (*const g_r0f[11])(void) = { r0f_0, r0f_1, r0f_2, r0f_3, r0f_4, r0f_
  *       <it>\unicode.nls */
 #define K386_TAG 0xFEEE8000u
 static void guest_put(uint32_t va, const char* s, size_t max);
-const char* g_w9x_sysdir = "C:\\WINDOWS\\SYSTEM";
+const char* g_w9x_sysdir = "C:\\WINDOWS\\SYSTEM", *g_w9x_windir = "C:\\WINDOWS";
 static uint32_t lin16(uint32_t p1616) { return recomp_sel_base(p1616 >> 16) + (p1616 & 0xFFFF); }
 static void krnl386_thunk(void) {
     uint8_t n = MEM8(g_ebp - 4);
     uint32_t sp = g_esp + 4;          /* past the return address the call pushed */
     switch (n) {
-    case 0x12: {
+    case 0x12: case 0x13: {   /* 13h (lpBuf, cb) GetWindowsDirectory: 0xBFF968EC appends \APPLOG */
         uint16_t cb = MEM16(sp);
         uint32_t buf = lin16(MEM32(sp + 2));
-        size_t len = strlen(g_w9x_sysdir);
-        if (len < cb) guest_put(buf, g_w9x_sysdir, cb);
+        const char* dir = n == 0x12 ? g_w9x_sysdir : g_w9x_windir;
+        size_t len = strlen(dir);
+        if (len < cb) guest_put(buf, dir, cb);
         g_eax = (uint32_t)len; g_edx = 0;
-        if (g_trace > 0) fprintf(stderr, "[krnl386] thunk %02X GetSystemDirectory(%08X, %u) = %u\n", n, buf, cb, (unsigned)len);
+        if (g_trace > 0) fprintf(stderr, "[krnl386] thunk %02X Get%sDirectory(%08X, %u) = %u\n", n, n == 0x12 ? "System" : "Windows", buf, cb, (unsigned)len);
         break; }
     case 0x30:   /* (hTask:16, lpszName:16:16): _INIT passes the boot task and
                   * "KERNEL32.DLL" (0xBFFC6F68), CreateProcess a new process's
@@ -206,6 +207,15 @@ static void krnl386_thunk(void) {
                   * reads Win16 task names yet. */
         if (g_trace > 0) fprintf(stderr, "[krnl386] thunk 30 task %04X name \"%s\"\n", MEM16(sp + 4), (const char*)(uintptr_t)lin16(MEM32(sp)));
         g_eax = 0; g_edx = 0;
+        break;
+    case 0x0D:   /* (drive:16, 0 = A:) GetDriveType: GetDriveTypeA (0xBFF74D33)
+                  * asks for a drive it found real. Only C: (fixed, 3). */
+        g_eax = MEM16(sp) == 2 ? 3 : 0; g_edx = 0;
+        break;
+    case 0x2D:   /* () GetWinFlags: _INIT (0xBFFC702E) picks the CPU it describes
+                  * from it (2000h, else 4 = 386 checks). Protected mode,
+                  * enhanced, an x87, a 486 and 2000h (the Pentium class). */
+        g_eax = 0x2000 | 0x400 | 0x20 | 0x8 | 0x1; g_edx = 0;
         break;
     default:
         fprintf(stderr, "\n[krnl386] unknown thunk %02Xh from sub_%08X: 16-bit args at esp %04X %04X %04X %04X %04X %04X\n",
@@ -703,6 +713,12 @@ static uint32_t vwin32_int21(const uint32_t* a) {
             HANDLE fh = dos_handle((uint16_t)g_ebx);
             if (!fh) { dos_fail(6); return g_eax; }
             SET16(g_edx, GetFileType(fh) == FILE_TYPE_CHAR ? 0x80D3 : 0x0002);
+            return g_eax;
+        }
+        if (al == 0x08 || al == 0x09) {                        /* BL drive (0 current): removable? / remote? */
+            uint8_t d = (uint8_t)g_ebx;
+            if (d != 0 && d != 3) { dos_fail(15); return g_eax; }   /* only C: exists */
+            if (al == 0x08) SET16(g_eax, 1); else SET16(g_edx, 0);  /* fixed, local */
             return g_eax;
         }
         break;
