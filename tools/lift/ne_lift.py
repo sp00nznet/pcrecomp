@@ -375,6 +375,13 @@ class NELifter(Lifter):
             func_name = f'seg{self.seg.index:03d}_{target:04X}'
             self.func_calls.add(func_name)
             self._emit(f'push16(cpu, 0x{local_off + inst.length:04X});', 'near call return addr')
+            # A callee that pops its own return address and `jmp`s to it (KRNL386
+            # seg1 AAE5: `pop dx; ...; jmp dx`) runs the continuation itself,
+            # through dispatch_near. Returning here afterwards would run it a
+            # second time on a stack that is already unwound. Tail-call it.
+            if target in getattr(self, 'popret_offsets', ()):
+                self._emit(f'{func_name}(cpu); return;', orig + ' (pops its return address)')
+                return
             self._emit(f'{func_name}(cpu);', orig)
             return
 
@@ -888,6 +895,17 @@ def lift_segment(ne: NEHeader, seg_num: int, func_offset: int = -1, xmod=None):
     lifter.xmod = xmod or {}
     # Function entry offsets in this segment, for near-jmp-to-another-function.
     lifter.seg_func_offsets = {f.offset for f in functions}
+    # Functions whose first instruction pops the return address into a register
+    # that the function later jumps through (see the near-call case).
+    lifter.popret_offsets = set()
+    _by_off = {i.offset - seg.file_offset: i for i in instructions}
+    for f in functions:
+        i0 = _by_off.get(f.offset)
+        if not (i0 and i0.mnemonic == 'pop' and i0.op1 and i0.op1.type == OpType.REG16):
+            continue
+        if any(i.mnemonic == 'jmp' and i.op1 and i.op1.type == OpType.REG16 and i.op1.reg == i0.op1.reg
+               for o, i in _by_off.items() if f.offset < o < f.end):
+            lifter.popret_offsets.add(f.offset)
 
     target_funcs = functions
     if func_offset >= 0:

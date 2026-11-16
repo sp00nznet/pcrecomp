@@ -31,6 +31,8 @@ static drv_t g_drv[] = {
     { "KEYBOARD", { 0 } },
     { "MOUSE",    { 0 } },
     { "DISPLAY",  { 0 } },
+    { "MMSOUND",  { 0 } },   /* SlowBoot: sound.drv= default; makes no sound */
+    { "COMM",     { 0 } },   /* comm.drv=: no ports */
 };
 #define NDRV (int)(sizeof g_drv / sizeof *g_drv)
 
