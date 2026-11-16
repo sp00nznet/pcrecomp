@@ -377,6 +377,11 @@ class Lifter:
             sreg = {'lds': 'cpu->ds', 'les': 'cpu->es', 'lss': 'cpu->ss',
                     'lfs': 'cpu->fs', 'lgs': 'cpu->gs'}[m]
             seg, off = _mem_addr(op2)
+            if _wsz(op1) == '32':   # o32: m16:32, a dword offset then the selector at +4
+                self._emit(f'{{ uint32_t _o = mem_read32(cpu, {seg}, {off}); '
+                           f'uint16_t _s = mem_read16(cpu, {seg}, (uint16_t)({off} + 4)); '
+                           f'{_reg32(op1)} = _o; {sreg} = _s; }}', orig)
+                return
             self._emit(f'{{ uint16_t _o = mem_read16(cpu, {seg}, {off}); '
                        f'uint16_t _s = mem_read16(cpu, {seg}, (uint16_t)({off} + 2)); '
                        f'{_reg16(op1)} = _o; {sreg} = _s; }}', orig)

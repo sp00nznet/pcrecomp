@@ -375,6 +375,17 @@ static inline uint16_t _pop16(uint32_t *sp) {
 }
 #define POP16_VAL(sp) _pop16(&(sp))
 
+/* The same through ss's base, in a function LIFT32_W9X sees load ss: kernel32's
+ * 16->32 dispatcher (0xBFF71903) pushes on the 16-bit caller's stack before it
+ * switches to its flat one, and pops there after its lss back. */
+#define PUSH32_SS(sp, val) do { uint32_t _pv = (uint32_t)(val); (sp) -= 4; MEM32(SS_BASE + (sp)) = _pv; } while(0)
+#define PUSH16_SS(sp, val) do { uint16_t _pv = (uint16_t)(val); (sp) -= 2; MEM16(SS_BASE + (sp)) = _pv; } while(0)
+static inline uint32_t _pop32_ss(uint32_t *sp) { uint32_t v = MEM32(SS_BASE + *sp); *sp += 4; return v; }
+static inline uint16_t _pop16_ss(uint32_t *sp) { uint16_t v = MEM16(SS_BASE + *sp); *sp += 2; return v; }
+#define POP32_SS_VAL(sp) _pop32_ss(&(sp))
+#define POP16_SS_VAL(sp) _pop16_ss(&(sp))
+#define POP32_SS(sp, dest) do { (dest) = POP32_SS_VAL(sp); } while(0)
+
 #define PUSHAD() do { \
     uint32_t _tmp_esp = esp; \
     PUSH32(esp, eax); PUSH32(esp, ecx); PUSH32(esp, edx); PUSH32(esp, ebx); \

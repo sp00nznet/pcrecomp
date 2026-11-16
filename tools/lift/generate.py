@@ -333,7 +333,12 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
 
     lifter._flag_state = None
     lifter._seg_fn = lifter.seg_function(instructions)   # LIFT32_W9X: reloads ds/es
-    lifter._ss_fn = lifter.ss_function(instructions)     # LIFT32_W9X: reloads ss
+    # LIFT32_W9X: every function addresses its stack through ss's base, not
+    # only those that load ss: kernel32's 16->32 dispatcher (0xBFF71903) runs
+    # its first pushes on the 16-bit caller's stack and loads ss in a block
+    # catalogued as another function. ponytail: one add per stack access;
+    # SS_BASE is 0 on a flat stack.
+    lifter._ss_fn = lift32.W9X
 
     # An indirect jump inside a function (a switch/jump table) can compute a
     # target that lands on ANY instruction in it, so when one is present every
@@ -436,6 +441,10 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
             for t in sorted(push_ret_far):
                 lines.append(f'    if (MEM32(esp) == 0x{t:08X}u) {{ esp += 4; RECOMP_FLAGS_OUT(); RECOMP_ITAIL(0x{t:08X}u); return; }} /* push 0x{t:08X}; ret */')
         for line in lifter.lift_instruction(insn):
+            if lifter._ss_fn:   # pushes and pops through ss's base (recomp_types.h PUSH32_SS)
+                line = (line.replace('PUSH32(esp,', 'PUSH32_SS(esp,').replace('PUSH16(esp,', 'PUSH16_SS(esp,')
+                        .replace('POP32(esp,', 'POP32_SS(esp,').replace('POP32_VAL(esp)', 'POP32_SS_VAL(esp)')
+                        .replace('POP16_VAL(esp)', 'POP16_SS_VAL(esp)'))
             lines.append(f'    {line}')
         if k in gaps:
             t = gaps[k]

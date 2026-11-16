@@ -2245,7 +2245,19 @@ class Lifter:
             if len(ops) >= 2 and ops[1].type == X86_OP_MEM:
                 addr = self._fmt_mem_addr(ops[1].mem)
                 seg = {'les': X86_REG_ES, 'lfs': X86_REG_FS, 'lgs': X86_REG_GS}.get(m)
-                if self.dos and seg:
+                if W9X:
+                    # The selector loads with its base (kernel32's 16->32
+                    # dispatcher goes back to the caller's stack by `lss sp,
+                    # [esp]`); a 16-bit destination takes m16:16. ponytail:
+                    # `lss sp` zero-extends esp, which a 16-bit (B=0) stack
+                    # ignores the top of anyway.
+                    w = ops[0].size == 2
+                    idx = {'les': 0, 'lss': 2, 'lds': 3, 'lfs': 4, 'lgs': 5}[m]
+                    dst = 'esp = _o' if (m == 'lss' and w) else self._fmt_write(ops[0], '_o')
+                    lines.append(f"{{ uint32_t _o = {'MEM16' if w else 'MEM32'}({addr}); "
+                                 f"uint16_t _s = MEM16({addr} + {2 if w else 4}); {dst}; "
+                                 f"recomp_set_seg({idx}, _s); }} {comment}")
+                elif self.dos and seg:
                     lines.append(f"recomp_set_seg({DOS_SEG_IDX[seg]}, MEM16({addr} + 4)); "
                                  f"{self._fmt_write(ops[0], f'MEM32({addr})')}; {comment}")
                 else:

@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
+#include <setjmp.h>
 #include "cpu.h"
 #include "mem_layout.h"   /* RECOMP_NUM_SEG */
 #define W16_PSP_PARA 0x1000   /* where the host puts KRNL386's PSP (w16test.c) */
@@ -32,7 +33,12 @@ const char *g_fn_ring[RECOMP_FN_RING_SIZE];
 unsigned g_fn_ring_pos;
 int g_fncount, g_watch_ds;
 uint16_t g_wsel;
-void recomp_fn_hit(const char *n) { fprintf(stderr, "FN %s\n", n); }   /* g_fncount: W16_FN=1 */
+static CPU g_w16;
+void recomp_fn_hit(const char *n) {   /* g_fncount: W16_FN=1 (with fs when it changes) */
+    static uint16_t fs;
+    if (g_w16.fs != fs) { fs = g_w16.fs; fprintf(stderr, "FN %s fs=%04X\n", n, fs); }
+    else fprintf(stderr, "FN %s\n", n);
+}
 void recomp_sel_write(uint16_t seg, uint16_t off, uint16_t val) { (void)seg; (void)off; (void)val; }
 
 /* native32's registers (recomp32/recomp_types.h) and Win9x segment state (vxd32.c) */
@@ -223,6 +229,13 @@ static void host_far(CPU *c, uint16_t off) {
         if (!memcmp((void *)(uintptr_t)0xBFF71000u, "KEXP", 4)) memcpy(g_w16_low + 0x1000, (void *)(uintptr_t)0xBFF71000u, 0x100);
         ok(c); return;
     case 0x04: c->eax = 0; ok(c); return;        /* seg001_7898 -> dx:ax into DGROUP:12EC (ponytail: 0 until a reader needs it) */
+    case 0x0C:   /* KRNL386 registers with VWIN32 once kernel32 is up (seg001_6F7B): es = its code,
+                  * bx/cx/dx/di/bp entry offsets in it (8D71, 0ACE, 0C2B, 7C44, 7CAA), esi =
+                  * DGROUP:1338. eax comes back and goes (seg001_53FF) into the table at
+                  * [13BE]:36h. ponytail: nothing kept, eax 0, until a VWIN32 caller of those
+                  * entries exists here */
+        if (getenv("W16_TRACE")) fprintf(stderr, "[w16] VWIN32 0C: es %04X bx %04X cx %04X dx %04X di %04X bp %04X esi %08X\n", c->es, c->bx, c->cx, c->dx, c->di, c->bp, c->esi);
+        c->eax = 0; ok(c); return;
     case 0x08: c->al = 0; ok(c); return;        /* -> DGROUP:1417, a flag read as "nonzero?" (ponytail: 0 until a caller needs 1) */
     case 0x03: {   /* VMM page services: args on the 16-bit stack, ecx bytes of them, which
                     * the entry removes (KRNL386 seg001_1FF7 pops what it pushed before them);
@@ -272,6 +285,7 @@ static void int2f(CPU *c) {
     case 0x1684: { /* VxD protected-mode API for bx, named from the call site */
         static const struct { uint16_t id; const char *name; int present; } vxd[] = {
             { 0x0001, "VMM", 0 },        /* KRNL386 seg001_B83D (after BootStrap's reload): ax=26Dh/26Eh into DGROUP:1450, optional */
+            { 0x000A, "VDD", 0 },        /* KRNL386 seg001_BF33 (after kernel32's boot); ponytail: absent until a display driver here asks */
             { 0x0021, "PAGEFILE", 0 },   /* KRNL386 seg001_BEF9: paging-file info (ax=1), optional */
             { 0x002A, "VWIN32", 1 },
             { 0x0442, "VTDAPI", 1 },     /* KRNL386 seg001_6E8D: ax=9 -> DGROUP:1A88 and the table it hands kernel32, unchecked */     /* KRNL386 seg001_7293: ah=0, then ah=8 -> al into DGROUP:1417; GlobalInit's caller needs it */
@@ -318,7 +332,9 @@ void dos_int21(CPU *c) {
     uint16_t sds = g_seg_ds, ses = g_seg_es;
     uint32_t in_dx = recomp_sel_base(c->ds) + c->dx, in_si = recomp_sel_base(c->ds) + c->si,
              in_di = recomp_sel_base(c->es) + c->di, in_bx = c->bx, in_cx = c->cx;
-    g_ebx = in_bx; g_edx = in_dx; g_esi = in_si; g_edi = in_di;
+    /* cx is a count and dx a value, not ds:dx, for seek (42h cx:dx), ioctl (44h) and file times (57h) */
+    if (c->ah == 0x42 || c->ah == 0x44 || c->ah == 0x57) in_dx = c->dx;
+    g_ebx = in_bx; g_ecx = in_cx; g_edx = in_dx; g_esi = in_si; g_edi = in_di;
     int cf = native32_w9x_int21(c->ax, in_cx);
     c->ax = (uint16_t)g_eax;
     if (g_ebx != in_bx) c->bx = (uint16_t)g_ebx;
@@ -445,6 +461,13 @@ void w16_retf32(CPU *c) {
     w16_fn32 f = (sel & 4) && !recomp_sel_base(sel) ? recomp_lookup(eip) : NULL;   /* a flat code selector */
     if (!f) w16_stop("o32 retf to", sel, eip);
     uint32_t ret = *(uint32_t *)(uintptr_t)(sb + c->esp);
+    if (getenv("W16_TRACE")) {   /* the first arguments, and what the first points at */
+        const uint32_t *a = (const uint32_t *)(uintptr_t)(sb + c->esp + 4);
+        fprintf(stderr, "[w16] far32 args %08X %08X %08X (fs %04X):", a[0], a[1], a[2], c->fs);
+        if (a[0] > 0x10000 && !IsBadReadPtr((void *)(uintptr_t)a[0], 0xA0))
+            for (int i = 0; i < 0xA0; i += 4) fprintf(stderr, "%s%08X", i % 32 ? " " : "\n  ", *(const uint32_t *)(uintptr_t)(a[0] + i));
+        fprintf(stderr, "\n");
+    }
     static const uint8_t stub[] = { 0x66, 0x8E, 0xD7, 0x2B, 0xE6, 0x66, 0x16, 0x66, 0x68, 0xFF, 0xFF, 0x53, 0x66, 0x68 };
     const uint8_t *r = (const uint8_t *)(uintptr_t)ret;
     if (memcmp(r, stub, sizeof stub) || r[16] != 0x66 || r[17] != 0x68 || r[20] != 0x66 || r[21] != 0xCB)
@@ -455,7 +478,13 @@ void w16_retf32(CPU *c) {
     g_ebp = c->ebp; g_esi = c->esi; g_edi = c->edi;
     g_seg_ss = c->ss; g_ss_base = sb; g_esp = c->esp;
     g_seg_ds = c->ds; g_seg_es = c->es;
+    /* fs and gs are the same registers on both sides: kernel32 reads the
+     * TIB KRNL386 built for the boot thread (seg001_7240) through fs, and
+     * whatever fs kernel32 leaves (its _INIT loads its own) is KRNL386's */
+    void recomp_set_seg(int sreg, uint32_t sel);
+    recomp_set_seg(4, c->fs); recomp_set_seg(5, c->gs);
     f();
+    c->fs = g_seg_fs; c->gs = g_seg_gs;
     c->eax = g_eax; c->ecx = g_ecx; c->edx = g_edx; c->ebx = g_ebx;
     c->ebp = g_ebp; c->esi = g_esi; c->edi = g_edi;
     uint32_t lin = g_esp + g_ss_base;   /* past the return the function popped */
@@ -518,7 +547,59 @@ static int g_w16_ready;
 static uint16_t seg_of(uint16_t sel);
 int w16_ss_big(uint16_t ss);
 
+/* A far return into a 16->32 thunk KRNL386 generated (seg001_76BA, the
+ * first call of each of seg 3's kernel32 entries: it writes the stub over
+ * the entry and retfs into it):
+ *   B8 sel / 8E C0 / 66 0F B7 C9 / 67 66 26 8B 91 tab32 / 66 EA off32 sel16
+ * = es = sel; ecx = cx; edx = es:[ecx + tab]; jmp far 32 sel16:off32, a
+ * kernel32 dispatcher that runs entry edx and comes back to the 16-bit
+ * caller with an o16 retf (w16_enter sees its return address and unwinds
+ * here). Static code cannot hold it, so the runtime runs it. */
+static struct { jmp_buf jb; uint32_t back; } g_thk[16];
+static int g_nthk;
+int w16_retf(CPU *c) {
+    uint32_t at = mem_read32(c, c->ss, c->sp);
+    int recomp_lar32(uint16_t sel, uint32_t *rights);
+    uint32_t r;   /* only a present code selector of the guest's (a C return names a placeholder) */
+    if (!(at >> 16 & 4) || !recomp_lar32((uint16_t)(at >> 16), &r) || (r & 0x8800) != 0x8800 || !recomp_sel_base(at >> 16)) return 0;
+    const uint8_t *p = (const uint8_t *)(uintptr_t)w16_lin(recomp_sel_base(at >> 16) + (at & 0xFFFF));
+    static const uint8_t t1[] = { 0x8E, 0xC0, 0x66, 0x0F, 0xB7, 0xC9, 0x67, 0x66, 0x26, 0x8B, 0x91 };
+    if (p[0] != 0xB8 || memcmp(p + 3, t1, sizeof t1) || p[0x12] != 0x66 || p[0x13] != 0xEA) return 0;
+    c->sp += 4;
+    c->es = *(const uint16_t *)(p + 1);
+    c->ecx = c->cx;
+    c->edx = *(const uint32_t *)(uintptr_t)(recomp_sel_base(c->es) + c->ecx + *(const uint32_t *)(p + 0xE));
+    uint32_t eip = *(const uint32_t *)(p + 0x14);
+    w16_fn32 f = recomp_lookup(eip);
+    if (getenv("W16_TRACE")) fprintf(stderr, "[w16] stub %04X:%04X -> %08X (entry %08X, cx %04X)\n", at >> 16, at & 0xFFFF, eip, c->edx, c->cx);
+    if (!f) w16_stop("generated stub jumps to no lifted function", eip >> 16, eip & 0xFFFF);
+    if (g_nthk == 16) w16_stop("16->32 stubs nested too deep", 0, 0);
+    uint32_t se[8] = { g_eax, g_ecx, g_edx, g_ebx, g_esp, g_ebp, g_esi, g_edi };
+    uint16_t sss = g_seg_ss, sds = g_seg_ds, ses = g_seg_es; uint32_t ssb = g_ss_base;
+    void recomp_set_seg(int sreg, uint32_t sel);
+    g_eax = c->eax; g_ecx = c->ecx; g_edx = c->edx; g_ebx = c->ebx;
+    g_ebp = c->ebp; g_esi = c->esi; g_edi = c->edi;
+    recomp_set_seg(2, c->ss); g_esp = c->sp;
+    recomp_set_seg(3, c->ds); recomp_set_seg(0, c->es); recomp_set_seg(4, c->fs); recomp_set_seg(5, c->gs);
+    CPU keep = *c;
+    int k = g_nthk++;
+    g_thk[k].back = mem_read32(c, c->ss, c->sp);   /* the 16-bit caller's far return */
+    if (!setjmp(g_thk[k].jb)) {
+        f();
+        w16_stop("16->32 stub's function returned without its retf", eip >> 16, eip & 0xFFFF);
+    }
+    g_nthk = k;
+    *c = keep;   /* g_w16 may have been reused by a nested 32->16 call */
+    c->eax = g_eax; c->ecx = g_ecx; c->edx = g_edx; c->ebx = g_ebx;
+    c->ebp = g_ebp; c->esi = g_esi; c->edi = g_edi;
+    c->ss = g_seg_ss; c->sp = (uint16_t)g_esp; c->ds = g_seg_ds; c->es = g_seg_es; c->fs = g_seg_fs; c->gs = g_seg_gs;
+    g_eax = se[0]; g_ecx = se[1]; g_edx = se[2]; g_ebx = se[3]; g_esp = se[4]; g_ebp = se[5]; g_esi = se[6]; g_edi = se[7];
+    g_seg_ss = sss; g_seg_ds = sds; g_seg_es = ses; g_ss_base = ssb;
+    return 1;
+}
+
 int w16_enter(uint32_t target) {
+    if (g_nthk && target == g_thk[g_nthk - 1].back) longjmp(g_thk[g_nthk - 1].jb, 1);   /* a 16->32 stub's return */
     uint16_t sel = (uint16_t)(target >> 16), off = (uint16_t)target;
     if (!g_w16_ready) { cpu_init(&g_w16); g_w16.mem = NULL; g_w16_ready = 1; segsel_init(); }
     CPU saved = g_w16, *c = &g_w16;

@@ -235,6 +235,13 @@ class NELifter(Lifter):
             self._emit('w16_retf32(cpu); return;',
                        orig + ' (o32: into flat code)')
             return
+        # Any other far return may land on code KRNL386 wrote at run time
+        # (seg001_76BA writes a thunk over seg 3 +41F6 and retfs into it):
+        # identity.c w16_retf runs such a stub, else it is a C return.
+        if _IDENTITY and m == 'retf' and op1 is None and not (prev is not None and prev.mnemonic == 'push' and
+                prev.address >= 0 and prev.address + prev.length == inst.address):
+            self._emit('if (w16_retf(cpu)) return; cpu->sp += 4; return;', orig + ' (or into a generated stub)')
+            return
         if _IDENTITY and m == 'retf' and op1 is None and prev is not None and prev.mnemonic == 'push' and \
                 prev.address >= 0 and prev.address + prev.length == inst.address:
             self._emit('{ uint16_t _o = pop16(cpu); uint16_t _s = pop16(cpu); dispatch_far(cpu, _s, _o); return; }',
@@ -271,7 +278,10 @@ class NELifter(Lifter):
         if m == 'call' and op1 and op1.type == OpType.FAR:
             func_name = self._resolve_far_call(inst)
             if func_name and not func_name.startswith('/*'):
-                self._emit(f'push16(cpu, cpu->cs); push16(cpu, 0x{local_off + inst.length:04X});',
+                # identity: the caller's own selector (cpu->cs is not kept up as
+                # KRNL386 moves segments; a 16->32 thunk returns through it)
+                cs = f'SEG_{self.seg.index}' if _IDENTITY else 'cpu->cs'
+                self._emit(f'push16(cpu, {cs}); push16(cpu, 0x{local_off + inst.length:04X});',
                            'far call return addr')
                 # Identity mode: the fixup KRNL386's loader patched names the
                 # target segment's block; bind SEG_n to it before its code runs.
@@ -291,7 +301,8 @@ class NELifter(Lifter):
             read = (f'uint16_t _o = mem_read16(cpu, {seg_e}, {off_e}); '
                     f'uint16_t _s = mem_read16(cpu, {seg_e}, (uint16_t)({off_e} + 2));')
             if m == 'call far':
-                self._emit(f'{{ {read} push16(cpu, cpu->cs); push16(cpu, 0x{local_off + inst.length:04X}); '
+                cs = f'SEG_{self.seg.index}' if _IDENTITY else 'cpu->cs'
+                self._emit(f'{{ {read} push16(cpu, {cs}); push16(cpu, 0x{local_off + inst.length:04X}); '
                            f'dispatch_far(cpu, _s, _o); }}', orig)
             else:  # jmp far -> tail dispatch
                 self._emit(f'{{ {read} dispatch_far(cpu, _s, _o); return; }}', orig)

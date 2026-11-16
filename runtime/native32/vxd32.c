@@ -102,8 +102,8 @@ static LONG CALLBACK resv_fault(EXCEPTION_POINTERS* e) {
     uintptr_t at = e->ExceptionRecord->ExceptionInformation[1];
     MEMORY_BASIC_INFORMATION mb;
     if (at < 0x10000 && low_emulate(e->ContextRecord)) {
-        if (g_trace > 0) fprintf(stderr, "[vxd] low-memory %s %04X (Win9x's first 64 KB) emulated\n",
-                                 e->ExceptionRecord->ExceptionInformation[0] ? "write" : "read", (unsigned)at);
+        if (g_trace > 0) fprintf(stderr, "[vxd] low-memory %s %04X (Win9x's first 64 KB) emulated (in sub_%08X)\n",
+                                 e->ExceptionRecord->ExceptionInformation[0] ? "write" : "read", (unsigned)at, g_cur_func);
         return EXCEPTION_CONTINUE_EXECUTION;
     }
     for (LONG i = 0; i < g_nresv; i++)
@@ -1414,7 +1414,15 @@ static uint8_t g_ldt[0x10000];
 static uint16_t g_ldt_alias;
 uint32_t g_es_base, g_cs_base, g_ds_base, g_ss_base;
 
-void native32_w9x_ldt(uint16_t alias_sel, uint32_t* ldt_base) { g_ldt_alias = alias_sel & ~7; *ldt_base = (uint32_t)(uintptr_t)g_ldt; }
+/* The alias's own descriptor is in the LDT too, as on Win9x: KRNL386 reads
+ * the LDT's base from it (seg001_4E8C on cs:[6]) for kernel32's boot block
+ * +14, which MapSL then indexes. */
+void native32_w9x_ldt(uint16_t alias_sel, uint32_t* ldt_base) {
+    g_ldt_alias = alias_sel & ~7; *ldt_base = (uint32_t)(uintptr_t)g_ldt;
+    uint8_t* d = g_ldt + g_ldt_alias; uint32_t b = *ldt_base;
+    d[0] = d[1] = 0xFF; d[2] = (uint8_t)b; d[3] = (uint8_t)(b >> 8); d[4] = (uint8_t)(b >> 16); d[7] = (uint8_t)(b >> 24);
+    d[5] = 0xF2; d[6] = 0x40;
+}
 
 uint32_t recomp_sel_base(uint32_t sel) {
     sel &= 0xFFFF;
