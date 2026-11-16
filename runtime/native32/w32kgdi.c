@@ -136,6 +136,17 @@ uint32_t native32_gdi_handle(uint32_t h) {
         AT32(attr, 0x78) = AT32(attr, 0x7C) = GetTextAlign(d);
         AT32(attr, 0x90) = GUEST(GetCurrentObject(d, OBJ_FONT));
         AT32(attr, 0x168) = (uint32_t)GetMapMode(d);   /* iMapMode (GetMapMode reads it; RichEdit relaid out on 0) */
+        {   /* window origin +0x174, window extent +0x17C, viewport origin +0x184, viewport extent +0x18C */
+            SIZE z;
+            GetWindowOrgEx(d, &p);
+            AT32(attr, 0x174) = (uint32_t)p.x, AT32(attr, 0x178) = (uint32_t)p.y;
+            GetWindowExtEx(d, &z);
+            AT32(attr, 0x17C) = (uint32_t)z.cx, AT32(attr, 0x180) = (uint32_t)z.cy;
+            GetViewportOrgEx(d, &p);
+            AT32(attr, 0x184) = (uint32_t)p.x, AT32(attr, 0x188) = (uint32_t)p.y;
+            GetViewportExtEx(d, &z);
+            AT32(attr, 0x18C) = (uint32_t)z.cx, AT32(attr, 0x190) = (uint32_t)z.cy;
+        }
         GetBrushOrgEx(d, &p);
         AT32(attr, 0x1B0) = (uint32_t)p.x;
         AT32(attr, 0x1B4) = (uint32_t)p.y;
@@ -167,8 +178,13 @@ static HDC dc(uint32_t g) {
         SetTextAlign(h, AT32(a, 0x7C));
         MoveToEx(h, (int)AT32(a, 0x3C), (int)AT32(a, 0x40), NULL);
         SetBrushOrgEx(h, (int)AT32(a, 0x1B0), (int)AT32(a, 0x1B4), NULL);
-        /* the viewport origin SetViewportOrgEx keeps client-side (wordpad's
-         * ruler). ponytail: window origin and extents not applied */
+        /* origins and extents gdi32 keeps client-side (wordpad's ruler sets
+         * the viewport origin); the extents count only in MM_ISOTROPIC/ANISOTROPIC */
+        if (GetMapMode(h) >= MM_ISOTROPIC && (int)AT32(a, 0x17C) && (int)AT32(a, 0x18C)) {
+            SetWindowExtEx(h, (int)AT32(a, 0x17C), (int)AT32(a, 0x180), NULL);
+            SetViewportExtEx(h, (int)AT32(a, 0x18C), (int)AT32(a, 0x190), NULL);
+        }
+        SetWindowOrgEx(h, (int)AT32(a, 0x174), (int)AT32(a, 0x178), NULL);
         SetViewportOrgEx(h, (int)AT32(a, 0x184), (int)AT32(a, 0x188), NULL);
     }
     return h;

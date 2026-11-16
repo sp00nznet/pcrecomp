@@ -1,75 +1,533 @@
 /*
  * regbox32.c - a registry of the guest's own, per instance.
  *
- * native32_registry_sandbox(name) redirects the guest's Reg*A imports so that
- * HKEY_LOCAL_MACHINE and HKEY_CURRENT_USER are, for the guest only,
+ * native32_registry_sandbox(name) gives the guest, and only the guest, a
+ * private hive under
  *
- *     HKCU\Software\pcrecomp\sandbox\<name>\HKLM   and   ...\<name>\HKCU
+ *     HKCU\Software\pcrecomp\sandbox\<name>       (a name with a backslash,
+ *     HKCU\Software\pcrecomp\<name>               "w2k\wordpad", is used as is)
  *
- * Keys it creates and values it writes land there. A key it only opens, and
- * that the sandbox does not have yet, is opened read-only in the real
- * registry (KEY_READ), so the guest still sees what Windows set up (shell
- * folders, Internet settings). Nothing outside the guest is affected: Windows'
- * own code in the process (Winsock providers, COM, the shell) reads the real
- * registry, which RegOverridePredefKey would not leave alone.
+ * with HKCU, HKLM and NT (any other \REGISTRY path) under it, and INI for the
+ * win.ini-style profile calls. The rule: the guest can never change the real
+ * registry.
  *
- * What it is for: two instances of one program side by side (two clients of
- * a network test, each its own user), a program that writes HKLM without
- * admin rights, and a test run that leaves the real registry as it was.
- * Delete the key to start from a clean install. Call before native32_bind.
+ *   create      always in the sandbox (the real path mapped under it)
+ *   open        the sandbox's key if it has one, else the real key READ-ONLY
+ *               (write access bits stripped): Windows' own settings still read
+ *   set/delete  on whichever key the handle is, mapped to the sandbox by its
+ *               path (NtQueryKey); a real handle is never written
+ *   query       a value: the sandbox first, then the real key
+ *   the rest    RegSaveKey/RestoreKey/LoadKey/ReplaceKey/SetKeySecurity/
+ *               OverridePredefKey/ConnectRegistry/DeleteTree/...: refused
+ *
+ * Covered: the guest's advapi32 imports, A and W (native32_redirect, so a
+ * stage-1 host advapi32 and a run-time GetProcAddress), the profile calls of
+ * kernel32 (WriteProfileString lands in INI\win.ini\<section>), and with
+ * native32_registry_sandbox_nt() the NtXxxKey system calls of a lifted ntdll
+ * and the proxied host advapi32 of a lifted process.
+ *
+ * ponytail: RegEnumKey/RegEnumValue see one side only (the handle's), and a
+ * delete of a value that is only in the real key is a no-op (no tombstones).
+ * Host DLLs in the process (comdlg32, shell32, shlwapi's SHSetValue) call
+ * the host advapi32 directly and are not boxed: add RegOverridePredefKey on
+ * their threads if one is seen writing.
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
+#include <wchar.h>
 
 #include "native32.h"
 
-static HKEY g_lm, g_cu;
+#pragma comment(lib, "advapi32.lib")
 
-static HKEY box(HKEY k) {
-    return k == HKEY_LOCAL_MACHINE ? g_lm : k == HKEY_CURRENT_USER ? g_cu : k;
+#define KP 1024
+#define WRITE_BITS (KEY_SET_VALUE | KEY_CREATE_SUB_KEY | KEY_CREATE_LINK | DELETE | WRITE_DAC | WRITE_OWNER | \
+                    MAXIMUM_ALLOWED | GENERIC_WRITE | GENERIC_ALL | ACCESS_SYSTEM_SECURITY)
+
+typedef struct { USHORT Length, MaximumLength; PWSTR Buffer; } US;
+typedef struct { ULONG Length; HANDLE Root; US* Name; ULONG Attributes; PVOID Sd, Qos; } OA;
+static LONG (WINAPI* p_NtQueryKey)(HANDLE, int, void*, ULONG, ULONG*);
+static LONG (WINAPI* p_NtOpenKey)(HANDLE*, ACCESS_MASK, OA*);
+static ULONG (WINAPI* p_RtlNtStatusToDosError)(LONG);
+
+static wchar_t g_cu_nt[256];      /* \REGISTRY\USER\S-1-5-21-... */
+static wchar_t g_root_nt[512];    /* g_cu_nt\Software\pcrecomp\sandbox\<name> */
+static wchar_t g_root_rel[300];   /* the same, relative to HKCU */
+static int g_on;
+
+static int prefix(const wchar_t* s, const wchar_t* p) {
+    size_t n = wcslen(p);
+    return !_wcsnicmp(s, p, n) && (s[n] == L'\\' || !s[n]);
 }
 
-#define WRITE_BITS (KEY_SET_VALUE | KEY_CREATE_SUB_KEY | KEY_CREATE_LINK | DELETE | WRITE_DAC | WRITE_OWNER)
-
-static LONG WINAPI g_RegOpenKeyExA(HKEY k, LPCSTR sub, DWORD opt, REGSAM sam, PHKEY out) {
-    LONG r = RegOpenKeyExA(box(k), sub, opt, sam, out);
-    if (r == ERROR_FILE_NOT_FOUND && box(k) != k)          /* not in the sandbox: the real one, read-only */
-        r = RegOpenKeyExA(k, sub, opt, (sam & ~WRITE_BITS) | KEY_READ, out);
-    return r;
+/* the NT path of a key handle (or a predefined key), 0 if it has none */
+static int key_path(HKEY k, wchar_t* out) {
+    const wchar_t* fixed = k == HKEY_LOCAL_MACHINE ? L"\\REGISTRY\\MACHINE"
+        : k == HKEY_CURRENT_USER ? g_cu_nt
+        : k == HKEY_CLASSES_ROOT ? L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes"   /* ponytail: not the per-user merge */
+        : k == HKEY_USERS ? L"\\REGISTRY\\USER"
+        : k == HKEY_CURRENT_CONFIG ? L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current"
+        : NULL;
+    if (fixed) { wcscpy(out, fixed); return 1; }
+    if ((ULONG_PTR)k >= 0x80000000u && (ULONG_PTR)k < 0x80000100u) return 0;   /* HKEY_PERFORMANCE_DATA... */
+    union { ULONG len; BYTE b[KP * 2 + 8]; } u;
+    ULONG got;
+    if (p_NtQueryKey((HANDLE)k, 3 /* KeyNameInformation */, &u, sizeof u - 2, &got) < 0) return 0;
+    ULONG n = u.len / 2;
+    if (n >= KP) return 0;
+    memcpy(out, u.b + 4, n * 2);
+    out[n] = 0;
+    return 1;
 }
-static LONG WINAPI g_RegOpenKeyA(HKEY k, LPCSTR sub, PHKEY out) {
-    return g_RegOpenKeyExA(k, sub, 0, MAXIMUM_ALLOWED, out);
+static void join(wchar_t* full, const wchar_t* sub) {
+    if (sub && *sub) {
+        size_t n = wcslen(full);
+        _snwprintf(full + n, KP - n - 1, L"\\%ls", sub);
+        full[KP - 1] = 0;
+    }
+}
+static int in_box(const wchar_t* nt) { return prefix(nt, g_root_nt); }
+
+/* real NT path -> the sandbox's, relative to HKCU */
+static void to_box(const wchar_t* nt, wchar_t* rel) {
+    if (in_box(nt)) _snwprintf(rel, KP - 1, L"%ls%ls", g_root_rel, nt + wcslen(g_root_nt));
+    else if (prefix(nt, g_cu_nt)) _snwprintf(rel, KP - 1, L"%ls\\HKCU%ls", g_root_rel, nt + wcslen(g_cu_nt));
+    else if (prefix(nt, L"\\REGISTRY\\MACHINE")) _snwprintf(rel, KP - 1, L"%ls\\HKLM%ls", g_root_rel, nt + 17);
+    else _snwprintf(rel, KP - 1, L"%ls\\NT%ls", g_root_rel, nt);
+    rel[KP - 1] = 0;
+}
+/* a sandbox NT path -> the real one; 0 for the sandbox's own top keys */
+static int from_box(const wchar_t* nt, wchar_t* real) {
+    const wchar_t* r = nt + wcslen(g_root_nt);
+    if (prefix(r, L"\\HKCU")) _snwprintf(real, KP - 1, L"%ls%ls", g_cu_nt, r + 5);
+    else if (prefix(r, L"\\HKLM")) _snwprintf(real, KP - 1, L"\\REGISTRY\\MACHINE%ls", r + 5);
+    else if (prefix(r, L"\\NT") && r[3]) _snwprintf(real, KP - 1, L"%ls", r + 3);
+    else return 0;
+    real[KP - 1] = 0;
+    return 1;
+}
+static LONG real_open(const wchar_t* nt, REGSAM sam, HKEY* out) {
+    US us = { (USHORT)(wcslen(nt) * 2), (USHORT)(wcslen(nt) * 2), (PWSTR)nt };
+    OA oa = { sizeof oa, NULL, &us, 0x40 /* OBJ_CASE_INSENSITIVE */, NULL, NULL };
+    LONG st = p_NtOpenKey((HANDLE*)out, (sam & ~WRITE_BITS) | KEY_READ, &oa);
+    return st < 0 ? (LONG)p_RtlNtStatusToDosError(st) : 0;
+}
+
+/* The policy, by NT path: create in the box; open the box's, else the real one read-only. */
+static LONG sb_open(const wchar_t* full, REGSAM sam, int create, DWORD opts, HKEY* out, DWORD* disp) {
+    wchar_t rel[KP], real[KP];
+    to_box(full, rel);
+    LONG r = RegOpenKeyExW(HKEY_CURRENT_USER, rel, 0, sam, out);
+    if (!r) { if (disp) *disp = REG_OPENED_EXISTING_KEY; return 0; }
+    if (create) return RegCreateKeyExW(HKEY_CURRENT_USER, rel, 0, NULL, opts & ~REG_OPTION_BACKUP_RESTORE, sam, NULL, out, disp);
+    if (in_box(full)) { if (!from_box(full, real)) return r; full = real; }
+    return real_open(full, sam, out);
+}
+
+/* The key a write on handle k lands in: k itself when it is the box's, else
+ * the box's copy of k's path (made, and closed by the caller through *tmp). */
+static HKEY write_key(HKEY k, HKEY* tmp) {
+    wchar_t nt[KP], rel[KP];
+    *tmp = NULL;
+    if (!key_path(k, nt)) return NULL;
+    if (in_box(nt)) return k;
+    to_box(nt, rel);
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, rel, 0, NULL, 0, KEY_ALL_ACCESS, NULL, tmp, NULL)) return NULL;
+    return *tmp;
+}
+/* The box's copy of k (opened, if it exists) and the real key behind a box handle. */
+static HKEY box_of(HKEY k, int* is_box) {
+    wchar_t nt[KP], rel[KP];
+    HKEY h;
+    *is_box = 0;
+    if (!key_path(k, nt)) return NULL;
+    if (in_box(nt)) {
+        *is_box = 1;
+        return from_box(nt, rel) && !real_open(rel, KEY_READ, &h) ? h : NULL;
+    }
+    to_box(nt, rel);
+    return RegOpenKeyExW(HKEY_CURRENT_USER, rel, 0, KEY_READ, &h) ? NULL : h;
+}
+#define done(x) do { if (tmp) RegCloseKey(tmp); return (x); } while (0)
+
+static wchar_t* wide(const char* s, wchar_t* buf) {
+    if (!s) return NULL;
+    MultiByteToWideChar(CP_ACP, 0, s, -1, buf, KP);
+    buf[KP - 1] = 0;
+    return buf;
+}
+
+/* ---- advapi32 ------------------------------------------------------------ */
+static LONG WINAPI g_RegCreateKeyExW(HKEY k, LPCWSTR sub, DWORD res, LPWSTR cls, DWORD opt, REGSAM sam,
+                                     LPSECURITY_ATTRIBUTES sa, PHKEY out, LPDWORD disp) {
+    wchar_t full[KP];
+    (void)res; (void)cls; (void)sa;
+    if (!key_path(k, full)) return ERROR_ACCESS_DENIED;
+    join(full, sub);
+    return sb_open(full, sam, 1, opt, out, disp);
+}
+static LONG WINAPI g_RegOpenKeyExW(HKEY k, LPCWSTR sub, DWORD opt, REGSAM sam, PHKEY out) {
+    wchar_t full[KP];
+    if (!key_path(k, full)) return RegOpenKeyExW(k, sub, opt, (sam & ~WRITE_BITS) | KEY_READ, out);
+    join(full, sub);
+    return sb_open(full, sam, 0, 0, out, NULL);
 }
 static LONG WINAPI g_RegCreateKeyExA(HKEY k, LPCSTR sub, DWORD res, LPSTR cls, DWORD opt, REGSAM sam,
                                      LPSECURITY_ATTRIBUTES sa, PHKEY out, LPDWORD disp) {
-    return RegCreateKeyExA(box(k), sub, res, cls, opt, sam, sa, out, disp);
+    wchar_t s[KP];
+    (void)cls;
+    return g_RegCreateKeyExW(k, wide(sub, s), res, NULL, opt, sam, sa, out, disp);
 }
-static LONG WINAPI g_RegCreateKeyA(HKEY k, LPCSTR sub, PHKEY out) { return RegCreateKeyA(box(k), sub, out); }
-static LONG WINAPI g_RegDeleteKeyA(HKEY k, LPCSTR sub) { return RegDeleteKeyA(box(k), sub); }
-static LONG WINAPI g_RegDeleteValueA(HKEY k, LPCSTR v) { return RegDeleteValueA(box(k), v); }
+static LONG WINAPI g_RegOpenKeyExA(HKEY k, LPCSTR sub, DWORD opt, REGSAM sam, PHKEY out) {
+    wchar_t s[KP];
+    return g_RegOpenKeyExW(k, wide(sub, s), opt, sam, out);
+}
+static LONG WINAPI g_RegCreateKeyW(HKEY k, LPCWSTR sub, PHKEY out) {
+    return g_RegCreateKeyExW(k, sub, 0, NULL, 0, KEY_ALL_ACCESS, NULL, out, NULL);
+}
+static LONG WINAPI g_RegCreateKeyA(HKEY k, LPCSTR sub, PHKEY out) {
+    return g_RegCreateKeyExA(k, sub, 0, NULL, 0, KEY_ALL_ACCESS, NULL, out, NULL);
+}
+static LONG WINAPI g_RegOpenKeyW(HKEY k, LPCWSTR sub, PHKEY out) { return g_RegOpenKeyExW(k, sub, 0, MAXIMUM_ALLOWED, out); }
+static LONG WINAPI g_RegOpenKeyA(HKEY k, LPCSTR sub, PHKEY out) { return g_RegOpenKeyExA(k, sub, 0, MAXIMUM_ALLOWED, out); }
+static LONG WINAPI g_RegOpenCurrentUser(REGSAM sam, PHKEY out) { return real_open(g_cu_nt, sam, out); }
+
+static LONG WINAPI g_RegSetValueExW(HKEY k, LPCWSTR v, DWORD r, DWORD t, const BYTE* d, DWORD n) {
+    HKEY tmp, h = write_key(k, &tmp);
+    if (!h) return ERROR_ACCESS_DENIED;
+    done(RegSetValueExW(h, v, r, t, d, n));
+}
 static LONG WINAPI g_RegSetValueExA(HKEY k, LPCSTR v, DWORD r, DWORD t, const BYTE* d, DWORD n) {
-    return RegSetValueExA(box(k), v, r, t, d, n);
+    HKEY tmp, h = write_key(k, &tmp);
+    if (!h) return ERROR_ACCESS_DENIED;
+    done(RegSetValueExA(h, v, r, t, d, n));
+}
+static LONG WINAPI g_RegSetValueW(HKEY k, LPCWSTR sub, DWORD t, LPCWSTR d, DWORD n) {
+    HKEY h;
+    LONG r = g_RegCreateKeyW(k, sub, &h);
+    (void)n;
+    if (r) return r;
+    r = t == REG_SZ && d ? RegSetValueExW(h, NULL, 0, REG_SZ, (const BYTE*)d, (DWORD)(wcslen(d) + 1) * 2)
+                         : ERROR_INVALID_PARAMETER;
+    RegCloseKey(h);
+    return r;
+}
+static LONG WINAPI g_RegSetValueA(HKEY k, LPCSTR sub, DWORD t, LPCSTR d, DWORD n) {
+    HKEY h;
+    LONG r = g_RegCreateKeyA(k, sub, &h);
+    (void)n;
+    if (r) return r;
+    r = t == REG_SZ && d ? RegSetValueExA(h, NULL, 0, REG_SZ, (const BYTE*)d, (DWORD)strlen(d) + 1)
+                         : ERROR_INVALID_PARAMETER;
+    RegCloseKey(h);
+    return r;
+}
+static LONG WINAPI g_RegDeleteValueW(HKEY k, LPCWSTR v) {
+    int b;
+    HKEY h = box_of(k, &b);
+    LONG r;
+    if (b) { if (h) RegCloseKey(h); return RegDeleteValueW(k, v); }
+    if (!h) return ERROR_FILE_NOT_FOUND;
+    RegCloseKey(h);
+    HKEY tmp; h = write_key(k, &tmp);
+    r = h ? RegDeleteValueW(h, v) : ERROR_ACCESS_DENIED;
+    done(r);
+}
+static LONG WINAPI g_RegDeleteValueA(HKEY k, LPCSTR v) {
+    wchar_t s[KP];
+    return g_RegDeleteValueW(k, wide(v, s));
+}
+static LONG WINAPI g_RegDeleteKeyW(HKEY k, LPCWSTR sub) {
+    wchar_t full[KP], rel[KP];
+    if (!sub || !*sub || !key_path(k, full)) return ERROR_ACCESS_DENIED;
+    join(full, sub);
+    to_box(full, rel);
+    return RegDeleteKeyW(HKEY_CURRENT_USER, rel);      /* only ever the box's */
+}
+static LONG WINAPI g_RegDeleteKeyA(HKEY k, LPCSTR sub) {
+    wchar_t s[KP];
+    return g_RegDeleteKeyW(k, wide(sub, s));
+}
+
+/* A value: the box's first, then the real key's. */
+static LONG WINAPI g_RegQueryValueExW(HKEY k, LPCWSTR v, LPDWORD r, LPDWORD t, LPBYTE d, LPDWORD n) {
+    int b;
+    HKEY o = box_of(k, &b);
+    LONG e;
+    if (!o) return RegQueryValueExW(k, v, r, t, d, n);
+    e = RegQueryValueExW(b ? k : o, v, r, t, d, n);
+    if (e == ERROR_FILE_NOT_FOUND) e = RegQueryValueExW(b ? o : k, v, r, t, d, n);
+    RegCloseKey(o);
+    return e;
 }
 static LONG WINAPI g_RegQueryValueExA(HKEY k, LPCSTR v, LPDWORD r, LPDWORD t, LPBYTE d, LPDWORD n) {
-    return RegQueryValueExA(box(k), v, r, t, d, n);
+    int b;
+    HKEY o = box_of(k, &b);
+    LONG e;
+    if (!o) return RegQueryValueExA(k, v, r, t, d, n);
+    e = RegQueryValueExA(b ? k : o, v, r, t, d, n);
+    if (e == ERROR_FILE_NOT_FOUND) e = RegQueryValueExA(b ? o : k, v, r, t, d, n);
+    RegCloseKey(o);
+    return e;
+}
+static LONG WINAPI g_RegQueryValueW(HKEY k, LPCWSTR sub, LPWSTR d, PLONG n) {
+    HKEY h = k;
+    LONG r = sub && *sub ? g_RegOpenKeyExW(k, sub, 0, KEY_READ, &h) : 0;
+    if (r) return r;
+    r = g_RegQueryValueExW(h, NULL, NULL, NULL, (LPBYTE)d, (LPDWORD)n);
+    if (h != k) RegCloseKey(h);
+    return r;
+}
+static LONG WINAPI g_RegQueryValueA(HKEY k, LPCSTR sub, LPSTR d, PLONG n) {
+    HKEY h = k;
+    LONG r = sub && *sub ? g_RegOpenKeyExA(k, sub, 0, KEY_READ, &h) : 0;
+    if (r) return r;
+    r = g_RegQueryValueExA(h, NULL, NULL, NULL, (LPBYTE)d, (LPDWORD)n);
+    if (h != k) RegCloseKey(h);
+    return r;
+}
+
+/* Refused outright: whole-hive and security operations. */
+#define DENY(n, ...) static LONG WINAPI deny##n(__VA_ARGS__) { fprintf(stderr, "[regbox] refused a registry write\n"); return ERROR_ACCESS_DENIED; }
+DENY(2, void* a, void* b) DENY(3, void* a, void* b, void* c) DENY(4, void* a, void* b, void* c, void* d)
+DENY(5, void* a, void* b, void* c, void* d, void* e) DENY(6, void* a, void* b, void* c, void* d, void* e, void* f)
+DENY(7, void* a, void* b, void* c, void* d, void* e, void* f, void* g)
+DENY(11, void* a, void* b, void* c, void* d, void* e, void* f, void* g, void* h, void* i, void* j, void* l)
+static BOOL WINAPI deny_prof2(void* a, void* b) { (void)a; (void)b; return FALSE; }
+static BOOL WINAPI deny_prof3(void* a, void* b, void* c) { (void)a; (void)b; (void)c; return FALSE; }
+static BOOL WINAPI deny_prof5(void* a, void* b, void* c, void* d, void* e) { (void)a; (void)b; (void)c; (void)d; (void)e; return FALSE; }
+
+/* ---- kernel32 profiles: INI\<file>\<section>, value = key ----------------- */
+static int ini_name(LPCWSTR file, wchar_t* out) {   /* win.ini, or a bare/Windows-directory .ini */
+    wchar_t win[MAX_PATH];
+    const wchar_t* base;
+    if (!file) { wcscpy(out, L"win.ini"); return 1; }
+    base = wcsrchr(file, L'\\');
+    if (!base) base = wcsrchr(file, L'/');
+    GetWindowsDirectoryW(win, MAX_PATH);
+    if (base && !(prefix(file, win) && (size_t)(base - file) == wcslen(win))) return 0;   /* the program's own file */
+    wcsncpy(out, base ? base + 1 : file, MAX_PATH - 1);
+    out[MAX_PATH - 1] = 0;
+    return 1;
+}
+static LONG ini_key(LPCWSTR file, LPCWSTR sec, int create, HKEY* h) {
+    wchar_t rel[KP], ini[MAX_PATH];
+    if (!ini_name(file, ini) || !sec) return ERROR_INVALID_PARAMETER;
+    _snwprintf(rel, KP - 1, L"%ls\\INI\\%ls\\%ls", g_root_rel, ini, sec);
+    rel[KP - 1] = 0;
+    return create ? RegCreateKeyExW(HKEY_CURRENT_USER, rel, 0, NULL, 0, KEY_ALL_ACCESS, NULL, h, NULL)
+                  : RegOpenKeyExW(HKEY_CURRENT_USER, rel, 0, KEY_READ, h);
+}
+static BOOL WINAPI g_WritePrivateProfileStringW(LPCWSTR sec, LPCWSTR key, LPCWSTR val, LPCWSTR file) {
+    wchar_t ini[MAX_PATH];
+    HKEY h;
+    LONG r;
+    if (file && !ini_name(file, ini)) return WritePrivateProfileStringW(sec, key, val, file);
+    if (!sec) return TRUE;                                  /* flush */
+    if (!key) {                                             /* delete the section (the box's) */
+        if (ini_key(file, L"", 0, &h)) return TRUE;
+        RegDeleteKeyW(h, sec);
+        RegCloseKey(h);
+        return TRUE;
+    }
+    if (ini_key(file, sec, 1, &h)) return FALSE;
+    r = val ? RegSetValueExW(h, key, 0, REG_SZ, (const BYTE*)val, (DWORD)(wcslen(val) + 1) * 2) : RegDeleteValueW(h, key);
+    RegCloseKey(h);
+    return !r || !val;
+}
+static BOOL WINAPI g_WriteProfileStringW(LPCWSTR sec, LPCWSTR key, LPCWSTR val) {
+    return g_WritePrivateProfileStringW(sec, key, val, NULL);
+}
+static BOOL WINAPI g_WritePrivateProfileStringA(LPCSTR sec, LPCSTR key, LPCSTR val, LPCSTR file) {
+    static wchar_t a[KP], b[KP], c[KP], d[KP];   /* ponytail: not reentrant across threads */
+    return g_WritePrivateProfileStringW(wide(sec, a), wide(key, b), wide(val, c), wide(file, d));
+}
+static BOOL WINAPI g_WriteProfileStringA(LPCSTR sec, LPCSTR key, LPCSTR val) {
+    return g_WritePrivateProfileStringA(sec, key, val, NULL);
+}
+/* the box's string for sec/key, or 0 */
+static int ini_get(LPCWSTR file, LPCWSTR sec, LPCWSTR key, wchar_t* out, DWORD cch) {
+    HKEY h;
+    DWORD t, n = cch * 2;
+    LONG r;
+    if (!sec || !key || (file && !ini_name(file, out)) || ini_key(file, sec, 0, &h)) return 0;
+    r = RegQueryValueExW(h, key, NULL, &t, (LPBYTE)out, &n);
+    RegCloseKey(h);
+    if (r || t != REG_SZ) return 0;
+    out[cch - 1] = 0;
+    return 1;
+}
+static DWORD WINAPI g_GetPrivateProfileStringW(LPCWSTR sec, LPCWSTR key, LPCWSTR def, LPWSTR out, DWORD n, LPCWSTR file) {
+    wchar_t v[KP];
+    if (n && ini_get(file, sec, key, v, KP)) {
+        wcsncpy(out, v, n - 1);
+        out[n - 1] = 0;
+        return (DWORD)wcslen(out);
+    }
+    return file ? GetPrivateProfileStringW(sec, key, def, out, n, file) : GetProfileStringW(sec, key, def, out, n);
+}
+static DWORD WINAPI g_GetProfileStringW(LPCWSTR sec, LPCWSTR key, LPCWSTR def, LPWSTR out, DWORD n) {
+    return g_GetPrivateProfileStringW(sec, key, def, out, n, NULL);
+}
+static UINT WINAPI g_GetPrivateProfileIntW(LPCWSTR sec, LPCWSTR key, INT def, LPCWSTR file) {
+    wchar_t v[KP];
+    if (ini_get(file, sec, key, v, KP)) return (UINT)_wtoi(v);
+    return file ? GetPrivateProfileIntW(sec, key, def, file) : GetProfileIntW(sec, key, def);
+}
+static UINT WINAPI g_GetProfileIntW(LPCWSTR sec, LPCWSTR key, INT def) { return g_GetPrivateProfileIntW(sec, key, def, NULL); }
+
+static const struct { const char* name; void* fn; } g_fns[] = {
+    { "RegCreateKeyExW", g_RegCreateKeyExW }, { "RegCreateKeyExA", g_RegCreateKeyExA },
+    { "RegCreateKeyW", g_RegCreateKeyW }, { "RegCreateKeyA", g_RegCreateKeyA },
+    { "RegOpenKeyExW", g_RegOpenKeyExW }, { "RegOpenKeyExA", g_RegOpenKeyExA },
+    { "RegOpenKeyW", g_RegOpenKeyW }, { "RegOpenKeyA", g_RegOpenKeyA }, { "RegOpenCurrentUser", g_RegOpenCurrentUser },
+    { "RegSetValueExW", g_RegSetValueExW }, { "RegSetValueExA", g_RegSetValueExA },
+    { "RegSetValueW", g_RegSetValueW }, { "RegSetValueA", g_RegSetValueA },
+    { "RegDeleteValueW", g_RegDeleteValueW }, { "RegDeleteValueA", g_RegDeleteValueA },
+    { "RegDeleteKeyW", g_RegDeleteKeyW }, { "RegDeleteKeyA", g_RegDeleteKeyA },
+    { "RegQueryValueExW", g_RegQueryValueExW }, { "RegQueryValueExA", g_RegQueryValueExA },
+    { "RegQueryValueW", g_RegQueryValueW }, { "RegQueryValueA", g_RegQueryValueA },
+    { "RegUnLoadKeyW", deny2 }, { "RegUnLoadKeyA", deny2 }, { "RegOverridePredefKey", deny2 },
+    { "RegDeleteTreeW", deny2 }, { "RegDeleteTreeA", deny2 },
+    { "RegLoadKeyW", deny3 }, { "RegLoadKeyA", deny3 }, { "RegRestoreKeyW", deny3 }, { "RegRestoreKeyA", deny3 },
+    { "RegSaveKeyW", deny3 }, { "RegSaveKeyA", deny3 }, { "RegSetKeySecurity", deny3 },
+    { "RegConnectRegistryW", deny3 }, { "RegConnectRegistryA", deny3 }, { "RegCopyTreeW", deny3 }, { "RegCopyTreeA", deny3 },
+    { "RegRenameKey", deny3 }, { "RegDeleteKeyValueW", deny3 }, { "RegDeleteKeyValueA", deny3 },
+    { "RegReplaceKeyW", deny4 }, { "RegReplaceKeyA", deny4 }, { "RegSaveKeyExW", deny4 }, { "RegSaveKeyExA", deny4 },
+    { "RegDeleteKeyExW", deny4 }, { "RegDeleteKeyExA", deny4 }, { "RegLoadAppKeyW", deny5 }, { "RegLoadAppKeyA", deny5 },
+    { "RegSetKeyValueW", deny6 }, { "RegSetKeyValueA", deny6 }, { "RegDeleteKeyTransactedW", deny6 },
+    { "RegDeleteKeyTransactedA", deny6 }, { "RegOpenKeyTransactedW", deny7 }, { "RegOpenKeyTransactedA", deny7 },
+    { "RegCreateKeyTransactedW", deny11 }, { "RegCreateKeyTransactedA", deny11 },
+    { "WriteProfileStringW", g_WriteProfileStringW }, { "WriteProfileStringA", g_WriteProfileStringA },
+    { "WritePrivateProfileStringW", g_WritePrivateProfileStringW }, { "WritePrivateProfileStringA", g_WritePrivateProfileStringA },
+    { "GetProfileStringW", g_GetProfileStringW }, { "GetPrivateProfileStringW", g_GetPrivateProfileStringW },
+    { "GetProfileIntW", g_GetProfileIntW }, { "GetPrivateProfileIntW", g_GetPrivateProfileIntW },
+    { "WriteProfileSectionW", deny_prof2 }, { "WriteProfileSectionA", deny_prof2 },
+    { "WritePrivateProfileSectionW", deny_prof3 }, { "WritePrivateProfileSectionA", deny_prof3 },
+    { "WritePrivateProfileStructW", deny_prof5 }, { "WritePrivateProfileStructA", deny_prof5 },
+};
+#define NFNS ((int)(sizeof g_fns / sizeof g_fns[0]))
+
+void* native32_registry_sandbox_fn(const char* name) {
+    for (int i = 0; g_on && i < NFNS; i++)
+        if (g_fns[i].fn && !strcmp(g_fns[i].name, name)) return g_fns[i].fn;
+    return NULL;
 }
 
 int native32_registry_sandbox(const char* name) {
-    char path[512];
-    _snprintf(path, sizeof path - 1, "Software\\pcrecomp\\sandbox\\%s\\HKLM", name);
+    char path[300];
+    HKEY cu, root;
+    HMODULE nt = GetModuleHandleA("ntdll.dll");
+    p_NtQueryKey = (void*)GetProcAddress(nt, "NtQueryKey");
+    p_NtOpenKey = (void*)GetProcAddress(nt, "NtOpenKey");
+    p_RtlNtStatusToDosError = (void*)GetProcAddress(nt, "RtlNtStatusToDosError");
+    if (RegOpenCurrentUser(KEY_READ, &cu)) return 0;
+    if (!key_path(cu, g_cu_nt)) return 0;
+    RegCloseKey(cu);
+    _snprintf(path, sizeof path - 1, strchr(name, '\\') ? "Software\\pcrecomp\\%s" : "Software\\pcrecomp\\sandbox\\%s", name);
     path[sizeof path - 1] = 0;
-    if (RegCreateKeyExA(HKEY_CURRENT_USER, path, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &g_lm, NULL)) return 0;
-    strcpy(path + strlen(path) - 4, "HKCU");
-    if (RegCreateKeyExA(HKEY_CURRENT_USER, path, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &g_cu, NULL)) return 0;
-    native32_redirect("RegOpenKeyExA", (void*)g_RegOpenKeyExA);
-    native32_redirect("RegOpenKeyA", (void*)g_RegOpenKeyA);
-    native32_redirect("RegCreateKeyExA", (void*)g_RegCreateKeyExA);
-    native32_redirect("RegCreateKeyA", (void*)g_RegCreateKeyA);
-    native32_redirect("RegDeleteKeyA", (void*)g_RegDeleteKeyA);
-    native32_redirect("RegDeleteValueA", (void*)g_RegDeleteValueA);
-    native32_redirect("RegSetValueExA", (void*)g_RegSetValueExA);
-    native32_redirect("RegQueryValueExA", (void*)g_RegQueryValueExA);
+    MultiByteToWideChar(CP_ACP, 0, path, -1, g_root_rel, 300);
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, g_root_rel, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &root, NULL)) return 0;
+    RegCloseKey(root);
+    _snwprintf(g_root_nt, 511, L"%ls\\%ls", g_cu_nt, g_root_rel);
+    g_on = 1;
+    for (int i = 0; i < NFNS; i++)
+        if (g_fns[i].fn) native32_redirect(g_fns[i].name, g_fns[i].fn);
     return 1;
+}
+
+/* ---- NtXxxKey of a lifted ntdll (syscall32's argument arrays) ------------- */
+#define ST_DENIED 0xC0000022u
+#define ST_NOT_FOUND 0xC0000034u
+static uint32_t (*nt_fwd)(const char*, uint32_t*);
+static uint32_t st_of(LONG e) { return !e ? 0 : e == ERROR_FILE_NOT_FOUND ? ST_NOT_FOUND : e == ERROR_ACCESS_DENIED ? ST_DENIED
+                                    : e == ERROR_PATH_NOT_FOUND ? 0xC000003Au : 0xC0000001u; }
+static int oa_path(OA* oa, wchar_t* full) {
+    if (oa->Root) { if (!key_path((HKEY)oa->Root, full)) return 0; }
+    else full[0] = 0;
+    if (oa->Name && oa->Name->Length) {
+        size_t n = wcslen(full), m = oa->Name->Length / 2;
+        if (n + m + 2 >= KP) return 0;
+        if (n) full[n++] = L'\\';
+        memcpy(full + n, oa->Name->Buffer, m * 2);
+        full[n + m] = 0;
+    }
+    return full[0] == L'\\';
+}
+/* NtCreateKey(PHANDLE, ACCESS, OA*, TitleIndex, Class, Options, Disposition*) */
+static uint32_t nt_create_key(uint32_t* a) {
+    wchar_t full[KP];
+    if (!oa_path((OA*)(uintptr_t)a[2], full)) return ST_DENIED;
+    return st_of(sb_open(full, a[1], 1, a[5], (HKEY*)(uintptr_t)a[0], (DWORD*)(uintptr_t)a[6]));
+}
+/* NtOpenKey(PHANDLE, ACCESS, OA*) */
+static uint32_t nt_open_key(uint32_t* a) {
+    wchar_t full[KP];
+    if (!oa_path((OA*)(uintptr_t)a[2], full)) { a[1] = (a[1] & ~WRITE_BITS) | KEY_READ; return nt_fwd("NtOpenKey", a); }
+    return st_of(sb_open(full, a[1], 0, 0, (HKEY*)(uintptr_t)a[0], NULL));
+}
+/* NtSetValueKey(H, US*, TitleIndex, Type, Data, Size) */
+static uint32_t nt_set_value(uint32_t* a) {
+    HKEY tmp, h = write_key((HKEY)(uintptr_t)a[0], &tmp);
+    uint32_t r, k = a[0];
+    if (!h) return ST_DENIED;
+    a[0] = (uint32_t)(uintptr_t)h;
+    r = nt_fwd("NtSetValueKey", a);
+    a[0] = k;
+    if (tmp) RegCloseKey(tmp);
+    return r;
+}
+/* NtDeleteValueKey(H, US*) */
+static uint32_t nt_delete_value(uint32_t* a) {
+    int b;
+    HKEY o = box_of((HKEY)(uintptr_t)a[0], &b);
+    uint32_t r, k = a[0];
+    if (b) { if (o) RegCloseKey(o); return nt_fwd("NtDeleteValueKey", a); }
+    if (!o) return ST_NOT_FOUND;
+    RegCloseKey(o);
+    HKEY tmp, h = write_key((HKEY)(uintptr_t)k, &tmp);
+    if (!h) return ST_DENIED;
+    a[0] = (uint32_t)(uintptr_t)h;
+    r = nt_fwd("NtDeleteValueKey", a);
+    a[0] = k;
+    if (tmp) RegCloseKey(tmp);
+    return r;
+}
+/* NtDeleteKey(H): the box's only */
+static uint32_t nt_delete_key(uint32_t* a) {
+    wchar_t nt[KP];
+    return key_path((HKEY)(uintptr_t)a[0], nt) && in_box(nt) ? nt_fwd("NtDeleteKey", a) : ST_DENIED;
+}
+/* NtQueryValueKey(H, US*, class, buf, len, ret*): the box's, then the real one */
+static uint32_t nt_query_value(uint32_t* a) {
+    int b;
+    HKEY o = box_of((HKEY)(uintptr_t)a[0], &b);
+    uint32_t r, k = a[0];
+    if (!o) return nt_fwd("NtQueryValueKey", a);
+    if (!b) a[0] = (uint32_t)(uintptr_t)o;
+    r = nt_fwd("NtQueryValueKey", a);
+    if (r == ST_NOT_FOUND) { a[0] = b ? (uint32_t)(uintptr_t)o : k; r = nt_fwd("NtQueryValueKey", a); }
+    a[0] = k;
+    RegCloseKey(o);
+    return r;
+}
+static uint32_t nt_deny(uint32_t* a) { (void)a; fprintf(stderr, "[regbox] refused an NT registry write\n"); return ST_DENIED; }
+
+void native32_registry_sandbox_nt(void (*ovr)(const char*, native32_syscall_fn),
+                                  uint32_t (*fwd)(const char*, uint32_t*), void (*hook)(const char*, void*)) {
+    static const char* deny[] = { "NtSetInformationKey", "NtSaveKey", "NtSaveMergedKeys", "NtRestoreKey", "NtLoadKey",
+        "NtLoadKey2", "NtReplaceKey", "NtUnloadKey", "NtInitializeRegistry", "NtSaveKeyEx", "NtLoadKeyEx", "NtRenameKey" };
+    if (!g_on) return;
+    nt_fwd = fwd;
+    ovr("NtCreateKey", nt_create_key);
+    ovr("NtOpenKey", nt_open_key);
+    ovr("NtSetValueKey", nt_set_value);
+    ovr("NtDeleteValueKey", nt_delete_value);
+    ovr("NtDeleteKey", nt_delete_key);
+    ovr("NtQueryValueKey", nt_query_value);
+    for (int i = 0; i < (int)(sizeof deny / sizeof deny[0]); i++) ovr(deny[i], nt_deny);
+    for (int i = 0; hook && i < NFNS; i++)                  /* the proxied host advapi32 */
+        if (g_fns[i].fn && !strncmp(g_fns[i].name, "Reg", 3)) hook(g_fns[i].name, g_fns[i].fn);
 }

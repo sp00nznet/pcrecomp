@@ -35,7 +35,7 @@
 static struct { const char* name; uint8_t argc; native32_syscall_fn fn; void* host; } g_svc[MAX_SVC];
 static int g_trace = -1;
 
-#define MAX_OVR 64
+#define MAX_OVR 128
 static struct { const char* name; native32_syscall_fn fn; } g_ovr[MAX_OVR];
 static int g_novr;
 
@@ -282,7 +282,7 @@ static const struct { const char* name; void* fn; } g_deny[] = {
 /* Host functions a host puts in place of a proxied export (native32_nt_proxy_hook):
  * the same signature, usually calling the real one and noting its result
  * (w32kgdi.c registers the HDC host user32's BeginPaint returns). */
-#define MAX_HOOKS 96
+#define MAX_HOOKS 224
 static struct { const char* name; void* fn; } g_hook[MAX_HOOKS];
 static int g_nhook;
 void native32_nt_proxy_hook(const char* name, void* fn) {

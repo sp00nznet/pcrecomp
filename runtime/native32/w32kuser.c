@@ -622,6 +622,9 @@ static uint32_t s_call_noparam(uint32_t* a) {
     if (a[0] == 8) return ReleaseCapture();
     if (a[0] == 5) return GetMessagePos();
     if (a[0] == 2) return DestroyCaret();
+    /* 0x12: asked by user32's ClientThreadSetup; 1 skips its client-side
+     * setup (ghdcBits2, the cursors), so 0: this thread is new */
+    if (a[0] == 0x12) return 0;
     fprintf(stderr, "[user] NtUserCallNoParam %u not answered\n", a[0]);
     return 0;
 }
@@ -864,10 +867,13 @@ static uint32_t s_setlong(uint32_t* a) {
         uint32_t v = a[2], old;
         /* WS_VISIBLE stays the host's: the guest's value is read-modify-write
          * from the WND, which can predate ShowWindow (RichEdit's view, made
-         * visible by CreateWindowEx after WM_CREATE, was hidden again).
-         * ponytail: a guest that shows a window through its style is not
-         * answered */
-        if ((int)a[1] == GWL_STYLE) v = (v & ~WS_VISIBLE) | ((uint32_t)GetWindowLongW(h, GWL_STYLE) & WS_VISIBLE);
+         * visible by CreateWindowEx after WM_CREATE, was hidden again). A
+         * value that sets WS_VISIBLE the WND does not have is a show, and
+         * passes. ponytail: a hide through the style is not answered */
+        if ((int)a[1] == GWL_STYLE) {
+            uint32_t show = w && (v & WS_VISIBLE) && !(*(uint32_t*)(w + 0x20) & WS_VISIBLE) ? WS_VISIBLE : 0;
+            v = (v & ~WS_VISIBLE) | ((uint32_t)GetWindowLongW(h, GWL_STYLE) & WS_VISIBLE) | show;
+        }
         old = (uint32_t)SetWindowLongW(h, (int)a[1], (LONG)v);
         if (w) *(uint32_t*)(w + ((int)a[1] == GWL_STYLE ? 0x20 : 0x1C)) = (uint32_t)GetWindowLongW(h, (int)a[1]);
         return old;

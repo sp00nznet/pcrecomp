@@ -72,11 +72,20 @@ int native32_registry(const char* file);
  * server. Call before native32_bind. */
 void native32_net_loopback_only(void);
 
-/* Give the guest its own HKLM and HKCU (regbox32.c), under
- * HKCU\Software\pcrecomp\sandbox\<name>: its Reg*A imports write there and
- * read there first, then the real registry read-only. Two instances with two
- * names keep apart. Call before native32_bind; 0 if the key can't be made. */
+/* Give the guest its own registry (regbox32.c), under
+ * HKCU\Software\pcrecomp\sandbox\<name> (or \pcrecomp\<name> when name has a
+ * backslash): its Reg* imports (A and W) and profile calls write there and
+ * read there first, then the real registry read-only; it can never write the
+ * real one. Two instances with two names keep apart. Call before
+ * native32_bind; 0 if the key can't be made. */
 int native32_registry_sandbox(const char* name);
+/* The same for a lifted ntdll's NtXxxKey services and a proxied host
+ * advapi32: pass native32_nt_override, native32_nt_forward and
+ * native32_nt_proxy_hook (before native32_nt_boot). */
+void native32_registry_sandbox_nt(void (*ovr)(const char*, uint32_t (*)(uint32_t*)),
+                                  uint32_t (*fwd)(const char*, uint32_t*), void (*hook)(const char*, void*));
+/* A sandbox replacement by its export name (WriteProfileStringW...), or NULL. */
+void* native32_registry_sandbox_fn(const char* name);
 
 /* Call once, before anything else. */
 void native32_init(void);
