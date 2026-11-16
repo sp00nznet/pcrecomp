@@ -217,6 +217,25 @@ void mach_leave(void) {
     LeaveCriticalSection(&g_mach);
 }
 
+/* A host call that may wait on another guest thread gives up the machine at
+ * every level it holds: inside a window procedure (a callback, depth 2) one
+ * mach_leave still held it, and explorer's main thread, sending to the tray
+ * thread from its WM_CREATE, kept the tray thread from ever running. */
+int mach_release(void) {
+    mstate* m = (mstate*)TlsGetValue(g_mach_tls);
+    int n = m->depth;
+    regs_save(&m->r);
+    m->depth = 0;
+    for (int i = 0; i < n; i++) LeaveCriticalSection(&g_mach);
+    return n;
+}
+
+void mach_reacquire(int n) {
+    mach_enter();                                  /* reloads this thread's registers */
+    for (int i = 1; i < n; i++) EnterCriticalSection(&g_mach);
+    ((mstate*)TlsGetValue(g_mach_tls))->depth = n;
+}
+
 /* RECOMP_BACKEDGE's hand-over: let another guest thread take the machine.
  * Only the outermost claim can give it up; inside a callback the lock is
  * still held further out, and the loop simply runs on. */

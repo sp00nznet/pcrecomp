@@ -144,6 +144,10 @@ void native32_call_guest(uint32_t va, int nargs, const uint32_t* args);
  * register globals from its own threads must too. Nests. */
 void mach_enter(void);
 void mach_leave(void);
+/* Give up every level of the machine around a host call that may wait on
+ * another guest thread; put the same count back after. */
+int mach_release(void);
+void mach_reacquire(int n);
 
 /* A lifted function answered by the host instead, wherever its address is
  * resolved (indirect calls, snapped imports); and a built-in shim by name.

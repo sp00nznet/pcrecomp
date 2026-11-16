@@ -137,7 +137,9 @@ void recomp_syscall(int vector) {
     if (g_svc[svc].fn) r = g_svc[svc].fn(args);
     else if (g_svc[svc].host) {
         if (g_trace && strstr(g_svc[svc].name, "Wait"))   /* a wait that never returns is otherwise never printed */
-            fprintf(stderr, "[syscall] t%lu waits in %s(%08X) from sub_%08X\n", GetCurrentThreadId(), g_svc[svc].name, args[0], g_cur_func);
+            fprintf(stderr, "[syscall] t%lu waits in %s(%08X) from sub_%08X  stack %08X %08X %08X %08X %08X %08X %08X %08X\n",
+                    GetCurrentThreadId(), g_svc[svc].name, args[0], g_cur_func, args[3], args[4], args[5], args[6], args[7],
+                    args[8], args[9], args[10]);
         mach_leave();                                 /* a wait must not hold the machine */
         r = call_std(g_svc[svc].host, args, g_svc[svc].argc);
         mach_enter();
@@ -709,13 +711,17 @@ static uint32_t win32k_call(uint32_t svc, uint32_t* args) {
      * the desktop thread could never run the window procedure. The host calls
      * back into a guest window procedure through mach_enter as usual. */
     const char* nm = g_w32k[i].name;
-    int blocks = g_w32k[i].fn && (!strcmp(nm, "NtUserMessageCall") || !strcmp(nm, "NtUserGetMessage") ||
-                                  !strcmp(nm, "NtUserWaitMessage"));
+    /* ponytail: only a send to another thread's window; a send to this
+     * thread's own runs the window procedure right here, under the machine */
+    int blocks = g_w32k[i].fn && ((!strcmp(nm, "NtUserMessageCall") && args[0] &&
+                                   GetWindowThreadProcessId((HWND)(uintptr_t)args[0], NULL) != GetCurrentThreadId()) ||
+                                  !strcmp(nm, "NtUserGetMessage") || !strcmp(nm, "NtUserWaitMessage"));
     if (g_trace && blocks)
-        fprintf(stderr, "[win32k] t%lu enters %s(%08X %08X)\n", GetCurrentThreadId(), nm, args[0], args[1]);
-    if (blocks) mach_leave();
+        fprintf(stderr, "[win32k] t%lu enters %s(%08X %08X), window of t%lu\n", GetCurrentThreadId(), nm, args[0], args[1],
+                args[0] ? GetWindowThreadProcessId((HWND)(uintptr_t)args[0], NULL) : 0);
+    int held = blocks ? mach_release() : 0;
     uint32_t r = g_w32k[i].fn ? g_w32k[i].fn(args) : 0;
-    if (blocks) mach_enter();
+    if (blocks) mach_reacquire(held);
     if (g_trace || (!g_w32k[i].fn && !g_w32k[i].seen)) {
         fprintf(stderr, "[win32k] %-34s(", g_w32k[i].name[0] ? g_w32k[i].name : "?");
         for (int k = 0; k < g_w32k[i].argc && k < 16; k++) fprintf(stderr, k ? " %08X" : "%08X", args[k]);
