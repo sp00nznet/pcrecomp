@@ -275,9 +275,16 @@ static void server_info(void) {
         SystemParametersInfoW(SPI_GETKEYBOARDCUES, 0, &cues, 0);
         *(uint32_t*)(psi + 0xE50) = (fx ? 0x80000000u : 0) | (cues ? 0x20u : 0);
     }
-    /* +0xE4A dmLogPixels: a dialog font's height is -MulDiv(points, it, 72) */
+    /* +0xE4A dmLogPixels: a dialog font's height is -MulDiv(points, it, 72).
+     * +0xE48 BitCount (planes * bits), +0xE4C Planes, +0xE4D BitsPixel: the
+     * display depth an icon's image is chosen by (LookupIconIdFromDirectoryEx);
+     * left 0, user32 took the 16-colour image where the host takes 256 */
     {
         HDC s = GetDC(NULL);
+        int pl = GetDeviceCaps(s, PLANES), bp = GetDeviceCaps(s, BITSPIXEL);
+        *(uint16_t*)(psi + 0xE48) = (uint16_t)(pl * bp);
+        *(uint8_t*)(psi + 0xE4C) = (uint8_t)pl;
+        *(uint8_t*)(psi + 0xE4D) = (uint8_t)bp;
         *(uint16_t*)(psi + 0xE4A) = (uint16_t)GetDeviceCaps(s, LOGPIXELSY);
         ReleaseDC(NULL, s);
     }
@@ -756,9 +763,8 @@ static uint32_t s_set_cursor_data(uint32_t* a) {
                     (HBITMAP)(uintptr_t)(c && native32_gdi_host(c) ? native32_gdi_host(c) : c) };
     /* Windows 2000's user32 hands a double-height mask (AND mask on top) even
      * with a colour bitmap (explorer's icons); the host wants the AND mask
-     * alone, the colour bitmap's height (else ERROR_INVALID_PARAMETER). Only
-     * when the host refuses: notepad's icon is accepted as it is, and the
-     * half mask drew it differently. */
+     * alone, the colour bitmap's height (else ERROR_INVALID_PARAMETER). Tried
+     * second, when the host refuses (notepad's icon takes this path too). */
     BITMAP bm, bc;
     HBITMAP half = NULL;
     HICON h = CreateIconIndirect(&ii);

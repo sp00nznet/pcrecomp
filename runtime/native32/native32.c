@@ -7,6 +7,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "native32.h"
 #include "image_loader.h"
@@ -675,11 +676,12 @@ static recomp_func_t dispatch_find(uint32_t va) {
 /* native32_replace: a lifted function answered by the host instead, for every
  * call that resolves its address (indirect calls, imports the guest's own
  * loader snapped). Direct calls inside its own module still reach the lift. */
-#define MAX_REPLACE 32
+#define MAX_REPLACE 256
 static struct { uint32_t va; recomp_func_t fn; } g_replace[MAX_REPLACE];
 static int g_nreplace;
 void native32_replace(uint32_t va, recomp_func_t fn) {
     if (g_nreplace < MAX_REPLACE) g_replace[g_nreplace].va = va, g_replace[g_nreplace++].fn = fn;
+    else { fprintf(stderr, "[native32] native32_replace table full (%d): 0x%08X not replaced\n", MAX_REPLACE, va); abort(); }
 }
 
 recomp_func_t recomp_lookup(uint32_t va) {
