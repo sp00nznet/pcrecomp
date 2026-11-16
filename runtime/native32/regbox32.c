@@ -121,6 +121,27 @@ static int from_box(const wchar_t* nt, wchar_t* real) {
 static int g_guest_classes;
 static int host_class_key(const wchar_t* nt) {
     wchar_t u[KP];
+    /* Keys a box that has them answers whole, never merged with the host's:
+     * the time zones (Windows 11's Display values are @tzres.dll MUI strings)
+     * and Control Panel's namespace (Windows 11's items were nameless folders) */
+    {
+        static const wchar_t* whole[] = { L"\\MICROSOFT\\WINDOWS NT\\CURRENTVERSION\\TIME ZONES",
+                                          L"\\MICROSOFT\\WINDOWS\\CURRENTVERSION\\EXPLORER\\CONTROLPANEL\\NAMESPACE" };
+        static const wchar_t* rels[] = { L"Microsoft\\Windows NT\\CurrentVersion\\Time Zones",
+                                         L"Microsoft\\Windows\\CurrentVersion\\Explorer\\ControlPanel\\NameSpace" };
+        wcsncpy(u, nt, KP - 1), u[KP - 1] = 0, _wcsupr(u);
+        for (int i = 0; i < 2; i++)
+            /* (the per-user Control Panel namespace too: Windows 11 has items there) */
+            if ((!wcsncmp(u, L"\\REGISTRY\\MACHINE\\SOFTWARE", 26) || !wcsncmp(u, L"\\REGISTRY\\USER\\", 15)) && wcsstr(u, whole[i])) {
+                wchar_t rel[KP];
+                HKEY h;
+                _snwprintf(rel, KP - 1, L"%ls\\HKLM\\SOFTWARE\\%ls", g_root_rel, rels[i]);
+                rel[KP - 1] = 0;
+                if (RegOpenKeyExW(HKEY_CURRENT_USER, rel, 0, KEY_READ, &h)) return 0;
+                RegCloseKey(h);
+                return 1;
+            }
+    }
     if (g_guest_classes < 0 && native32_module("ole32.dll")) g_guest_classes = 1;   /* Windows 2000's own COM, lifted (asked until the guest's modules are mapped) */
     if (g_guest_classes <= 0) return 0;
     wcsncpy(u, nt, KP - 1), u[KP - 1] = 0, _wcsupr(u);

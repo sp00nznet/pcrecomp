@@ -1342,8 +1342,15 @@ static uint32_t s_menu_item(uint32_t* a) {
     MENUITEMINFOW mi = *(MENUITEMINFOW*)(uintptr_t)a[4];
     mi.cbSize = sizeof mi;
     if (a[5] && MEM32(a[5] + 4)) mi.dwTypeData = (LPWSTR)(uintptr_t)MEM32(a[5] + 4), mi.cch = MEM16(a[5]) / 2;
+    /* MIIM_TYPE with MIIM_FTYPE/STRING/BITMAP (shell32's Shell_MergeMenus copies an item
+     * with every bit, 0x1FF): Windows 2000 took it, the host answers ERROR_INVALID_PARAMETER
+     * (Control Panel's context menu was empty: a double-click on an applet opened nothing).
+     * The newer bits say the same thing */
+    if ((mi.fMask & MIIM_TYPE) && (mi.fMask & (MIIM_FTYPE | MIIM_STRING | MIIM_BITMAP))) mi.fMask &= ~MIIM_TYPE;
     BOOL r = a[3] ? InsertMenuItemW((HMENU)(uintptr_t)a[0], a[1], a[2], &mi)
                   : SetMenuItemInfoW((HMENU)(uintptr_t)a[0], a[1], a[2], &mi);
+    if (!r) fprintf(stderr, "[user] %sMenuItem(%08X, %u, %u) failed: %lu (mask %X type %X)\n", a[3] ? "Insert" : "Set", a[0], a[1], a[2],
+                    GetLastError(), mi.fMask, mi.fType);
     menu_sync((HMENU)(uintptr_t)a[0]);
     return r;
 }

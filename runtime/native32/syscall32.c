@@ -991,6 +991,21 @@ HOST_SETTING(NtSetSystemInformation) HOST_SETTING(NtSetDefaultLocale) HOST_SETTI
 HOST_SETTING(NtShutdownSystem) HOST_SETTING(NtSetSystemPowerState) HOST_SETTING(NtInitiatePowerAction)
 HOST_SETTING(NtLoadDriver) HOST_SETTING(NtUnloadDriver) HOST_SETTING(NtSetSystemEnvironmentValue)
 
+/* NtQuerySystemInformation(SystemCurrentTimeZoneInformation = 44): Windows
+ * 11's kernel names the zone by MUI reference ("@tzres.dll,-212", Date/Time's
+ * "Current time zone" line); the guest gets the names the host's
+ * GetTimeZoneInformation resolves them to, as Windows 2000's kernel kept them */
+static uint32_t ovr_query_sysinfo(uint32_t* a) {
+    uint32_t st = native32_nt_forward("NtQuerySystemInformation", a);
+    if (!st && a[0] == 44 && a[1] && a[2] >= sizeof(TIME_ZONE_INFORMATION)) {
+        TIME_ZONE_INFORMATION z, *g = (TIME_ZONE_INFORMATION*)(uintptr_t)a[1];
+        GetTimeZoneInformation(&z);
+        memcpy(g->StandardName, z.StandardName, sizeof z.StandardName);
+        memcpy(g->DaylightName, z.DaylightName, sizeof z.DaylightName);
+    }
+    return st;
+}
+
 /* NtSetInformationThread(ThreadZeroTlsCell = 10, &index): the guest's TlsFree
  * clears that slot in every thread. Its slots are in the guest TIBs
  * (native32.c make_tib), not the host TEBs: forwarded, the host zeroed its own
@@ -1284,6 +1299,7 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
     native32_nt_override("NtSetInformationThread", ovr_set_thread);
     native32_nt_override("NtAdjustPrivilegesToken", ovr_adjust_privs);
     native32_nt_override("NtSetSystemInformation", ovr_NtSetSystemInformation);
+    native32_nt_override("NtQuerySystemInformation", ovr_query_sysinfo);
     native32_nt_override("NtSetDefaultLocale", ovr_NtSetDefaultLocale);
     native32_nt_override("NtSetDefaultUILanguage", ovr_NtSetDefaultUILanguage);
     native32_nt_override("NtShutdownSystem", ovr_NtShutdownSystem);
