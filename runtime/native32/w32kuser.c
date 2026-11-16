@@ -923,6 +923,7 @@ static uint32_t s_set_cursor_data(uint32_t* a) {
  * user32 exports that call them */
 static uint32_t s_call_oneparam(uint32_t* a) {
     if (a[1] == 0x19) return cur_new();
+    if (a[1] == 0x21) return 1;   /* LockSetForegroundWindow: the guest's own, never the host's */
     if (a[1] == 0x16) return (uint32_t)(uintptr_t)BeginDeferWindowPos((int)a[0]);
     /* 0x24 MessageBeep, 0x26 PostQuitMessage, 0x2D ShowCursor, 0x33
      * GetProcessDefaultLayout (param: the DWORD* it fills) */
@@ -1150,6 +1151,8 @@ static uint32_t s_setlong(uint32_t* a) {
 static uint32_t s_hwnd_lock(uint32_t* a) {
     if (a[1] == 0x48) return DrawMenuBar((HWND)(uintptr_t)a[0]);
     if (a[1] == 0x50) return UpdateWindow((HWND)(uintptr_t)a[0]);
+    /* 0x4D SetForegroundWindow: inside the virtual screen it activates the window, never the host's foreground */
+    if (a[1] == 0x4D) { if (!own_window(a[0])) return 0; SetActiveWindow((HWND)(uintptr_t)a[0]); return 1; }
     fprintf(stderr, "[user] NtUserCallHwndLock index 0x%X not answered\n", a[1]);
     return 0;
 }
