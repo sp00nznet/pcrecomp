@@ -51,11 +51,110 @@ static void kb_xlat(CPU *c, UINT from, UINT to) {
 static void kb_ansi_to_oem(CPU *c) { kb_xlat(c, 1252, 437); }
 static void kb_oem_to_ansi(CPU *c) { kb_xlat(c, 437, 1252); }
 
+/* ---- DISPLAY.DRV: a 16-bit DIB framebuffer (pcrecomp's own, no hardware) ----
+ * Entries are the Win 3.1 DDK display ordinals, named from GDI.EXE's call
+ * sites as each is reached. ponytail: 800x600x16 (5-6-5), no palette (RC_PALETTE
+ * off, so no SetPalette/translate traffic); a host window shows g_fb later. */
+#define FB_W 800
+#define FB_H 600
+static uint16_t g_fb[FB_W * FB_H];
+static void put16(char *p, int off, int v) { *(uint16_t *)(p + off) = (uint16_t)v; }
+/* DISPLAY.5 Enable(lpDevice, style, lpDestDevType, lpOutputFile, lpData): GDI seg005_26A4 asks
+ * with style 1 for GDIINFO into a 7Eh-byte block (it keeps its own words from 78h), then
+ * seg005_289F with style 0 for the PDEVICE (dpDEVICEsize bytes it GlobalAllocs). */
+#define PDEV_SIZE 0x20
+static void disp_enable(CPU *c) {
+    char *dev = farptr(argfar(c, 7));
+    uint16_t style = arg16(c, 6);
+    if (style & 1) {
+        memset(dev, 0, 0x6E);
+        put16(dev, 0x00, 0x030A);      /* dpVersion 3.10 */
+        put16(dev, 0x02, 1);           /* DT_RASDISPLAY */
+        put16(dev, 0x04, 208); put16(dev, 0x06, 156);       /* mm */
+        put16(dev, 0x08, FB_W); put16(dev, 0x0A, FB_H);
+        put16(dev, 0x0C, 16); put16(dev, 0x0E, 1);          /* bits/pixel, planes */
+        put16(dev, 0x10, -1); put16(dev, 0x12, 100);         /* brushes, pens */
+        put16(dev, 0x16, 0); put16(dev, 0x18, -1);           /* device fonts, colors (more than 256) */
+        put16(dev, 0x1A, PDEV_SIZE);
+        put16(dev, 0x1C, 0);           /* dpCurves: GDI draws them */
+        put16(dev, 0x1E, 0x0002);      /* dpLines: LC_POLYLINE */
+        put16(dev, 0x20, 0x0008);      /* dpPolygonals: PC_SCANLINE */
+        put16(dev, 0x22, 0x2000);      /* dpText: TC_RA_ABLE (GDI's raster fonts, StrBlt/ExtTextOut) */
+        put16(dev, 0x24, 0x0001);      /* dpClip: CP_RECTANGLE */
+        put16(dev, 0x26, 0x0699);      /* dpRaster: BITBLT|BITMAP64|GDI20_OUTPUT|DI_BITMAP|DIBTODEV|BIGFONT */
+        put16(dev, 0x28, 36); put16(dev, 0x2A, 36); put16(dev, 0x2C, 51); put16(dev, 0x2E, 72);   /* aspect, style len */
+        static const int16_t map[20] = { 2080, 1560, 800, -600,  20800, 15600, 800, -600,   /* MM_LOMETRIC, HIMETRIC */
+                                         819, 614, 800, -600,  8189, 6142, 800, -600,       /* LOENGLISH, HIENGLISH */
+                                         11792, 8844, 800, -600 };                           /* TWIPS */
+        memcpy(dev + 0x30, map, sizeof map);
+        put16(dev, 0x58, 96); put16(dev, 0x5A, 96);          /* LOGPIXELS */
+        put16(dev, 0x5C, 4);           /* dpDCManage: DC_IGNOREDFNP */
+        c->ax = 0x6E;
+    } else {
+        memset(dev, 0, PDEV_SIZE);     /* a BITMAP header, bmType nonzero: the screen */
+        put16(dev, 0x00, 0x2000); put16(dev, 0x02, FB_W); put16(dev, 0x04, FB_H); put16(dev, 0x06, FB_W * 2);
+        dev[0x08] = 1; dev[0x09] = 16;
+        c->ax = 1;
+    }
+    if (getenv("W16_TRACE")) fprintf(stderr, "[drv] DISPLAY.Enable style %u -> %04X\n", style, c->ax);
+    ret_far(c, 18);
+}
+
+/* DISPLAY.3 Control(lpDevice, wFunction, lpInData, lpOutData): escapes (GDI seg005_2AB6
+ * right after Enable). ponytail: none supported, 0 for all (QUERYESCSUPPORT included). */
+static void disp_control(CPU *c) {
+    if (getenv("W16_TRACE")) fprintf(stderr, "[drv] DISPLAY.Control %u -> 0\n", arg16(c, 4));
+    c->ax = 0; c->dx = 0; ret_far(c, 14);
+}
+
+/* DISPLAY.2 ColorInfo(lpDevice, DWORD color, LPDWORD lpPhys) -> dx:ax RGB (GDI seg005_1B99):
+ * with lpPhys, RGB -> the 5-6-5 physical color stored there, and the RGB that shows;
+ * without, physical -> RGB. */
+static uint16_t rgb565(uint32_t rgb) { return (uint16_t)(((rgb & 0xF8) << 8) | ((rgb >> 5) & 0x7E0) | ((rgb >> 19) & 0x1F)); }
+static uint32_t rgb_of(uint16_t p) {
+    uint32_t r = (p >> 11) & 31, g = (p >> 5) & 63, b = p & 31;
+    return (r << 3 | r >> 2) | (g << 2 | g >> 4) << 8 | (b << 3 | b >> 2) << 16;
+}
+static void disp_colorinfo(CPU *c) {
+    uint32_t col = argfar(c, 2), lp = argfar(c, 0), rgb;
+    if (lp) { uint16_t p = rgb565(col); *(uint32_t *)farptr(lp) = p; rgb = rgb_of(p); }
+    else rgb = rgb_of((uint16_t)col);
+    c->ax = (uint16_t)rgb; c->dx = (uint16_t)(rgb >> 16); ret_far(c, 12);
+}
+
+/* DISPLAY.10 RealizeObject(lpDevice, style, lpIn, lpOut, lpTextXForm) (GDI seg005_5263):
+ * lpOut 0 asks the physical size. Pens: {style, width, color}; brushes: {style, hatch,
+ * color, bk, 8x8 pattern}; style < 0 deletes (nothing to free); fonts 0: GDI realizes its
+ * own raster fonts (dpNumFonts 0). ponytail: hatched and pattern brushes fill solid in their color. */
+typedef struct { uint16_t style, width, color, pad; } ppen_t;
+typedef struct { uint16_t style, hatch, color, bk; uint16_t pat[64]; } pbrush_t;
+static void disp_realize(CPU *c) {
+    int16_t style = (int16_t)arg16(c, 6);
+    uint32_t in = argfar(c, 4), out = argfar(c, 2);
+    int sz = style == 1 ? (int)sizeof(ppen_t) : style == 2 ? (int)sizeof(pbrush_t) : 0;
+    if (style > 0 && out && sz) {
+        const uint8_t *li = (const uint8_t *)farptr(in);
+        if (style == 1) {
+            ppen_t *p = (ppen_t *)farptr(out);
+            p->style = *(const uint16_t *)li; p->width = *(const uint16_t *)(li + 2);
+            p->color = rgb565(*(const uint32_t *)(li + 6)); p->pad = 0;
+        } else {
+            pbrush_t *b = (pbrush_t *)farptr(out);
+            b->style = *(const uint16_t *)li; b->color = rgb565(*(const uint32_t *)(li + 2));
+            b->hatch = *(const uint16_t *)(li + 6); b->bk = 0xFFFF;
+            for (int i = 0; i < 64; i++) b->pat[i] = b->color;
+            if (b->style > 1 && getenv("W16_TRACE")) fprintf(stderr, "[drv] DISPLAY brush style %u: solid\n", b->style);
+        }
+    }
+    c->ax = (uint16_t)(style > 0 ? sz : 1); c->dx = 0;
+    ret_far(c, 18);
+}
+
 static drv_t g_drv[] = {
     { "SYSTEM",   { 0 } },
     { "KEYBOARD", { [5] = kb_ansi_to_oem, [6] = kb_oem_to_ansi } },
     { "MOUSE",    { 0 } },
-    { "DISPLAY",  { 0 } },
+    { "DISPLAY",  { [2] = disp_colorinfo, [3] = disp_control, [5] = disp_enable, [10] = disp_realize } },
     { "MMSOUND",  { 0 } },   /* SlowBoot: sound.drv= default; makes no sound */
     { "COMM",     { 0 } },   /* comm.drv=: no ports */
 };

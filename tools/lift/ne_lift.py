@@ -54,7 +54,7 @@ _IDENTITY = os.environ.get('NE_IDENTITY_SEL') == '1'   # Win16 identity mode (ge
 # `push ...; retf` in identity mode: a far jump. Its target's own retf comes
 # back here as a C return, but the 16-bit stack has returned to whichever far
 # call's frame it passed (identity.c w16_unwind throws there).
-_PUSHED_RETF = '{ uint16_t _o = pop16(cpu); uint16_t _s = pop16(cpu); dispatch_far(cpu, _s, _o); w16_unwind(cpu); return; }'
+_PUSHED_RETF = '{ uint16_t _o = pop16(cpu); uint16_t _s = pop16(cpu); w16_jmpf(cpu, _s, _o); return; }'
 _NO_SP = ('mov', 'xor', 'cwd', 'cdq', 'and', 'or', 'sub', 'add', 'lea', 'movzx', 'movsx', 'xchg', 'inc', 'dec', 'neg', 'not')
 
 

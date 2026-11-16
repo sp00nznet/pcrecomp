@@ -612,6 +612,23 @@ void w16_unwind(CPU *c) {
     RaiseException(W16_UNWIND_CODE, 0, 0, NULL);
 }
 
+/* `push seg; push off; retf`. To a lifted function: a far jump, whose own retf
+ * comes back here, then w16_unwind. To no function (a return address in a
+ * call site's middle: GDI's driver wrapper seg5 5FB0 retfs to 5:2941 after the
+ * driver call): a return -- to the far call frame it passed, or as a C return
+ * up a chain of tail calls (an indirect dispatch_far has no frame).
+ * ponytail: the C-return case assumes the frames between are tail calls. */
+void w16_jmpf(CPU *c, uint16_t sel, uint16_t off) {
+    if ((sel & 4) && sel != g_host_sel && recomp_sel_base(sel) && memcmp((const void *)(uintptr_t)recomp_sel_base(sel), "PCRD", 4)) {
+        if (recomp_dispatch_lookup(c, seg_of(sel), off)) { w16_unwind(c); return; }   /* ran it: the far jump */
+        if (getenv("W16_TRACE")) fprintf(stderr, "[w16] retf to %04X:%04X: a return to a call site\n", sel, off);
+        w16_unwind(c);
+        return;
+    }
+    dispatch_far(c, sel, off);
+    w16_unwind(c);
+}
+
 void dispatch_near(CPU *cpu, uint16_t seg, uint16_t off) {   /* seg: the segment index */
     if (!recomp_dispatch_lookup(cpu, seg, off)) w16_stop("near call miss", seg, off);
 }
