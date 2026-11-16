@@ -272,6 +272,9 @@ static void int2f(CPU *c) {
     case 0x168D:   /* es:di into the table KRNL386 hands VWIN32 0Ch (seg001_6B2A, unchecked): kernel32
                     * is the host's already, so nothing reads it: 0:0 */
         c->es = 0; c->di = 0; return;
+    case 0x150B:   /* MSCDEX drive check, cx = drive (KRNL386 seg001_7AD6, kernel32 thunk 0Dh: drive type):
+                    * no MSCDEX (bx stays, not ADADh), no CD-ROM */
+        c->ax = 0; return;
     case 0xFE03:   /* Norton Utilities TSR check (si:di 'CF','NU', CF set; KRNL386 seg001_8436): none, CF stays set */
         return;
     case 0x1687:   /* DPMI present: 32-bit clients, 386, v0.90, no private data, entry es:di */

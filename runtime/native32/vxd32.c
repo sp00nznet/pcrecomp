@@ -396,11 +396,26 @@ static void guest_message_box(void) {
 }
 uint32_t native32_w9x_message_box(void) { return MBOX_TAG; }
 
+/* kernel32's 32->16 slot (0xBFF9AD46) points at a stub in its .data
+ * (0xBFFC9ED0) that rewrites itself on first call (patcher 0xBFF7273F) into
+ * `xor ecx,ecx; mov cl,[ebp-4]; mov edx,[ecx*4+table]; mov eax,0xBFF727D9;
+ * jmp eax`, table = the dword before the stub. Static code can't run the
+ * rewritten bytes, so this is that stub, done once. */
+/* ponytail: Win98 SE kernel32 addresses hardcoded; read them off the patcher if another build shows up */
+static void qt_stub(void) {
+    g_ecx = MEM8(g_ebp - 4);
+    g_edx = MEM32(MEM32(0xBFFC9ECCu) + g_ecx * 4);
+    if (g_trace > 0 || getenv("W16_TRACE")) fprintf(stderr, "[qt] thunk %02X -> %04X:%04X (esp %08X fs %04X)\n", g_ecx, g_edx >> 16, g_edx & 0xFFFF, g_esp, g_seg_fs);
+    g_eax = 0xBFF727D9u;
+    recomp_lookup(0xBFF727D9u)();
+}
+
 /* The host's recomp_lookup_manual forwards here: VWIN32's entries above. */
 recomp_func_t native32_w9x_lookup(uint32_t va) {
     if (va == K386_TAG) return krnl386_thunk;
     if (va == USIG_TAG) return user_signal_proc;
     if (va == MBOX_TAG) return guest_message_box;
+    if (va == 0xBFFC9ED0u) return qt_stub;
     if ((va & 0xFFFF0000u) == R0F_TAG && (va & 0xFFFF) < 4 * 11 && !(va & 3)) return g_r0f[(va & 0xFFFF) / 4];
     return NULL;
 }
@@ -1412,7 +1427,7 @@ uint32_t native32_vwin32_r0_table(void) {
  * selectors (the host's own flat ones) are base 0. */
 static uint8_t g_ldt[0x10000];
 static uint16_t g_ldt_alias;
-uint32_t g_es_base, g_cs_base, g_ds_base, g_ss_base;
+extern uint32_t g_es_base, g_cs_base, g_ds_base, g_ss_base;   /* native32.c (per-thread state) */
 
 /* The alias's own descriptor is in the LDT too, as on Win9x: KRNL386 reads
  * the LDT's base from it (seg001_4E8C on cs:[6]) for kernel32's boot block

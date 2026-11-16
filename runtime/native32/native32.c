@@ -30,6 +30,7 @@ xmm_t     g_xmm[8];
 uint32_t  g_mxcsr = 0x1F80;
 uint32_t  g_fs_base, g_gs_base;
 ptrdiff_t g_mem_base = 0;
+uint32_t g_es_base, g_cs_base, g_ds_base, g_ss_base;   /* Win9x segment bases (vxd32.c sets them) */
 uint32_t  g_cur_func;
 uint32_t  g_icall_trace[ICALL_TRACE_SIZE], g_icall_from[ICALL_TRACE_SIZE];
 uint32_t  g_icall_trace_idx, g_icall_count;
@@ -40,6 +41,10 @@ uint32_t native32_fs_mirror_lo, native32_fs_mirror_hi;
 
 typedef struct {
     uint32_t eax, ecx, edx, esp, ebx, esi, edi, ebp, fs, cur;
+    /* segment state is per thread too: Win9x guests (kernel32's threads,
+     * KRNL386's TIB) each run on their own fs/ss, and a wait switches threads */
+    uint16_t seg[6];
+    uint32_t gs, es_b, cs_b, ds_b, ss_b;
     double   st[8];
     int      fp_top;
     uint16_t fpu_cw;
@@ -52,6 +57,8 @@ static void regs_save(regs_t* r) {
     r->eax = g_eax; r->ecx = g_ecx; r->edx = g_edx; r->esp = g_esp;
     r->ebx = g_ebx; r->esi = g_esi; r->edi = g_edi; r->ebp = g_ebp;
     r->fs = g_fs_base; r->cur = g_cur_func;
+    r->seg[0] = g_seg_cs; r->seg[1] = g_seg_ds; r->seg[2] = g_seg_es; r->seg[3] = g_seg_fs; r->seg[4] = g_seg_gs; r->seg[5] = g_seg_ss;
+    r->gs = g_gs_base; r->es_b = g_es_base; r->cs_b = g_cs_base; r->ds_b = g_ds_base; r->ss_b = g_ss_base;
     memcpy(r->st, g_st, sizeof g_st); r->fp_top = g_fp_top; r->fpu_cw = g_fpu_cw;
     memcpy(r->mm, g_mm, sizeof g_mm);
     memcpy(r->xmm, g_xmm, sizeof g_xmm); r->mxcsr = g_mxcsr;
@@ -61,6 +68,8 @@ static void regs_load(const regs_t* r) {
     g_eax = r->eax; g_ecx = r->ecx; g_edx = r->edx; g_esp = r->esp;
     g_ebx = r->ebx; g_esi = r->esi; g_edi = r->edi; g_ebp = r->ebp;
     g_fs_base = r->fs; g_cur_func = r->cur;
+    g_seg_cs = r->seg[0]; g_seg_ds = r->seg[1]; g_seg_es = r->seg[2]; g_seg_fs = r->seg[3]; g_seg_gs = r->seg[4]; g_seg_ss = r->seg[5];
+    g_gs_base = r->gs; g_es_base = r->es_b; g_cs_base = r->cs_b; g_ds_base = r->ds_b; g_ss_base = r->ss_b;
     memcpy(g_st, r->st, sizeof g_st); g_fp_top = r->fp_top; g_fpu_cw = r->fpu_cw;
     memcpy(g_mm, r->mm, sizeof g_mm);
     memcpy(g_xmm, r->xmm, sizeof g_xmm); g_mxcsr = r->mxcsr;
@@ -203,6 +212,7 @@ void mach_enter(void) {
          * read off the end of it. With 64 bytes of headroom it did, and faulted
          * whenever ASLR left the next page unmapped: the selftest crashed on
          * about two runs in three. */
+        regs_save(&m->r);                 /* selectors as they stood (a new thread used to inherit them) */
         m->r.esp = lo + GUEST_STACK - BRIDGE_SLOTS * 4 - 64;
         m->r.fs = make_tib(lo, lo + GUEST_STACK);
         m->r.fpu_cw = 0x027F;
