@@ -2673,6 +2673,16 @@ static uint32_t s_setscroll(uint32_t* a) {      /* NtUserSetScrollInfo(hwnd, SB_
     if (a[3]) u->ncdirty = 1;
     return (uint32_t)i[3];
 }
+/* NtUserGetThreadState(index): 0 focus, 1 active, 2 capture (Windows 2000's numbering) */
+static uint32_t s_threadstate(uint32_t* a) { return a[0] == 0 ? g_focus : a[0] == 1 ? g_active : a[0] == 2 ? g_capture : 0; }
+/* NtUserGetIconSize(hicon, step, cx*, cy*): cy is both masks' height */
+static uint32_t s_iconsize(uint32_t* a) {
+    uobj_t* c = U(a[0], W2K_TYPE_CURSOR);
+    if (!c) return 0;
+    if (a[2]) MEM32(a[2]) = (uint32_t)(c->icx ? c->icx : 32);
+    if (a[3]) MEM32(a[3]) = (uint32_t)(2 * (c->icy ? c->icy : 32));
+    return 1;
+}
 static uint32_t s_keystate(uint32_t* a) { return a[0] < 256 && g_keys[a[0]] ? 0xFF80u : 0; }
 static uint32_t s_dblclick(uint32_t* a) { (void)a; return 500; }
 static uint32_t s_register_msg(uint32_t* a) { (void)a; static uint32_t n = 0xC100; return n++; }
@@ -3179,7 +3189,7 @@ void w2kx_install(int cx, int cy, const char* fontdir) {
         { "NtUserCallHwndLock", s_hwnd_lock }, { "NtUserCallHwndParam", s_hwnd_param }, { "NtUserCallHwndParamLock", s_hwnd_param_lock },
         { "NtUserSetWindowFNID", s_set_fnid }, { "NtUserDefSetText", s_deftext }, { "NtUserSetScrollInfo", s_setscroll }, { "NtUserQueryWindow", s_query_window }, { "NtUserSetWindowLong", s_setlong },
         { "NtUserSetFocus", s_setfocus }, { "NtUserSetCapture", s_setcapture }, { "NtUserSetActiveWindow", s_setactive },
-        { "NtUserGetForegroundWindow", s_foreground }, { "NtUserGetThreadDesktop", s_threaddesk },
+        { "NtUserGetForegroundWindow", s_foreground }, { "NtUserGetThreadState", s_threadstate }, { "NtUserGetIconSize", s_iconsize }, { "NtUserGetThreadDesktop", s_threaddesk },
         { "NtUserModifyUserStartupInfoFlags", s_one_u }, { "NtUserGetDoubleClickTime", s_dblclick },
         { "NtUserRegisterWindowMessage", s_register_msg }, { "NtUserCreateAcceleratorTable", s_accel },
         { "NtUserTranslateAccelerator", s_translate_accel }, { "NtUserSetWindowsHookEx", s_sethook }, { "NtUserUnhookWindowsHookEx", s_one_u },
