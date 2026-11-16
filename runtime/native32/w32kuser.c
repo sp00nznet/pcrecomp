@@ -390,6 +390,13 @@ static void user_pre(void) {        /* before every win32k service */
         thread_setup();
         /* DESKTOPINFO +8 spwnd: user32's GetDesktopWindow reads it */
         if (g_screen && !*(uint32_t*)(g_deskinfo + 8)) *(uint32_t*)(g_deskinfo + 8) = desktop_wnd();
+        /* +0x50 spwndShell (GetShellWindow, client-side): the screen's shell, also
+         * for a second guest process (explorer started to open a folder hands it
+         * to the running shell instead of becoming one). Never the host's shell. */
+        if (g_screen && !*(uint32_t*)(g_deskinfo + 0x50)) {
+            HWND sh = (HWND)GetPropW(g_screen, L"pcrecomp.shell");
+            if (sh && IsWindow(sh)) *(uint32_t*)(g_deskinfo + 0x50) = (uint32_t)(uintptr_t)native32_user_wnd(sh);
+        }
         wnd_sync_all();
     }
     if (g_prev_pre) g_prev_pre();
@@ -708,6 +715,7 @@ static void shell_bottom(HWND h) {
 static uint32_t s_set_shell(uint32_t* a) {
     if (!own_window(a[0])) return 0;
     shell_bottom(g_shellwnd = (HWND)(uintptr_t)a[0]);
+    if (g_screen) SetPropW(g_screen, L"pcrecomp.shell", g_shellwnd);
     return 1;
 }
 /* a broadcast stays in the guest (ponytail: dropped, not sent to the guest's
@@ -745,7 +753,13 @@ static void shell_post(WPARAM code, HWND h) {
     if (!msg) msg = RegisterWindowMessageW(L"SHELLHOOK");
     if (h && code != HSHELL_WINDOWDESTROYED) native32_user_wnd(h);
    /* the guest's ValidateHwnd (GetWindowText) finds it */
-    if (code != HSHELL_WINDOWACTIVATED) fprintf(stderr, "[user] shell hook %u: %p\n", (unsigned)code, (void*)h);
+    if (code == HSHELL_WINDOWCREATED) {
+        wchar_t cls[64] = L"";
+        RECT r = { 0 };
+        GetClassNameW(h, cls, 64), GetWindowRect(h, &r);
+        fprintf(stderr, "[user] shell hook 1: %p %ls style %08lX (%ld,%ld)-(%ld,%ld)\n", (void*)h, cls,
+                (unsigned long)GetWindowLongW(h, GWL_STYLE), r.left, r.top, r.right, r.bottom);
+    } else if (code != HSHELL_WINDOWACTIVATED) fprintf(stderr, "[user] shell hook %u: %p\n", (unsigned)code, (void*)h);
     PostMessageW(g_shellhook, msg, code, (LPARAM)h);
 }
 /* explorer's own top-level window is a task when captioned and not a tool
@@ -1088,6 +1102,7 @@ static uint32_t s_set_cursor_data(uint32_t* a) {
  * user32 exports that call them */
 static uint32_t s_call_oneparam(uint32_t* a) {
     if (a[1] == 0x19) return cur_new();
+    if (a[1] == 0x18) return 1;   /* AllowSetForegroundWindow(pid): the guest's own, never the host's */
     if (a[1] == 0x21) return 1;   /* LockSetForegroundWindow: the guest's own, never the host's */
     if (a[1] == 0x16) return (uint32_t)(uintptr_t)BeginDeferWindowPos((int)a[0]);
     /* 0x24 MessageBeep, 0x26 PostQuitMessage, 0x2D ShowCursor, 0x33
@@ -1138,6 +1153,15 @@ static uint32_t s_remove_menu(uint32_t* a) {
 }
 static uint32_t s_delete_menu(uint32_t* a) {
     BOOL r = DeleteMenu((HMENU)(uintptr_t)a[0], a[1], a[2]);
+    menu_sync((HMENU)(uintptr_t)a[0]);
+    return r;
+}
+
+/* NtUserSetMenuDefaultItem(hmenu, item, fByPos): GetMenuDefaultItem is
+ * client-side (MFS_DEFAULT in the synced items); unanswered, a context menu
+ * had no default verb and a desktop double-click opened nothing */
+static uint32_t s_menu_default(uint32_t* a) {
+    BOOL r = SetMenuDefaultItem((HMENU)(uintptr_t)a[0], a[1], a[2]);
     menu_sync((HMENU)(uintptr_t)a[0]);
     return r;
 }
@@ -1566,7 +1590,7 @@ void native32_user_install(void) {
         { "NtUserTranslateMessage", s_translate }, { "NtUserDispatchMessage", s_dispatch },
         { "NtUserBeginPaint", s_beginpaint }, { "NtUserGetUpdateRect", s_getupdaterect }, { "NtUserEndPaint", s_endpaint },
         { "NtUserThunkedMenuItemInfo", s_menu_item }, { "NtUserDestroyMenu", s_destroy_menu },
-        { "NtUserRemoveMenu", s_remove_menu }, { "NtUserDeleteMenu", s_delete_menu },
+        { "NtUserRemoveMenu", s_remove_menu }, { "NtUserDeleteMenu", s_delete_menu }, { "NtUserSetMenuDefaultItem", s_menu_default },
         { "NtUserCheckMenuItem", s_check_menu }, { "NtUserEnableMenuItem", s_enable_menu },
         { "NtUserGetMenuItemRect", s_menu_rect }, { "NtUserFindExistingCursorIcon", s_find_icon }, { "NtUserSetCursorIconData", s_set_cursor_data },
         { "NtUserDrawCaptionTemp", s_drawcaptiontemp }, { "NtUserSetWindowsHookEx", s_sethook }, { "NtUserCallNextHookEx", s_nexthook }, { "NtUserUnhookWindowsHookEx", s_unhook },

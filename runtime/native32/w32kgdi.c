@@ -400,6 +400,26 @@ static uint32_t s_dibitmap(uint32_t* a) {
 /* NtGdiGetRegionData(hrgn, count, RGNDATA*). NtGdiGetDeviceWidth stays
  * unanswered (0): answered with HORZRES, gdisol looped in gdi32 */
 static uint32_t s_rgndata(uint32_t* a) { return GetRegionData((HRGN)(uintptr_t)HOST(a[0]), a[1], (RGNDATA*)(uintptr_t)a[2]); }
+/* NtGdiEqualRgn(a, b) */
+static uint32_t s_equalrgn(uint32_t* a) { return EqualRgn((HRGN)(uintptr_t)HOST(a[0]), (HRGN)(uintptr_t)HOST(a[1])); }
+/* NtGdiPolyPolyDraw(hdc or fill mode, POINT*, ULONG* counts, ccounts, fn): 1
+ * PolyPolygon, 2 PolyPolyline, 3 PolyBezier, 4 PolylineTo, 5 PolyBezierTo, 6
+ * CreatePolyPolygonRgn (the first argument its fill mode; a folder window's
+ * band edges) */
+static uint32_t s_polypolydraw(uint32_t* a) {
+    HDC dc = (HDC)(uintptr_t)HOST(a[0]);
+    const POINT* p = (const POINT*)(uintptr_t)a[1];
+    const DWORD* c = (const DWORD*)(uintptr_t)a[2];
+    switch (a[4]) {
+    case 1: { INT n[64]; uint32_t k = a[3] < 64 ? a[3] : 64; for (uint32_t i = 0; i < k; i++) n[i] = (INT)c[i]; return PolyPolygon(dc, p, n, (int)k); }
+    case 2: return PolyPolyline(dc, p, c, a[3]);
+    case 3: return PolyBezier(dc, p, c[0]);
+    case 4: return PolylineTo(dc, p, c[0]);
+    case 5: return PolyBezierTo(dc, p, c[0]);
+    case 6: { INT n[64]; uint32_t k = a[3] < 64 ? a[3] : 64; for (uint32_t i = 0; i < k; i++) n[i] = (INT)c[i]; return GUEST(CreatePolyPolygonRgn(p, n, (int)k, (int)a[0])); }
+    }
+    return 0;
+}
 /* NtGdiCreateDIBSection(hdc, hSection, offset, BITMAPINFO*, usage, cjHeader,
  * fl, colorspace, void** bits): the host's, its bits in this address space.
  * ponytail: a file-mapping section (hSection) is not passed on */
@@ -791,7 +811,7 @@ void native32_gdi_install(void) {
         { "NtGdiCreateCompatibleDC", s_compat_dc }, { "NtGdiCreateCompatibleBitmap", s_compat_bitmap },
         { "NtGdiCreatePen", s_pen }, { "NtGdiCreateRectRgn", s_rectrgn }, { "NtGdiCreateDIBitmapInternal", s_dibitmap }, { "NtGdiCreateBitmap", s_bitmap }, { "NtGdiCreatePatternBrushInternal", s_patbrush }, { "NtGdiCreateDIBSection", s_dibsection },
         { "NtGdiGetDCObject", s_dcobject }, { "NtGdiExcludeClipRect", s_excludeclip },
-        { "NtGdiGetRegionData", s_rgndata }, { "NtGdiGetDCforBitmap", s_dcforbitmap }, { "NtGdiSaveDC", s_savedc }, { "NtGdiRestoreDC", s_restoredc },
+        { "NtGdiGetRegionData", s_rgndata }, { "NtGdiEqualRgn", s_equalrgn }, { "NtGdiPolyPolyDraw", s_polypolydraw }, { "NtGdiGetDCforBitmap", s_dcforbitmap }, { "NtGdiSaveDC", s_savedc }, { "NtGdiRestoreDC", s_restoredc },
         { "NtGdiGetRandomRgn", s_randomrgn }, { "NtGdiIntersectClipRect", s_intersectclip }, { "NtGdiGetAppClipBox", s_appclipbox },
         { "NtGdiSetBoundsRect", s_setbounds }, { "NtGdiGetBoundsRect", s_getbounds }, { "NtGdiRectVisible", s_rectvisible }, { "NtGdiExtSelectClipRgn", s_selectcliprgn }, { "NtGdiCreateSolidBrush", s_brush },
         { "NtGdiSelectBitmap", s_select_bitmap }, { "NtGdiSelectBrush", s_select }, { "NtGdiSelectPen", s_select },

@@ -513,8 +513,11 @@ static uint32_t ovr_create_section(uint32_t* a) {
          * it and its stubs answer failure. ponytail: one name, a list when a
          * second such DLL turns up */
         const wchar_t* leaf = wcsrchr(path, L'\\');
-        if (leaf && !_wcsicmp(leaf + 1, L"mpr.dll")) {
-            fprintf(stderr, "[guard] %ls: host network provider router: not mapped\n", path);
+        /* also the host's device installer (setupapi: cfgmgr32, the real
+         * devices) and link tracking (linkinfo: real volumes and shares),
+         * which shell32 delay-loads for a folder window */
+        if (leaf && (!_wcsicmp(leaf + 1, L"mpr.dll") || !_wcsicmp(leaf + 1, L"setupapi.dll") || !_wcsicmp(leaf + 1, L"linkinfo.dll"))) {
+            fprintf(stderr, "[guard] %ls: host network/device/volume DLL: not mapped\n", path);
             return 0xC0000022u;
         }
         if (host_com_server(path)) {
@@ -836,6 +839,16 @@ static uint32_t ovr_raise_exception(uint32_t* a) {
     }
     fprintf(stderr, "\n[nt] unhandled guest exception %08X at %08X (first chance %u), eip %08X esp %08X\n",
             rec ? MEM32(rec) : 0, rec ? MEM32(rec + 12) : 0, a[2], ctx ? MEM32(ctx + 0xB8) : 0, ctx ? MEM32(ctx + 0xC4) : 0);
+    fprintf(stderr, "  pid %lu thread %lu\n", GetCurrentProcessId(), GetCurrentThreadId());
+    native32_dump_icalls(24);
+    if (ctx) {   /* the raiser's callers: guest code addresses on its stack (return addresses, some stale) */
+        uint32_t sp = MEM32(ctx + 0xC4);
+        fprintf(stderr, "stack code addresses:");
+        for (int i = 0, k = 0; i < 1024 && k < 40; i++)
+            if (!IsBadReadPtr((void*)(uintptr_t)(sp + 4 * i), 4) && native32_in_guest(MEM32(sp + 4 * i)))
+                fprintf(stderr, " %08X", MEM32(sp + 4 * i)), k++;
+        fprintf(stderr, "\n");
+    }
     fflush(NULL);
     TerminateProcess(GetCurrentProcess(), rec ? MEM32(rec) : 1);
     return 0;
