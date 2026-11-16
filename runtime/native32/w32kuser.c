@@ -111,6 +111,7 @@ static int class_ansi(HWND h) { int i = class_index(h); return i >= 0 && g_cls[i
  * host: menus stay) and PrintWindow of it is the whole screen. A runner
  * started by a guest in it gets W2K_SCREEN_HWND and joins the same one. */
 static COLORREF sys_color(int i);
+static LRESULT CALLBACK screen_proc(HWND h, UINT m, WPARAM w, LPARAM l);
 static HWND g_screen;
 static int g_scx, g_scy;
 static RECT g_work;
@@ -120,7 +121,7 @@ static void screen_init(void) {
     if (e && IsWindow((HWND)(uintptr_t)strtoul(e, NULL, 16))) g_screen = (HWND)(uintptr_t)strtoul(e, NULL, 16);
     else if (s && sscanf(s, "%dx%d", &g_scx, &g_scy) == 2 && g_scx > 0 && g_scy > 0) {
         WNDCLASSW wc = { 0 };
-        wc.lpfnWndProc = DefWindowProcW;
+        wc.lpfnWndProc = screen_proc;
         wc.hInstance = GetModuleHandleW(NULL);
         wc.hbrBackground = CreateSolidBrush(sys_color(COLOR_BACKGROUND));
         wc.lpszClassName = L"pcrecomp.screen";
@@ -129,6 +130,7 @@ static void screen_init(void) {
                                    0, 0, g_scx, g_scy, NULL, NULL, wc.hInstance, NULL);
     }
     if (!g_screen) return;
+    if (!e) SetTimer(g_screen, 1, 250, NULL);   /* the screen's owner: shell_poll */
     GetClientRect(g_screen, &r);
     g_scx = r.right, g_scy = r.bottom;
     SetRect(&g_work, 0, 0, g_scx, g_scy);
@@ -521,7 +523,16 @@ static uint32_t msg_call(uint32_t api, uint32_t* msg, uint32_t len, uint32_t m, 
     if (o && olen >= 4) memcpy(out, (void*)(uintptr_t)o, olen < 12 ? olen : 12);
     return o && olen >= 4;
 }
+static HWND g_shellwnd;
+/* the shell window stays the screen's bottom child whatever moves it: a click
+ * activates it (a host child without WS_CHILD), and activation raised it over
+ * the taskbar and every program (the desktop then showed icons only) */
+static void shell_pin(HWND h, UINT m, LPARAM l) {
+    if (m == WM_WINDOWPOSCHANGING && h && h == g_shellwnd && l && !(((WINDOWPOS*)l)->flags & SWP_NOZORDER))
+        ((WINDOWPOS*)l)->hwndInsertAfter = HWND_BOTTOM;
+}
 static LRESULT CALLBACK wnd_thunk(HWND h, UINT m, WPARAM w, LPARAM l) {
+    shell_pin(h, m, l);
     uint8_t* pw = native32_user_wnd(h);
     uint32_t pfn = pw ? *(uint32_t*)(pw + 0x5C) : 0, args[4] = { (uint32_t)(uintptr_t)h, m, (uint32_t)w, (uint32_t)l };
     uint32_t teb, oh, op, rep[3] = { 0, 0, 0 };
@@ -588,27 +599,51 @@ static LRESULT CALLBACK wnd_thunk(HWND h, UINT m, WPARAM w, LPARAM l) {
      * (calc's owner-drawn buttons: DrawEdge's PatBlts are batched) */
     if (native32_win32k_pre) native32_win32k_pre();
     if (native32_cb_out) native32_cb_out(args, &rep[0]);
+    shell_pin(h, m, l);
     return (LRESULT)rep[0];
 }
 
+/* A top-level frame: Windows 2000 sizes it with its own borders (one
+ * SM_CXBORDER each for WS_EX_WINDOWEDGE x2 and a caption or modal frame,
+ * GetWindowBorders); the host's frame is thicker (padded borders). The client
+ * area is what the guest meant, so the difference goes on each side: at
+ * creation and at every later size of a window of the virtual screen
+ * (winmine sizes itself after creation and was clipped by 10 px). */
+static int frame_pad(uint32_t style, uint32_t ex) {
+    int b = (ex & WS_EX_WINDOWEDGE) ? 2 : (ex & WS_EX_STATICEDGE) ? 1 : 0;
+    RECT r = { 0, 0, 0, 0 };
+    if (style & WS_CHILD) return 0;
+    if ((style & WS_CAPTION) || (ex & WS_EX_DLGMODALFRAME)) b++;
+    if (style & WS_THICKFRAME) { UINT g = 1; SystemParametersInfoW(SPI_GETBORDER, 0, &g, 0); b += g; }
+    if (ex & WS_EX_CLIENTEDGE) b += 2;
+    b *= GetSystemMetrics(SM_CXBORDER);
+    AdjustWindowRectEx(&r, style, FALSE, ex);
+    return -r.left > b ? -r.left - b : 0;
+}
+static int screen_pad(HWND h) {
+    /* a captioned window only: the tray (a thick frame) and the BaseBar keep their sizes */
+    return g_screen && GetAncestor(h, GA_PARENT) == g_screen && (GetWindowLongW(h, GWL_STYLE) & WS_CAPTION) == WS_CAPTION
+        ? frame_pad((uint32_t)GetWindowLongW(h, GWL_STYLE), (uint32_t)GetWindowLongW(h, GWL_EXSTYLE)) : 0;
+}
+/* A window made top-level then put on the screen keeps the frame DWM drew for
+ * it, so nobody painted its caption (winmine, the Run dialog: blank). DWM's
+ * frame off, the classic (Windows 2000) caption and borders. */
+static void screen_frame(HWND h) {
+    typedef HRESULT (WINAPI *dwmset_t)(HWND, DWORD, LPCVOID, DWORD);
+    typedef HRESULT (WINAPI *settheme_t)(HWND, LPCWSTR, LPCWSTR);
+    static dwmset_t dwmset; static settheme_t settheme;
+    DWORD off = 1;   /* DWMNCRP_DISABLED */
+    if (!dwmset) dwmset = (dwmset_t)GetProcAddress(LoadLibraryW(L"dwmapi.dll"), "DwmSetWindowAttribute");
+    if (!settheme) settheme = (settheme_t)GetProcAddress(LoadLibraryW(L"uxtheme.dll"), "SetWindowTheme");
+    if (dwmset) dwmset(h, 2 /* DWMWA_NCRENDERING_POLICY */, &off, sizeof off);
+    if (settheme) settheme(h, L"", L"");
+    SetWindowPos(h, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+}
 /* NtUserCreateWindowEx(exstyle, LARGE_STRING* class, LARGE_STRING* name, style,
  * x, y, cx, cy, parent, menu, hInstance, lpParam, flags) */
 static uint32_t s_create_window(uint32_t* a) {
-    /* A top-level frame: Windows 2000 sized it with its own borders (one
-     * SM_CXBORDER each for WS_EX_WINDOWEDGE x2 and a caption or modal frame,
-     * GetWindowBorders); the host's frame is thicker (padded borders). The
-     * client area is what the guest meant, so the difference goes on. */
-    int cx = (int)a[6], cy = (int)a[7];
-    if (a[4] != CW_USEDEFAULT && !(a[3] & WS_CHILD) && cx > 0 && cy > 0 && cx != CW_USEDEFAULT) {
-        int b = (a[0] & WS_EX_WINDOWEDGE) ? 2 : (a[0] & WS_EX_STATICEDGE) ? 1 : 0;
-        RECT r = { 0, 0, 0, 0 };
-        if ((a[3] & WS_CAPTION) || (a[0] & WS_EX_DLGMODALFRAME)) b++;
-        if (a[3] & WS_THICKFRAME) { UINT g = 1; SystemParametersInfoW(SPI_GETBORDER, 0, &g, 0); b += g; }
-        if (a[0] & WS_EX_CLIENTEDGE) b += 2;
-        b *= GetSystemMetrics(SM_CXBORDER);
-        AdjustWindowRectEx(&r, a[3], FALSE, a[0]);
-        if (-r.left > b) { cx += 2 * (-r.left - b); cy += 2 * (-r.left - b); }
-    }
+    int cx = (int)a[6], cy = (int)a[7], p = frame_pad(a[3], a[0]);
+    if (a[4] != CW_USEDEFAULT && cx > 0 && cy > 0 && cx != CW_USEDEFAULT) cx += 2 * p, cy += 2 * p;
     /* The guest's own class, under the instance it was registered with: win32k
      * finds a DLL's local class with no instance (ole32's OleMainThreadWndClass)
      * and a guest DLL's global class from any instance (comctl32's controls,
@@ -628,7 +663,10 @@ static uint32_t s_create_window(uint32_t* a) {
                              (HWND)(uintptr_t)a[8], (HMENU)(uintptr_t)a[9], (HINSTANCE)(uintptr_t)a[10],
                              (void*)(uintptr_t)a[11]);
     if (!h) fprintf(stderr, "[user] CreateWindowExW %08X %ls failed: %lu (style %08X ex %08X parent %08X menu %08X inst %08X)\n", a[1], (uintptr_t)lstr_name(a[1]) < 0x10000 ? L"(atom)" : lstr_name(a[1]), GetLastError(), a[3], a[0], a[8], a[9], a[10]);
-    if (h && g_screen && !(a[3] & WS_CHILD)) SetParent(h, g_screen);   /* a top-level window: on the screen */
+    if (h && g_screen && !(a[3] & WS_CHILD)) {   /* a top-level window: on the screen */
+        SetParent(h, g_screen);
+        if ((a[3] & WS_CAPTION) == WS_CAPTION) screen_frame(h);
+    }
     /* a window of a host class (a dialog's #32770) never calls the guest
      * while it is made, so its WND is entered here */
     if (h) native32_user_wnd(h);
@@ -658,7 +696,6 @@ static int own_window(uint32_t h) {
 /* SetShellWindowEx: win32k keeps the shell window (explorer's desktop) under
  * every other; inside the virtual screen that is its bottom child, here and
  * whenever it is shown (else it covered the taskbar) */
-static HWND g_shellwnd;
 static void shell_bottom(HWND h) {
     if (h && h == g_shellwnd) SetWindowPos(h, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
@@ -672,11 +709,93 @@ static uint32_t s_set_shell(uint32_t* a) {
 static uint32_t s_send_notify(uint32_t* a) {
     return own_window(a[0]) ? SendNotifyMessageW((HWND)(uintptr_t)a[0], a[1], a[2], a[3]) : 1;
 }
-static uint32_t s_post_thread(uint32_t* a) {
-    HANDLE t = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, a[0]);
+static int own_thread(uint32_t tid) {
+    HANDLE t = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
     DWORD pid = t ? GetProcessIdOfThread(t) : 0;
     if (t) CloseHandle(t);
-    return pid == GetCurrentProcessId() ? PostThreadMessageW(a[0], a[1], a[2], a[3]) : 0;
+    return pid == GetCurrentProcessId();
+}
+static uint32_t s_post_thread(uint32_t* a) {
+    return own_thread(a[0]) ? PostThreadMessageW(a[0], a[1], a[2], a[3]) : 0;
+}
+/* NtUserAttachThreadInput(idAttach, idAttachTo, fAttach): this process's threads only */
+static uint32_t s_attach_input(uint32_t* a) {
+    return own_thread(a[0]) && own_thread(a[1]) && AttachThreadInput(a[0], a[1], (BOOL)a[2]);
+}
+/* The shell hook, inside the virtual screen only (never the host's
+ * RegisterShellHookWindow): win32k tells explorer's tray of top-level windows
+ * with a posted "SHELLHOOK" message (HSHELL_WINDOWCREATED 1, DESTROYED 2,
+ * ACTIVATED 4). The screen's other programs (a runner explorer started) are
+ * other processes, so the screen polls its children (a timer, 250 ms): a
+ * visible, unowned window of another process is a task. ponytail: explorer's
+ * own top-level windows (a folder window) are not reported; add them with a
+ * caption test when explorer opens one */
+#define MAX_TASKS 64
+static HWND g_shellhook, g_tasks[MAX_TASKS], g_task_top;
+static int g_ntasks;
+static void shell_post(WPARAM code, HWND h) {
+    static UINT msg;
+    if (!msg) msg = RegisterWindowMessageW(L"SHELLHOOK");
+    if (h && code != HSHELL_WINDOWDESTROYED) native32_user_wnd(h);
+   /* the guest's ValidateHwnd (GetWindowText) finds it */
+    if (code != HSHELL_WINDOWACTIVATED) fprintf(stderr, "[user] shell hook %u: %p\n", (unsigned)code, (void*)h);
+    PostMessageW(g_shellhook, msg, code, (LPARAM)h);
+}
+static void shell_poll(void) {
+    HWND now[MAX_TASKS], top = NULL;
+    int n = 0;
+    if (!g_shellhook || !IsWindow(g_shellhook)) return;
+    for (HWND c = GetWindow(g_screen, GW_CHILD); c && n < MAX_TASKS; c = GetWindow(c, GW_HWNDNEXT))
+        if (IsWindowVisible(c) && !GetWindow(c, GW_OWNER) && !own_window((uint32_t)(uintptr_t)c)) {
+            if (!top) top = c;
+            now[n++] = c;
+        }
+    for (int i = 0; i < n; i++) {
+        int k = 0;
+        while (k < g_ntasks && g_tasks[k] != now[i]) k++;
+        if (k == g_ntasks) shell_post(HSHELL_WINDOWCREATED, now[i]);
+    }
+    for (int k = 0; k < g_ntasks; k++) {
+        int i = 0;
+        while (i < n && now[i] != g_tasks[k]) i++;
+        if (i == n) shell_post(HSHELL_WINDOWDESTROYED, g_tasks[k]);
+    }
+    if (top != g_task_top) shell_post(HSHELL_WINDOWACTIVATED, top);
+    memcpy(g_tasks, now, n * sizeof *now), g_ntasks = n, g_task_top = top;
+}
+static LRESULT CALLBACK screen_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_TIMER && w == 1) { shell_poll(); return 0; }
+    return DefWindowProcW(h, m, w, l);
+}
+/* NtUserCallHwnd(hwnd, index): 0x3C RegisterShellHookWindow, 0x39 Deregister */
+static uint32_t s_callhwnd(uint32_t* a) {
+    if (a[1] == 0x3C && own_window(a[0])) { g_shellhook = (HWND)(uintptr_t)a[0]; g_ntasks = 0; g_task_top = NULL; return 1; }
+    if (a[1] == 0x39) { if (g_shellhook == (HWND)(uintptr_t)a[0]) g_shellhook = NULL; return 1; }
+    fprintf(stderr, "[user] NtUserCallHwnd index 0x%X not answered\n", a[1]);
+    return 0;
+}
+/* NtUserInternalGetWindowText(hwnd, buf, cch): the host's (no message: the
+ * taskbar reads another program's title with it) */
+static uint32_t s_internal_text(uint32_t* a) {
+    return (uint32_t)InternalGetWindowText((HWND)(uintptr_t)a[0], (LPWSTR)(uintptr_t)a[1], (int)a[2]);
+}
+/* NtUserGetClassName(hwnd, bReal, UNICODE_STRING* out): the host's name into
+ * out's buffer (MaximumLength bytes); characters copied. The taskbar asks it
+ * of each window the shell hook names. ponytail: bReal (the base class of a
+ * superclass) not told apart */
+static uint32_t s_classname(uint32_t* a) {
+    int n;
+    if (!a[2] || !MEM32(a[2] + 4) || MEM16(a[2] + 2) < 2) return 0;
+    n = GetClassNameW((HWND)(uintptr_t)a[0], (LPWSTR)(uintptr_t)MEM32(a[2] + 4), MEM16(a[2] + 2) / 2);
+    MEM16(a[2]) = (uint16_t)(n * 2);
+    return (uint32_t)n;
+}
+/* NtUserCallHwndOpt(hwnd, index): 0x3E SetProgmanWindow, 0x3F SetTaskmanWindow:
+ * the screen's, never the host's (nothing reads them back yet) */
+static uint32_t s_callhwnd_opt(uint32_t* a) {
+    if (a[1] == 0x3E || a[1] == 0x3F) return 1;
+    fprintf(stderr, "[user] NtUserCallHwndOpt index 0x%X not answered\n", a[1]);
+    return 0;
 }
 /* SetWindowRgn: the system owns the region it is given, so the host gets a copy */
 static uint32_t s_setrgn(uint32_t* a) {
@@ -1139,6 +1258,7 @@ static uint32_t s_setpos(uint32_t* a) {
      * child): the top of the screen's children (the Start menu's BaseBar) */
     if (g_screen && (a[1] == (uint32_t)-1 || a[1] == (uint32_t)-2) && GetAncestor((HWND)(uintptr_t)a[0], GA_PARENT) == g_screen)
         a[1] = a[1] == (uint32_t)-1 ? 0 : 1, a[6] |= a[1] ? SWP_NOZORDER : 0;
+    if (!(a[6] & SWP_NOSIZE)) { int p = screen_pad((HWND)(uintptr_t)a[0]); a[4] += 2 * p, a[5] += 2 * p; }
     BOOL r = SetWindowPos((HWND)(uintptr_t)a[0], (HWND)(uintptr_t)a[1], (int)a[2], (int)a[3], (int)a[4], (int)a[5], a[6]);
     return r;
 }
@@ -1205,8 +1325,14 @@ static uint32_t s_setlong(uint32_t* a) {
 static uint32_t s_hwnd_lock(uint32_t* a) {
     if (a[1] == 0x48) return DrawMenuBar((HWND)(uintptr_t)a[0]);
     if (a[1] == 0x50) return UpdateWindow((HWND)(uintptr_t)a[0]);
-    /* 0x4D SetForegroundWindow: inside the virtual screen it activates the window, never the host's foreground */
+    /* 0x4D SetForegroundWindow: inside the virtual screen it activates the window, never the host's foreground
+     * (another program on the screen, as a taskbar button raises it: the top of the screen) */
+    if (a[1] == 0x4D && g_screen && !own_window(a[0]) && GetAncestor((HWND)(uintptr_t)a[0], GA_PARENT) == g_screen)
+        return SetWindowPos((HWND)(uintptr_t)a[0], HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     if (a[1] == 0x4D) { if (!own_window(a[0])) return 0; SetActiveWindow((HWND)(uintptr_t)a[0]); return 1; }
+    /* 0x4C: a new dialog with WS_SYSMENU and no size/min/max box has its
+     * system menu trimmed (user32's dialog creation); the host made its own */
+    if (a[1] == 0x4C) return 1;
     fprintf(stderr, "[user] NtUserCallHwndLock index 0x%X not answered\n", a[1]);
     return 0;
 }
@@ -1233,7 +1359,8 @@ static uint32_t s_sethook(uint32_t* a) {
 /* NtUserDrawCaptionTemp(hwnd, hdc, RECT*, hfont, hicon, UNICODE_STRING* text,
  * flags): the host's DrawCaptionTempW. explorer draws the Start button's logo
  * and "Start" with it (DC_INBUTTON | DC_ICON | DC_TEXT) into the button's
- * bitmap; unanswered, the bitmap stayed black. */
+ * bitmap; unanswered, the bitmap stayed black. A string with no buffer is
+ * the window's own title (the taskbar's buttons: winmine's had none). */
 static uint32_t s_drawcaptiontemp(uint32_t* a) {
     typedef BOOL (WINAPI *dct_t)(HWND, HDC, const RECT*, HFONT, HICON, LPCWSTR, UINT);
     static dct_t dct;
@@ -1242,7 +1369,7 @@ static uint32_t s_drawcaptiontemp(uint32_t* a) {
     if (!dct) dct = (dct_t)GetProcAddress(GetModuleHandleA("user32.dll"), "DrawCaptionTempW");
     if (a[5] && MEM32(a[5] + 4)) wcsncpy(text, (const wchar_t*)(uintptr_t)MEM32(a[5] + 4), min(MEM16(a[5]) / 2, 255));
     return dct && dct((HWND)(uintptr_t)a[0], (HDC)(uintptr_t)(dc ? dc : a[1]), (const RECT*)(uintptr_t)a[2],
-                      (HFONT)(uintptr_t)(f ? f : a[3]), (HICON)(uintptr_t)cur_host(a[4]), a[5] ? text : NULL, a[6]);
+                      (HFONT)(uintptr_t)(f ? f : a[3]), (HICON)(uintptr_t)cur_host(a[4]), a[5] && MEM32(a[5] + 4) ? text : NULL, a[6]);
 }
 /* NtUserCallNextHookEx(nCode, wParam, lParam, bAnsi) */
 static uint32_t s_nexthook(uint32_t* a) { return (uint32_t)CallNextHookEx(NULL, (int)a[0], a[1], a[2]); }
@@ -1361,7 +1488,11 @@ static uint32_t s_waitmessage(uint32_t* a) { (void)a; return WaitMessage(); }
 
 #define HW(x) ((HWND)(uintptr_t)(x))
 static uint32_t s_thread_state(uint32_t* a) { return a[0] == 0x11 ? 1 : 0; }
-static uint32_t s_move(uint32_t* a) { return MoveWindow(HW(a[0]), (int)a[1], (int)a[2], (int)a[3], (int)a[4], a[5]); }
+/* ponytail: a guest that resizes from its own GetWindowRect grows by the pad each time; none on the screen does yet */
+static uint32_t s_move(uint32_t* a) {
+    int p = screen_pad(HW(a[0]));
+    return MoveWindow(HW(a[0]), (int)a[1], (int)a[2], (int)a[3] + 2 * p, (int)a[4] + 2 * p, a[5]);
+}
 static uint32_t s_setmenu(uint32_t* a) { return SetMenu(HW(a[0]), (HMENU)(uintptr_t)a[1]); }
 static uint32_t s_invalidate(uint32_t* a) { return InvalidateRect(HW(a[0]), (RECT*)(uintptr_t)a[1], a[2]); }
 /* NtUserRedrawWindow(hwnd, rect*, hrgn, flags): explorer's desktop asks
@@ -1450,6 +1581,11 @@ void native32_user_install(void) {
     native32_nt_win32k_override("NtUserSetShellWindowEx", s_set_shell);
     native32_nt_win32k_override("NtUserSendNotifyMessage", s_send_notify);
     native32_nt_win32k_override("NtUserPostThreadMessage", s_post_thread);
+    native32_nt_win32k_override("NtUserCallHwnd", s_callhwnd);
+    native32_nt_win32k_override("NtUserCallHwndOpt", s_callhwnd_opt);
+    native32_nt_win32k_override("NtUserInternalGetWindowText", s_internal_text);
+    native32_nt_win32k_override("NtUserGetClassName", s_classname);
+    native32_nt_win32k_override("NtUserAttachThreadInput", s_attach_input);
     native32_nt_win32k_override("NtUserSetWindowRgn", s_setrgn);
     native32_nt_win32k_override("NtUserEnumDisplayMonitors", s_enum_monitors);
     native32_nt_win32k_override("NtUserGetDoubleClickTime", s_dblclick);
