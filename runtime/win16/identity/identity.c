@@ -40,6 +40,13 @@ void recomp_fn_hit(const char *n) {   /* g_fncount: W16_FN=1 (with fs when it ch
     static uint16_t fs;
     static int sp = -1;
     if (sp < 0) { const char *e = getenv("W16_FN"); sp = e && *e == '2'; }
+    if (g_watch_ds) {   /* W16_WSEL=sel: say which function first sees sel's LDT descriptor change */
+        extern uint8_t* native32_w9x_desc(uint16_t);
+        static uint32_t last[2];
+        uint32_t *d = (uint32_t*)native32_w9x_desc(g_wsel);
+        if (d[0] != last[0] || d[1] != last[1]) { last[0] = d[0]; last[1] = d[1]; fprintf(stderr, "WATCH %04X = %08X %08X at %s\n", g_wsel, d[0], d[1], n); }
+        if (!g_fncount) return;
+    }
     if (sp) fprintf(stderr, "FN %s ss:sp %04X:%04X bp %04X\n", n, g_w16.ss, g_w16.sp, g_w16.bp);
     else if (g_w16.fs != fs) { fs = g_w16.fs; fprintf(stderr, "FN %s fs=%04X\n", n, fs); }
     else fprintf(stderr, "FN %s\n", n);
@@ -255,6 +262,18 @@ static void host_far(CPU *c, uint16_t off) {
                   * DGROUP:12EC, USER's LibEntry one at es:[0FAEh] and fails on 0. A host event;
                   * ponytail: auto-reset, unsignaled (Set/Wait come as their own functions when called) */
         c->eax = (uint32_t)(uintptr_t)CreateEventA(NULL, FALSE, FALSE, NULL); ok(c); return;
+    case 0x05:   /* KERNEL.443 VWIN32_EventDestroy (seg001_78AB): ebx = the event */
+        CloseHandle((HANDLE)(uintptr_t)c->ebx); ok(c); return;
+    case 0x06: {   /* KERNEL.450 VWIN32_EventWait (seg001_78C7): ebx = the event; blocks, the
+                    * machine given up meanwhile (a thread created for USER's init waits here).
+                    * ponytail: al (27h) not read */
+        uint32_t native32_w9x_wait(void *h, uint32_t ms);
+        CPU sv = *c;
+        native32_w9x_wait((void *)(uintptr_t)c->ebx, INFINITE);
+        *c = sv; ok(c); return;
+    }
+    case 0x07:   /* KERNEL.451 VWIN32_EventSet (seg001_78E3) and 479 (seg001_7903): ebx = the event */
+        SetEvent((HANDLE)(uintptr_t)c->ebx); ok(c); return;
     case 0x0C:   /* KRNL386 registers with VWIN32 once kernel32 is up (seg001_6F7B): es = its code,
                   * bx/cx/dx/di/bp entry offsets in it (8D71, 0ACE, 0C2B, 7C44, 7CAA), esi =
                   * DGROUP:1338. eax comes back and goes (seg001_53FF) into the table at
@@ -367,7 +386,10 @@ void dos_int21(CPU *c) {
     case 0x02: fputc(c->dl, stderr); return;                  /* write a character (KRNL386's messages) */
     case 0x47:   /* current directory of drive dl at ds:si, no drive or leading '\': the root */
         *(char *)(uintptr_t)(recomp_sel_base(c->ds) + c->si) = 0; ok(c); return;
-    case 0x50: ok(c); return;                                 /* set PSP */
+    case 0x50: {   /* set PSP: the parent int 21h 55h copies (KRNL386 seg2 4956 sets it around 55h) */
+        void native32_w9x_set_psp(uint16_t sel);
+        native32_w9x_set_psp(c->bx); ok(c); return;
+    }
     case 0x06:   /* direct console I/O; DL FFh reads without waiting: no console, no key (ZF set, AL 0). KRNL386 seg1 80D9 drains it at boot */
         if (c->dl == 0xFF) { c->al = 0; c->flags |= FLAG_ZF; }
         ok(c); return;
@@ -379,7 +401,8 @@ void dos_int21(CPU *c) {
     uint32_t in_dx = recomp_sel_base(c->ds) + c->dx, in_si = recomp_sel_base(c->ds) + c->si,
              in_di = recomp_sel_base(c->es) + c->di, in_bx = c->bx, in_cx = c->cx;
     /* cx is a count and dx a value, not ds:dx, for seek (42h cx:dx), ioctl (44h) and file times (57h) */
-    if (c->ah == 0x42 || c->ah == 0x44 || c->ah == 0x57) in_dx = c->dx;
+    /* (and 55h's dx is the new PSP's selector) */
+    if (c->ah == 0x42 || c->ah == 0x44 || c->ah == 0x57 || c->ah == 0x55) in_dx = c->dx;
     g_ebx = in_bx; g_ecx = in_cx; g_edx = in_dx; g_esi = in_si; g_edi = in_di;
     int cf = native32_w9x_int21(c->ax, in_cx);
     c->ax = (uint16_t)g_eax;
@@ -853,6 +876,7 @@ int w16_call(CPU *r) {
     CPU saved = g_w16;
     g_w16 = *r; g_w16.mem = NULL;
     if (getenv("W16_FN")) g_fncount = 1;
+    if (getenv("W16_WSEL")) { g_watch_ds = 1; g_wsel = (uint16_t)strtoul(getenv("W16_WSEL"), 0, 16); }   /* a descriptor watch (recomp_fn_hit) */
     push16(&g_w16, 0); push16(&g_w16, 0);
     int okc = w16_entry(&g_w16, (uint16_t)(r->cs >> 3), r->ip);
     *r = g_w16;

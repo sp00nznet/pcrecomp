@@ -519,6 +519,12 @@ static uint32_t vmm_heap_alloc(const uint32_t* a) {
 /* VMM service 10h (block, flags): _HeapFree of a service-5 block
  * (0xBFF7CF3B frees kernel32's ring-0 allocations through it). */
 static uint32_t vmm_heap_free(const uint32_t* a) { return a[0] ? HeapFree(vmm_heap(), 0, (void*)(uintptr_t)a[0]) : 1; }
+/* VMM service 0Ch (block, nbytes, flags): _HeapReAllocate of a service-5 block
+ * (a process's handle table at PDB+44h grows through it, 0xBFF7D7B0). */
+static uint32_t vmm_heap_realloc(const uint32_t* a) {
+    if (!a[0]) return vmm_heap_alloc(a + 1);
+    return (uint32_t)(uintptr_t)HeapReAlloc(vmm_heap(), (a[2] & 1) ? HEAP_ZERO_MEMORY : 0, (void*)(uintptr_t)a[0], a[1] ? a[1] : 1);
+}
 
 /* VMM service 6, no arguments: a new memory context, kept in the process
  * database at +1C (beside +24, the PSP's linear address). Every guest
@@ -554,6 +560,7 @@ static uint32_t vwin32_set_priorities(const uint32_t* a) { (void)a; return 0; }
 #define R0T_THREAD 0x28
 #define R0T_PROCESS 0x38
 #define R0T_TDBX   0x3C
+#define R0T_SS     0x54      /* the stack selector of esp (a[6]) */
 static void track_thread(uint32_t r0);
 /* A TDBX: +0 its thread, +4 its process (ExitProcess reads it, 0xBFF89768),
  * +50 -> the current PSP selector. */
@@ -569,11 +576,12 @@ static uint32_t vwin32_create_thread(const uint32_t* a) {
     track_thread((uint32_t)(uintptr_t)r0);
     *(uint32_t*)(r0 + R0T_ENTRY) = a[5];
     *(uint32_t*)(r0 + R0T_ESP) = a[7];
+    *(uint32_t*)(r0 + R0T_SS) = a[6];
     *(uint32_t*)(r0 + R0T_THREAD) = a[0];
     MEM32(a[8]) = new_tdbx(a[0], a[1]);
     *(uint32_t*)(r0 + R0T_PROCESS) = a[1];
     *(uint32_t*)(r0 + R0T_TDBX) = MEM32(a[8]);
-    if (g_trace > 0) fprintf(stderr, "[vxd] new thread %08X: entry %08X esp %08X\n", a[0], a[5], a[7]);
+    if (g_trace > 0) fprintf(stderr, "[vxd] new thread %08X: entry %04X:%08X esp %04X:%08X\n", a[0], a[4], a[5], a[6], a[7]);
     return (uint32_t)(uintptr_t)r0;
 }
 
@@ -611,6 +619,9 @@ static DWORD w9x_wait(HANDLE h, DWORD ms) {
     return rc;
 }
 
+/* A blocking wait from 16-bit code (VWIN32_EventWait): the machine is given up meanwhile. */
+uint32_t native32_w9x_wait(void* h, uint32_t ms) { return w9x_wait((HANDLE)h, ms); }
+
 /* Whichever guest thread takes the machine (a back-edge hand-over as much as
  * a wait coming back) is VWIN32's current one. */
 static void w9x_on_enter(void) {
@@ -623,6 +634,7 @@ static DWORD WINAPI guest_thread(LPVOID p) {
     mach_enter();
     g_cur[0] = MEM32(t_r0 + R0T_THREAD); g_cur[1] = MEM32(t_r0 + R0T_PROCESS); g_cur[2] = MEM32(t_r0 + R0T_TDBX);
     g_esp = MEM32(t_r0 + R0T_ESP);
+    recomp_set_seg(2, MEM32(t_r0 + R0T_SS));   /* a host thread starts with ss 0: 16-bit code would take esp as a 16-bit sp */
     recomp_func_t f = recomp_lookup(MEM32(t_r0 + R0T_ENTRY));
     if (f) {
         f();
@@ -731,7 +743,7 @@ static uint32_t vwin32_link_thread(const uint32_t* a) { (void)a; return 0; }
  * ponytail: ecx (0 or F01h) is not read; every switch blocks the caller
  * until woken, which the callers' loops re-check. */
 void native32_w9x_switch_to(uint32_t r0) {
-    if (g_trace > 0) fprintf(stderr, "[vxd] switch from %08X to r0 %08X (thread %08X)\n", g_cur[0], r0, r0 ? MEM32(r0 + R0T_THREAD) : 0);
+    if (g_trace > 0) fprintf(stderr, "[vxd] switch from %08X to r0 %08X (thread %08X; this r0 %08X)\n", g_cur[0], r0, r0 ? MEM32(r0 + R0T_THREAD) : 0, t_r0 ? t_r0 : g_boot_r0);
     if (!r0 || r0 == (t_r0 ? t_r0 : g_boot_r0)) return;   /* to itself: nothing to switch */
     {
         if (!MEM32(r0 + R0T_PARKED)) { MEM32(r0 + R0T_READY) = 1; start_thread(r0); }
@@ -911,6 +923,14 @@ static uint32_t vwin32_release_58(const uint32_t* a) { (void)a; return 0; }
  * nothing. ponytail: name it when a caller reads the result. */
 static uint32_t vmm_20_release(const uint32_t* a) { (void)a; return 0; }
 
+/* VMM 1F (r0 thread, 35h): kernel32's service thread (proc 0xBFF91AC5),
+ * once per turn of its loop (0xBFF91B94, after its work in 0xBFF8502C),
+ * on itself: it sleeps there until there is more work. ponytail: blocks on
+ * the thread's wake event (nothing sets it; the loop's work, Ctrl+Alt+Del
+ * and process clean-up, has no host source yet); 35h not read. */
+static HANDLE thread_wake(void);
+static uint32_t vmm_1f_sleep(const uint32_t* a) { (void)a; w9x_wait(thread_wake(), INFINITE); return 0; }
+
 /* VWIN32 2B (): the calling thread is done (the end of ExitThread/
  * ExitProcess, 0xBFF89EBE, looping if it ever came back). Its host thread
  * gives the machine up for good. ponytail: it stays parked, not ended, so
@@ -942,6 +962,8 @@ static uint32_t vwin32_13(const uint32_t* a) { (void)a; return 0; }
  * (0xBFF91B3D) hands it its Ctrl+Alt+Del ("close program") callback. The
  * host has no such key path: ponytail: kept nowhere, 0. */
 static uint32_t reboot_0(const uint32_t* a) { (void)a; return 0; }
+/* REBOOT 1 (0, 0): right after 0, before the thread's own loop (0xBFF91B44);
+ * the result is not read. ponytail: no-op (no Ctrl+Alt+Del path to arm). */
 
 static uint32_t vwin32_set_thread_priority(const uint32_t* a) {
     if (a[0]) MEM32(a[0] + R0T_PRIORITY) = a[1];
@@ -1029,6 +1051,7 @@ static uint32_t nls_block(void) {
 }
 
 uint16_t g_w9x_psp_sel;            /* the host's boot PSP (k32host sets it) */
+void native32_w9x_set_psp(uint16_t sel) { g_cur_psp = sel; }   /* int 21h 50h from 16-bit code */
 static uint32_t vwin32_first_thread(const uint32_t* a) {
     uint32_t* blk = (uint32_t*)(uintptr_t)a[0];
     g_cur[0] = blk[0]; g_cur[1] = blk[1]; g_cur[2] = new_tdbx(blk[0], blk[1]);
@@ -1428,6 +1451,7 @@ static const vxd_service_t g_services[] = {
     { 0x002A000D, 3, vwin32_queue_to_thread, "VWIN32_QueueToThread" },
     { 0x002A0058, 1, vwin32_release_58, "VWIN32_58_Release" },
     { 0x00010020, 1, vmm_20_release, "VMM_20_Release" },
+    { 0x0001001F, 2, vmm_1f_sleep, "VMM_1F_Sleep" },
     { 0x00380014, 2, vcond_zero, "VCOND_14_Detach" },
     { 0x00380018, 1, vcond_zero, "VCOND_18_Get" },
     { 0x0038001E, 2, vcond_zero, "VCOND_1E_Set" },
@@ -1444,6 +1468,7 @@ static const vxd_service_t g_services[] = {
     { 0x002A0021, 2, vwin32_set_thread_priority, "VWIN32_SetThreadPriority" },
     { 0x002A0013, 2, vwin32_13, "VWIN32_13" },
     { 0x00090000, 2, reboot_0, "REBOOT_0" },
+    { 0x00090001, 2, reboot_0, "REBOOT_1" },
     { 0x002A0030, 2, vwin32_wait_block_destroy, "VWIN32_DestroyWaitBlock" },
     { 0x002A0060, 1, vwin32_set_event, "VWIN32_SetEvent" },
     { 0x002A0061, 1, vwin32_pulse_event, "VWIN32_PulseEvent" },
@@ -1455,6 +1480,7 @@ static const vxd_service_t g_services[] = {
     { 0x00010006, 0, vmm_context_create, "VMM_ContextCreate" },
     { 0x00010007, 1, vmm_context_destroy, "VMM_ContextDestroy" },
     { 0x00010010, 2, vmm_heap_free, "VMM_HeapFree" },
+    { 0x0001000C, 3, vmm_heap_realloc, "VMM_HeapReAllocate" },
     { 0x002A0047, 1, vwin32_set_env, "VWIN32_SetEnvironment" },
     { 0x002A0006, 3, vwin32_set_callbacks, "VWIN32_SetCallbacks" },
     { 0x00010000, 3, vmm_page_reserve, "VMM_PageReserve" },
