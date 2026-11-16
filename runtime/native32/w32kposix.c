@@ -2118,6 +2118,28 @@ static uint32_t s_dispatch(uint32_t* a) {        /* NtUserDispatchMessage(MSG*) 
     }
     return send(MEM32(m), MEM32(m + 4), MEM32(m + 8), MEM32(m + 12));
 }
+/* the caret: kept apart from the framebuffer and inverted over it when the
+ * live window is presented, so painting never has to hide it first.
+ * ponytail: shots leave it out (the Windows build's shots do too); one caret, as win32k has per queue. */
+static uint32_t host_ms(void);
+static struct { uint32_t hwnd; int x, y, w, h, shown; uint32_t t0; } g_caret;
+static uint32_t s_createcaret(uint32_t* a) {     /* NtUserCreateCaret(hwnd, hbitmap, cx, cy) */
+    g_caret.hwnd = a[0], g_caret.w = (int)a[2] ? (int)a[2] : 1, g_caret.h = (int)a[3] ? (int)a[3] : 1;
+    g_caret.x = g_caret.y = g_caret.shown = 0, g_caret.t0 = host_ms();
+    return 1;
+}
+static uint32_t s_showcaret(uint32_t* a) { if (!a[0] || a[0] == g_caret.hwnd) g_caret.shown++, g_caret.t0 = host_ms(); return 1; }
+static uint32_t s_hidecaret(uint32_t* a) { if (!a[0] || a[0] == g_caret.hwnd) g_caret.shown--; return 1; }
+static void caret_overlay(uint32_t* o) {          /* o: the presented copy of the screen */
+    uobj_t* u = W(g_caret.hwnd);
+    if (!u || g_caret.shown <= 0 || (host_ms() - g_caret.t0) / 530 % 2) return;   /* GetCaretBlinkTime: 530 */
+    rc_t r = rc_and((rc_t){ u->cr.l + g_caret.x, u->cr.t + g_caret.y, u->cr.l + g_caret.x + g_caret.w, u->cr.t + g_caret.y + g_caret.h }, u->cr);
+    for (int y = r.t; y < r.b; y++) for (int x = r.l; x < r.r; x++) o[(size_t)y * g_cx + x] ^= 0xFFFFFF;
+}
+/* accelerators: the ACCEL table copied at create, matched at TranslateAccelerator */
+typedef struct { uint8_t virt; uint16_t key, cmd; } accel_t;
+static accel_t* g_acc[MAXU];
+static int g_nacc[MAXU];
 static uint8_t g_keys[256];                       /* live: keys down (VK), and the character each one typed */
 static uint16_t g_keychar[256];
 static uint32_t s_translate(uint32_t* a) {       /* NtUserTranslateMessage(MSG*, flags): WM_KEYDOWN -> WM_CHAR */
@@ -2250,7 +2272,7 @@ static uint32_t s_call_noparam(uint32_t* a) {
     switch (a[0]) {
     case 0: return menu_new(0);                  /* CreateMenu */
     case 1: return menu_new(1);                  /* CreatePopupMenu */
-    case 2: return 1;                            /* DestroyCaret */
+    case 2: g_caret.hwnd = 0; return 1;          /* DestroyCaret */
     case 5: return 0;                            /* GetMessagePos */
     case 8: g_capture = 0; return 1;             /* ReleaseCapture */
     case 0x12: return 0;                         /* ClientThreadSetup asks: a new thread */
@@ -2273,7 +2295,7 @@ static uint32_t s_call_oneparam(uint32_t* a) {
     return 0;
 }
 static uint32_t s_call_twoparam(uint32_t* a) {
-    if (a[2] == 0x5E) return 1;                  /* SetCaretPos */
+    if (a[2] == 0x5E) { g_caret.x = (int)a[0], g_caret.y = (int)a[1], g_caret.t0 = host_ms(); return 1; }   /* SetCaretPos */
     fprintf(stderr, "[user] NtUserCallTwoParam(%08X, %08X, 0x%X) not answered\n", a[0], a[1], a[2]);
     return 0;
 }
@@ -2377,7 +2399,33 @@ static uint32_t s_setscroll(uint32_t* a) {      /* NtUserSetScrollInfo(hwnd, SB_
 static uint32_t s_keystate(uint32_t* a) { return a[0] < 256 && g_keys[a[0]] ? 0xFF80u : 0; }
 static uint32_t s_dblclick(uint32_t* a) { (void)a; return 500; }
 static uint32_t s_register_msg(uint32_t* a) { (void)a; static uint32_t n = 0xC100; return n++; }
-static uint32_t s_accel(uint32_t* a) { (void)a; uobj_t* c = unew(W2K_TYPE_ACCEL, 0x20); return c ? c->h : 0; }
+static uint32_t s_accel(uint32_t* a) {           /* NtUserCreateAcceleratorTable(ACCEL*, n): 6-byte entries */
+    uobj_t* c = unew(W2K_TYPE_ACCEL, 0x20);
+    if (!c) return 0;
+    int i = (int)(c->h & 0xFFFF), n = (int)a[1];
+    free(g_acc[i]), g_acc[i] = calloc((size_t)(n > 0 ? n : 1), sizeof(accel_t)), g_nacc[i] = n;
+    for (int k = 0; k < n; k++)
+        g_acc[i][k] = (accel_t){ MEM8(a[0] + 6 * k), MEM16(a[0] + 6 * k + 2), MEM16(a[0] + 6 * k + 4) };
+    return c->h;
+}
+/* NtUserTranslateAccelerator(hwnd, haccel, MSG*): FVIRTKEY 1, FSHIFT 4, FCONTROL 8, FALT 0x10 */
+static uint32_t s_translate_accel(uint32_t* a) {
+    uobj_t* c = U(a[1], W2K_TYPE_ACCEL);
+    uint32_t m = a[2], msg = MEM32(m + 4), k = MEM32(m + 8);
+    if (!c || !W(a[0])) return 0;
+    int i = (int)(c->h & 0xFFFF), sys = msg == 0x104 || msg == 0x106;
+    if (msg != 0x100 && msg != 0x104 && msg != 0x102 && msg != 0x106) return 0;
+    for (int n = 0; n < g_nacc[i]; n++) {
+        accel_t* e = &g_acc[i][n];
+        if (e->virt & 1) {
+            if ((msg != 0x100 && msg != 0x104) || e->key != k) continue;
+            if (!!(e->virt & 4) != !!g_keys[16] || !!(e->virt & 8) != !!g_keys[17] || !!(e->virt & 0x10) != sys) continue;
+        } else if ((msg != 0x102 && msg != 0x106) || e->key != k || !!(e->virt & 0x10) != sys) continue;
+        send(a[0], 0x111, 0x10000u | e->cmd, 0);   /* WM_COMMAND, HIWORD 1: from an accelerator */
+        return 1;
+    }
+    return 0;
+}
 static uint32_t s_sethook(uint32_t* a) { (void)a; return 0x00010001u + 0x100; }   /* ponytail: hooks are never called */
 static uint32_t s_fill_window(uint32_t* a) {     /* NtUserFillWindow(hwndBrush, hwnd, hdc, hbr) */
     uobj_t* u = W(a[1]);
@@ -2652,6 +2700,7 @@ static void x_open(void) {
 static void x_present(void) {                    /* COLORREF (0x00BBGGRR) to the visual's 0x00RRGGBB */
     uint32_t* o = (uint32_t*)g_xi->data;
     for (int i = 0; i < g_cx * g_cy; i++) { uint32_t c = g_screen.px[i]; o[i] = (c & 0xFF) << 16 | (c & 0xFF00) | (c >> 16 & 0xFF); }
+    caret_overlay(o);
     XPutImage(g_xd, g_xw, g_xgc, g_xi, 0, 0, 0, 0, (unsigned)g_cx, (unsigned)g_cy);
     XFlush(g_xd);
     g_xshown = host_ms();
@@ -2836,12 +2885,12 @@ void w2kx_install(int cx, int cy, const char* fontdir) {
         { "NtUserGetForegroundWindow", s_foreground }, { "NtUserGetThreadDesktop", s_threaddesk },
         { "NtUserModifyUserStartupInfoFlags", s_one_u }, { "NtUserGetDoubleClickTime", s_dblclick },
         { "NtUserRegisterWindowMessage", s_register_msg }, { "NtUserCreateAcceleratorTable", s_accel },
-        { "NtUserTranslateAccelerator", s_zero_u }, { "NtUserSetWindowsHookEx", s_sethook }, { "NtUserUnhookWindowsHookEx", s_one_u },
+        { "NtUserTranslateAccelerator", s_translate_accel }, { "NtUserSetWindowsHookEx", s_sethook }, { "NtUserUnhookWindowsHookEx", s_one_u },
         { "NtUserCallNextHookEx", s_zero_u }, { "NtUserSetProp", s_one_u }, { "NtUserRemoveProp", s_zero_u },
         { "NtUserFillWindow", s_fill_window }, { "NtUserWindowFromPoint", s_frompoint }, { "NtUserGetWindowPlacement", s_getplacement },
         { "NtUserSetWindowPlacement", s_one_u }, { "NtUserSystemParametersInfo", s_spi }, { "NtUserGetKeyState", s_keystate },
-        { "NtUserGetAsyncKeyState", s_keystate }, { "NtUserShowCaret", s_one_u }, { "NtUserHideCaret", s_one_u },
-        { "NtUserCreateCaret", s_one_u }, { "NtUserGetKeyboardLayoutList", s_zero_u },
+        { "NtUserGetAsyncKeyState", s_keystate }, { "NtUserShowCaret", s_showcaret }, { "NtUserHideCaret", s_hidecaret },
+        { "NtUserCreateCaret", s_createcaret }, { "NtUserGetKeyboardLayoutList", s_zero_u },
         { "NtUserGetControlBrush", s_ctlbrush }, { "NtUserGetControlColor", s_ctlcolor },
     };
     for (unsigned i = 0; i < sizeof svc / sizeof svc[0]; i++) ntp_win32k_override(svc[i].name, svc[i].fn);
