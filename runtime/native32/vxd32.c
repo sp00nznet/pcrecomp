@@ -615,6 +615,19 @@ static uint32_t vwin32_create_thread(const uint32_t* a) {
 static uint32_t g_boot_r0;          /* the first thread's twin (VWIN32 0C) */
 static __declspec(thread) uint32_t t_r0;   /* this host thread's guest r0 twin, 0 for the boot thread */
 
+/* A thread's termination, on the thread: VWIN32 first calls the routine
+ * _INIT gave VWIN32 0C at +24 (0xBFF89912: DLL_THREAD_DETACH, USER's
+ * signal 20h, thread exit, which frees the thread's queue; process exit
+ * when it is the last), then blk's own (+8, 0xBFF89302: the thread object's
+ * teardown, which frees its TIB selector). ponytail: the order and the
+ * "always" are read off what each needs (89912 runs on the live TIB). */
+static uint32_t g_k32_thread_term;   /* 0C's +24 */
+static void run_termination(uint32_t blk) {
+    uint32_t arg[1] = { blk };
+    if (g_k32_thread_term) native32_call_guest(g_k32_thread_term, 0, NULL);
+    native32_call_guest(MEM32(blk + 8), 1, arg);
+}
+
 static DWORD w9x_wait(HANDLE h, DWORD ms) {
     uint16_t sds = g_seg_ds, ses = g_seg_es, sfs = g_seg_fs, sgs = g_seg_gs;
     uint32_t bds = g_ds_base, bes = g_es_base, bgs = g_gs_base;
@@ -625,10 +638,10 @@ static DWORD w9x_wait(HANDLE h, DWORD ms) {
     g_ds_base = bds; g_es_base = bes; g_gs_base = bgs;
     g_cur[0] = cur[0]; g_cur[1] = cur[1]; g_cur[2] = cur[2];   /* this thread is VWIN32's current one again */
     if (t_r0 && MEM32(t_r0 + R0T_KILL)) {    /* VWIN32 B from another thread: run the teardown here (it ends in 2B) */
-        uint32_t arg[1] = { MEM32(t_r0 + R0T_KILL) };
+        uint32_t blk = MEM32(t_r0 + R0T_KILL);
         MEM32(t_r0 + R0T_KILL) = 0;
         if (g_trace > 0) fprintf(stderr, "[vxd] thread %08X (r0 %08X): its termination runs\n", g_cur[0], t_r0);
-        native32_call_guest(MEM32(arg[0] + 8), 1, arg);
+        run_termination(blk);
     }
     return rc;
 }
@@ -987,8 +1000,7 @@ static uint32_t vwin32_terminate_thread(const uint32_t* a) {
         SetEvent((HANDLE)(uintptr_t)MEM32(a[0] + R0T_WAKE));
         return 0;
     }
-    uint32_t arg[1] = { a[1] };
-    native32_call_guest(MEM32(a[1] + 8), 1, arg);
+    run_termination(a[1]);
     return 0;
 }
 
@@ -1010,6 +1022,11 @@ static uint32_t vwin32_queue_to_thread(const uint32_t* a) {
 /* VWIN32 58 (x): a dying thread's +58 handed back (0xBFF89C97, then
  * cleared; the result unread). Nothing on the host holds it. */
 static uint32_t vwin32_release_58(const uint32_t* a) { (void)a; return 0; }
+
+/* VWIN32 2C (ebx at entry): the end of 0C's +24 thread-termination routine
+ * (0xBFF89A4E), handing ring 0 back the ebx it was entered with. Here the
+ * routine is a plain call (run_termination), so there is nothing to resume. */
+static uint32_t vwin32_term_done(const uint32_t* a) { (void)a; return 0; }
 
 /* VMM 20 (blk): a block of kernel32's handed to ring 0 for the last time:
  * a mapped-file record on close (0xBFFAB776, outside the 4/5 bracket) and
@@ -1150,6 +1167,7 @@ static uint32_t vwin32_first_thread(const uint32_t* a) {
     uint32_t* blk = (uint32_t*)(uintptr_t)a[0];
     g_cur[0] = blk[0]; g_cur[1] = blk[1]; g_cur[2] = new_tdbx(blk[0], blk[1]);
     g_cur_psp = g_w9x_psp_sel;
+    g_k32_thread_term = blk[0x24 / 4];
     blk[0x0C / 4] = g_boot_r0 = (uint32_t)(uintptr_t)calloc(1, 0x100);   /* its ring-0 twin */
     MEM32(g_boot_r0 + R0T_THREAD) = blk[0];
     MEM32(g_boot_r0 + R0T_PROCESS) = blk[1];
@@ -1555,6 +1573,7 @@ static const vxd_service_t g_services[] = {
     { 0x002A002B, 0, vwin32_thread_done, "VWIN32_ThreadDone" },
     { 0x002A000D, 3, vwin32_queue_to_thread, "VWIN32_QueueToThread" },
     { 0x002A0058, 1, vwin32_release_58, "VWIN32_58_Release" },
+    { 0x002A002C, 1, vwin32_term_done, "VWIN32_TermDone" },
     { 0x00010020, 1, vmm_20_release, "VMM_20_Release" },
     { 0x0001001F, 2, vmm_1f_sleep, "VMM_1F_Sleep" },
     { 0x00380014, 2, vcond_zero, "VCOND_14_Detach" },
@@ -1738,6 +1757,18 @@ int recomp_ss_big(void) {
 }
 
 void recomp_set_seg(int sreg, uint32_t sel) {
+    /* A register reloaded with the selector it holds, whose descriptor has
+     * been freed since (not present): the cached base stays. A dying
+     * thread's teardown (0xBFF893E9) frees its own TIB selector, fs, through
+     * QT_Thunk, whose tail reloads fs (0xBFF72881) and whose next call (the
+     * thread's 16-bit stack, 0xBFF893FB) reads fs:[18h]. ponytail: real x86
+     * would #GP on that load; what Win98 does with the fault is not known,
+     * this keeps the descriptor cache as it was. */
+    uint16_t* cur[6] = { &g_seg_es, NULL, &g_seg_ss, &g_seg_ds, &g_seg_fs, &g_seg_gs };
+    sel &= 0xFFFF;
+    if (sreg >= 0 && sreg < 6 && cur[sreg] && *cur[sreg] == sel && (sel & 4) && (sel & ~7u) != g_ldt_alias
+        && !(g_ldt[(sel & ~7u) + 5] & 0x80))
+        return;
     if (sreg == 0) { g_seg_es = (uint16_t)sel; g_es_base = recomp_sel_base(sel); }
     if (sreg == 5) { g_seg_gs = (uint16_t)sel; g_gs_base = recomp_sel_base(sel); }
     if (sreg == 4) {   /* a thread's TIB (Win9x layout: fs:[1Ch] flags, fs:[1Eh] Win16 mutex count) */

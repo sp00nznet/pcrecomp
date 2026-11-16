@@ -909,7 +909,8 @@ int w16_enter(uint32_t target) {
         g_w16_ret = cont;
     } else {
         uint32_t ret = mem_read32(c, c->ss, c->sp);
-        if (getenv("W16_TRACE")) fprintf(stderr, "[w16] enter %04X:%04X ss:sp %04X:%04X ds %04X ret %08X\n", sel, off, c->ss, c->sp, c->ds, ret);
+        if (getenv("W16_TRACE")) fprintf(stderr, "[w16] enter %04X:%04X ss:sp %04X:%04X ds %04X ret %08X args %04X %04X\n", sel, off, c->ss, c->sp, c->ds, ret,
+            mem_read16(c, c->ss, (uint16_t)(c->sp + 4)), mem_read16(c, c->ss, (uint16_t)(c->sp + 6)));
         const uint8_t *stub = (const uint8_t *)(uintptr_t)(recomp_sel_base(ret >> 16) + (ret & 0xFFFF));
         if (stub[0] != 0x66 || stub[1] != 0xEA) w16_stop("thunk return is not a jmp far 32", ret >> 16, ret & 0xFFFF);
         memcpy(&cont, stub + 2, 4);
