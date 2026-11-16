@@ -548,6 +548,11 @@ static uint32_t vwin32_link_thread(const uint32_t* a) { (void)a; return 0; }
  * back. The host's console needs no agent. */
 static uint32_t vcond_init(const uint32_t* a) { (void)a; return 0; }
 
+/* VCOND 1F (): right after the console agent is started (0xBFFA2092), the
+ * new console's ring-0 object, which kernel32 flags at +10 (|= 20h). A
+ * zeroed block stands for the host's console. */
+static uint32_t vcond_new_console(const uint32_t* a) { (void)a; return (uint32_t)(uintptr_t)calloc(1, 0x200); }
+
 /* VWIN32 1D (crst) / 1E (crst): a critical section's contention. kernel32's
  * EnterCriticalSection (0xBFF741B4) calls 1D when another thread owns it
  * and then returns as the owner, so the hand-over happens here: 1E, from
@@ -963,6 +968,7 @@ static const vxd_service_t g_services[] = {
     { 0x002A0009, 1, vwin32_thread_starting, "VWIN32_ThreadStarting" },
     { 0x002A0026, 2, vwin32_link_thread, "VWIN32_LinkThread" },
     { 0x00380023, 3, vcond_init, "VCOND_Init" },
+    { 0x0038001F, 0, vcond_new_console, "VCOND_NewConsole" },
     { 0x002A002D, 2, vwin32_block, "VWIN32_BlockThread" },
     { 0x002A005D, 5, vwin32_wait_multiple, "VWIN32_WaitMultiple" },
     { 0x002A001D, 1, vwin32_crst_wait, "VWIN32_WaitCrst" },
