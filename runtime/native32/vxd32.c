@@ -19,6 +19,8 @@
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
 
 #include "native32.h"
 void recomp_trace_flush(void);   /* recomp_trace.c: --calltrace before we end */
@@ -56,9 +58,81 @@ static uint32_t vwin32_crst_create(const uint32_t* a) {
  * ponytail: every arena is "anywhere" in the host; place PR_SHARED above 2 GB
  * if kernel32 turns out to test addresses for sharedness. */
 #define PR_ANY(p) (((p) & 0xFFF00000u) == 0x80000000u)
+/* Win9x commits a reserved page on first touch (a thread's stack grows that
+ * way: kernel32 commits its top 2 pages and the program probes below). A
+ * first-chance handler does the same for regions reserved here.
+ * ponytail: a fixed table of 4096 regions, never pruned on PageFree. */
+static struct { uintptr_t base, size; } g_resv[4096];
+static volatile LONG g_nresv;
+/* Win9x maps the first 64 KB (the V86 IVT and BIOS data) readable and
+ * writable from ring 3, and kernel32 relies on it: a thread whose context
+ * was just released (+58 = 0) is read as [0+38h] during its own process's
+ * teardown (0xBFF7D65E). Win11 maps nothing there, so a lifted access to
+ * the low 64 KB is emulated: the host instruction (32-bit, compiled C) is
+ * decoded, a load gives 0, a store is dropped.
+ * ponytail: mov/movzx/movsx loads and mov stores only; any other form still
+ * faults and the report names it. */
+static int low_emulate(CONTEXT* c) {
+    uint8_t* p = (uint8_t*)(uintptr_t)c->Eip;
+    int o16 = 0, n = 0;
+    if (p[n] == 0x66) { o16 = 1; n++; }
+    uint8_t op = p[n++], op2 = 0;
+    if (op == 0x0F) op2 = p[n++];
+    int load = op == 0x8B || op == 0x8A || (op == 0x0F && (op2 == 0xB6 || op2 == 0xB7 || op2 == 0xBE || op2 == 0xBF));
+    int store = op == 0x89 || op == 0x88 || op == 0xC7 || op == 0xC6;
+    if (!load && !store) return 0;
+    uint8_t m = p[n++], mod = m >> 6, reg = (m >> 3) & 7, rm = m & 7;
+    if (mod == 3) return 0;
+    if (rm == 4) { uint8_t sib = p[n++]; if (mod == 0 && (sib & 7) == 5) n += 4; }
+    else if (mod == 0 && rm == 5) n += 4;
+    n += mod == 1 ? 1 : mod == 2 ? 4 : 0;
+    if (op == 0xC7) n += o16 ? 2 : 4;
+    if (op == 0xC6) n += 1;
+    if (load) {
+        DWORD* r[8] = { &c->Eax, &c->Ecx, &c->Edx, &c->Ebx, &c->Esp, &c->Ebp, &c->Esi, &c->Edi };
+        if (op == 0x8A) { if (reg < 4) *r[reg] &= ~0xFFu; else *r[reg - 4] &= ~0xFF00u; }
+        else if (o16 && op == 0x8B) *r[reg] &= ~0xFFFFu;
+        else *r[reg] = 0;
+    }
+    c->Eip += n;
+    return 1;
+}
+static LONG CALLBACK resv_fault(EXCEPTION_POINTERS* e) {
+    if (e->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
+    uintptr_t at = e->ExceptionRecord->ExceptionInformation[1];
+    MEMORY_BASIC_INFORMATION mb;
+    if (at < 0x10000 && low_emulate(e->ContextRecord)) {
+        if (g_trace > 0) fprintf(stderr, "[vxd] low-memory %s %04X (Win9x's first 64 KB) emulated\n",
+                                 e->ExceptionRecord->ExceptionInformation[0] ? "write" : "read", (unsigned)at);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    for (LONG i = 0; i < g_nresv; i++)
+        if (at - g_resv[i].base < g_resv[i].size) {
+            if (!VirtualQuery((void*)at, &mb, sizeof mb) || mb.State != MEM_RESERVE) break;
+            if (!VirtualAlloc((void*)(at & ~(uintptr_t)0xFFF), 0x1000, MEM_COMMIT, PAGE_EXECUTE_READWRITE)) break;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+/* VWIN32 40 (r0, addr, &mbi, cb): VirtualQuery(Ex) (0xBFFA1E2A, 0xBFF85301
+ * with cb 1Ch); the bytes written. One address space: the host's answer. */
+static uint32_t vwin32_virtual_query(const uint32_t* a) {
+    if (a[3] < sizeof(MEMORY_BASIC_INFORMATION)) return 0;
+    return (uint32_t)VirtualQuery((void*)(uintptr_t)a[1], (MEMORY_BASIC_INFORMATION*)(uintptr_t)a[2], sizeof(MEMORY_BASIC_INFORMATION));
+}
+/* VWIN32 41 (value, ctx): ExitProcess (0xBFF89786) passes PDB+38 + 60h and
+ * then each of a list's +4 with the process's +58 (its context) and keeps
+ * the results to restore later: a value translated into a context. The
+ * host has one context, so the value comes back as it went in. */
+static uint32_t vwin32_in_context(const uint32_t* a) { return a[0]; }
 static uint32_t vmm_page_reserve(const uint32_t* a) {
     void* want = PR_ANY(a[0]) ? NULL : (void*)(uintptr_t)(a[0] << 12);
     void* p = VirtualAlloc(want, a[1] << 12, MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (p) {
+        if (!g_nresv) AddVectoredExceptionHandler(1, resv_fault);
+        LONG i = InterlockedIncrement(&g_nresv) - 1;
+        if (i < 4096) { g_resv[i].base = (uintptr_t)p; g_resv[i].size = (uintptr_t)a[1] << 12; } else g_nresv = 4096;
+    }
     MEMORY_BASIC_INFORMATION mb;
     /* kernel32's loader reserving a module at its own base, where native32
      * already holds that image (the lifted code is for that address): the
@@ -245,6 +319,31 @@ static void krnl386_thunk(void) {
         fprintf(stderr, "\n[krnl386] WinExec(\"%s\"): no 16-bit programs here\n", cmd);
         fflush(stderr); recomp_trace_flush(); TerminateProcess(GetCurrentProcess(), 5);
         break; }
+    case 0x33:   /* () under crst 0xBFFC9470, from a new process's first thread
+                  * (0xBFF8B493, before its task name, thunk 30): 0 sends the
+                  * process to ExitProcess(-1). Nothing for KRNL386 to set up. */
+        g_eax = 1; g_edx = 0;
+        break;
+    case 0x34:   /* (sel:16) FreeSelector: 0xBFF7202B returns TRUE when this
+                  * gives 0 (ExitProcess frees the process's selectors). The
+                  * host LDT only grows. ponytail: never reused. */
+        g_eax = 0; g_edx = 0;
+        break;
+    case 0x31:   /* (task:16) the Win16 task thunk 32 made, deleted with its
+                  * process (0xBFF92FA4). ponytail: the TDB block stays. */
+        if (g_trace > 0) fprintf(stderr, "[krnl386] thunk 31 delete task %04X\n", MEM16(sp));
+        g_eax = 0; g_edx = 0;
+        break;
+    case 0x55:   /* (sel:16) a dying thread's selector, right after USER's
+                  * signal 1 for it (0xBFF89083); then the selector is
+                  * freed. Nothing kept per selector. */
+        g_eax = 0; g_edx = 0;
+        break;
+    case 0x43:   /* (pdb:32) the process teardown (0xBFF8CDE8) tells KRNL386 a
+                  * Win32 process is gone; its result is not read. */
+        if (g_trace > 0) fprintf(stderr, "[krnl386] thunk 43 process %08X gone\n", MEM32(sp));
+        g_eax = 0; g_edx = 0;
+        break;
     case 0x0D:   /* (drive:16, 0 = A:) GetDriveType: GetDriveTypeA (0xBFF74D33)
                   * asks for a drive it found real. Only C: (fixed, 3). */
         g_eax = MEM16(sp) == 2 ? 3 : 0; g_edx = 0;
@@ -279,10 +378,29 @@ static void user_signal_proc(void) {
 }
 uint32_t native32_w9x_user_signal_proc(void) { return USIG_TAG; }
 
+/* Guest hard errors. Win98's kernel32 shows them with USER32!MessageBoxA,
+ * bound lazily through its own table (0xBFFCB2C4: FatalAppExit 0xBFF94E8A,
+ * a process's load and teardown failures 0xBFFA96F1 and others), and the
+ * guest's USER32 is a proxy onto the host's. The proxy's MessageBoxA is
+ * this instead: the message is logged, nothing is shown on the host, and
+ * the answer is the one that ends the operation (OK, Cancel, Abort, No). */
+#define MBOX_TAG (USIG_TAG + 0x10)
+static void guest_message_box(void) {
+    const char* text = (const char*)(uintptr_t)MEM32(g_esp + 8);
+    const char* cap = (const char*)(uintptr_t)MEM32(g_esp + 12);
+    uint32_t type = MEM32(g_esp + 16);
+    static const uint32_t answer[8] = { 1, 2, 3, 2, 7, 2, 2, 1 };   /* MB_OK .. MB_CANCELTRYCONTINUE */
+    fprintf(stderr, "[hard error] \"%s\": \"%s\" (type %X) -> %u\n", cap ? cap : "", text ? text : "", type, answer[type & 7]);
+    g_eax = answer[type & 7];
+    g_esp += 4 + 16;
+}
+uint32_t native32_w9x_message_box(void) { return MBOX_TAG; }
+
 /* The host's recomp_lookup_manual forwards here: VWIN32's entries above. */
 recomp_func_t native32_w9x_lookup(uint32_t va) {
     if (va == K386_TAG) return krnl386_thunk;
     if (va == USIG_TAG) return user_signal_proc;
+    if (va == MBOX_TAG) return guest_message_box;
     if ((va & 0xFFFF0000u) == R0F_TAG && (va & 0xFFFF) < 4 * 11 && !(va & 3)) return g_r0f[(va & 0xFFFF) / 4];
     return NULL;
 }
@@ -380,6 +498,9 @@ static uint32_t vmm_heap_free(const uint32_t* a) { return a[0] ? HeapFree(vmm_he
  * database at +1C (beside +24, the PSP's linear address). Every guest
  * process shares the host's one address space: a nonzero cookie. */
 static uint32_t vmm_context_create(const uint32_t* a) { static uint32_t n; (void)a; return 0xC0DE0000u + ++n; }
+/* VMM 7 (ctx): a dead process's memory context (PDB+1C, 0xBFF8D3CA and
+ * 0xBFF8D9B4) destroyed. A cookie: nothing to free. */
+static uint32_t vmm_context_destroy(const uint32_t* a) { (void)a; return 1; }
 
 /* VWIN32 4F (fn, handle, 0, 0): 33h registers a kernel32 object (a process) with
  * VWIN32's ring-0 side, 34h drops it. The host keeps no ring-0 twin. */
@@ -408,8 +529,12 @@ static uint32_t vwin32_set_priorities(const uint32_t* a) { (void)a; return 0; }
 #define R0T_PROCESS 0x38
 #define R0T_TDBX   0x3C
 static void track_thread(uint32_t r0);
-static uint32_t new_tdbx(void) {
+/* A TDBX: +0 its thread, +4 its process (ExitProcess reads it, 0xBFF89768),
+ * +50 -> the current PSP selector. */
+static uint32_t new_tdbx(uint32_t thread, uint32_t process) {
     uint8_t* tdbx = calloc(1, 0x100);
+    *(uint32_t*)(tdbx + 0x00) = thread;
+    *(uint32_t*)(tdbx + 0x04) = process;
     *(uint32_t*)(tdbx + 0x50) = (uint32_t)(uintptr_t)&g_cur_psp;
     return (uint32_t)(uintptr_t)tdbx;
 }
@@ -419,7 +544,7 @@ static uint32_t vwin32_create_thread(const uint32_t* a) {
     *(uint32_t*)(r0 + R0T_ENTRY) = a[5];
     *(uint32_t*)(r0 + R0T_ESP) = a[7];
     *(uint32_t*)(r0 + R0T_THREAD) = a[0];
-    MEM32(a[8]) = new_tdbx();
+    MEM32(a[8]) = new_tdbx(a[0], a[1]);
     *(uint32_t*)(r0 + R0T_PROCESS) = a[1];
     *(uint32_t*)(r0 + R0T_TDBX) = MEM32(a[8]);
     if (g_trace > 0) fprintf(stderr, "[vxd] new thread %08X: entry %08X esp %08X\n", a[0], a[5], a[7]);
@@ -437,7 +562,8 @@ static uint32_t vwin32_create_thread(const uint32_t* a) {
  * it was going (0xBFF868EC), entered as a jump. */
 #define R0T_READY  0x2C
 #define R0T_PARKED 0x30      /* host event: the thread blocked or ended */
-#define R0T_WAKE   0x34      /* host event: what a blocked thread sleeps on */
+#define R0T_WAKE   0x34
+#define R0T_KILL   0x50      /* a termination block queued by VWIN32 B */      /* host event: what a blocked thread sleeps on */
 static uint32_t g_boot_r0;          /* the first thread's twin (VWIN32 0C) */
 static __declspec(thread) uint32_t t_r0;   /* this host thread's guest r0 twin, 0 for the boot thread */
 
@@ -450,9 +576,22 @@ static DWORD w9x_wait(HANDLE h, DWORD ms) {
     g_seg_ds = sds; g_seg_es = ses; g_seg_fs = sfs; g_seg_gs = sgs;
     g_ds_base = bds; g_es_base = bes; g_gs_base = bgs;
     g_cur[0] = cur[0]; g_cur[1] = cur[1]; g_cur[2] = cur[2];   /* this thread is VWIN32's current one again */
+    if (t_r0 && MEM32(t_r0 + R0T_KILL)) {    /* VWIN32 B from another thread: run the teardown here (it ends in 2B) */
+        uint32_t arg[1] = { MEM32(t_r0 + R0T_KILL) };
+        MEM32(t_r0 + R0T_KILL) = 0;
+        if (g_trace > 0) fprintf(stderr, "[vxd] thread %08X (r0 %08X): its termination runs\n", g_cur[0], t_r0);
+        native32_call_guest(MEM32(arg[0] + 8), 1, arg);
+    }
     return rc;
 }
 
+/* Whichever guest thread takes the machine (a back-edge hand-over as much as
+ * a wait coming back) is VWIN32's current one. */
+static void w9x_on_enter(void) {
+    uint32_t r0 = t_r0 ? t_r0 : g_boot_r0;
+    if (!r0 || !MEM32(r0 + R0T_THREAD)) return;
+    g_cur[0] = MEM32(r0 + R0T_THREAD); g_cur[1] = MEM32(r0 + R0T_PROCESS); g_cur[2] = MEM32(r0 + R0T_TDBX);
+}
 static DWORD WINAPI guest_thread(LPVOID p) {
     t_r0 = (uint32_t)(uintptr_t)p;
     mach_enter();
@@ -473,6 +612,7 @@ static DWORD WINAPI guest_thread(LPVOID p) {
 
 static void start_thread(uint32_t r0) {
     if (MEM32(r0 + R0T_PARKED)) return;
+    native32_on_enter = w9x_on_enter;
     MEM32(r0 + R0T_PARKED) = (uint32_t)(uintptr_t)CreateEventA(NULL, FALSE, FALSE, NULL);
     CloseHandle(CreateThread(NULL, 1u << 20, guest_thread, (LPVOID)(uintptr_t)r0, 0, NULL));
 }
@@ -515,11 +655,19 @@ static uint32_t vwin32_wait_multiple(const uint32_t* a) {
     MEM32(r0 + R0T_WAITN) = a[0];
     MEM32(r0 + R0T_WAITS) = a[1];
     MEM32(r0 + R0T_WOKEN) = 0xFFFFFFFFu;
-    if (g_trace > 0) fprintf(stderr, "[vxd] thread %08X waits on %u blocks (%d ms)\n", g_cur[0], a[0], (int)a[2]);
+    if (g_trace > 0) fprintf(stderr, "[vxd] thread %08X waits on %u blocks (%d ms), first %08X\n", g_cur[0], a[0], (int)a[2], MEM32(a[1]));
     DWORD rc = w9x_wait(thread_wake(), a[2]);
     MEM32(r0 + R0T_WAITN) = 0;
     if (rc == WAIT_TIMEOUT) return 0x102;
     return MEM32(r0 + R0T_WOKEN) == 0xFFFFFFFFu ? 0xC0 : MEM32(r0 + R0T_WOKEN);
+}
+
+/* VWIN32 5C (blk, ms, alertable): 5D for one block (WaitForSingleObject's
+ * ring-0 half, 0xBFF99B28): 0, 102h or C0h. */
+static uint32_t vwin32_wait_single(const uint32_t* a) {
+    uint32_t objs[1] = { a[0] };
+    uint32_t m[5] = { 1, (uint32_t)(uintptr_t)objs, a[1], 0, a[2] };
+    return vwin32_wait_multiple(m);
 }
 
 /* VWIN32 2D (ms, alertable): block this thread (SleepEx, 0xBFF88BB0):
@@ -549,9 +697,47 @@ static uint32_t vwin32_link_thread(const uint32_t* a) { (void)a; return 0; }
 static uint32_t vcond_init(const uint32_t* a) { (void)a; return 0; }
 
 /* VCOND 1F (): right after the console agent is started (0xBFFA2092), the
- * new console's ring-0 object, which kernel32 flags at +10 (|= 20h). A
- * zeroed block stands for the host's console. */
-static uint32_t vcond_new_console(const uint32_t* a) { (void)a; return (uint32_t)(uintptr_t)calloc(1, 0x200); }
+ * new console's object, which kernel32 flags at +10 (|= 20h). On Win98 the
+ * agent builds it by calling back into kernel32 (16-bit entry 0xBFF941D9 ->
+ * 0xBFF8E9E1 (info, word)): a 0x470-byte object with its crst at +20, two
+ * buffers at +40/+44, +150 the VCOND handle (from VCOND 2), +46C an event.
+ * The host has no agent, so it runs that constructor itself, on the
+ * creating thread, and puts back the process's +B0 the constructor sets
+ * (the agent's, on Win98). */
+static uint32_t vcond_new_console(const uint32_t* a) {
+    static uint8_t info[0x100];
+    uint32_t pdb = g_cur[1], b0 = MEM32(pdb + 0xB0);
+    uint32_t saved[8] = { g_eax, g_ecx, g_edx, g_ebx, g_esp, g_ebp, g_esi, g_edi };
+    uint32_t args[2] = { (uint32_t)(uintptr_t)info, 0 };
+    (void)a;
+    native32_call_guest(0xBFF8E9E1, 2, args);
+    uint32_t c = g_eax;
+    g_eax = saved[0]; g_ecx = saved[1]; g_edx = saved[2]; g_ebx = saved[3];
+    g_esp = saved[4]; g_ebp = saved[5]; g_esi = saved[6]; g_edi = saved[7];
+    MEM32(pdb + 0xB0) = b0;
+    if (g_trace > 0) fprintf(stderr, "[vcond] console object %08X\n", c);
+    return c;
+}
+
+/* VCOND 1 (h, buf, n): text for the console's teletype, the DOS box's
+ * screen (WriteConsole's output path, 0xBFFA367E; single bytes from
+ * 0xBFFCADA8/0xBFFCADB0 for line ends). The host console is stdout. */
+static uint32_t vcond_write(const uint32_t* a) {
+    DWORD n = 0;
+    WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), (void*)(uintptr_t)a[1], a[2], &n, NULL);
+    return 0;
+}
+
+/* VCOND 2 (info, obj): the constructor registers the object; the result is
+ * its handle (+150; -1 fails). The object itself serves. */
+static uint32_t vcond_register(const uint32_t* a) { return a[1]; }
+
+/* VCOND services the attach (0xBFFA2100) and the console set-up call on the
+ * console handle (+150) that need nothing from a host console: 18 (h) and
+ * 1E (h, x) leave a value at +1C, 0E (h, 17h), 13 (h) once the process owns
+ * it, 14 (h, exit code low byte / -1 / 8) when a process lets it go
+ * (0xBFF9090A, 0xBFF90E7A). All answer 0. */
+static uint32_t vcond_zero(const uint32_t* a) { (void)a; return 0; }
 
 /* VWIN32 1D (crst) / 1E (crst): a critical section's contention. kernel32's
  * EnterCriticalSection (0xBFF741B4) calls 1D when another thread owns it
@@ -581,13 +767,15 @@ static uint32_t vwin32_crst_wake(const uint32_t* a) {
     return 0;
 }
 
-/* Wake every thread waiting on wait block obj; returns how many. */
+/* Wake every thread waiting on wait block obj; returns how many. A wait
+ * lists wait blocks or kernel32 objects (a process, a thread), whose +4 is
+ * their wait block (the process at 0xBFF8CDxx signals PDB+4). */
 static int vxd_wake(uint32_t obj) {
     int woke = 0;
     for (int t = 0; t < g_nthreads; t++) {
         uint32_t r0 = g_threads[t], n = MEM32(r0 + R0T_WAITN);
         for (uint32_t i = 0; i < n; i++)
-            if (MEM32(MEM32(r0 + R0T_WAITS) + 4 * i) == obj) {
+            if (MEM32(MEM32(r0 + R0T_WAITS) + 4 * i) == obj || MEM32(MEM32(MEM32(r0 + R0T_WAITS) + 4 * i) + 4) == obj) {
                 MEM32(r0 + R0T_WOKEN) = i;
                 MEM32(r0 + R0T_WAITN) = 0;
                 SetEvent((HANDLE)(uintptr_t)MEM32(r0 + R0T_WAKE));
@@ -596,6 +784,64 @@ static int vxd_wake(uint32_t obj) {
             }
     }
     return woke;
+}
+
+/* VWIN32 B (r0thread, blk): a thread's termination (ExitProcess,
+ * 0xBFF89628, for any thread but the boot one, 0xBFFC9CF8). blk is the
+ * thread's +1F4: {+0 thread, +8 0xBFF89302, the routine that tears it
+ * down}. On Win98 the thread runs blk's routine itself; for the calling
+ * thread that is a call, here. Another thread's would have to be delivered
+ * to it: not needed yet, so it stops the run. */
+static uint32_t vwin32_terminate_thread(const uint32_t* a) {
+    uint32_t r0 = t_r0 ? t_r0 : g_boot_r0;
+    if (a[0] != r0) {   /* delivered at the thread's next wake (w9x_wait) */
+        if (g_trace > 0) fprintf(stderr, "[vxd] thread %08X: termination queued\n", MEM32(a[0] + R0T_THREAD));
+        MEM32(a[0] + R0T_KILL) = a[1];
+        if (!MEM32(a[0] + R0T_WAKE)) MEM32(a[0] + R0T_WAKE) = (uint32_t)(uintptr_t)CreateEventA(NULL, FALSE, FALSE, NULL);
+        SetEvent((HANDLE)(uintptr_t)MEM32(a[0] + R0T_WAKE));
+        return 0;
+    }
+    uint32_t arg[1] = { a[1] };
+    native32_call_guest(MEM32(a[1] + 8), 1, arg);
+    return 0;
+}
+
+/* VWIN32 D (fn, arg, r0thread): queue fn(arg) (stdcall) to a thread, always
+ * kernel32's service thread (0xBFFC9D0C) at the call sites: a dying
+ * thread's cleanup (0xBFF894A4, fn 0xBFF996CD), ExitProcess (0xBFF89714),
+ * the console's teardown (0xBFF908D6). ponytail: run now, on the caller,
+ * under the machine lock; deliver it to the service thread if a fn ever
+ * needs to be on it. */
+static uint32_t vwin32_queue_to_thread(const uint32_t* a) {
+    uint32_t saved[8] = { g_eax, g_ecx, g_edx, g_ebx, g_esp, g_ebp, g_esi, g_edi };
+    uint32_t arg[1] = { a[1] };
+    native32_call_guest(a[0], 1, arg);
+    g_eax = saved[0]; g_ecx = saved[1]; g_edx = saved[2]; g_ebx = saved[3];
+    g_esp = saved[4]; g_ebp = saved[5]; g_esi = saved[6]; g_edi = saved[7];
+    return 1;
+}
+
+/* VWIN32 58 (x): a dying thread's +58 handed back (0xBFF89C97, then
+ * cleared; the result unread). Nothing on the host holds it. */
+static uint32_t vwin32_release_58(const uint32_t* a) { (void)a; return 0; }
+
+/* VMM 20 (blk): a block of kernel32's handed to ring 0 for the last time:
+ * a mapped-file record on close (0xBFFAB776, outside the 4/5 bracket) and
+ * a dying process's block (0xBFFA972A). Results unread; the host holds
+ * nothing. ponytail: name it when a caller reads the result. */
+static uint32_t vmm_20_release(const uint32_t* a) { (void)a; return 0; }
+
+/* VWIN32 2B (): the calling thread is done (the end of ExitThread/
+ * ExitProcess, 0xBFF89EBE, looping if it ever came back). Its host thread
+ * gives the machine up for good. ponytail: it stays parked, not ended, so
+ * nothing unwinds through lifted frames; ExitThread if threads pile up. */
+static uint32_t vwin32_thread_done(const uint32_t* a) {
+    uint32_t r0 = t_r0 ? t_r0 : g_boot_r0;
+    (void)a;
+    if (g_trace > 0) fprintf(stderr, "[vxd] thread %08X ended (VWIN32 2B)\n", g_cur[0]);
+    if (MEM32(r0 + R0T_PARKED)) SetEvent((HANDLE)(uintptr_t)MEM32(r0 + R0T_PARKED));
+    HANDLE never = CreateEventA(NULL, TRUE, FALSE, NULL);
+    for (;;) native32_wait(never, INFINITE);
 }
 
 /* VWIN32 9 (-1): a new thread's first call, from its start frame
@@ -611,13 +857,20 @@ static uint32_t vwin32_set_thread_priority(const uint32_t* a) {
     return R0T_PRIORITY;
 }
 
-/* VWIN32 60 (waitblk): called on a fresh file object's wait block (made by
- * 0xBFF7E4BA, 10h bytes, +4 count, +8 manual-reset) at 0xBFF80215, and on a
- * thread's in its teardown (0xBFF8CC9F). Its neighbours 5E (3 args) and 61
- * (1) are wrapped the same way (0xBFF92D4D..77). The host keeps no ring-0
- * wait state: nothing to do, and kernel32 ignores the result.
- * ponytail: the name is still open; give it one when a caller needs a result. */
-static uint32_t vwin32_wait_block_60(const uint32_t* a) { (void)a; return 0; }
+/* VWIN32 60/61/62 (waitblk): SetEvent (0xBFF92BAE), PulseEvent (0xBFF92BE6)
+ * and ResetEvent (0xBFF92C1E) go through these wrappers (0xBFF92D66..88),
+ * as do a fresh file object (0xBFF80215), a dying thread (0xBFF8CC9F) and
+ * ExitProcess (0xBFF89610). A wait block (0xBFF7E4BA, 10h bytes) has +4 its
+ * signal count and +8 manual-reset. 60 signals it and wakes its waiters (an
+ * auto-reset one goes back to 0 once it has woken one), 61 wakes them and
+ * leaves it reset, 62 resets it. TRUE. */
+static uint32_t vwin32_set_event(const uint32_t* a) {
+    MEM32(a[0] + 4) = 1;
+    if (vxd_wake(a[0]) && !MEM32(a[0] + 8)) MEM32(a[0] + 4) = 0;
+    return 1;
+}
+static uint32_t vwin32_pulse_event(const uint32_t* a) { vxd_wake(a[0]); MEM32(a[0] + 4) = 0; return 1; }
+static uint32_t vwin32_reset_event(const uint32_t* a) { MEM32(a[0] + 4) = 0; return 1; }
 
 /* VWIN32 30 (waitblk, 1): the first step of kernel32's wait-block destroy
  * (0xBFF92D19: then it frees +0C and, for type 3, more), e.g. when a file
@@ -687,10 +940,8 @@ static uint32_t nls_block(void) {
 uint16_t g_w9x_psp_sel;            /* the host's boot PSP (k32host sets it) */
 static uint32_t vwin32_first_thread(const uint32_t* a) {
     uint32_t* blk = (uint32_t*)(uintptr_t)a[0];
-    uint8_t* tdbx = calloc(1, 0x100);
-    g_cur[0] = blk[0]; g_cur[1] = blk[1]; g_cur[2] = (uint32_t)(uintptr_t)tdbx;
+    g_cur[0] = blk[0]; g_cur[1] = blk[1]; g_cur[2] = new_tdbx(blk[0], blk[1]);
     g_cur_psp = g_w9x_psp_sel;
-    *(uint32_t*)(tdbx + 0x50) = (uint32_t)(uintptr_t)&g_cur_psp;
     blk[0x0C / 4] = g_boot_r0 = (uint32_t)(uintptr_t)calloc(1, 0x100);   /* its ring-0 twin */
     MEM32(g_boot_r0 + R0T_THREAD) = blk[0];
     MEM32(g_boot_r0 + R0T_PROCESS) = blk[1];
@@ -802,6 +1053,8 @@ static void put_find(uint32_t p, const WIN32_FIND_DATAA* fd, int dos_times) {
     guest_put(p + 0x2C, fd->cFileName, 260);
     guest_put(p + 0x130, fd->cAlternateFileName, 14);
 }
+static uint8_t g_dta_default[128];
+static uint32_t g_dta = (uint32_t)(uintptr_t)g_dta_default;   /* Int21 1Ah; DOS's default is PSP:80 */
 #define NFINDS 64
 static HANDLE g_find[NFINDS];
 static uint16_t g_find_attr[NFINDS];
@@ -841,6 +1094,57 @@ static uint32_t vwin32_int21(const uint32_t* a) {
     case 0x59:                                                 /* extended error: AX code, BH class, BL action, CH locus */
         SET16(g_eax, g_dos_err); SET16(g_ebx, 0x0D01); g_ecx = (g_ecx & 0xFFFF00FFu) | 0x0200; return g_eax;
     case 0x30: SET16(g_eax, 0x0A07); SET16(g_ebx, 0xFF00); return g_eax;   /* DOS 7.10 */
+    case 0x69:   /* AL 0: BL drive -> DS:DX {+0 level, +2 serial, +6 label[11], +11h fs[8]} (GetVolumeInformationA) */
+        if (al == 0) {
+            uint8_t d = (uint8_t)g_ebx;
+            if (d != 0 && d != 3) { dos_fail(15); return g_eax; }
+            MEM16(g_edx) = 0; MEM32(g_edx + 2) = 0x19980505u;   /* a fixed serial: nothing of the host's */
+            memcpy((void*)(uintptr_t)(g_edx + 6), "NO NAME    FAT32   ", 19);
+            return g_eax;
+        }
+        break;
+    case 0x1A: g_dta = g_edx; return g_eax;                    /* set DTA (DS:DX) */
+    case 0x2F: g_ebx = g_dta; return g_eax;                    /* get DTA -> ES:BX */
+    case 0x3C: case 0x3D: {   /* create (CX attrs) / open (AL mode): DS:DX name -> AX handle */
+        DWORD acc = ah == 0x3C || (al & 3) == 2 ? GENERIC_READ | GENERIC_WRITE : (al & 3) == 1 ? GENERIC_WRITE : GENERIC_READ;
+        DWORD share = ah == 0x3C ? FILE_SHARE_READ | FILE_SHARE_WRITE : (al & 0x70) == 0x10 ? 0 : (al & 0x70) == 0x20 ? FILE_SHARE_READ
+                    : (al & 0x70) == 0x30 ? FILE_SHARE_WRITE : FILE_SHARE_READ | FILE_SHARE_WRITE;
+        if (!host_path(g_edx, path)) { dos_fail(3); return g_eax; }
+        HANDLE fh = CreateFileA(path, acc, share, NULL, ah == 0x3C ? CREATE_ALWAYS : OPEN_EXISTING,
+                                ah == 0x3C && ((uint16_t)g_ecx & 0x27) ? ((uint16_t)g_ecx & 0x27) : FILE_ATTRIBUTE_NORMAL, NULL);
+        if (fh == INVALID_HANDLE_VALUE) { dos_fail(host_err()); return g_eax; }
+        int h = new_handle(fh);
+        if (h < 0) { dos_fail(4); return g_eax; }
+        SET16(g_eax, h);
+        return g_eax; }
+    case 0x4E: case 0x4F: {   /* 8.3 find first (CX attrs, DS:DX spec) / next, into the DTA */
+        WIN32_FIND_DATAA fd;
+        int h;
+        if (ah == 0x4E) {
+            if (!host_path(g_edx, path)) { dos_fail(3); return g_eax; }
+            for (h = 0; h < NFINDS && g_find[h]; h++) ;
+            if (h == NFINDS) { dos_fail(4); return g_eax; }
+            HANDLE f = FindFirstFileA(path, &fd);
+            if (f == INVALID_HANDLE_VALUE) { dos_fail(GetLastError() == ERROR_FILE_NOT_FOUND ? 18 : host_err()); return g_eax; }
+            g_find[h] = f; g_find_attr[h] = (uint16_t)g_ecx;
+            { char* sl = strrchr(path, '\\'); g_find_root[h] = sl && (size_t)(sl - path) == strlen(g_root); }
+            MEM16(g_dta) = 0xF1D0; MEM16(g_dta + 2) = (uint16_t)h;   /* the DTA's reserved bytes carry the search */
+        } else {
+            h = MEM16(g_dta) == 0xF1D0 ? MEM16(g_dta + 2) : -1;
+            if (h < 0 || h >= NFINDS || !g_find[h] || !FindNextFileA(g_find[h], &fd)) { dos_fail(18); return g_eax; }
+        }
+        while (!find_ok(&fd, g_find_attr[h]) || (g_find_root[h] && (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, ".."))))
+            if (!FindNextFileA(g_find[h], &fd)) { FindClose(g_find[h]); g_find[h] = NULL; dos_fail(18); return g_eax; }
+        {   FILETIME l; WORD d = 0, t = 0;
+            FileTimeToLocalFileTime(&fd.ftLastWriteTime, &l); FileTimeToDosDateTime(&l, &d, &t);
+            MEM8(g_dta + 0x15) = (uint8_t)(fd.dwFileAttributes & 0x3F);
+            MEM16(g_dta + 0x16) = t; MEM16(g_dta + 0x18) = d; MEM32(g_dta + 0x1A) = fd.nFileSizeLow;
+            const char* sn = fd.cAlternateFileName[0] ? fd.cAlternateFileName : fd.cFileName;
+            char n83[13]; int i = 0;
+            for (; sn[i] && i < 12; i++) n83[i] = (char)toupper((unsigned char)sn[i]);
+            n83[i] = 0;
+            guest_put(g_dta + 0x1E, n83, 13); }
+        return g_eax; }
     case 0x3E: if (!dos_close((uint16_t)g_ebx)) dos_fail(6); return g_eax;
     case 0x3F: case 0x40: { HANDLE fh = dos_handle((uint16_t)g_ebx); DWORD n = 0;
         if (!fh || fh == INVALID_HANDLE_VALUE) { dos_fail(6); return g_eax; }
@@ -937,6 +1241,22 @@ static uint32_t vwin32_int21(const uint32_t* a) {
             if (al == 0x4E) SET16(g_eax, h + 1);
             SET16(g_ecx, 0);
             return g_eax; }
+        case 0xA7: {   /* time conversion, no time zone: BL 0 FILETIME DS:ESI -> CX time, DX date, BH 10 ms;
+                        * BL 1 CX time, DX date, BH 10 ms -> FILETIME ES:EDI */
+            FILETIME ft; WORD d, t;
+            if ((uint8_t)g_ebx == 0) {
+                ft.dwLowDateTime = MEM32(g_esi); ft.dwHighDateTime = MEM32(g_esi + 4);
+                if (!FileTimeToDosDateTime(&ft, &d, &t)) { dos_fail(1); return g_eax; }
+                SET16(g_ecx, t); SET16(g_edx, d); g_ebx &= 0xFFFF00FFu;
+                return g_eax;
+            }
+            if ((uint8_t)g_ebx == 1) {
+                if (!DosDateTimeToFileTime((WORD)g_edx, (WORD)g_ecx, &ft)) { dos_fail(1); return g_eax; }
+                uint64_t v = ((uint64_t)ft.dwHighDateTime << 32 | ft.dwLowDateTime) + (uint64_t)((g_ebx >> 8) & 0xFF) * 100000u;
+                MEM32(g_edi) = (uint32_t)v; MEM32(g_edi + 4) = (uint32_t)(v >> 32);
+                return g_eax;
+            }
+            break; }
         case 0xA1: { int h = (uint16_t)g_ebx - 1;              /* LFN find close */
             if (h >= 0 && h < NFINDS && g_find[h]) { FindClose(g_find[h]); g_find[h] = NULL; }
             return g_eax; }
@@ -969,19 +1289,42 @@ static const vxd_service_t g_services[] = {
     { 0x002A0026, 2, vwin32_link_thread, "VWIN32_LinkThread" },
     { 0x00380023, 3, vcond_init, "VCOND_Init" },
     { 0x0038001F, 0, vcond_new_console, "VCOND_NewConsole" },
+    { 0x00380001, 3, vcond_write, "VCOND_Write" },
+    { 0x00380002, 2, vcond_register, "VCOND_Register" },
+    { 0x00380017, 3, vcond_zero, "VCOND_17_PostAgent" },
+    { 0x0038000A, 1, vcond_zero, "VCOND_0A" },
+    { 0x0038000D, 2, vcond_zero, "VCOND_0D_SetMode" },
+    { 0x0038000C, 2, vcond_zero, "VCOND_0C_Set" },
+    { 0x0038001B, 2, vcond_zero, "VCOND_1B_Set" },
+    { 0x002A0040, 4, vwin32_virtual_query, "VWIN32_VirtualQuery" },
+    { 0x002A0041, 2, vwin32_in_context, "VWIN32_InContext" },
+    { 0x002A000B, 2, vwin32_terminate_thread, "VWIN32_TerminateThread" },
+    { 0x002A002B, 0, vwin32_thread_done, "VWIN32_ThreadDone" },
+    { 0x002A000D, 3, vwin32_queue_to_thread, "VWIN32_QueueToThread" },
+    { 0x002A0058, 1, vwin32_release_58, "VWIN32_58_Release" },
+    { 0x00010020, 1, vmm_20_release, "VMM_20_Release" },
+    { 0x00380014, 2, vcond_zero, "VCOND_14_Detach" },
+    { 0x00380018, 1, vcond_zero, "VCOND_18_Get" },
+    { 0x0038001E, 2, vcond_zero, "VCOND_1E_Set" },
+    { 0x0038000E, 2, vcond_zero, "VCOND_0E" },
+    { 0x00380013, 1, vcond_zero, "VCOND_13_Attached" },
     { 0x002A002D, 2, vwin32_block, "VWIN32_BlockThread" },
+    { 0x002A005C, 3, vwin32_wait_single, "VWIN32_WaitSingle" },
     { 0x002A005D, 5, vwin32_wait_multiple, "VWIN32_WaitMultiple" },
     { 0x002A001D, 1, vwin32_crst_wait, "VWIN32_WaitCrst" },
     { 0x002A001E, 1, vwin32_crst_wake, "VWIN32_WakeCrst" },
     { 0x002A0020, 1, vwin32_fpu_info, "VWIN32_GetCoprocessor" },
     { 0x002A0021, 2, vwin32_set_thread_priority, "VWIN32_SetThreadPriority" },
     { 0x002A0030, 2, vwin32_wait_block_destroy, "VWIN32_DestroyWaitBlock" },
-    { 0x002A0060, 1, vwin32_wait_block_60, "VWIN32_60_WaitBlock" },
+    { 0x002A0060, 1, vwin32_set_event, "VWIN32_SetEvent" },
+    { 0x002A0061, 1, vwin32_pulse_event, "VWIN32_PulseEvent" },
+    { 0x002A0062, 1, vwin32_reset_event, "VWIN32_ResetEvent" },
     { 0x002A0064, 2, vwin32_set_priorities, "VWIN32_SetThreadPriorities" },
     { 0x002A0032, 1, vwin32_obj_release, "VWIN32_ReleaseObject" },
     { 0x002A004F, 4, vwin32_obj_fn, "VWIN32_ObjectFn" },
     { 0x00010005, 2, vmm_heap_alloc, "VMM_HeapAllocate" },
     { 0x00010006, 0, vmm_context_create, "VMM_ContextCreate" },
+    { 0x00010007, 1, vmm_context_destroy, "VMM_ContextDestroy" },
     { 0x00010010, 2, vmm_heap_free, "VMM_HeapFree" },
     { 0x002A0047, 1, vwin32_set_env, "VWIN32_SetEnvironment" },
     { 0x002A0006, 3, vwin32_set_callbacks, "VWIN32_SetCallbacks" },

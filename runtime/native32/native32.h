@@ -144,6 +144,9 @@ void native32_call_guest(uint32_t va, int nargs, const uint32_t* args);
  * register globals from its own threads must too. Nests. */
 void mach_enter(void);
 void mach_leave(void);
+/* Called when a thread takes the machine (outermost mach_enter), after its
+ * registers are back: vxd32 makes it VWIN32's current thread there too. */
+extern void (*native32_on_enter)(void);
 
 /* Block a guest thread from inside a host answer (a VxD service, an
  * import): its registers are kept, the machine lock is released however deep

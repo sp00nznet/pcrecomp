@@ -173,6 +173,7 @@ static void WINAPI tslot_free(void* v) {
     InterlockedExchange(&g_tid[k], 0);
 }
 
+extern void (*native32_on_enter)(void);
 void mach_enter(void) {
     if (!t_slot) {
         t_slot = tslot(GetCurrentThreadId(), 1) + 1;
@@ -208,9 +209,10 @@ void mach_enter(void) {
         m->r.mxcsr = 0x1F80;              /* exceptions masked, round to nearest */
         TlsSetValue(g_mach_tls, m);
     }
-    if (m->depth++ == 0) regs_load(&m->r);
+    if (m->depth++ == 0) { regs_load(&m->r); if (native32_on_enter) native32_on_enter(); }
 }
 
+void (*native32_on_enter)(void);
 void mach_leave(void) {
     mstate* m = (mstate*)TlsGetValue(g_mach_tls);
     if (--m->depth == 0) regs_save(&m->r);
