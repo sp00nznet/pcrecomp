@@ -36,6 +36,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <stdint.h>
 #include <ctype.h>
 #include "ntposix.h"
@@ -140,7 +141,7 @@ typedef struct {
     uint32_t off[256];
     const uint8_t* raw;
 } fnt_t;
-#define MAX_FNT 24
+#define MAX_FNT 64
 static fnt_t g_fnt[MAX_FNT];
 static int g_nfnt;
 static uint16_t rd16(const uint8_t* p) { return (uint16_t)(p[0] | p[1] << 8); }
@@ -183,12 +184,242 @@ static void fon_load(const char* path) {
         }
     }
 }
+/* ======================================================================
+ * TrueType: Windows 2000's own .ttf files (lucon.ttf, tahoma.ttf, ...),
+ * read and scan-converted here, each size turned into an fnt_t so the
+ * bitmap text path draws it. Monochrome, as Windows 2000 draws without
+ * font smoothing: a pixel is on when its centre is inside the outline
+ * (non-zero winding).
+ * ponytail: no hinting (no bytecode interpreter), so stems can land a pixel
+ * off the hinted output Windows draws; cp1252 only; composites keep offsets,
+ * not scale; glyphs are cut at their advance.
+ * ====================================================================== */
+typedef struct { char fam[32]; const uint8_t* d; uint32_t glyf, loca, hmtx, cmap4; int upem, longloca, nhm, asc, desc, avgw, maxw, weight, fixed; } ttf_t;
+static ttf_t g_ttf[8];
+static int g_nttf;
+static uint16_t rbe16(const uint8_t* p) { return (uint16_t)(p[0] << 8 | p[1]); }
+static uint32_t rbe32(const uint8_t* p) { return (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
+static void ttf_load(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f || g_nttf >= 8) { if (f) fclose(f); return; }
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    uint8_t* d = malloc(n);
+    fseek(f, 0, SEEK_SET);
+    if (n < 12 || fread(d, 1, n, f) != (size_t)n) { fclose(f); free(d); return; }
+    fclose(f);
+    ttf_t* T = &g_ttf[g_nttf];
+    memset(T, 0, sizeof *T);
+    T->d = d;
+    uint32_t head = 0, hhea = 0, os2 = 0, name = 0, cmap = 0, post = 0;
+    for (int i = 0; i < rbe16(d + 4); i++) {
+        const uint8_t* e = d + 12 + 16 * i;
+        uint32_t o = rbe32(e + 8);
+        if (!memcmp(e, "head", 4)) head = o; else if (!memcmp(e, "hhea", 4)) hhea = o;
+        else if (!memcmp(e, "OS/2", 4)) os2 = o; else if (!memcmp(e, "name", 4)) name = o;
+        else if (!memcmp(e, "cmap", 4)) cmap = o; else if (!memcmp(e, "post", 4)) post = o;
+        else if (!memcmp(e, "glyf", 4)) T->glyf = o; else if (!memcmp(e, "loca", 4)) T->loca = o;
+        else if (!memcmp(e, "hmtx", 4)) T->hmtx = o;
+    }
+    if (!head || !hhea || !os2 || !name || !cmap || !T->glyf || !T->loca || !T->hmtx) { free(d); return; }
+    T->upem = rbe16(d + head + 18), T->longloca = (int16_t)rbe16(d + head + 50);
+    T->nhm = rbe16(d + hhea + 34), T->maxw = rbe16(d + hhea + 10);
+    T->avgw = (int16_t)rbe16(d + os2 + 2), T->weight = rbe16(d + os2 + 4);
+    T->asc = rbe16(d + os2 + 74), T->desc = rbe16(d + os2 + 76);
+    T->fixed = post ? rbe32(d + post + 12) != 0 : 0;
+    for (int i = 0; i < rbe16(d + cmap + 2); i++) {                /* (3,1) format 4 */
+        const uint8_t* e = d + cmap + 4 + 8 * i;
+        if (rbe16(e) == 3 && rbe16(e + 2) == 1 && rbe16(d + cmap + rbe32(e + 4)) == 4) T->cmap4 = cmap + rbe32(e + 4);
+    }
+    const uint8_t* nt = d + name;
+    for (int i = 0; i < rbe16(nt + 2); i++) {                      /* the family name (1), Windows Unicode */
+        const uint8_t* r = nt + 6 + 12 * i;
+        if (rbe16(r) != 3 || rbe16(r + 6) != 1 || (rbe16(r + 4) & 0x3FF) != 9) continue;
+        const uint8_t* s = nt + rbe16(nt + 4) + rbe16(r + 10);
+        int k = 0;
+        for (int j = 0; j + 1 < rbe16(r + 8) && k < 31; j += 2) T->fam[k++] = (char)s[j + 1];
+        T->fam[k] = 0;
+        break;
+    }
+    if (!T->cmap4 || !T->fam[0]) { free(d); return; }
+    TRACE("[w32k] TrueType %s (%s)\n", T->fam, path);
+    g_nttf++;
+}
+static int ttf_glyph(const ttf_t* T, uint32_t u) {
+    const uint8_t* c = T->d + T->cmap4;
+    int n = rbe16(c + 6) / 2;
+    for (int i = 0; i < n; i++) {
+        uint32_t end = rbe16(c + 14 + 2 * i), start = rbe16(c + 16 + 2 * n + 2 * i);
+        if (u > end) continue;
+        if (u < start) return 0;
+        uint16_t delta = rbe16(c + 16 + 4 * n + 2 * i);
+        uint32_t ro = 16 + 6 * n + 2 * i, r = rbe16(c + ro);
+        if (!r) return (uint16_t)(u + delta);
+        uint16_t g = rbe16(c + ro + r + 2 * (u - start));
+        return g ? (uint16_t)(g + delta) : 0;
+    }
+    return 0;
+}
+/* a glyph's outline as line segments in font units (quadratics flattened) */
+typedef struct { float x0, y0, x1, y1; } seg_t;
+typedef struct { seg_t* s; int n, cap; } segs_t;
+static void seg_add(segs_t* S, float x0, float y0, float x1, float y1) {
+    if (S->n == S->cap) S->cap = S->cap ? 2 * S->cap : 256, S->s = realloc(S->s, S->cap * sizeof *S->s);
+    S->s[S->n++] = (seg_t){ x0, y0, x1, y1 };
+}
+static void seg_quad(segs_t* S, float x0, float y0, float cx, float cy, float x1, float y1) {
+    float px = x0, py = y0;
+    for (int i = 1; i <= 8; i++) {
+        float t = i / 8.f, u = 1 - t;
+        float x = u * u * x0 + 2 * u * t * cx + t * t * x1, y = u * u * y0 + 2 * u * t * cy + t * t * y1;
+        seg_add(S, px, py, x, y);
+        px = x, py = y;
+    }
+}
+static void ttf_outline(const ttf_t* T, int g, float dx, float dy, segs_t* S, int depth) {
+    const uint8_t* d = T->d;
+    uint32_t o0 = T->longloca ? rbe32(d + T->loca + 4 * g) : 2u * rbe16(d + T->loca + 2 * g);
+    uint32_t o1 = T->longloca ? rbe32(d + T->loca + 4 * g + 4) : 2u * rbe16(d + T->loca + 2 * g + 2);
+    if (o1 <= o0 || depth > 4) return;
+    const uint8_t* p = d + T->glyf + o0;
+    int nc = (int16_t)rbe16(p);
+    if (nc < 0) {                                                 /* a composite: its parts at their offsets */
+        const uint8_t* q = p + 10;
+        for (;;) {
+            int fl = rbe16(q), sub = rbe16(q + 2);
+            float ox, oy;
+            q += 4;
+            if (fl & 1) ox = (int16_t)rbe16(q), oy = (int16_t)rbe16(q + 2), q += 4;
+            else ox = (int8_t)q[0], oy = (int8_t)q[1], q += 2;
+            if (!(fl & 2)) ox = oy = 0;                           /* point matching: not done */
+            q += fl & 8 ? 2 : fl & 0x40 ? 4 : fl & 0x80 ? 8 : 0;
+            ttf_outline(T, sub, dx + ox, dy + oy, S, depth + 1);
+            if (!(fl & 0x20)) break;
+        }
+        return;
+    }
+    const uint8_t* ends = p + 10;
+    int np = nc ? rbe16(ends + 2 * (nc - 1)) + 1 : 0;
+    const uint8_t* ip = ends + 2 * nc;
+    const uint8_t* fp = ip + 2 + rbe16(ip);
+    uint8_t* fl = malloc(np + 1);
+    float* xs = malloc(sizeof(float) * (np + 1)), *ys = malloc(sizeof(float) * (np + 1));
+    for (int i = 0; i < np; ) {
+        uint8_t f = *fp++;
+        int r = f & 8 ? *fp++ : 0;
+        for (int k = 0; k <= r && i < np; k++) fl[i++] = f;
+    }
+    int v = 0;
+    for (int i = 0; i < np; i++) {
+        if (fl[i] & 2) v += fl[i] & 0x10 ? *fp : -*fp, fp++;
+        else if (!(fl[i] & 0x10)) v += (int16_t)rbe16(fp), fp += 2;
+        xs[i] = (float)v + dx;
+    }
+    v = 0;
+    for (int i = 0; i < np; i++) {
+        if (fl[i] & 4) v += fl[i] & 0x20 ? *fp : -*fp, fp++;
+        else if (!(fl[i] & 0x20)) v += (int16_t)rbe16(fp), fp += 2;
+        ys[i] = (float)v + dy;
+    }
+    for (int c = 0, s = 0; c < nc; c++) {
+        int e = rbe16(ends + 2 * c), m = e - s + 1;
+        if (m < 2) { s = e + 1; continue; }
+        int k0 = s;                                               /* start on an on-curve point (or a midpoint) */
+        while (k0 <= e && !(fl[k0] & 1)) k0++;
+        float sx, sy;
+        int mid = k0 > e;
+        if (mid) sx = (xs[s] + xs[e]) / 2, sy = (ys[s] + ys[e]) / 2, k0 = e;
+        else sx = xs[k0], sy = ys[k0];
+        float px = sx, py = sy, cx = 0, cy = 0;
+        int hasc = 0;
+        for (int j = 1; j <= m; j++) {
+            int k = s + (k0 - s + j) % m;
+            if (j == m && !mid) break;                            /* back at the start point */
+            float x = xs[k], y = ys[k];
+            if (fl[k] & 1) {
+                if (hasc) seg_quad(S, px, py, cx, cy, x, y); else seg_add(S, px, py, x, y);
+                px = x, py = y, hasc = 0;
+            } else {
+                if (hasc) { float mx = (cx + x) / 2, my = (cy + y) / 2; seg_quad(S, px, py, cx, cy, mx, my); px = mx, py = my; }
+                cx = x, cy = y, hasc = 1;
+            }
+        }
+        if (hasc) seg_quad(S, px, py, cx, cy, sx, sy);
+        else if (px != sx || py != sy) seg_add(S, px, py, sx, sy);
+        s = e + 1;
+    }
+    free(fl), free(xs), free(ys);
+}
+/* a TrueType face at a LOGFONT height, as a new fnt_t (cached by face and ppem) */
+static int ttf_pick(const char* face, int height) {
+    static const uint16_t cp1252[32] = { 0x20AC, 0, 0x201A, 0x192, 0x201E, 0x2026, 0x2020, 0x2021, 0x2C6, 0x2030, 0x160, 0x2039, 0x152, 0, 0x17D, 0,
+        0, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0x2DC, 0x2122, 0x161, 0x203A, 0x153, 0, 0x17E, 0x178 };
+    ttf_t* T = NULL;
+    for (int i = 0; i < g_nttf; i++) if (!strcasecmp(g_ttf[i].fam, face)) T = &g_ttf[i];
+    if (!T) return -1;
+    int ppem = height < 0 ? -height : height ? (height * T->upem + (T->asc + T->desc) / 2) / (T->asc + T->desc) : 13;
+    for (int i = 0; i < g_nfnt; i++) if (g_fnt[i].points == -ppem && !strcmp(g_fnt[i].face, T->fam)) return i;
+    if (g_nfnt >= MAX_FNT) return -1;
+    float sc = (float)ppem / T->upem;
+    fnt_t* F = &g_fnt[g_nfnt];
+    memset(F, 0, sizeof *F);
+    snprintf(F->face, sizeof F->face, "%s", T->fam);
+    F->points = -ppem;                                            /* (marks a TrueType size; the cache key) */
+    F->ascent = (int)(T->asc * sc + .5f), F->h = F->ascent + (int)(T->desc * sc + .5f), F->ilead = F->h - ppem;
+    F->avgw = (int)(T->avgw * sc + .5f), F->maxw = (int)(T->maxw * sc + .5f), F->weight = T->weight;
+    F->first = 0, F->last = 255, F->defch = '?', F->brk = ' ', F->pitch = (T->fixed ? 0 : 1) | 4;
+    size_t tot = 0;
+    int gl[256];
+    for (int c = 0; c < 256; c++) {
+        uint32_t u = c >= 0x80 && c < 0xA0 ? cp1252[c - 0x80] : (uint32_t)c;
+        int g = gl[c] = u ? ttf_glyph(T, u) : 0;
+        int adv = rbe16(T->d + T->hmtx + 4 * (g < T->nhm ? g : T->nhm - 1));
+        F->w[c] = (uint16_t)(int)(adv * sc + .5f), F->off[c] = (uint32_t)tot;
+        tot += (size_t)((F->w[c] + 7) / 8) * F->h;
+    }
+    uint8_t* raw = calloc(tot ? tot : 1, 1);
+    segs_t S = { 0 };
+    enum { MAXX = 512 };
+    float xs[MAXX];
+    int dir[MAXX];
+    for (int c = 0; c < 256; c++) {
+        S.n = 0;
+        ttf_outline(T, gl[c], 0, 0, &S, 0);
+        for (int y = 0; y < F->h; y++) {                          /* a row at its pixel centres: the crossings, by winding */
+            float fy = (F->ascent - (y + .5f)) / sc;
+            int nx = 0;
+            for (int i = 0; i < S.n && nx < MAXX; i++) {
+                seg_t* e = &S.s[i];
+                if ((e->y0 <= fy) == (e->y1 <= fy)) continue;
+                float x = e->x0 + (fy - e->y0) * (e->x1 - e->x0) / (e->y1 - e->y0);
+                int k = nx++;                                     /* (insertion sort: few crossings) */
+                for (; k > 0 && xs[k - 1] > x * sc; k--) xs[k] = xs[k - 1], dir[k] = dir[k - 1];
+                xs[k] = x * sc, dir[k] = e->y1 > e->y0 ? 1 : -1;
+            }
+            int wind = 0;
+            for (int i = 0; i + 1 < nx; i++) {
+                wind += dir[i];
+                if (!wind) continue;
+                for (int x = (int)ceilf(xs[i] - .5f); x + .5f < xs[i + 1] && x < F->w[c]; x++)
+                    if (x >= 0) raw[F->off[c] + (size_t)(x >> 3) * F->h + y] |= (uint8_t)(0x80 >> (x & 7));
+            }
+        }
+    }
+    free(S.s);
+    F->raw = raw;
+    TRACE("[w32k] TrueType %s at %d ppem: %d high\n", F->face, ppem, F->h);
+    return g_nfnt++;
+}
 /* the font for a LOGFONT: the face if we have it (MS Sans Serif otherwise),
  * the nearest cell height. ponytail: bitmap faces only; bold is overstruck */
 static int fnt_pick(const char* face, int height) {
     int best = -1, bd = 1 << 30;
+    for (int i = 0; i < g_nfnt; i++) if (g_fnt[i].points > 0 && !strcasecmp(g_fnt[i].face, face)) goto bitmap;
+    if ((best = ttf_pick(face, height)) >= 0) return best;
+bitmap:
     for (int pass = 0; pass < 2 && best < 0; pass++)
         for (int i = 0; i < g_nfnt; i++) {
+            if (g_fnt[i].points <= 0) continue;           /* (TrueType sizes are made on demand) */
             if (pass == 0 && strcasecmp(g_fnt[i].face, face)) continue;
             if (pass == 1 && strcasecmp(g_fnt[i].face, "MS Sans Serif")) continue;
             int ch = height < 0 ? g_fnt[i].h - g_fnt[i].ilead : g_fnt[i].h;
@@ -2842,6 +3073,8 @@ void w2kx_install(int cx, int cy, const char* fontdir) {
     for (int i = 0; i < cx * cy; i++) g_screen.px[i] = w2k_colors_2000[1];   /* COLOR_BACKGROUND */
     snprintf(p, sizeof p, "%s/sserife.fon", fontdir), fon_load(p);
     snprintf(p, sizeof p, "%s/vgasys.fon", fontdir), fon_load(p);
+    static const char* const ttfs[] = { "lucon.ttf", "tahoma.ttf", "tahomabd.ttf", "arial.ttf", "times.ttf", "cour.ttf" };
+    for (unsigned i = 0; i < sizeof ttfs / sizeof ttfs[0]; i++) snprintf(p, sizeof p, "%s/%s", fontdir, ttfs[i]), ttf_load(p);
     ntp_csr_connect = user_connect;
     ntp_win32k_pre = pre;
     static const struct { const char* name; uint32_t (*fn)(uint32_t*); } svc[] = {
