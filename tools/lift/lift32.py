@@ -415,7 +415,7 @@ class Lifter:
             return self._fmt_mem_write(op.mem, op.size, value)
         return f"??? = {value}"
 
-    def _fmt_mem_addr(self, mem) -> str:
+    def _fmt_mem_addr(self, mem, lea=False) -> str:
         """Format the effective address calculation for a memory operand."""
         parts = []
         if mem.base != 0:
@@ -445,6 +445,8 @@ class Lifter:
         # ponytail: a bare 67h [disp16] (no register) is not caught.
         if mem.base in REG_NAMES_16 or mem.index in REG_NAMES_16:
             addr = f"(uint16_t)({addr})"
+        if lea:   # lea is the offset alone: no segment base (kernel32's `lea esi, ds:[esi+9]` on a 16-bit ds)
+            return addr
         # Segment override: fs/gs are thread-relative (TIB/TEB) and must NOT be
         # treated as flat. Route them through a runtime base so e.g. `fs:[0]`
         # (the SEH chain head) reads the simulated TIB instead of VA 0.
@@ -499,7 +501,7 @@ class Lifter:
 
     def _fmt_lea(self, mem) -> str:
         """Format LEA (just the address calculation, no memory access)."""
-        return self._fmt_mem_addr(mem)
+        return self._fmt_mem_addr(mem, lea=True)
 
     @staticmethod
     def _string_cmp_base(insn, m):

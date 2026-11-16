@@ -47,6 +47,11 @@ void recomp_fn_hit(const char *n) {   /* g_fncount: W16_FN=1 (with fs when it ch
         if (d[0] != last[0] || d[1] != last[1]) { last[0] = d[0]; last[1] = d[1]; fprintf(stderr, "WATCH %04X = %08X %08X at %s\n", g_wsel, d[0], d[1], n); }
         if (!g_fncount) return;
     }
+    {   /* W16_WW=ss:off: say which function first sees that word change */
+        static int ww = -1; static uint16_t wss, last;
+        if (ww < 0) { const char *e = getenv("W16_WW"); char *t; wss = e ? (uint16_t)strtoul(e, &t, 16) : 0; ww = e && *t == ':' ? (int)strtoul(t + 1, 0, 16) : 0x10000; }
+        if (ww < 0x10000 && g_w16.ss == wss) { uint16_t v = mem_read16(&g_w16, g_w16.ss, (uint16_t)ww); if (v != last) { last = v; fprintf(stderr, "WW ss:%04X = %04X at %s\n", ww, v, n); } }
+    }
     if (sp) fprintf(stderr, "FN %s ss:sp %04X:%04X bp %04X\n", n, g_w16.ss, g_w16.sp, g_w16.bp);
     else if (g_w16.fs != fs) { fs = g_w16.fs; fprintf(stderr, "FN %s fs=%04X\n", n, fs); }
     else fprintf(stderr, "FN %s\n", n);
@@ -819,12 +824,19 @@ int w16_retf(CPU *c) {
     if (!(at >> 16 & 4) || !recomp_lar32((uint16_t)(at >> 16), &r) || (r & 0x8800) != 0x8800 || !recomp_sel_base(at >> 16)) return 0;
     const uint8_t *p = (const uint8_t *)(uintptr_t)w16_lin(recomp_sel_base(at >> 16) + (at & 0xFFFF));
     static const uint8_t t1[] = { 0x8E, 0xC0, 0x66, 0x0F, 0xB7, 0xC9, 0x67, 0x66, 0x26, 0x8B, 0x91 };
-    if (p[0] != 0xB8 || memcmp(p + 3, t1, sizeof t1) || p[0x12] != 0x66 || p[0x13] != 0xEA) return 0;
+    /* or seg001_7618's (a flat thunk's first call, e.g. USER's WNet ones):
+     *   B8 sel / 8E C0 / 66 BA imm32 / 66 EA off32 sel16 = es = sel; edx = imm32 */
+    static const uint8_t t2[] = { 0x8E, 0xC0, 0x66, 0xBA };
+    int ft = p[0] == 0xB8 && !memcmp(p + 3, t2, sizeof t2) && p[0xB] == 0x66 && p[0xC] == 0xEA;
+    if (!ft && (p[0] != 0xB8 || memcmp(p + 3, t1, sizeof t1) || p[0x12] != 0x66 || p[0x13] != 0xEA)) return 0;
     c->sp += 4;
     c->es = *(const uint16_t *)(p + 1);
-    c->ecx = c->cx;
-    c->edx = *(const uint32_t *)(uintptr_t)(recomp_sel_base(c->es) + c->ecx + *(const uint32_t *)(p + 0xE));
-    uint32_t eip = *(const uint32_t *)(p + 0x14);
+    if (ft) c->edx = *(const uint32_t *)(p + 7);
+    else {
+        c->ecx = c->cx;
+        c->edx = *(const uint32_t *)(uintptr_t)(recomp_sel_base(c->es) + c->ecx + *(const uint32_t *)(p + 0xE));
+    }
+    uint32_t eip = *(const uint32_t *)(p + (ft ? 0xD : 0x14));
     w16_fn32 f = recomp_lookup(eip);
     if (getenv("W16_TRACE")) fprintf(stderr, "[w16] stub %04X:%04X -> %08X (entry %08X, cx %04X) depth %d back %04X:%04X thread %lu\n", at >> 16, at & 0xFFFF, eip, c->edx, c->cx,
         g_nthk, mem_read16(c, c->ss, (uint16_t)(c->sp + 6)), mem_read16(c, c->ss, (uint16_t)(c->sp + 4)), GetCurrentThreadId());
@@ -857,8 +869,14 @@ int w16_retf(CPU *c) {
 
 int w16_enter(uint32_t target) {
     if (g_nthk && target == g_thk[g_nthk - 1].back) {   /* a 16->32 stub's return */
-        if (getenv("W16_TRACE")) fprintf(stderr, "[w16] stub %d returns to %04X:%04X (thread %lu)\n", g_nthk - 1, target >> 16, target & 0xFFFF, GetCurrentThreadId());
-        longjmp(g_thk[g_nthk - 1].jb, 1);
+        /* the outermost of a run with the same return: a flat thunk not yet
+         * connected re-enters itself through KRNL386 (kernel32 0xBFF718AE ->
+         * 16-bit connect -> jmp far32 0xBFF718C7), and both come back to the
+         * one 16-bit caller, whose C frame is the outer one's */
+        int k = g_nthk - 1;
+        while (k > 0 && g_thk[k - 1].back == target) k--;
+        if (getenv("W16_TRACE")) fprintf(stderr, "[w16] stub %d returns to %04X:%04X (thread %lu)\n", k, target >> 16, target & 0xFFFF, GetCurrentThreadId());
+        longjmp(g_thk[k].jb, 1);
     }
     uint16_t sel = (uint16_t)(target >> 16), off = (uint16_t)target;
     if (!g_w16_ready) { cpu_init(&g_w16); g_w16.mem = NULL; g_w16_ready = 1; segsel_init(); }

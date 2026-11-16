@@ -691,11 +691,47 @@ static int g_nthreads;
 static HANDLE thread_wake(void);
 static void track_thread(uint32_t r0) { if (g_nthreads < MAXTHREADS) g_threads[g_nthreads++] = r0; }
 static uint32_t g_console_obj;   /* VCOND 2's object: its input is the host's stdin */
+/* Mutexes (kernel32 type 3, 0xBFF8CAA2: 18h bytes, +4 0, +8 1): Win98's
+ * WaitForSingleObject goes straight to ring 0 (0xBFF99B28), which owns
+ * them; CreateMutex(TRUE) is a 5C with 0 ms, ReleaseMutex is 5F (0xBFF92DC1).
+ * Owner and recursion are kept here, by object. ponytail: 64 mutexes, no
+ * abandonment when an owner dies, wait-all still wait-any. */
+#define MAXMUTEX 64
+static struct { uint32_t obj, owner, n; } g_mutex[MAXMUTEX];
+static int mutex_slot(uint32_t obj) {
+    int f = -1;
+    for (int i = 0; i < MAXMUTEX; i++) { if (g_mutex[i].obj == obj) return i; if (f < 0 && !g_mutex[i].obj) f = i; }
+    if (f >= 0) { g_mutex[f].obj = obj; g_mutex[f].owner = 0; g_mutex[f].n = 0; }
+    return f;
+}
+static int is_mutex(uint32_t obj) { return obj && MEM8(obj) == 3; }
+static uint32_t vwin32_release_mutex(const uint32_t* a) {
+    int m = is_mutex(a[0]) ? mutex_slot(a[0]) : -1;
+    if (m < 0 || g_mutex[m].owner != g_cur[0] || !g_mutex[m].n) return 0;
+    if (--g_mutex[m].n) return 1;
+    g_mutex[m].owner = 0;
+    for (int t = 0; t < g_nthreads; t++) {   /* hand it to one waiter */
+        uint32_t r0 = g_threads[t], n = MEM32(r0 + R0T_WAITN);
+        for (uint32_t i = 0; i < n; i++)
+            if (MEM32(MEM32(r0 + R0T_WAITS) + 4 * i) == a[0]) {
+                g_mutex[m].owner = MEM32(r0 + R0T_THREAD); g_mutex[m].n = 1;
+                MEM32(r0 + R0T_WOKEN) = i; MEM32(r0 + R0T_WAITN) = 0;
+                SetEvent((HANDLE)(uintptr_t)MEM32(r0 + R0T_WAKE));
+                return 1;
+            }
+    }
+    return 1;
+}
 static uint32_t vwin32_wait_multiple(const uint32_t* a) {
     /* A wait on the console (ReadFile on a console handle, 0xBFF774E4)
      * waits for input: always ready, the read itself blocks on stdin. */
     for (uint32_t i = 0; g_console_obj && i < a[0]; i++)
         if (MEM32(a[1] + 4 * i) == g_console_obj) return i;
+    for (uint32_t i = 0; i < a[0]; i++) {   /* a free (or our own) mutex is taken at once */
+        uint32_t o = MEM32(a[1] + 4 * i);
+        int m = is_mutex(o) ? mutex_slot(o) : -1;
+        if (m >= 0 && (!g_mutex[m].owner || g_mutex[m].owner == g_cur[0])) { g_mutex[m].owner = g_cur[0]; g_mutex[m].n++; return i; }
+    }
     uint32_t r0 = t_r0 ? t_r0 : g_boot_r0;
     MEM32(r0 + R0T_WAITN) = a[0];
     MEM32(r0 + R0T_WAITS) = a[1];
@@ -1223,6 +1259,8 @@ static uint32_t vwin32_int21(const uint32_t* a) {
         if (getenv("W16_TRACE")) fprintf(stderr, "[int21] delete %s\n", path);
         if (!DeleteFileA(path)) dos_fail(host_err());
         return g_eax;
+    case 0x50: g_cur_psp = (uint16_t)g_ebx; return g_eax;      /* set PSP (kernel32 walking 16-bit modules, MSGSRV32's WNet thunk) */
+    case 0x51: case 0x62: SET16(g_ebx, g_cur_psp); return g_eax;
     case 0x55: {   /* create child PSP at DX (KRNL386's LoadModule of a task, MSGSRV32): a copy of
                     * the current one, SI its memory top, parent = current; it becomes current.
                     * ponytail: the job file table is shared, not duplicated (no inheritance counts). */
@@ -1479,6 +1517,7 @@ static const vxd_service_t g_services[] = {
     { 0x00090000, 2, reboot_0, "REBOOT_0" },
     { 0x00090001, 2, reboot_0, "REBOOT_1" },
     { 0x002A0030, 2, vwin32_wait_block_destroy, "VWIN32_DestroyWaitBlock" },
+    { 0x002A005F, 1, vwin32_release_mutex, "VWIN32_ReleaseMutex" },
     { 0x002A0060, 1, vwin32_set_event, "VWIN32_SetEvent" },
     { 0x002A0061, 1, vwin32_pulse_event, "VWIN32_PulseEvent" },
     { 0x002A0062, 1, vwin32_reset_event, "VWIN32_ResetEvent" },

@@ -606,6 +606,14 @@ class NELifter(Lifter):
                                    f'{orig} -- KERNEL.{r.ordinal} '
                                    f'({"__AHSHIFT" if r.ordinal == 113 else "__AHINCR"})')
                         return
+                    # KERNEL.178 is __WINFLAGS, a value the loader patches in
+                    # (Win98 SHELL.DLL's LibEntry: `mov ax, __WINFLAGS; or ax,
+                    # ax; jns` -- left as the FFFF chain end it took the
+                    # InitTask path and returned on InitTask's frame).
+                    if tt == 1 and module_name(self.ne, r.module_idx).upper() == 'KERNEL'                             and r.ordinal == 178:
+                        self._emit(_put(f'0x{win16.get_value("KERNEL", "__WINFLAGS"):04X}'),
+                                   f'{orig} -- KERNEL.178 (__WINFLAGS)')
+                        return
                     # KERNEL's selectors to fixed real-mode memory: __A000H
                     # (174), __B000H (181), __B800H (182), __0040H (193),
                     # __F000H (194), __C000H (195), __D000H (179), __E000H (190);
