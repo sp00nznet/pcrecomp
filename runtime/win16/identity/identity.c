@@ -33,10 +33,15 @@ const char *g_fn_ring[RECOMP_FN_RING_SIZE];
 unsigned g_fn_ring_pos;
 int g_fncount, g_watch_ds;
 uint16_t g_wsel;
-static CPU g_w16;
+/* per thread: kernel32's 16->32 dispatcher leaves the Win16Mutex, so another
+ * guest thread can run 16-bit code while this one is inside a thunk */
+static __declspec(thread) CPU g_w16;
 void recomp_fn_hit(const char *n) {   /* g_fncount: W16_FN=1 (with fs when it changes) */
     static uint16_t fs;
-    if (g_w16.fs != fs) { fs = g_w16.fs; fprintf(stderr, "FN %s fs=%04X\n", n, fs); }
+    static int sp = -1;
+    if (sp < 0) { const char *e = getenv("W16_FN"); sp = e && *e == '2'; }
+    if (sp) fprintf(stderr, "FN %s ss:sp %04X:%04X bp %04X\n", n, g_w16.ss, g_w16.sp, g_w16.bp);
+    else if (g_w16.fs != fs) { fs = g_w16.fs; fprintf(stderr, "FN %s fs=%04X\n", n, fs); }
     else fprintf(stderr, "FN %s\n", n);
 }
 void recomp_sel_write(uint16_t seg, uint16_t off, uint16_t val) { (void)seg; (void)off; (void)val; }
@@ -57,6 +62,7 @@ static void w16_stop(const char *what, unsigned a, unsigned b) {
     exit(5);
 }
 
+void w16_drv_stop(const char *what, unsigned a, unsigned b) { w16_stop(what, a, b); }
 void recomp_unreachable(const char *seg, unsigned off) { w16_stop("unlifted target", (unsigned)strtoul(seg, NULL, 10), off); }
 void recomp_div0(const char *kind) { (void)kind; w16_stop("divide error", 0, 0); }
 
@@ -79,7 +85,7 @@ static void d_set_base(uint8_t *d, uint32_t b) { d[2] = (uint8_t)b; d[3] = (uint
  * data, DOS) stays unmapped. KRNL386's PSP is at 1000h. */
 static int g_rm;
 uint8_t g_w16_low[0x10000];   /* linear 0-FFFFh (cpu.h w16_lin) */
-static uint32_t g_w16_ret;   /* the flat return of the innermost w16_enter on a big stack */
+static __declspec(thread) uint32_t g_w16_ret;   /* the flat return of the innermost w16_enter on a big stack */
 
 /* What a PC's first megabyte holds before DOS: every IVT vector at an iret
  * in the BIOS, a BIOS data area for a VGA colour text screen, 640 KB, no
@@ -369,7 +375,9 @@ void bios_int16(CPU *cpu) { int_handler(cpu, 0x16); }
  * loads GDI's and USER's), SEG_n becomes that block's selector, so `push
  * cs`, cs:[n] and DGROUP fixups name what KRNL386's own tables know. */
 uint16_t g_w16_segsel[RECOMP_NUM_SEG + 1];
-static void segsel_init(void) {
+static void segsel_init(void) {   /* once per process: g_w16_ready is per thread */
+    static int done;
+    if (done++) return;
     for (uint16_t n = 0; n <= RECOMP_NUM_SEG; n++) g_w16_segsel[n] = (uint16_t)(n << 3 | 7);
 }
 
@@ -515,6 +523,8 @@ void w16_segin(uint16_t n) {
 void dispatch_far(CPU *cpu, uint16_t sel, uint16_t off) {
     if (getenv("W16_TRACE")) fprintf(stderr, "[w16] far %04X:%04X (seg %u) ss:sp %04X:%04X\n", sel, off, seg_of(sel), cpu->ss, cpu->sp);
     if (sel && sel == g_host_sel) { host_far(cpu, off); return; }
+    int w16_drv_far(CPU *c, uint16_t sel, uint16_t off);
+    if (w16_drv_far(cpu, sel, off)) return;   /* a host driver's segment (drv16.c) */
     if (!(sel & 4) || !recomp_dispatch_lookup(cpu, seg_of(sel), off)) w16_stop("far call miss", sel, off);
 }
 /* Exception n at cs:ip (a lifted ud0/ud2): what a DPMI host does. The
@@ -545,8 +555,8 @@ void dispatch_near(CPU *cpu, uint16_t seg, uint16_t off) {   /* seg: the segment
 }
 
 
-static CPU g_w16;
-static int g_w16_ready;
+static __declspec(thread) CPU g_w16;
+static __declspec(thread) int g_w16_ready;
 static uint16_t seg_of(uint16_t sel);
 int w16_ss_big(uint16_t ss);
 
@@ -558,8 +568,8 @@ int w16_ss_big(uint16_t ss);
  * kernel32 dispatcher that runs entry edx and comes back to the 16-bit
  * caller with an o16 retf (w16_enter sees its return address and unwinds
  * here). Static code cannot hold it, so the runtime runs it. */
-static struct { jmp_buf jb; uint32_t back; } g_thk[16];
-static int g_nthk;
+static __declspec(thread) struct { jmp_buf jb; uint32_t back; } g_thk[16];
+static __declspec(thread) int g_nthk;
 int w16_retf(CPU *c) {
     uint32_t at = mem_read32(c, c->ss, c->sp);
     int recomp_lar32(uint16_t sel, uint32_t *rights);
@@ -574,7 +584,8 @@ int w16_retf(CPU *c) {
     c->edx = *(const uint32_t *)(uintptr_t)(recomp_sel_base(c->es) + c->ecx + *(const uint32_t *)(p + 0xE));
     uint32_t eip = *(const uint32_t *)(p + 0x14);
     w16_fn32 f = recomp_lookup(eip);
-    if (getenv("W16_TRACE")) fprintf(stderr, "[w16] stub %04X:%04X -> %08X (entry %08X, cx %04X)\n", at >> 16, at & 0xFFFF, eip, c->edx, c->cx);
+    if (getenv("W16_TRACE")) fprintf(stderr, "[w16] stub %04X:%04X -> %08X (entry %08X, cx %04X) depth %d back %04X:%04X thread %lu\n", at >> 16, at & 0xFFFF, eip, c->edx, c->cx,
+        g_nthk, mem_read16(c, c->ss, (uint16_t)(c->sp + 6)), mem_read16(c, c->ss, (uint16_t)(c->sp + 4)), GetCurrentThreadId());
     if (!f) w16_stop("generated stub jumps to no lifted function", eip >> 16, eip & 0xFFFF);
     if (g_nthk == 16) w16_stop("16->32 stubs nested too deep", 0, 0);
     uint32_t se[8] = { g_eax, g_ecx, g_edx, g_ebx, g_esp, g_ebp, g_esi, g_edi };
@@ -602,7 +613,10 @@ int w16_retf(CPU *c) {
 }
 
 int w16_enter(uint32_t target) {
-    if (g_nthk && target == g_thk[g_nthk - 1].back) longjmp(g_thk[g_nthk - 1].jb, 1);   /* a 16->32 stub's return */
+    if (g_nthk && target == g_thk[g_nthk - 1].back) {   /* a 16->32 stub's return */
+        if (getenv("W16_TRACE")) fprintf(stderr, "[w16] stub %d returns to %04X:%04X (thread %lu)\n", g_nthk - 1, target >> 16, target & 0xFFFF, GetCurrentThreadId());
+        longjmp(g_thk[g_nthk - 1].jb, 1);
+    }
     uint16_t sel = (uint16_t)(target >> 16), off = (uint16_t)target;
     if (!g_w16_ready) { cpu_init(&g_w16); g_w16.mem = NULL; g_w16_ready = 1; segsel_init(); }
     CPU saved = g_w16, *c = &g_w16;
