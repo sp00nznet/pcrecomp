@@ -120,7 +120,7 @@ uint32_t native32_gdi_handle(uint32_t h) {
     MEM8(e + 10) = (uint8_t)type;
     /* a region's RGNATTR (gdi32 keeps a rectangular region's rectangle in
      * it client-side, CreateRectRgn / SetRectRgn) */
-    if (type == 4 && !attr) attr = (uint8_t*)calloc(1, 0x20);
+    if (type == 4 && !attr) attr = (uint8_t*)calloc(1, ATTR_SIZE);   /* (the slot may be a DC's next: its memset is ATTR_SIZE) */
     MEM32(e + 12) = type == 1 || type == 4 ? (uint32_t)(uintptr_t)attr : 0;
     if (type == 1) {                                                   /* a DC: its attributes, as it is */
         POINT p;
@@ -286,6 +286,10 @@ static uint32_t s_dibitmap(uint32_t* a) {
     if (!bi) return GUEST(CreateCompatibleBitmap(h ? h : GetDC(NULL), (int)a[1], (int)a[2]));
     return GUEST(CreateDIBitmap(h ? h : GetDC(NULL), &bi->bmiHeader, a[3] & CBM_INIT, (void*)(uintptr_t)a[4], bi, a[6]));
 }
+/* NtGdiGetRegionData(hrgn, count, RGNDATA*); NtGdiGetDeviceWidth(hdc): the
+ * width of the DC's surface (gdi32's mirroring check) */
+static uint32_t s_rgndata(uint32_t* a) { return GetRegionData((HRGN)(uintptr_t)HOST(a[0]), a[1], (RGNDATA*)(uintptr_t)a[2]); }
+static uint32_t s_devwidth(uint32_t* a) { return (uint32_t)GetDeviceCaps((HDC)(uintptr_t)HOST(a[0]), HORZRES); }
 /* NtGdiCreateBitmap(cx, cy, planes, bpp, bits) */
 static uint32_t s_bitmap(uint32_t* a) {
     return GUEST(CreateBitmap((int)a[0], (int)a[1], a[2], a[3], (void*)(uintptr_t)a[4]));
@@ -533,6 +537,7 @@ void native32_gdi_install(void) {
         { "NtGdiInit", s_init }, { "NtGdiQueryFontAssocInfo", s_zero }, { "NtGdiGetStockObject", s_stock },
         { "NtGdiCreateCompatibleDC", s_compat_dc }, { "NtGdiCreateCompatibleBitmap", s_compat_bitmap },
         { "NtGdiCreatePen", s_pen }, { "NtGdiCreateRectRgn", s_rectrgn }, { "NtGdiCreateDIBitmapInternal", s_dibitmap }, { "NtGdiCreateBitmap", s_bitmap },
+        { "NtGdiGetRegionData", s_rgndata }, { "NtGdiGetDeviceWidth", s_devwidth },
         { "NtGdiGetRandomRgn", s_randomrgn }, { "NtGdiIntersectClipRect", s_intersectclip }, { "NtGdiExtSelectClipRgn", s_selectcliprgn }, { "NtGdiCreateSolidBrush", s_brush },
         { "NtGdiSelectBitmap", s_select }, { "NtGdiSelectBrush", s_select }, { "NtGdiSelectPen", s_select },
         { "NtGdiSelectFont", s_select }, { "NtGdiDeleteObjectApp", s_delete }, { "NtGdiBitBlt", s_bitblt },
