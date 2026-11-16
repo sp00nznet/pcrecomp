@@ -1051,6 +1051,43 @@ static uint32_t s_nexthook(uint32_t* a) { return (uint32_t)CallNextHookEx(NULL, 
 static uint32_t s_unhook(uint32_t* a) { return UnhookWindowsHookEx((HHOOK)(uintptr_t)a[0]); }
 /* NtUserDestroyCursor(hcur, force) */
 static uint32_t s_destroy_cursor(uint32_t* a) { (void)a; return 1; }   /* ponytail: shared host icons are never freed */
+/* NtUserGetIconSize(hicon, step, LONG* cx, LONG* cy): cy is the doubled
+ * height, as win32k keeps it (CURSORDATA +0x38); user32 halves it. shell32's
+ * icon extraction got 0 here. */
+static uint32_t s_get_icon_size(uint32_t* a) {
+    ICONINFO ii;
+    BITMAP bm;
+    if (!GetIconInfo((HICON)(uintptr_t)cur_host(a[0]), &ii)) return 0;
+    int ok = GetObjectW(ii.hbmColor ? ii.hbmColor : ii.hbmMask, sizeof bm, &bm) != 0;
+    if (ok) {
+        MEM32(a[2]) = (uint32_t)bm.bmWidth;
+        MEM32(a[3]) = (uint32_t)(ii.hbmColor ? 2 * bm.bmHeight : bm.bmHeight);   /* a mono mask is already doubled */
+    }
+    if (ii.hbmColor) DeleteObject(ii.hbmColor);
+    DeleteObject(ii.hbmMask);
+    return ok;
+}
+/* NtUserGetIconInfo(hicon, ICONINFO*, UNICODE_STRING* module, UNICODE_STRING*
+ * resource, DWORD* bpp, BOOL internal): the host's copies of the bitmaps, as
+ * guest handles. ImageList_ReplaceIcon reads them; unanswered, shell32's icon
+ * cache never filled and its lookup recursed until the stack ran out
+ * (sub_20A13F31). ponytail: no module/resource names (only CopyImage's
+ * LR_COPYFROMRESOURCE wants them) */
+static uint32_t s_get_icon_info(uint32_t* a) {
+    ICONINFO ii;
+    if (!a[1] || !GetIconInfo((HICON)(uintptr_t)cur_host(a[0]), &ii)) return 0;
+    MEM32(a[1]) = (uint32_t)ii.fIcon;
+    MEM32(a[1] + 4) = ii.xHotspot;
+    MEM32(a[1] + 8) = ii.yHotspot;
+    MEM32(a[1] + 12) = native32_gdi_handle((uint32_t)(uintptr_t)ii.hbmMask);
+    MEM32(a[1] + 16) = ii.hbmColor ? native32_gdi_handle((uint32_t)(uintptr_t)ii.hbmColor) : 0;
+    if (a[4]) {
+        BITMAP bm = { 0 };
+        GetObjectW(ii.hbmColor ? ii.hbmColor : ii.hbmMask, sizeof bm, &bm);
+        MEM32(a[4]) = bm.bmBitsPixel;
+    }
+    return 1;
+}
 /* NtUserGetClassInfo(hInstance, UNICODE_STRING* class, WNDCLASSEXW*, LPWSTR* menu, bAnsi):
  * the atom, as GetClassInfoEx's result */
 static uint32_t s_classinfo(uint32_t* a) {
@@ -1110,6 +1147,14 @@ static uint32_t s_thread_state(uint32_t* a) { return a[0] == 0x11 ? 1 : 0; }
 static uint32_t s_move(uint32_t* a) { return MoveWindow(HW(a[0]), (int)a[1], (int)a[2], (int)a[3], (int)a[4], a[5]); }
 static uint32_t s_setmenu(uint32_t* a) { return SetMenu(HW(a[0]), (HMENU)(uintptr_t)a[1]); }
 static uint32_t s_invalidate(uint32_t* a) { return InvalidateRect(HW(a[0]), (RECT*)(uintptr_t)a[1], a[2]); }
+/* NtUserRedrawWindow(hwnd, rect*, hrgn, flags): explorer's desktop asks
+ * for its first paint this way. No window is the guest's desktop: the
+ * virtual screen, never the host's desktop. */
+static uint32_t s_redraw(uint32_t* a) {
+    HWND h = a[0] ? HW(a[0]) : g_screen;
+    if (!h) return 0;
+    return RedrawWindow(h, (RECT*)(uintptr_t)a[1], (HRGN)(uintptr_t)(a[2] ? native32_gdi_host(a[2]) : 0), a[3]);
+}
 static uint32_t s_show(uint32_t* a) { return ShowWindow(HW(a[0]), (int)a[1]); }
 static uint32_t s_update(uint32_t* a) { return UpdateWindow(HW(a[0])); }
 /* NtUserGetMessage(MSG*, hwnd, min, max) / NtUserPeekMessage(MSG*, hwnd, min, max, remove) */
@@ -1136,7 +1181,7 @@ static uint32_t s_endpaint(uint32_t* a) {
 void native32_user_install(void) {
     static const struct { const char* name; native32_syscall_fn fn; } svc[] = {
         { "NtUserGetThreadState", s_thread_state }, { "NtUserMoveWindow", s_move }, { "NtUserSetMenu", s_setmenu },
-        { "NtUserInvalidateRect", s_invalidate }, { "NtUserShowWindow", s_show },
+        { "NtUserInvalidateRect", s_invalidate }, { "NtUserShowWindow", s_show }, { "NtUserRedrawWindow", s_redraw },
         { "NtUserGetMessage", s_getmessage }, { "NtUserPeekMessage", s_peekmessage },
         { "NtUserTranslateMessage", s_translate }, { "NtUserDispatchMessage", s_dispatch },
         { "NtUserBeginPaint", s_beginpaint }, { "NtUserEndPaint", s_endpaint },
@@ -1144,7 +1189,7 @@ void native32_user_install(void) {
         { "NtUserCheckMenuItem", s_check_menu }, { "NtUserEnableMenuItem", s_enable_menu },
         { "NtUserGetMenuItemRect", s_menu_rect }, { "NtUserFindExistingCursorIcon", s_find_icon }, { "NtUserSetCursorIconData", s_set_cursor_data },
         { "NtUserSetWindowsHookEx", s_sethook }, { "NtUserCallNextHookEx", s_nexthook }, { "NtUserUnhookWindowsHookEx", s_unhook },
-        { "NtUserDestroyCursor", s_destroy_cursor }, { "NtUserDeferWindowPos", s_deferpos }, { "NtUserEndDeferWindowPosEx", s_enddeferpos },
+        { "NtUserDestroyCursor", s_destroy_cursor }, { "NtUserGetIconSize", s_get_icon_size }, { "NtUserGetIconInfo", s_get_icon_info }, { "NtUserDeferWindowPos", s_deferpos }, { "NtUserEndDeferWindowPosEx", s_enddeferpos },
         { "NtUserSetProp", s_setprop }, { "NtUserSelectPalette", s_selectpal }, { "NtUserSetParent", s_setparent }, { "NtUserSetScrollInfo", s_setscroll },
         { "NtUserWindowFromPoint", s_frompoint }, { "NtUserSetActiveWindow", s_setactive }, { "NtUserRemoveProp", s_removeprop }, { "NtUserSetWindowPlacement", s_setplacement }, { "NtUserGetWindowPlacement", s_getplacement }, { "NtUserGetClassInfo", s_classinfo },
         { "NtUserSetCursor", s_setcursor }, { "NtUserSetTimer", s_settimer }, { "NtUserKillTimer", s_killtimer },

@@ -505,6 +505,15 @@ static uint32_t ovr_create_section(uint32_t* a) {
     }
     if (base) size = image_size(base);
     else if (under(path, sys) || under(path, win)) {
+        /* the host's network provider router (WNet*: drive mappings, the
+         * network neighbourhood) reaches past the guest; shell32 delay-loads
+         * it and its stubs answer failure. ponytail: one name, a list when a
+         * second such DLL turns up */
+        const wchar_t* leaf = wcsrchr(path, L'\\');
+        if (leaf && !_wcsicmp(leaf + 1, L"mpr.dll")) {
+            fprintf(stderr, "[guard] %ls: host network provider router: not mapped\n", path);
+            return 0xC0000022u;
+        }
         if (host_com_server(path)) {
             fprintf(stderr, "[guard] %ls: a host COM server or applet: not mapped\n", path);
             return 0xC0000022u;                                              /* STATUS_ACCESS_DENIED */
@@ -964,11 +973,18 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
     ustr(pp + 0x38, image_path, &pool);
     ustr(pp + 0x40, cmdline, &pool);
     {
+        /* The host's environment, but Path is the loader's search path: the
+         * host's (3.5 KB here, every tool's directory) overran Windows 2000
+         * shell32's fixed buffers (a smashed frame in sub_20A13F31) and had
+         * the guest probing host directories. */
         wchar_t* e = GetEnvironmentStringsW();
-        size_t n = 0;
+        size_t n = 0, o = 0, dl = wcslen(dll_path);
         while (e[n] || e[n + 1]) n++;
-        void* copy = VirtualAlloc(NULL, (n + 2) * 2, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        memcpy(copy, e, (n + 2) * 2);
+        wchar_t* copy = (wchar_t*)VirtualAlloc(NULL, (n + dl + 8) * 2, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        for (wchar_t* s = e; *s; s += wcslen(s) + 1)
+            if (_wcsnicmp(s, L"Path=", 5)) { wcscpy(copy + o, s); o += wcslen(s) + 1; }
+        wcscpy(copy + o, L"Path="), wcscpy(copy + o + 5, dll_path), o += 5 + dl + 1;
+        copy[o] = 0;
         FreeEnvironmentStringsW(e);
         *(uint32_t*)(pp + 0x48) = (uint32_t)(uintptr_t)copy;
     }
