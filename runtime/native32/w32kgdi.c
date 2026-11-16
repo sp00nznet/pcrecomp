@@ -450,6 +450,24 @@ static uint32_t s_bitmap(uint32_t* a) {
 static uint32_t s_getobject(uint32_t* a) {
     return GetObjectW((HGDIOBJ)(uintptr_t)HOST(a[0]), (int)a[1], (void*)(uintptr_t)a[2]);
 }
+/* NtGdiDoPalette(h, iStart, cEntries, entries, iFunc, bInbound), Windows 2000's
+ * iFunc: 0 AnimatePalette, 1 SetPaletteEntries, 2 GetPaletteEntries,
+ * 3 GetSystemPaletteEntries, 4 GetDIBColorTable, 5 SetDIBColorTable.
+ * comctl32's ImageList blend (a selected icon) takes the colour table of a
+ * palettized image list this way: unanswered, its copy was all black. */
+static uint32_t s_dopalette(uint32_t* a) {
+    void* p = (void*)(uintptr_t)a[3];
+    UINT i = a[1] & 0xFFFF, n = a[2] & 0xFFFF;
+    switch (a[4]) {
+    case 0: return AnimatePalette((HPALETTE)(uintptr_t)HOST(a[0]), i, n, p);
+    case 1: return SetPaletteEntries((HPALETTE)(uintptr_t)HOST(a[0]), i, n, p);
+    case 2: return GetPaletteEntries((HPALETTE)(uintptr_t)HOST(a[0]), i, n, p);
+    case 3: return GetSystemPaletteEntries(dc(a[0]), i, n, p);
+    case 4: return GetDIBColorTable(dc(a[0]), i, n, p);
+    case 5: return SetDIBColorTable(dc(a[0]), i, n, p);
+    }
+    return 0;
+}
 /* NtGdiGetTextMetricsW(hdc, TMW_INTERNAL*, cj): TEXTMETRICW, then zeros */
 static uint32_t s_textmetrics(uint32_t* a) {
     TEXTMETRICW tm;
@@ -819,7 +837,7 @@ void native32_gdi_install(void) {
         { "NtGdiLineTo", s_lineto }, { "NtGdiMoveTo", s_moveto }, { "NtGdiSetPixel", s_setpixel },
         { "NtGdiGetDeviceCaps", s_devcaps }, { "NtGdiSetLayout", s_setlayout },
         { "NtGdiSetDIBitsToDeviceInternal", s_setdibits }, { "NtGdiFlush", s_one },
-        { "NtGdiExtGetObjectW", s_getobject }, { "NtGdiComputeXformCoefficients", s_one },
+        { "NtGdiExtGetObjectW", s_getobject }, { "NtGdiDoPalette", s_dopalette }, { "NtGdiComputeXformCoefficients", s_one },
         { "NtGdiGetTextMetricsW", s_textmetrics }, { "NtGdiOpenDCW", s_opendc },
         { "NtGdiHfontCreate", s_font }, { "NtGdiExtTextOutW", s_textout },
         { "NtGdiFlushUserBatch", s_flushbatch }, { "NtGdiGetTextExtent", s_textextent }, { "NtGdiGetTextCharsetInfo", s_charset },
