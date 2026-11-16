@@ -512,8 +512,16 @@ static uint32_t s_call_noparam(uint32_t* a) {
     fprintf(stderr, "[user] NtUserCallNoParam %u not answered\n", a[0]);
     return 0;
 }
-/* NtUserCallOneParam(param, index): 0x29 ReleaseDC */
+/* NtUserCallOneParam(param, index): 0x29 ReleaseDC; the rest read off the
+ * user32 exports that call them. ponytail: 0x19 (CreateIcon's empty cursor
+ * object, then NtUserSetCursorIconData) not answered */
 static uint32_t s_call_oneparam(uint32_t* a) {
+    /* 0x24 MessageBeep, 0x26 PostQuitMessage, 0x2D ShowCursor, 0x33
+     * GetProcessDefaultLayout (param: the DWORD* it fills) */
+    if (a[1] == 0x24) return getenv("PCRECOMP_MUTE") ? 1 : MessageBeep(a[0]);   /* (muted runs stay silent) */
+    if (a[1] == 0x26) { PostQuitMessage((int)a[0]); return 1; }
+    if (a[1] == 0x2D) return (uint32_t)ShowCursor(a[0]);
+    if (a[1] == 0x33) { DWORD l = 0; GetProcessDefaultLayout(&l); if (a[0]) MEM32(a[0]) = l; return 1; }
     if (a[1] == 0x29) {
         uint32_t h = native32_gdi_host(a[0]);
         return ReleaseDC(NULL, (HDC)(uintptr_t)(h ? h : a[0]));
@@ -623,6 +631,11 @@ static uint32_t s_hwnd_param(uint32_t* a) {
         w[0x14 + (a[1] >> 8)] |= (uint8_t)a[1];
         return 1;
     }
+    /* 0x41 ClearWindowState, its mirror (user32 calls it only when the bit is set) */
+    if (a[2] == 0x41 && w && (a[1] >> 8) < 8) {
+        w[0x14 + (a[1] >> 8)] &= (uint8_t)~a[1];
+        return 1;
+    }
     fprintf(stderr, "[user] NtUserCallHwndParam index 0x%X not answered\n", a[2]);
     return 0;
 }
@@ -671,6 +684,36 @@ static uint32_t s_setpos(uint32_t* a) {
 static uint32_t s_foreground(uint32_t* a) { (void)a; return (uint32_t)(uintptr_t)GetForegroundWindow(); }
 /* NtUserGetSystemMenu(hwnd, bRevert) */
 static uint32_t s_sysmenu(uint32_t* a) { return menu(GetSystemMenu((HWND)(uintptr_t)a[0], a[1])); }
+/* NtUserSetWindowLong(hwnd, index, value, bAnsi). GWL_WNDPROC subclasses:
+ * the guest's procedure goes in WND+0x5C (DispatchMessage calls it
+ * client-side) and the host window gets wnd_thunk, so sent messages reach it
+ * too; the old one comes back (a host control's own procedure, called
+ * through the bridge by the guest's CallWindowProc). ponytail: the class's
+ * ANSI-ness is kept for the new procedure, whatever bAnsi says */
+static uint32_t s_setlong(uint32_t* a) {
+    HWND h = (HWND)(uintptr_t)a[0];
+    if ((int)a[1] == GWLP_WNDPROC) {
+        uint8_t* w = native32_user_wnd(h);
+        uint32_t old;
+        if (!w) return 0;
+        old = *(uint32_t*)(w + 0x5C);
+        if ((LONG_PTR)GetWindowLongPtrW(h, GWLP_WNDPROC) != (LONG_PTR)wnd_thunk)
+            SetWindowLongPtrW(h, GWLP_WNDPROC, (LONG_PTR)wnd_thunk);
+        *(uint32_t*)(w + 0x5C) = a[2];
+        return old;
+    }
+    /* ponytail: other indexes unanswered (0), as before: forwarded to the
+     * host they broke winmine's Custom dialog (a guest dialog's DWL_* live in
+     * its own DIALOG, not the host window) */
+    return 0;
+}
+/* NtUserCallHwndLock(hwnd, index): 0x48 DrawMenuBar, 0x50 UpdateWindow */
+static uint32_t s_hwnd_lock(uint32_t* a) {
+    if (a[1] == 0x48) return DrawMenuBar((HWND)(uintptr_t)a[0]);
+    if (a[1] == 0x50) return UpdateWindow((HWND)(uintptr_t)a[0]);
+    fprintf(stderr, "[user] NtUserCallHwndLock index 0x%X not answered\n", a[1]);
+    return 0;
+}
 static uint32_t s_waitmessage(uint32_t* a) { (void)a; return WaitMessage(); }
 
 #define HW(x) ((HWND)(uintptr_t)(x))
@@ -715,7 +758,7 @@ void native32_user_install(void) {
         { "NtUserCallHwndParamLock", s_hwnd_param_lock }, { "NtUserCallHwndParam", s_hwnd_param },
         { "NtUserDestroyWindow", s_destroy }, { "NtUserSetWindowFNID", s_set_fnid }, { "NtUserSetFocus", s_setfocus },
         { "NtUserQueryWindow", s_query_window }, { "NtUserFillWindow", s_fill_window }, { "NtUserSetCapture", s_setcapture },
-        { "NtUserWaitMessage", s_waitmessage }, { "NtUserRegisterWindowMessage", s_register_msg },
+        { "NtUserWaitMessage", s_waitmessage }, { "NtUserRegisterWindowMessage", s_register_msg }, { "NtUserCallHwndLock", s_hwnd_lock }, { "NtUserSetWindowLong", s_setlong },
         { "NtUserSetWindowPos", s_setpos }, { "NtUserGetForegroundWindow", s_foreground }, { "NtUserGetSystemMenu", s_sysmenu }, { "NtUserCallNoParam", s_call_noparam }, { "NtUserCallOneParam", s_call_oneparam },
     };
     for (int i = 0; i < (int)(sizeof svc / sizeof svc[0]); i++) native32_nt_win32k_override(svc[i].name, svc[i].fn);
