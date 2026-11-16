@@ -244,6 +244,26 @@ static uint32_t s_selectcliprgn(uint32_t* a) {
 }
 /* NtGdiCreateRectRgn(l, t, r, b) */
 static uint32_t s_rectrgn(uint32_t* a) { return GUEST(CreateRectRgn((int)a[0], (int)a[1], (int)a[2], (int)a[3])); }
+/* NtGdiSelectBitmap remembers which DC holds a bitmap, for
+ * NtGdiGetDCforBitmap: gdi32's SetDIBits/GetDIBits use that DC (a second
+ * DC could not select it). ponytail: a linear table of 64 */
+static struct { uint32_t bm, dc; } g_bmdc[64];
+static uint32_t s_select_bitmap(uint32_t* a) {
+    uint32_t old = GUEST(SelectObject((HDC)(uintptr_t)HOST(a[0]), (HGDIOBJ)(uintptr_t)HOST(a[1])));
+    if (!old) return 0;
+    for (int i = 0; i < 64; i++)
+        if (g_bmdc[i].dc == a[0] || g_bmdc[i].bm == a[1]) g_bmdc[i].bm = g_bmdc[i].dc = 0;
+    for (int i = 0; i < 64; i++)
+        if (!g_bmdc[i].bm) { g_bmdc[i].bm = a[1]; g_bmdc[i].dc = a[0]; break; }
+    return old;
+}
+static uint32_t s_dcforbitmap(uint32_t* a) {
+    for (int i = 0; i < 64; i++) if (g_bmdc[i].bm == a[0]) return g_bmdc[i].dc;
+    return 0;
+}
+/* NtGdiSaveDC(hdc), NtGdiRestoreDC(hdc, level): SetDIBits on the DC that holds the bitmap saves it first */
+static uint32_t s_savedc(uint32_t* a) { return (uint32_t)SaveDC(dc(a[0])); }
+static uint32_t s_restoredc(uint32_t* a) { return RestoreDC(dc(a[0]), (int)a[1]); }
 static uint32_t s_select(uint32_t* a) {
     return GUEST(SelectObject((HDC)(uintptr_t)HOST(a[0]), (HGDIOBJ)(uintptr_t)HOST(a[1])));
 }
@@ -251,6 +271,8 @@ static uint32_t s_delete(uint32_t* a) {
     uint32_t h = HOST(a[0]);
     BOOL r = !h ? FALSE : ((h >> 16) & 0x1F) == 1 ? DeleteDC((HDC)(uintptr_t)h) : DeleteObject((HGDIOBJ)(uintptr_t)h);
     if (r) forget(a[0]);
+    for (int i = 0; r && i < 64; i++)
+        if (g_bmdc[i].dc == a[0] || g_bmdc[i].bm == a[0]) g_bmdc[i].bm = g_bmdc[i].dc = 0;
     return r;
 }
 static uint32_t s_bitblt(uint32_t* a) {
@@ -536,9 +558,9 @@ void native32_gdi_install(void) {
         { "NtGdiInit", s_init }, { "NtGdiQueryFontAssocInfo", s_zero }, { "NtGdiGetStockObject", s_stock },
         { "NtGdiCreateCompatibleDC", s_compat_dc }, { "NtGdiCreateCompatibleBitmap", s_compat_bitmap },
         { "NtGdiCreatePen", s_pen }, { "NtGdiCreateRectRgn", s_rectrgn }, { "NtGdiCreateDIBitmapInternal", s_dibitmap }, { "NtGdiCreateBitmap", s_bitmap },
-        { "NtGdiGetRegionData", s_rgndata }, { "NtGdiGetDCforBitmap", s_zero },   /* (the DC a bitmap is selected into: none we know of) */
+        { "NtGdiGetRegionData", s_rgndata }, { "NtGdiGetDCforBitmap", s_dcforbitmap }, { "NtGdiSaveDC", s_savedc }, { "NtGdiRestoreDC", s_restoredc },
         { "NtGdiGetRandomRgn", s_randomrgn }, { "NtGdiIntersectClipRect", s_intersectclip }, { "NtGdiExtSelectClipRgn", s_selectcliprgn }, { "NtGdiCreateSolidBrush", s_brush },
-        { "NtGdiSelectBitmap", s_select }, { "NtGdiSelectBrush", s_select }, { "NtGdiSelectPen", s_select },
+        { "NtGdiSelectBitmap", s_select_bitmap }, { "NtGdiSelectBrush", s_select }, { "NtGdiSelectPen", s_select },
         { "NtGdiSelectFont", s_select }, { "NtGdiDeleteObjectApp", s_delete }, { "NtGdiBitBlt", s_bitblt },
         { "NtGdiLineTo", s_lineto }, { "NtGdiMoveTo", s_moveto }, { "NtGdiSetPixel", s_setpixel },
         { "NtGdiGetDeviceCaps", s_devcaps }, { "NtGdiSetLayout", s_setlayout },

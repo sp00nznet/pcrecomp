@@ -282,6 +282,7 @@ native32_module_t* native32_module_by_base(uint32_t base);
  * creation: no original binary runs natively), \KnownDlls hidden, and csrss
  * over its LPC port (csr32.c). NATIVE32_SYSCALLS=1 traces every call. */
 extern uint32_t native32_guest_peb;
+extern int native32_guest_loaded;
 int native32_nt_syscalls(uint32_t ntdll_base);
 typedef uint32_t (*native32_syscall_fn)(uint32_t* args);
 void native32_nt_override(const char* name, native32_syscall_fn fn);

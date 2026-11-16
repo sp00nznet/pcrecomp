@@ -527,6 +527,7 @@ void native32_nt_win32k_override(const char* name, native32_syscall_fn fn) {
     fprintf(stderr, "[win32k] no service named %s\n", name);
 }
 
+int native32_guest_loaded;             /* the guest's loader is done (native32_nt_boot) */
 void (*native32_win32k_pre)(void);   /* before every win32k service (GDI's TEB batch) */
 
 static uint32_t win32k_call(uint32_t svc, uint32_t* args) {
@@ -789,6 +790,7 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
     native32_call_guest(thunk, (int)(sizeof args / 4), args);
     g_esp = sp;
     mach_leave();
+    native32_guest_loaded = 1;
     fprintf(stderr, "[nt] guest PEB %p, process heap %08X: the guest's loader is done\n", peb, MEM32(native32_guest_peb + 0x18));
     return MEM32(native32_guest_peb + 0x18) != 0;
 }

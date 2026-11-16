@@ -238,6 +238,17 @@ static void user_pre(void) {        /* before every win32k service */
     sys_brushes();
     if (native32_user_ahe) { thread_setup(); wnd_sync_all(); }
     if (g_prev_pre) g_prev_pre();
+    /* win32k calls a thread back at __ClientThreadSetup (KernelCallbackTable
+     * 74) when it becomes a GUI thread: user32's ClientThreadSetup makes its
+     * drawing DCs there (ghdcBits2: LoadBitmap's DIB-to-DDB copy blits from
+     * it, a mono bitmap came out black without). ponytail: once per process,
+     * not per thread; per-thread when a guest starts a second GUI thread */
+    static int setup;
+    if (!setup && native32_guest_loaded && native32_user_ahe) {
+        uint32_t o = 0, olen = 0;
+        setup = 1;
+        native32_nt_callback(74, 0, 0, &o, &olen);
+    }
 }
 
 static void (*g_prev_cb_in)(uint32_t* args);
