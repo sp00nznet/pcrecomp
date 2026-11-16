@@ -392,6 +392,34 @@ static uint32_t proxy_image(const wchar_t* path) {
     return base;
 }
 
+/* A host COM server (exports DllGetClassObject) or control-panel applet: the
+ * guest's ole32 reaches these through the host's class registrations
+ * (Windows 11's HKCR names explorerframe.dll for browseui's classes), and
+ * one must never run in the guest. Mapped as an image resource: no code runs.
+ * ponytail: shell32, ole32 and comdlg32 stay allowed: the builds that do not
+ * lift them import them (notepad, wordpad, mspaint) and proxy the host's. */
+static int host_com_server(const wchar_t* path) {
+    const wchar_t* f = wcsrchr(path, L'\\') ? wcsrchr(path, L'\\') + 1 : path;
+    size_t n = wcslen(f);
+    if (n > 4 && !_wcsicmp(f + n - 4, L".cpl")) return 1;
+    if (!_wcsicmp(f, L"shell32.dll") || !_wcsicmp(f, L"ole32.dll") || !_wcsicmp(f, L"comdlg32.dll")) return 0;
+    HMODULE m = LoadLibraryExW(path, NULL, LOAD_LIBRARY_AS_IMAGE_RESOURCE | LOAD_LIBRARY_AS_DATAFILE);
+    int r = 0;
+    if (!m) return 1;
+    {
+        BYTE* b = (BYTE*)((uintptr_t)m & ~(uintptr_t)3);
+        IMAGE_NT_HEADERS32* nt = (IMAGE_NT_HEADERS32*)(b + ((IMAGE_DOS_HEADER*)b)->e_lfanew);
+        IMAGE_DATA_DIRECTORY d = nt->OptionalHeader.DataDirectory[0];
+        if (nt->OptionalHeader.Magic == 0x10B && d.VirtualAddress) {
+            IMAGE_EXPORT_DIRECTORY* e = (IMAGE_EXPORT_DIRECTORY*)(b + d.VirtualAddress);
+            uint32_t* nm = (uint32_t*)(b + e->AddressOfNames);
+            for (uint32_t i = 0; i < e->NumberOfNames && !r; i++) r = !strcmp((char*)b + nm[i], "DllGetClassObject");
+        }
+    }
+    FreeLibrary(m);
+    return r;
+}
+
 static int under(const wchar_t* path, const wchar_t* dir) {
     size_t n = wcslen(dir);
     return !_wcsnicmp(path, dir, n) && (path[n] == L'\\' || !path[n]);
@@ -422,6 +450,10 @@ static uint32_t ovr_create_section(uint32_t* a) {
     }
     if (base) size = image_size(base);
     else if (under(path, sys) || under(path, win)) {
+        if (host_com_server(path)) {
+            fprintf(stderr, "[guard] %ls: a host COM server or applet: not mapped\n", path);
+            return 0xC0000022u;                                              /* STATUS_ACCESS_DENIED */
+        }
         if (!(base = proxy_image(path))) return 0xC000007Bu;                 /* STATUS_INVALID_IMAGE_FORMAT */
         size = image_size(base);
         fprintf(stderr, "[nt] %ls: the host's, through a proxy image at 0x%08X\n", path, base);

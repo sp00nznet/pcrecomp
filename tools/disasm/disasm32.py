@@ -818,7 +818,10 @@ class Disassembler:
                     # from bad evidence claims the bytes (a vtable in
                     # Windows 2000's merged .text, run over by data decoded
                     # as code).
-                    run3 = ptr(off - 4) and ptr(off + 4)
+                    # Any three: the slot can end the run (an IUnknown-only
+                    # vtable { QI, AddRef, Release } before a string: browseui
+                    # 0x20D1CE68 -> 0x20D0B840) or start it.
+                    run3 = (ptr(off - 4) and ptr(off + 4)) or (ptr(off - 8) and ptr(off - 4)) or (ptr(off + 4) and ptr(off + 8))
                     if off % 4 or interior is None or not (code_start <= at and at + 4 <= code_end) \
                             or (not run3 and any(interior[at - code_start + k] for k in range(4))) \
                             or not (ptr(off - 4) or ptr(off + 4) or at in loads
@@ -828,6 +831,14 @@ class Disassembler:
                     in_code += 1
                 table = s.is_code and run3
                 if va in queued or va in found or va in getattr(self, 'seh_resume', ()):
+                    continue
+                # A vtable slot is a start even where a body decoded from a
+                # GUID before it runs over it (shdocvw 0x20E0AC30, covered by
+                # 0x20E0AC20, the IID's bytes): kept like the uncovered ones.
+                if table and va in covered:
+                    self.table_targets.add(va)
+                    in_run += 1
+                    found.add(va)
                     continue
                 if va in covered:
                     # An instruction some body already decoded. Normally a

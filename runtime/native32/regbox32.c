@@ -91,7 +91,11 @@ static int in_box(const wchar_t* nt) { return prefix(nt, g_root_nt); }
 
 /* real NT path -> the sandbox's, relative to HKCU */
 static void to_box(const wchar_t* nt, wchar_t* rel) {
+    size_t cu = wcslen(g_cu_nt);
     if (in_box(nt)) _snwprintf(rel, KP - 1, L"%ls%ls", g_root_rel, nt + wcslen(g_root_nt));
+    /* the per-user classes (HKCR's other half): one merged HKCR in the box */
+    else if (!_wcsnicmp(nt, g_cu_nt, cu) && prefix(nt + cu, L"_Classes"))
+        _snwprintf(rel, KP - 1, L"%ls\\HKLM\\SOFTWARE\\Classes%ls", g_root_rel, nt + cu + 8);
     else if (prefix(nt, g_cu_nt)) _snwprintf(rel, KP - 1, L"%ls\\HKCU%ls", g_root_rel, nt + wcslen(g_cu_nt));
     else if (prefix(nt, L"\\REGISTRY\\MACHINE")) _snwprintf(rel, KP - 1, L"%ls\\HKLM%ls", g_root_rel, nt + 17);
     else _snwprintf(rel, KP - 1, L"%ls\\NT%ls", g_root_rel, nt);
@@ -107,7 +111,24 @@ static int from_box(const wchar_t* nt, wchar_t* real) {
     real[KP - 1] = 0;
     return 1;
 }
+/* With a lifted ntdll (Windows 2000's own ole32), the host's COM class
+ * registrations are not the guest's: Windows 11's HKCR\CLSID names its own
+ * DLLs (explorerframe.dll for browseui's classes). Under any Classes\CLSID
+ * or Classes\AppID only the box answers, seeded from Windows 2000's own
+ * registration INFs (win2000 tools/reginst.py).
+ * ponytail: CLSID and AppID only; Interface/TypeLib still read the host's. */
+static int g_guest_classes;
+static int host_class_key(const wchar_t* nt) {
+    wchar_t u[KP];
+    if (g_guest_classes < 0 && native32_module("ole32.dll")) g_guest_classes = 1;   /* Windows 2000's own COM, lifted (asked until the guest's modules are mapped) */
+    if (g_guest_classes <= 0) return 0;
+    wcsncpy(u, nt, KP - 1), u[KP - 1] = 0, _wcsupr(u);
+    if (!wcsstr(u, L"CLASSES\\CLSID\\") && !wcsstr(u, L"CLASSES\\WOW6432NODE\\CLSID\\") && !wcsstr(u, L"CLASSES\\APPID\\")) return 0;
+    if (getenv("PCRECOMP_REGTRACE")) fprintf(stderr, "[regbox] %ls: the host's class, not the guest's\n", nt);
+    return 1;
+}
 static LONG real_open(const wchar_t* nt, REGSAM sam, HKEY* out) {
+    if (host_class_key(nt)) return ERROR_FILE_NOT_FOUND;
     US us = { (USHORT)(wcslen(nt) * 2), (USHORT)(wcslen(nt) * 2), (PWSTR)nt };
     OA oa = { sizeof oa, NULL, &us, 0x40 /* OBJ_CASE_INSENSITIVE */, NULL, NULL };
     LONG st = p_NtOpenKey((HANDLE*)out, (sam & ~WRITE_BITS) | KEY_READ, &oa);
@@ -178,6 +199,7 @@ static LONG WINAPI g_RegOpenKeyExW(HKEY k, LPCWSTR sub, DWORD opt, REGSAM sam, P
         wchar_t rel[KP];
         to_box(full, rel);
         if (!RegOpenKeyExW(HKEY_CURRENT_USER, rel, 0, sam, out)) return 0;
+        if (host_class_key(full)) return ERROR_FILE_NOT_FOUND;
         return RegOpenKeyExW(k, sub, opt, (sam & ~WRITE_BITS) | KEY_READ, out);
     }
     return sb_open(full, sam, 0, 0, out, NULL);
@@ -621,6 +643,7 @@ void native32_registry_sandbox_nt(void (*ovr)(const char*, native32_syscall_fn),
         "NtLoadKey2", "NtReplaceKey", "NtUnloadKey", "NtInitializeRegistry", "NtSaveKeyEx", "NtLoadKeyEx", "NtRenameKey" };
     if (!g_on) return;
     nt_fwd = fwd;
+    g_guest_classes = -1;   /* asked once the guest's modules are mapped */
     ovr("NtCreateKey", nt_create_key);
     ovr("NtOpenKey", nt_open_key);
     ovr("NtSetValueKey", nt_set_value);
