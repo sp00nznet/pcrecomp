@@ -332,6 +332,7 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
     lines.append('')
 
     lifter._flag_state = None
+    lifter._seg_fn = lifter.seg_function(instructions)   # LIFT32_W9X: reloads ds/es
 
     # An indirect jump inside a function (a switch/jump table) can compute a
     # target that lands on ANY instruction in it, so when one is present every

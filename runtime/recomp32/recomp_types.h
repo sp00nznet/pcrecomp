@@ -229,6 +229,9 @@ extern uint32_t g_gs_base;
  * is a real selector (the PSP, the environment), so es: overrides get a base. */
 extern uint32_t g_es_base, g_cs_base;
 #define ES_BASE  g_es_base
+/* ds as a real selector, in the functions LIFT32_W9X lifts segmented */
+extern uint32_t g_ds_base;
+#define DS_BASE  g_ds_base
 /* cs: overrides: 0 for the program, the module's base while a far call runs
  * code a program loaded at run time (a driver addressing its own tables). */
 #define CS_BASE  g_cs_base
@@ -237,6 +240,16 @@ void     recomp_int(int n);
 /* NT system call gate (int 2Eh / int 2Bh), lifted outside DOS mode: eax = service,
  * edx -> arguments. runtime/native32/syscall32.c. */
 void     recomp_syscall(int vector);
+/* call m16:32 outside DOS mode (a Windows 9x call gate: kernel32's VxDCall to
+ * VMM); ptr is the operand's address. Nonzero: returned to the caller's caller.
+ * runtime/native32/vxd32.c. */
+int      recomp_farcall32(uint32_t ptr);
+/* a flat retf lifted as a far jump (LIFT32_FAR_RETF): nonzero if the host ran
+ * the target, which then returned far to the next [esp]. vxd32.c. */
+int      recomp_retf32(uint32_t target);
+/* lsl / lar on the host's LDT (LIFT32_W9X): nonzero (ZF) if the selector is valid */
+int      recomp_lsl32(uint16_t sel, uint32_t* limit);
+int      recomp_lar32(uint16_t sel, uint32_t* rights);
 uint8_t  recomp_in8(uint32_t port);
 uint16_t recomp_in16(uint32_t port);
 uint32_t recomp_in32(uint32_t port);
