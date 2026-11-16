@@ -414,6 +414,16 @@ def parse_ne(filepath: str) -> NEHeader:
                 ordinal += 1
                 pos += 3
 
+    # A moveable internal reference (segment FFh) names an entry ordinal:
+    # resolve it to that entry's segment:offset, which is what the loader
+    # patches in (Win98 SHELL.DLL has 47).
+    by_ord = {e.ordinal: e for e in ne.entries}
+    for s in ne.segments:
+        for r in s.relocations:
+            e = by_ord.get(getattr(r, 'ordinal', 0)) if (r.flags & 3) == 0 and r.target_seg == 0xFF else None
+            if e and 1 <= e.segment < 0xFE:
+                r.target_seg, r.target_off = e.segment, e.offset
+
     # Map names to entries
     all_names = ne.resident_names + ne.nonresident_names
     name_map = {ordinal: name for name, ordinal in all_names}

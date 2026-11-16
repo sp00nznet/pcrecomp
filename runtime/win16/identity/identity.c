@@ -208,6 +208,14 @@ static void dpmi(CPU *c) {
     case 0x0502: VirtualFree((void *)(uintptr_t)((uint32_t)c->si << 16 | c->di), 0, MEM_RELEASE); ok(c); return;
     case 0x0600: case 0x0601: case 0x0602: case 0x0603:   /* lock/unlock, real-mode pageable */
     case 0x0702: case 0x0703: ok(c); return;               /* page hints */
+    case 0x0300: {   /* simulate a real-mode int bl, es:di = the register block (ax at +1Ch) */
+        const uint8_t *rb = (const uint8_t *)(uintptr_t)(recomp_sel_base(c->es) + c->di);
+        uint16_t rax = *(const uint16_t *)(rb + 0x1C);
+        /* 2F/160B, identify TSRs (USER seg72 20E7): nothing real-mode is
+         * loaded, so no one fills in es:di and the block comes back as sent */
+        if (c->bl == 0x2F && rax == 0x160B) { ok(c); return; }
+        w16_stop("int 31h 0300: real-mode int, vec:ax", c->bl, rax);
+    }
     }
     w16_stop("int 31h unknown, ax:bx", c->ax, c->bx);
 }
@@ -250,6 +258,17 @@ static void host_far(CPU *c, uint16_t off) {
     /* 0Ah: KRNL386 seg2 38F9, once per loaded code segment (flags&5004h == 4004h), cx = sel|1;
      * the result is not read. ponytail: nothing to tell, no-op. */
     if (off == H_VXD + 0x442 && c->ax == 0x0A) { ok(c); return; }
+    if (off == H_VXD + 0x17) switch (c->dx) {   /* SHELL's PM API, MSGSRV32's calls through its ds:[76h] */
+    case 0x19: {   /* register the event callback ax:bx (89:0541); es back = a flat data selector
+                    * (MSGSRV32 keeps it at [7Eh] and reads SHELL's event blocks through it).
+                    * ponytail: the callback is kept nowhere: no SHELL events (appy time,
+                    * ShellExecute from VxDs) here yet */
+        static uint16_t flat;
+        if (!flat) { flat = native32_w9x_alloc_sel(0, 0xFFFFF); native32_w9x_desc(flat)[6] |= 0x80; }
+        c->es = flat; ok(c); return;
+    }
+    case 0x1B: case 0x1C: ok(c); return;   /* an event handled (89:0019, 89:0065): nothing to tell */
+    }
     if (off == H_VXD + 0x2A) switch (c->ah) {   /* VWIN32's PM API, KRNL386's calls through DGROUP:1A80 */
     case 0x00:   /* version: KRNL386 wants >= 100h (4.10, Win98); edx nonzero (seg001_6A63: the
                   * Win32 kernel is there: kernel32's base, ponytail: a guess, only tested != 0).
@@ -284,6 +303,20 @@ static void host_far(CPU *c, uint16_t off) {
     case 0x01: {   /* task switch (seg1 73BA): ebx = the next task's r0 thread; back when switched to */
         void native32_w9x_switch_to(uint32_t r0);
         CPU sv = *c;
+        /* CurTDB (DGROUP:122C; the boot block's +1C points at it) is ring 0's
+         * to set on Win98: the thread that takes the CPU finds its own TDB
+         * there (Reschedule's 5F57 reads it right after the switch). 73BA
+         * calls with es = DGROUP, di = the next TDB (also put in 13E4).
+         * ponytail: di, not the r0 thread's own TDB; the same thing for every
+         * switch KRNL386 makes itself */
+        *(uint16_t *)(uintptr_t)(recomp_sel_base(c->es) + 0x122C) = c->di;
+        if (getenv("W16_TRACE")) fprintf(stderr, "[w16] VWIN32 01: CurTDB := %04X (ss:sp %04X:%04X) from ip %04X\n", c->di,
+            c->di ? *(uint16_t *)(uintptr_t)(recomp_sel_base(c->di) + 4) : 0, c->di ? *(uint16_t *)(uintptr_t)(recomp_sel_base(c->di) + 2) : 0, c->ret_ip);
+        if (getenv("W16_TRACE") && c->di) {
+            const uint8_t *t = (const uint8_t *)(uintptr_t)recomp_sel_base(c->di);
+            const uint16_t *f = (const uint16_t *)(uintptr_t)(recomp_sel_base(*(uint16_t *)(t + 4)) + *(uint16_t *)(t + 2));
+            fprintf(stderr, "[w16]   frame:"); for (int i = 0; i < 12; i++) fprintf(stderr, " %04X", f[i]); fprintf(stderr, " (ss base %08X)\n", recomp_sel_base(*(uint16_t *)(t + 4)));
+        }
         native32_w9x_switch_to(c->ebx);
         *c = sv; ok(c); return;
     }
@@ -346,6 +379,7 @@ static void int2f(CPU *c) {
             { 0x002A, "VWIN32", 1 },
             { 0x000C, "VMD", 0 },        /* USER.EXE LibEntry; ponytail: absent, the mouse is MOUSE.DRV's (drv16) */
             { 0x0037, "ENABLE", 0 },     /* accessibility, during USER.EXE's LibEntry; ponytail: absent (no StickyKeys etc.) */
+            { 0x0017, "SHELL", 1 },      /* MSGSRV32 seg89 0E14 exits (4C01) without it */
             { 0x0442, "VTDAPI", 1 },     /* KRNL386 seg001_6E8D: ax=9 -> DGROUP:1A88 and the table it hands kernel32, unchecked */     /* KRNL386 seg001_7293: ah=0, then ah=8 -> al into DGROUP:1417; GlobalInit's caller needs it */
         };
         for (unsigned i = 0; i < sizeof vxd / sizeof *vxd; i++)
@@ -525,6 +559,7 @@ void dispatch_far(CPU *cpu, uint16_t sel, uint16_t off);
 int w16_ss_big(uint16_t ss) { return (ss & 4) && (native32_w9x_desc(ss)[6] & 0x40) && !recomp_sel_base(ss); }
 typedef struct w16_ff { struct w16_ff *up; uint16_t ss, sp; } w16_ff;
 static __declspec(thread) w16_ff *g_ff, *g_ff_to;
+static __declspec(thread) uint32_t g_retf_at;   /* where the last plain retf went (dispatch_far) */
 /* 16->32 calls in flight whose 32-bit side comes back by a far jump into
  * 16-bit code (w16_retf's generated stubs, w16_retf32's 16:16 returns):
  * w16_enter longjmps here when its target is the pending return. */
@@ -624,7 +659,21 @@ void dispatch_far(CPU *cpu, uint16_t sel, uint16_t off) {
     if (sel && sel == g_host_sel) { host_far(cpu, off); return; }
     int w16_drv_far(CPU *c, uint16_t sel, uint16_t off);
     if (w16_drv_far(cpu, sel, off)) return;   /* a host driver's segment (drv16.c) */
+    uint32_t pushed = mem_read32(cpu, cpu->ss, cpu->sp);   /* the far return the caller pushed */
+    uint16_t ss0 = cpu->ss, sp0 = cpu->sp;
     if (!(sel & 4) || !recomp_dispatch_lookup(cpu, seg_of(sel), off)) w16_stop("far call miss", sel, off);
+    /* The callee's last retf popped some other frame: a task switch-in
+     * (KRNL386 seg1 5F7F loads the next task's ss:sp from its TDB, 5F8A
+     * retfs into it -- a new task's entry, MSGSRV32 89:22EE). That code is
+     * where control is; the C return to here is not. ponytail: only a
+     * plain retf records its target (retf N does not), hence the ret_ip check */
+    while (g_retf_at && g_retf_at != pushed && cpu->ret_ip == (uint16_t)g_retf_at && (g_retf_at >> 16 & 4)) {
+        uint32_t at = g_retf_at; g_retf_at = 0;
+        if (getenv("W16_TRACE")) fprintf(stderr, "[w16] retf to %04X:%04X, not the caller's %04X:%04X (ss:sp %04X:%04X, called at %04X:%04X)\n",
+            at >> 16, at & 0xFFFF, pushed >> 16, pushed & 0xFFFF, cpu->ss, cpu->sp, ss0, sp0);
+        if (!recomp_dispatch_lookup(cpu, seg_of((uint16_t)(at >> 16)), (uint16_t)at)) break;   /* mid-function: a C return after all */
+    }
+    g_retf_at = 0;
 }
 /* Exception n at cs:ip (a lifted ud0/ud2): what a DPMI host does. The
  * handler the guest set (0203) gets the 16-bit exception frame on a locked
@@ -764,6 +813,7 @@ int w16_ss_big(uint16_t ss);
  * here). Static code cannot hold it, so the runtime runs it. */
 int w16_retf(CPU *c) {
     uint32_t at = mem_read32(c, c->ss, c->sp);
+    g_retf_at = at;
     int recomp_lar32(uint16_t sel, uint32_t *rights);
     uint32_t r;   /* only a present code selector of the guest's (a C return names a placeholder) */
     if (!(at >> 16 & 4) || !recomp_lar32((uint16_t)(at >> 16), &r) || (r & 0x8800) != 0x8800 || !recomp_sel_base(at >> 16)) return 0;

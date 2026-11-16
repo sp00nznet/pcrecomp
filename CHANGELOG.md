@@ -7,6 +7,11 @@ versions follow [SemVer](https://semver.org/).
 
 ### Added
 
+- Win16 identity (Win98): VWIN32 01 sets CurTDB (DGROUP:122C) to the next task;
+  dispatch_far follows a retf that popped another frame (a task switch-in);
+  int 31h 0300 for 2F/160B; the SHELL VxD's PM API (19h/1Bh/1Ch); kernel32
+  int 21h 60h. ne_parse resolves moveable internal references (segment FFh)
+  through the entry table.
 - ne_lift, Win16 identity mode: jumps into another lifted function are
   trampolined (each function is a wrapper loop around its body, NAME__b;
   RECOMP_TAIL leaves the next body in cpu->tail), so a 16-bit loop that spans

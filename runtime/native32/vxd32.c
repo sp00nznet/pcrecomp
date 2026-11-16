@@ -1243,6 +1243,15 @@ static uint32_t vwin32_int21(const uint32_t* a) {
             return g_eax;
         }
         break;
+    case 0x60: {   /* truename DS:SI -> ES:DI (128 bytes), the 8.3 form of 7160 (MSGSRV32's
+                    * WinExec of the shell, after 716C did not find it) */
+        if (!host_path(g_esi, path)) { dos_fail(3); return g_eax; }
+        const char* rel = path + strlen(g_root);
+        _snprintf(path2, sizeof path2, "C:\\%s", *rel == '\\' ? rel + 1 : rel);
+        path2[127] = 0;
+        _strupr(path2);
+        guest_put(g_edi, path2, 128);
+        return g_eax; }
     case 0x1A: g_dta = g_edx; return g_eax;                    /* set DTA (DS:DX) */
     case 0x2F: g_ebx = g_dta; return g_eax;                    /* get DTA -> ES:BX */
     case 0x3C: case 0x3D: {   /* create (CX attrs) / open (AL mode): DS:DX name -> AX handle */
