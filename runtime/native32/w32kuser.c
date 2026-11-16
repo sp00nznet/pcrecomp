@@ -348,6 +348,17 @@ static void server_info(void) {
         *(uint32_t*)(native32_user_disp + 0x2C) = 1;
         *(uint32_t*)(native32_user_disp + 0x30) = (uint32_t)(uintptr_t)mon;
         *(uint32_t*)(native32_user_disp + 0x34) = (uint32_t)(uintptr_t)mon;
+        /* +0 HEAD.h: MonitorFromRect answers PtoH(pMonitor) and GetMonitorInfo
+         * validates it (TYPE_MONITOR 12). Handle 0 failed both: explorer's tray
+         * sized itself to an empty monitor (4x0 at -2,2). ponytail: the table's
+         * last slot, which a host window of index 0xFFFF would take over */
+        if (native32_user_ahe) {
+            uint32_t e = (uint32_t)(uintptr_t)native32_user_ahe + 12 * 0xFFFF;
+            *(uint32_t*)mon = 0x1FFFF;
+            MEM32(e) = (uint32_t)(uintptr_t)mon;
+            MEM8(e + 8) = 12;
+            MEM16(e + 0xA) = 1;
+        }
     }
 }
 
@@ -636,6 +647,54 @@ static uint32_t s_findwindow(uint32_t* a) {
 /* NtUserModifyUserStartupInfoFlags(set, clear): STARTF_* bits win32k keeps
  * for the first window; nothing to keep here */
 static uint32_t s_one_u(uint32_t* a) { (void)a; return 1; }
+/* The shell's system-wide calls (RegisterHotKey, SetShellWindowEx) are
+ * answered here, never the host's: a guest explorer must not take Win+E from
+ * the real shell or name itself the host's shell window */
+static int own_window(uint32_t h) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId((HWND)(uintptr_t)h, &pid);
+    return pid == GetCurrentProcessId();
+}
+/* SetShellWindowEx: win32k keeps the shell window (explorer's desktop) under
+ * every other; inside the virtual screen that is its bottom child, here and
+ * whenever it is shown (else it covered the taskbar) */
+static HWND g_shellwnd;
+static void shell_bottom(HWND h) {
+    if (h && h == g_shellwnd) SetWindowPos(h, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+static uint32_t s_set_shell(uint32_t* a) {
+    if (!own_window(a[0])) return 0;
+    shell_bottom(g_shellwnd = (HWND)(uintptr_t)a[0]);
+    return 1;
+}
+/* a broadcast stays in the guest (ponytail: dropped, not sent to the guest's
+ * own top-level windows; send it to them when something waits for one) */
+static uint32_t s_send_notify(uint32_t* a) {
+    return own_window(a[0]) ? SendNotifyMessageW((HWND)(uintptr_t)a[0], a[1], a[2], a[3]) : 1;
+}
+static uint32_t s_post_thread(uint32_t* a) {
+    HANDLE t = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, a[0]);
+    DWORD pid = t ? GetProcessIdOfThread(t) : 0;
+    if (t) CloseHandle(t);
+    return pid == GetCurrentProcessId() ? PostThreadMessageW(a[0], a[1], a[2], a[3]) : 0;
+}
+/* SetWindowRgn: the system owns the region it is given, so the host gets a copy */
+static uint32_t s_setrgn(uint32_t* a) {
+    HRGN g = (HRGN)(uintptr_t)native32_gdi_host(a[1]), c = NULL;
+    if (!own_window(a[0])) return 0;
+    if (g && (c = CreateRectRgn(0, 0, 0, 0)) != NULL) CombineRgn(c, g, NULL, RGN_COPY);
+    return SetWindowRgn((HWND)(uintptr_t)a[0], c, (BOOL)a[2]);
+}
+/* (hdc, lprcClip, proc, lParam): the one monitor, server_info's, to the
+ * guest's MONITORENUMPROC. ponytail: hdc and the clip rectangle ignored */
+static uint32_t s_enum_monitors(uint32_t* a) {
+    static RECT rc;
+    if (!g_mon || !a[2]) return 0;
+    memcpy(&rc, g_mon + 0x10, sizeof rc);
+    uint32_t args[4] = { MEM32((uint32_t)(uintptr_t)g_mon), a[0], (uint32_t)(uintptr_t)&rc, a[3] };
+    native32_call_guest(a[2], 4, args);
+    return 1;
+}
 /* RichEdit's (wordpad): read-only queries and its caret */
 static uint32_t s_dblclick(uint32_t* a) { (void)a; return GetDoubleClickTime(); }
 static uint32_t s_kblist(uint32_t* a) { return (uint32_t)GetKeyboardLayoutList((int)a[0], (HKL*)(uintptr_t)a[1]); }
@@ -1242,7 +1301,15 @@ static uint32_t s_redraw(uint32_t* a) {
     if (!h) return 0;
     return RedrawWindow(h, (RECT*)(uintptr_t)a[1], (HRGN)(uintptr_t)(a[2] ? native32_gdi_host(a[2]) : 0), a[3]);
 }
-static uint32_t s_show(uint32_t* a) { return ShowWindow(HW(a[0]), (int)a[1]); }
+static uint32_t s_show(uint32_t* a) {
+    uint32_t r = ShowWindow(HW(a[0]), (int)a[1]);
+    RECT rc;
+    shell_bottom(HW(a[0]));
+    if (getenv("NATIVE32_SYSCALLS") && GetWindowRect(HW(a[0]), &rc))
+        fprintf(stderr, "[user] ShowWindow %08X %u: %ld,%ld %ldx%ld visible %d\n", a[0], a[1], rc.left, rc.top,
+                rc.right - rc.left, rc.bottom - rc.top, IsWindowVisible(HW(a[0])));
+    return r;
+}
 static uint32_t s_update(uint32_t* a) { return UpdateWindow(HW(a[0])); }
 /* NtUserGetMessage(MSG*, hwnd, min, max) / NtUserPeekMessage(MSG*, hwnd, min, max, remove) */
 static uint32_t s_getmessage(uint32_t* a) { return GetMessageW((MSG*)(uintptr_t)a[0], HW(a[1]), a[2], a[3]); }
@@ -1306,6 +1373,13 @@ void native32_user_install(void) {
     native32_nt_win32k_override("NtUserEnableScrollBar", s_enable_sb);
     native32_nt_win32k_override("NtUserFindWindowEx", s_findwindow);
     native32_nt_win32k_override("NtUserModifyUserStartupInfoFlags", s_one_u);
+    native32_nt_win32k_override("NtUserRegisterHotKey", s_one_u);
+    native32_nt_win32k_override("NtUserUnregisterHotKey", s_one_u);
+    native32_nt_win32k_override("NtUserSetShellWindowEx", s_set_shell);
+    native32_nt_win32k_override("NtUserSendNotifyMessage", s_send_notify);
+    native32_nt_win32k_override("NtUserPostThreadMessage", s_post_thread);
+    native32_nt_win32k_override("NtUserSetWindowRgn", s_setrgn);
+    native32_nt_win32k_override("NtUserEnumDisplayMonitors", s_enum_monitors);
     native32_nt_win32k_override("NtUserGetDoubleClickTime", s_dblclick);
     native32_nt_win32k_override("NtUserGetKeyboardLayoutList", s_kblist);
     native32_nt_win32k_override("NtUserShowCaret", s_showcaret);
