@@ -1803,12 +1803,17 @@ static void ncpaint(uobj_t* u) {
  * key, which closes it and repaints the window */
 static rc_t g_popup;
 static uint32_t g_popup_owner, g_popup_menu;      /* the window and the drop-down menu shown (for a live click in it) */
+static int g_popup_bar, g_popup_sel = -1;         /* its bar item; the highlighted item (arrows, the mouse) */
+static int g_popup_next = -1;                     /* left/right: the bar item to drop down once the old one is painted over */
 static void invalidate(uobj_t* u, int erase);
 static void popup_draw(uobj_t* u, int k) {
     uobj_t* m = U(u->menu, W2K_TYPE_MENU), *p;
     if (!m || k < 0 || k >= m->nitems || !(p = U(m->items[k].sub, W2K_TYPE_MENU))) return;
-    send(u->h, 0x116, m->h, 0);                                       /* WM_INITMENU */
-    send(u->h, 0x117, p->h, (uint32_t)k);                             /* WM_INITMENUPOPUP */
+    if (rc_empty(&g_popup) || g_popup_owner != u->h || g_popup_bar != k) {
+        send(u->h, 0x116, m->h, 0);                                   /* WM_INITMENU */
+        send(u->h, 0x117, p->h, (uint32_t)k);                         /* WM_INITMENUPOPUP */
+        if (g_popup_bar != k || g_popup_owner != u->h) g_popup_sel = -1;
+    }
     menubar_layout(u);
     gobj_t* d = window_dc(NULL, 0);
     int bx = u->wr.l + m->items[k].x, by = u->wr.t + borders(u->style, u->ex) + caption_h(u->style, u->ex);
@@ -1840,6 +1845,10 @@ static void popup_draw(uobj_t* u, int k) {
         int has = *tab == 9;
         *tab = 0;
         uint32_t col = it->state & 3 ? C[17] : C[7];
+        if (i == g_popup_sel) {                                       /* highlighted: COLOR_HIGHLIGHT, its text */
+            fill(d, (rc_t){ r.l + 3, y, r.r - 3, y + 17 }, C[13]);
+            if (!(it->state & 3)) col = C[14];
+        }
         if (it->state & 8)                                            /* MFS_CHECKED: a check mark */
             for (int j = 0; j < 7; j++) {
                 int cx = r.l + 7 + j, cy = y + 9 + (j < 3 ? j : 4 - j) - 1;
@@ -1850,11 +1859,47 @@ static void popup_draw(uobj_t* u, int k) {
         y += 17;
     }
     gfree(d);
-    g_popup = r, g_popup_owner = u->h, g_popup_menu = p->h;
+    g_popup = r, g_popup_owner = u->h, g_popup_menu = p->h, g_popup_bar = k;
+}
+/* the keys while a menu is down: arrows move, Enter chooses, Esc closes (1: taken) */
+static void popup_close(void);
+static int popup_key(uint32_t vk) {
+    uobj_t* u = W(g_popup_owner), *p = U(g_popup_menu, W2K_TYPE_MENU), *m = u ? U(u->menu, W2K_TYPE_MENU) : NULL;
+    if (!u || !p || !m) return 0;
+    if (vk == 37 || vk == 39) {                                       /* left, right: the next bar item's menu */
+        int k = (g_popup_bar + (vk == 39 ? 1 : m->nitems - 1)) % m->nitems;
+        popup_close(), g_popup_next = k;
+        return 1;
+    }
+    if (vk == 38 || vk == 40) {                                       /* up, down: skipping separators */
+        for (int n = 0, i = g_popup_sel; n < p->nitems; n++) {
+            i = vk == 40 ? (i + 1) % p->nitems : (i <= 0 ? p->nitems : i) - 1;
+            if (!(p->items[i].type & 0x800)) { g_popup_sel = i; break; }
+        }
+        popup_draw(u, g_popup_bar);
+        return 1;
+    }
+    if (vk == 13) {
+        item_t* it = g_popup_sel >= 0 && g_popup_sel < p->nitems ? &p->items[g_popup_sel] : NULL;
+        uint32_t owner = g_popup_owner;
+        popup_close();
+        if (it && !(it->state & 3) && !it->sub) post(owner, 0x111, it->id, 0);
+        return 1;
+    }
+    if (vk == 27) { popup_close(); return 1; }
+    for (int i = 0; i < p->nitems; i++)                               /* a mnemonic in the menu */
+        for (uint16_t* t = p->items[i].text; *t && !(p->items[i].state & 3); t++)
+            if (*t == '&' && t[1] && (t[1] | 0x20) == (vk | 0x20) && vk >= 'A' && vk <= 'Z') {
+                uint32_t owner = g_popup_owner, id = p->items[i].id;
+                popup_close();
+                if (!p->items[i].sub) post(owner, 0x111, id, 0);
+                return 1;
+            }
+    return 1;                                                         /* (other keys: swallowed while the menu is down) */
 }
 static void popup_close(void) {
     if (rc_empty(&g_popup)) return;
-    g_popup = (rc_t){ 0, 0, 0, 0 };
+    g_popup = (rc_t){ 0, 0, 0, 0 }, g_popup_sel = -1;
     for (int i = 2; i < MAXU; i++) if (g_u[i].type == W2K_TYPE_WINDOW && visible(&g_u[i])) invalidate(&g_u[i], 1);
 }
 static void keymenu(uobj_t* u, uint32_t ch) {
@@ -2430,6 +2475,7 @@ static uint32_t s_menu_item(uint32_t* a) {
         int n = MEM16(a[5]) / 2;
         for (int i = 0; i < n && i < 63; i++) it->text[i] = MEM16(MEM32(a[5] + 4) + 2 * i), it->text[i + 1] = 0;
     }
+    if ((mask & 0x110) && !(it->type & 0x904) && !it->text[0] && !it->sub) it->type |= 0x800;   /* (MFT_STRING, no string: win32k makes it a separator) */
     menu_sync(own);
     return 1;
 }
@@ -2879,6 +2925,12 @@ static void run_event(ev_t* e) {
 static int live_idle(uint32_t now, uint32_t next);
 static int script_idle(void) {
     uint32_t now = ntp_clock_ms(), next = UINT32_MAX;
+    if (g_popup_next >= 0) {                      /* (the queue is empty: the windows have repainted) */
+        int k = g_popup_next;
+        g_popup_next = -1;
+        if (W(g_popup_owner)) popup_draw(W(g_popup_owner), k);
+        return 1;
+    }
     if (g_iev < g_nev && g_ev[g_iev].ms <= now) { run_event(&g_ev[g_iev++]); return 1; }
     if (g_iev < g_nev) next = g_ev[g_iev].ms;
     for (int i = 0; i < MAXT; i++) if (g_tm[i].on && g_tm[i].due < next) next = g_tm[i].due;
@@ -2970,6 +3022,17 @@ static void x_popup_click(int x, int y) {
 static void x_mouse(int type, int x, int y, unsigned button, unsigned state) {
     uint32_t mk = (state & Button1Mask ? 1 : 0) | (state & Button3Mask ? 2 : 0) | (state & ShiftMask ? 4 : 0) | (state & ControlMask ? 8 : 0);
     if (type != MotionNotify && button > 3) return;          /* the wheel */
+    if (type == MotionNotify && !rc_empty(&g_popup) && x >= g_popup.l && x < g_popup.r && y >= g_popup.t && y < g_popup.b) {
+        uobj_t* p = U(g_popup_menu, W2K_TYPE_MENU);                 /* hot-tracking */
+        int sel = -1;
+        for (int i = 0, iy = g_popup.t + 3; p && i < p->nitems; i++) {
+            int ih = p->items[i].type & 0x800 ? 9 : 17;
+            if (y >= iy && y < iy + ih && !(p->items[i].type & 0x800)) sel = i;
+            iy += ih;
+        }
+        if (sel != g_popup_sel && W(g_popup_owner)) g_popup_sel = sel, popup_draw(W(g_popup_owner), g_popup_bar);
+        return;
+    }
     if (type == ButtonPress && !rc_empty(&g_popup)) {
         if (x >= g_popup.l && x < g_popup.r && y >= g_popup.t && y < g_popup.b) { x_popup_click(x, y); return; }
         popup_close();
@@ -3021,7 +3084,7 @@ static void x_key(XKeyEvent* e, int down) {
     if (down) g_keychar[vk] = n == 1 && !(e->state & ControlMask) ? (uint8_t)ch[0] : 0;
     uint32_t lp = 1 | (uint32_t)(e->keycode - 8) << 16 | (down ? 0 : 0xC0000000u);
     uint32_t to = W(g_focus) ? g_focus : g_active ? g_active : g_main;
-    if (down && !rc_empty(&g_popup)) { popup_close(); if (vk == 27) return; }
+    if (!rc_empty(&g_popup) && vk != 16 && vk != 17 && vk != 18) { if (down) popup_key(vk); return; }
     if (down && (vk == 0x79 || (alt && vk >= 'A' && vk <= 'Z'))) {   /* F10, Alt+letter: the menu */
         post(top_of(to) ? top_of(to) : g_main, 0x112, 0xF100, vk == 0x79 ? 0 : vk + 32);
         return;
