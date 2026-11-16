@@ -21,6 +21,7 @@
 #include <stdlib.h>
 
 #include "native32.h"
+void recomp_trace_flush(void);   /* recomp_trace.c: --calltrace before we end */
 
 typedef struct { uint32_t id; int nargs; uint32_t (*fn)(const uint32_t* a); const char* name; } vxd_service_t;
 
@@ -66,28 +67,34 @@ static uint32_t vwin32_set_callbacks(const uint32_t* a) {
  * environment now lives (it copied it out of the DOS VM). Nothing to keep. */
 static uint32_t vwin32_set_env(const uint32_t* a) { (void)a; return 0; }
 
-/* VMM's ring-0 heap (DDK _HeapAllocate/_HeapFree/_HeapReAllocate/
- * _HeapGetSize order, services 5-8). flags bit 0 = HEAPZEROINIT. */
+/* VMM service 5: the ring-0 heap's _HeapAllocate(nbytes, flags), flags bit 0
+ * = HEAPZEROINIT. (Service 6 is NOT _HeapFree: see vmm_context_create.) */
 static HANDLE vmm_heap(void) { static HANDLE h; if (!h) h = HeapCreate(0, 0, 0); return h; }
 static uint32_t vmm_heap_alloc(const uint32_t* a) {
     return (uint32_t)(uintptr_t)HeapAlloc(vmm_heap(), (a[1] & 1) ? HEAP_ZERO_MEMORY : 0, a[0] ? a[0] : 1);
 }
-static uint32_t vmm_heap_free(const uint32_t* a) { return a[0] ? HeapFree(vmm_heap(), 0, (void*)(uintptr_t)a[0]) : 0; }
-static uint32_t vmm_heap_realloc(const uint32_t* a) {
-    return (uint32_t)(uintptr_t)HeapReAlloc(vmm_heap(), (a[2] & 1) ? HEAP_ZERO_MEMORY : 0, (void*)(uintptr_t)a[0], a[1] ? a[1] : 1);
-}
-static uint32_t vmm_heap_size(const uint32_t* a) { return (uint32_t)HeapSize(vmm_heap(), 0, (void*)(uintptr_t)a[0]); }
+/* VMM service 6, no arguments: a new memory context, kept in the process
+ * database at +1C (beside +24, the PSP's linear address). Every guest
+ * process shares the host's one address space: a nonzero cookie. */
+static uint32_t vmm_context_create(const uint32_t* a) { static uint32_t n; (void)a; return 0xC0DE0000u + ++n; }
 
 /* VWIN32 4F (fn, handle): 33h registers a kernel32 object (a process) with
  * VWIN32's ring-0 side, 34h drops it. The host keeps no ring-0 twin. */
 static uint32_t vwin32_obj_fn(const uint32_t* a) { return a[0] == 0x33 || a[0] == 0x34; }
 
+/* VWIN32 32 (obj): kernel32 releases an object's ring-0 part just before it
+ * clears the object. Nothing on the host side. */
+static uint32_t vwin32_obj_release(const uint32_t* a) { (void)a; return 0; }
+
+/* VMM service 0B (context): switch to a memory context. One address space. */
+static uint32_t vmm_context_switch(const uint32_t* a) { (void)a; return 0; }
+
 static const vxd_service_t g_services[] = {
+    { 0x0001000B, 1, vmm_context_switch, "VMM_ContextSwitch" },
+    { 0x002A0032, 1, vwin32_obj_release, "VWIN32_ReleaseObject" },
     { 0x002A004F, 2, vwin32_obj_fn, "VWIN32_ObjectFn" },
     { 0x00010005, 2, vmm_heap_alloc, "VMM_HeapAllocate" },
-    { 0x00010006, 2, vmm_heap_free, "VMM_HeapFree" },
-    { 0x00010007, 3, vmm_heap_realloc, "VMM_HeapReAllocate" },
-    { 0x00010008, 2, vmm_heap_size, "VMM_HeapGetSize" },
+    { 0x00010006, 0, vmm_context_create, "VMM_ContextCreate" },
     { 0x002A0047, 1, vwin32_set_env, "VWIN32_SetEnvironment" },
     { 0x002A0006, 3, vwin32_set_callbacks, "VWIN32_SetCallbacks" },
     { 0x00010000, 3, vmm_page_reserve, "VMM_PageReserve" },
@@ -185,6 +192,7 @@ int recomp_retf32(uint32_t target) {
         fprintf(stderr, "\n[vwin32-r0] unknown ring-0 entry +%02X from sub_%08X: eax=%08X ecx=%08X edx=%08X ebx=%08X\n",
                 off, g_cur_func, g_eax, g_ecx, g_edx, g_ebx);
         fflush(stderr);
+        recomp_trace_flush();
         TerminateProcess(GetCurrentProcess(), 5);
     }
     if (g_trace) fprintf(stderr, "[vwin32-r0] +%02X -> eax=%08X (from sub_%08X)\n", off, g_eax, g_cur_func);
@@ -210,6 +218,7 @@ int recomp_farcall32(uint32_t ptr) {
             id, id >> 16, id & 0xFFFF, g_cur_func, MEM32(g_esp), a[0], a[1], a[2], a[3], a[4], a[5]);
     native32_dump_icalls(8);
     fflush(stderr);
+    recomp_trace_flush();
     TerminateProcess(GetCurrentProcess(), 5);
     return 1;
 }
