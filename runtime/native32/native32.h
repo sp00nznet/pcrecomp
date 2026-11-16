@@ -220,6 +220,9 @@ int native32_headless(void);
  * function that registered the frame RtlUnwind last stopped at. That function
  * needs a landing pad (generate.py eh_resume). */
 void native32_seh_continue(uint32_t va);
+void native32_rpc_guard(uint32_t ndr_client_call2, uint32_t ndr_client_call);   /* guest RPC failures end the call (native32.c) */
+void native32_rpc_fail(uint32_t exception_record, uint32_t context);
+int native32_local_unwind2(void);   /* MSVC __local_unwind2 copies in the guest modules: a finally that exits its function (native32.c) */
 extern int native32_guest_seh;   /* 1: RaiseException goes to the guest chain */
 /* A Visual Basic 5/6 guest on the real MSVBVM60/50 (vb6rt.c): the runtime is
  * entered with the guest's registers and stack, and its runtime errors go to

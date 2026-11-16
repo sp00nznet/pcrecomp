@@ -190,9 +190,261 @@ void recomp_syscall(int vector) {
     g_eax = r;
 }
 
+/* ---- the file box: the guest's drives are directories ---------------------
+ * PCRECOMP_FILEBOX=<host dir> (unset: no box). Every drive path the guest
+ * names, X:\rest, is <box>\X\rest; the guest never sees the host's disks.
+ * Two exceptions, both checked on the normalized path (no . or ..):
+ *   - paths already under <box> (the profile the host points the guest's
+ *     environment at) are used as they are;
+ *   - the loader's directories (the modules, the NLS files, the DLL path:
+ *     the host system directory for the proxies) are READ-ONLY FILES:
+ *     no write access, no create, no directory opens (so no listing).
+ * Every other absolute name (\Device\..., UNC, \??\Volume{}, GLOBALROOT,
+ * pipes, \SystemRoot) is refused. Drive enumeration (ProcessDeviceMap) is
+ * the box's one-letter directories; the current directory is C:\.
+ * A relative open (RootDirectory) is relative to a handle the box gave. */
+static int under(const wchar_t* path, const wchar_t* dir);
+#define FB_RO_MAX 8
+static int fb_on;
+static wchar_t fb_root[MAX_PATH], fb_ro[FB_RO_MAX][MAX_PATH];
+static int fb_nro, fb_log = -1;
+enum { FB_ORIG, FB_PASS, FB_RO, FB_BOX };
+
+static int fb_dotdot(const wchar_t* s, int n) {             /* a "." or ".." component */
+    for (int i = 0; i < n; i++)
+        if ((i == 0 || s[i - 1] == L'\\') && s[i] == L'.') {
+            int j = i + 1 + (i + 1 < n && s[i + 1] == L'.');
+            if (j == n || s[j] == L'\\') return 1;
+        }
+    return 0;
+}
+
+/* The guest's name (OBJECT_ATTRIBUTES or a raw string) to a host NT path in
+ * out; 0 or the status to fail with. kind: FB_ORIG = use the guest's own. */
+static uint32_t fb_map(const wchar_t* s, int n, int relative, wchar_t* out, int* kind) {
+    static const wchar_t* pre[] = { L"\\??\\", L"\\DosDevices\\", L"\\GLOBAL??\\" };
+    wchar_t p[MAX_PATH + 8];
+    *kind = FB_ORIG;
+    if (fb_dotdot(s, n)) return 0xC0000033u;                  /* OBJECT_NAME_INVALID */
+    if (relative) return 0;
+    for (int i = 0; i < 3; i++) {
+        int k = (int)wcslen(pre[i]);
+        if (n >= k && !_wcsnicmp(s, pre[i], k)) { s += k, n -= k; goto dos; }
+    }
+    if (n >= 30 && !_wcsnicmp(s, L"\\Device\\NamedPipe\\Win32Pipes.", 30)) return 0;   /* CreatePipe's other end */
+    return 0xC0000022u;                                       /* \Device\..., \SystemRoot, ...: refused */
+dos:
+    if (n < 2 || n > MAX_PATH || s[1] != L':' || !iswalpha(s[0]) || (n > 2 && s[2] != L'\\'))
+        return 0xC0000022u;                                   /* UNC, pipe, Volume{}, GLOBALROOT, devices */
+    memcpy(p, s, n * 2), p[n] = 0;
+    if (under(p, fb_root)) { *kind = FB_PASS; return 0; }
+    for (int i = 0; i < fb_nro; i++)
+        if (under(p, fb_ro[i])) {                             /* out: an NT path */
+            _snwprintf(out, MAX_PATH * 2, L"\\??\\%ls", p);
+            if (i > 0 && i == fb_nro - 1) {                  /* the DLL path ends at the system directory: the guest's system32 is the lifted modules' first */
+                wchar_t m[MAX_PATH * 2 + 8];
+                _snwprintf(m, MAX_PATH * 2, L"%ls%ls", fb_ro[0], p + wcslen(fb_ro[i]));
+                if (GetFileAttributesW(m) != INVALID_FILE_ATTRIBUTES) _snwprintf(out, MAX_PATH * 2, L"\\??\\%ls", m);
+            }
+            *kind = FB_RO;
+            return 0;
+        }
+    _snwprintf(out, MAX_PATH * 2, L"\\??\\%ls\\%c%ls", fb_root, towupper(p[0]), n > 2 ? p + 2 : L"\\");
+    *kind = FB_BOX;
+    return 0;
+}
+
+/* Open/Create: a[2] is OBJECT_ATTRIBUTES; ro checks on access a[1], the
+ * create disposition and options (NtCreateFile a[7] a[8], NtOpenFile a[5]). */
+static uint32_t fb_open(uint32_t* a, const char* svc, uint32_t disp, uint32_t opts, int argc) {
+    uint32_t oa = a[2], b[11], us[2], oa2[6];
+    wchar_t out[MAX_PATH * 2 + 8];
+    int n, kind;
+    const wchar_t* s = oa_name(oa, &n);
+    uint32_t st = fb_map(s, n, oa && MEM32(oa + 4), out, &kind);
+    if (fb_log < 0) fb_log = getenv("PCRECOMP_FILEBOX_LOG") != NULL;
+    if (!st && kind == FB_RO &&
+        ((a[1] & 0x520D0056u) || disp != 1 || (opts & 0x1001)))   /* any write/delete/GENERIC_WRITE|ALL|MAX; create; dir; delete-on-close */
+        st = 0xC0000022u;
+    if (!st && kind == FB_RO) {                               /* opened without FILE_DIRECTORY_FILE, still a directory */
+        DWORD at = GetFileAttributesW(out + 4);
+        if (at != INVALID_FILE_ATTRIBUTES && (at & FILE_ATTRIBUTE_DIRECTORY)) st = 0xC0000022u;
+    }
+    if (st || fb_log) fprintf(stderr, "[filebox] %s %.*ls%s%ls%s (access %08X disp %u opts %08X)\n", svc, n > 260 ? 260 : n, s,
+                              kind >= FB_RO ? " -> " : "", kind >= FB_RO ? out : L"", st ? "  REFUSED" : "", a[1], disp, opts);
+    if (st) return st;
+    memcpy(b, a, argc * 4);
+    if (kind == FB_RO) b[1] &= ~0x100u;                       /* FILE_WRITE_ATTRIBUTES (icon extraction keeps the access time): not granted, not refused */
+    if (kind >= FB_RO) {
+        memcpy(oa2, (void*)(uintptr_t)oa, 24);
+        us[0] = (uint32_t)(wcslen(out) * 2) | (uint32_t)(wcslen(out) * 2 + 2) << 16;
+        us[1] = (uint32_t)(uintptr_t)out;
+        oa2[2] = (uint32_t)(uintptr_t)us;
+        b[2] = (uint32_t)(uintptr_t)oa2;
+    }
+    return native32_nt_forward(svc, b);
+}
+static uint32_t ovr_fb_create(uint32_t* a) { return fb_open(a, "NtCreateFile", a[7], a[8], 11); }
+static uint32_t ovr_fb_open(uint32_t* a) { return fb_open(a, "NtOpenFile", 1, a[5], 6); }
+
+/* NtQueryAttributesFile / NtQueryFullAttributesFile / NtDeleteFile: a[0] */
+static uint32_t fb_by_name(uint32_t* a, const char* svc, int ro_ok) {
+    uint32_t oa = a[0], b[2] = { a[0], a[1] }, us[2], oa2[6];
+    wchar_t out[MAX_PATH * 2 + 8];
+    int n, kind;
+    const wchar_t* s = oa_name(oa, &n);
+    uint32_t st = fb_map(s, n, oa && MEM32(oa + 4), out, &kind);
+    if (!st && kind == FB_RO && !ro_ok) st = 0xC0000022u;
+    if (st || fb_log > 0) fprintf(stderr, "[filebox] %s %.*ls%s\n", svc, n > 260 ? 260 : n, s, st ? "  REFUSED" : "");
+    if (st) return st;
+    if (kind >= FB_RO) {
+        memcpy(oa2, (void*)(uintptr_t)oa, 24);
+        us[0] = (uint32_t)(wcslen(out) * 2) | (uint32_t)(wcslen(out) * 2 + 2) << 16;
+        us[1] = (uint32_t)(uintptr_t)out;
+        oa2[2] = (uint32_t)(uintptr_t)us;
+        b[0] = (uint32_t)(uintptr_t)oa2;
+    }
+    return native32_nt_forward(svc, b);
+}
+static uint32_t ovr_fb_attr(uint32_t* a) { return fb_by_name(a, "NtQueryAttributesFile", 1); }
+static uint32_t ovr_fb_fattr(uint32_t* a) { return fb_by_name(a, "NtQueryFullAttributesFile", 1); }
+static uint32_t ovr_fb_delete(uint32_t* a) { return fb_by_name(a, "NtDeleteFile", 0); }
+
+/* NtSetInformationFile(h, iosb, info, len, class): a rename or link
+ * (FILE_RENAME_INFORMATION: Replace, RootDirectory, FileNameLength, FileName)
+ * names its target. */
+static uint32_t ovr_fb_setinfo(uint32_t* a) {
+    if ((a[4] != 10 && a[4] != 11) || a[3] < 12) return native32_nt_forward("NtSetInformationFile", a);
+    uint32_t in = a[2], nl = MEM32(in + 8), b[5];
+    wchar_t out[MAX_PATH * 2 + 8];
+    int kind;
+    if (nl > a[3] - 12) return 0xC000000Du;
+    uint32_t st = fb_map((const wchar_t*)(uintptr_t)(in + 12), (int)nl / 2, MEM32(in + 4) != 0, out, &kind);
+    if (!st && kind == FB_RO) st = 0xC0000022u;
+    if (st || fb_log > 0) fprintf(stderr, "[filebox] rename/link to %.*ls%s\n", (int)nl / 2, (wchar_t*)(uintptr_t)(in + 12), st ? "  REFUSED" : "");
+    if (st) return st;
+    if (kind != FB_BOX) return native32_nt_forward("NtSetInformationFile", a);
+    uint32_t ol = (uint32_t)wcslen(out) * 2;
+    uint8_t* buf = (uint8_t*)malloc(12 + ol + 2);
+    memcpy(buf, (void*)(uintptr_t)in, 8);
+    *(uint32_t*)(buf + 8) = ol;
+    memcpy(buf + 12, out, ol + 2);
+    memcpy(b, a, sizeof b);
+    b[2] = (uint32_t)(uintptr_t)buf, b[3] = 12 + ol;
+    uint32_t r = native32_nt_forward("NtSetInformationFile", b);
+    free(buf);
+    return r;
+}
+
+/* NtQueryVolumeInformationFile(h, iosb, info, len, class): the volume's
+ * label and serial are the box's, not the host disk's (FileFsVolumeInformation). */
+static uint32_t ovr_fb_volume(uint32_t* a) {
+    uint32_t r = native32_nt_forward("NtQueryVolumeInformationFile", a);
+    if (!r && a[4] == 1 && a[3] >= 18) {
+        MEM32(a[2] + 8) = 0x20001D2Bu;                        /* VolumeSerialNumber */
+        MEM32(a[2] + 12) = 0;                                 /* VolumeLabelLength: no label */
+    }
+    return r;
+}
+
+/* NtFsControlFile(h, ev, apc, ctx, iosb, code, ...): no junction or mount
+ * point inside the box can point out of it. */
+static uint32_t ovr_fb_fsctl(uint32_t* a) {
+    if (a[5] == 0x000900A4u) {                                /* FSCTL_SET_REPARSE_POINT */
+        fprintf(stderr, "[filebox] FSCTL_SET_REPARSE_POINT  REFUSED\n");
+        return 0xC0000022u;
+    }
+    return native32_nt_forward("NtFsControlFile", a);
+}
+
+/* NtOpenSymbolicLinkObject(h, access, oa): \??\C: would name the host's volume (QueryDosDevice). */
+static uint32_t ovr_fb_symlink(uint32_t* a) {
+    int n;
+    const wchar_t* s = oa_name(a[2], &n);
+    if (n >= 2 && s[n - 1] == L':') return 0xC0000034u;      /* OBJECT_NAME_NOT_FOUND */
+    return native32_nt_forward("NtOpenSymbolicLinkObject", a);
+}
+
+/* PROCESS_DEVICEMAP_INFORMATION (Query): DriveMap, DriveType[32]; the box's drives, fixed */
+static uint32_t fb_devmap(uint32_t* a) {
+    if (a[3] < 36) return 0xC0000004u;                        /* INFO_LENGTH_MISMATCH */
+    uint8_t* q = (uint8_t*)(uintptr_t)a[2];
+    uint32_t map = 0;
+    memset(q, 0, 36);
+    for (int d = 0; d < 26; d++) {
+        wchar_t p[MAX_PATH + 4];
+        _snwprintf(p, MAX_PATH + 3, L"%ls\\%c", fb_root, L'A' + d);
+        DWORD at = GetFileAttributesW(p);
+        if (at != INVALID_FILE_ATTRIBUTES && (at & FILE_ATTRIBUTE_DIRECTORY)) map |= 1u << d, q[4 + d] = 3;   /* DRIVE_FIXED */
+    }
+    *(uint32_t*)q = map;
+    if (a[4]) MEM32(a[4]) = 36;
+    return 0;
+}
+
+static void fb_ro_add(const wchar_t* d, size_t n) {
+    if (fb_nro >= FB_RO_MAX || !n || n >= MAX_PATH) return;
+    wchar_t t[MAX_PATH];
+    memcpy(t, d, n * 2), t[n] = 0;
+    if (!GetFullPathNameW(t, MAX_PATH, fb_ro[fb_nro], NULL)) return;
+    n = wcslen(fb_ro[fb_nro]);
+    while (n > 3 && fb_ro[fb_nro][n - 1] == L'\\') fb_ro[fb_nro][--n] = 0;
+    fb_nro++;
+}
+
+/* A host path in the box, <box>\X\rest, as the guest names it: X:\rest
+ * (the runner points USERPROFILE, TEMP, ... into the box's C). In place. */
+static void fb_guest_path(wchar_t* s) {
+    size_t n = wcslen(fb_root);
+    for (wchar_t* p = s; *p; p++)
+        if (!_wcsnicmp(p, fb_root, n) && p[n] == L'\\' && iswalpha(p[n + 1]) && (!p[n + 2] || p[n + 2] == L'\\' || p[n + 2] == L';')) {
+            p[0] = towupper(p[n + 1]), p[1] = L':';
+            memmove(p + 2, p + n + 2, (wcslen(p + n + 2) + 1) * sizeof *p);
+            if (!p[2] || p[2] == L';') memmove(p + 3, p + 2, (wcslen(p + 2) + 1) * sizeof *p), p[2] = L'\\';
+        }
+}
+
+/* The box from PCRECOMP_FILEBOX; the loader's read-only directories: the
+ * image's, the NLS directory and the DLL path's. 1 if the box is on. */
+static int fb_install(const wchar_t* image_path, const wchar_t* dll_path, const char* nls_dir) {
+    wchar_t env[MAX_PATH], c[MAX_PATH + 4], nls[MAX_PATH];
+    if (!GetEnvironmentVariableW(L"PCRECOMP_FILEBOX", env, MAX_PATH) || !GetFullPathNameW(env, MAX_PATH, fb_root, NULL))
+        return 0;
+    size_t n = wcslen(fb_root);
+    while (n > 3 && fb_root[n - 1] == L'\\') fb_root[--n] = 0;
+    _snwprintf(c, MAX_PATH + 3, L"%ls\\C", fb_root);
+    CreateDirectoryW(fb_root, NULL);
+    CreateDirectoryW(c, NULL);
+    if (wcsrchr(image_path, L'\\')) fb_ro_add(image_path, wcsrchr(image_path, L'\\') - image_path);
+    MultiByteToWideChar(CP_ACP, 0, nls_dir, -1, nls, MAX_PATH);
+    fb_ro_add(nls, wcslen(nls));
+    GetModuleFileNameW(NULL, nls, MAX_PATH);                  /* the host runners' (App Paths: the lifted programs) */
+    if (wcsrchr(nls, L'\\')) fb_ro_add(nls, wcsrchr(nls, L'\\') - nls);
+    for (const wchar_t* p = dll_path; *p;) {
+        const wchar_t* e = wcschr(p, L';') ? wcschr(p, L';') : p + wcslen(p);
+        fb_ro_add(p, e - p);
+        p = *e ? e + 1 : e;
+    }
+    native32_nt_override("NtCreateFile", ovr_fb_create);
+    native32_nt_override("NtOpenFile", ovr_fb_open);
+    native32_nt_override("NtQueryAttributesFile", ovr_fb_attr);
+    native32_nt_override("NtQueryFullAttributesFile", ovr_fb_fattr);
+    native32_nt_override("NtDeleteFile", ovr_fb_delete);
+    native32_nt_override("NtSetInformationFile", ovr_fb_setinfo);
+    native32_nt_override("NtQueryVolumeInformationFile", ovr_fb_volume);
+    native32_nt_override("NtFsControlFile", ovr_fb_fsctl);
+    native32_nt_override("NtOpenSymbolicLinkObject", ovr_fb_symlink);
+    fprintf(stderr, "[filebox] the guest's drives are %ls\\<letter>; read-only loader files:", fb_root);
+    for (int i = 0; i < fb_nro; i++) fprintf(stderr, " %ls", fb_ro[i]);
+    fprintf(stderr, "\n");
+    return fb_on = 1;
+}
+
 /* NtQueryInformationProcess(ProcessBasicInformation) on this process names
  * the HOST's PEB; the guest wants its own. */
 static uint32_t ovr_query_process(uint32_t* a) {
+    if (fb_on && a[1] == 23 && (a[0] == 0xFFFFFFFFu || GetProcessId((HANDLE)(uintptr_t)a[0]) == GetCurrentProcessId()))
+        return fb_devmap(a);                                  /* ProcessDeviceMap */
     uint32_t r = native32_nt_forward("NtQueryInformationProcess", a);
     if (!r && a[1] == 0 && (a[0] == 0xFFFFFFFFu || GetProcessId((HANDLE)(uintptr_t)a[0]) == GetCurrentProcessId()))
         MEM32(a[2] + 4) = native32_guest_peb;
@@ -837,10 +1089,17 @@ static uint32_t ovr_raise_exception(uint32_t* a) {
         depth--;
         g_esp = sp;                                    /* it came back: not handled */
     }
+    native32_rpc_fail(rec, ctx);                       /* in a guarded RPC client call: that call fails instead */
     fprintf(stderr, "\n[nt] unhandled guest exception %08X at %08X (first chance %u), eip %08X esp %08X\n",
             rec ? MEM32(rec) : 0, rec ? MEM32(rec + 12) : 0, a[2], ctx ? MEM32(ctx + 0xB8) : 0, ctx ? MEM32(ctx + 0xC4) : 0);
     fprintf(stderr, "  pid %lu thread %lu\n", GetCurrentProcessId(), GetCurrentThreadId());
     native32_dump_icalls(24);
+    /* the guest's handler chain (fs:[0]): who could have taken it. For an
+     * _except_handler3 frame (MSVC __try), the scope table and try level too. */
+    fprintf(stderr, "guest SEH chain:");
+    for (uint32_t r = MEM32(g_fs_base), k = 0; r && r != 0xFFFFFFFFu && k < 16 && !IsBadReadPtr((void*)(uintptr_t)r, 16); r = MEM32(r), k++)
+        fprintf(stderr, " [%08X handler %08X scope %08X level %d]", r, MEM32(r + 4), MEM32(r + 8), (int)MEM32(r + 12));
+    fprintf(stderr, "\n");
     if (ctx) {   /* the raiser's callers: guest code addresses on its stack (return addresses, some stale) */
         uint32_t sp = MEM32(ctx + 0xC4);
         fprintf(stderr, "stack code addresses:");
@@ -938,6 +1197,11 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
      * RtlUnwind walked the host's, found no target and ended the process with
      * STATUS_UNWIND (ole32's RPC __except when epmapper is refused) */
     native32_guest_seh = 1;
+    {   /* an RPC failure no guest frame takes fails its client call (native32.c) */
+        uint32_t rpc = native32_module("rpcrt4.dll");
+        if (rpc) native32_rpc_guard(native32_export(rpc, "NdrClientCall2"), native32_export(rpc, "NdrClientCall"));
+    }
+    native32_local_unwind2();
 
     /* PEB: the fields the kernel sets (NT 5 offsets). Ldr, the heap, the
      * locks and the TLS bitmap are the guest ntdll's to make. */
@@ -970,6 +1234,10 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
      * open the way the creating process leaves it. */
     GetCurrentDirectoryW(MAX_PATH - 1, cur);
     if (cur[wcslen(cur) - 1] != L'\\') wcscat(cur, L"\\");
+    wchar_t curh[MAX_PATH + 4];
+    wcscpy(curh, cur);
+    if (fb_install(image_path, dll_path, nls_dir))           /* in the box: C:\ is the box's C */
+        wcscpy(cur, L"C:\\"), _snwprintf(curh, MAX_PATH + 3, L"%ls\\C\\", fb_root);
     *(uint32_t*)(pp + 0x00) = 0x1000;
     *(uint32_t*)(pp + 0x04) = 0x2A0;
     *(uint32_t*)(pp + 0x08) = 1;                                      /* RTL_USER_PROC_PARAMS_NORMALIZED */
@@ -983,7 +1251,7 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
     ustr(pp + 0x24, cur, &pool);
     *(uint16_t*)(pp + 0x26) = MAX_PATH * 2;
     pool += MAX_PATH * 2;
-    *(uint32_t*)(pp + 0x2C) = (uint32_t)(uintptr_t)CreateFileW(cur, FILE_TRAVERSE | SYNCHRONIZE,
+    *(uint32_t*)(pp + 0x2C) = (uint32_t)(uintptr_t)CreateFileW(curh, FILE_TRAVERSE | SYNCHRONIZE,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
     ustr(pp + 0x30, dll_path, &pool);
     ustr(pp + 0x38, image_path, &pool);
@@ -998,7 +1266,7 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
         while (e[n] || e[n + 1]) n++;
         wchar_t* copy = (wchar_t*)VirtualAlloc(NULL, (n + dl + 8) * 2, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         for (wchar_t* s = e; *s; s += wcslen(s) + 1)
-            if (_wcsnicmp(s, L"Path=", 5)) { wcscpy(copy + o, s); o += wcslen(s) + 1; }
+            if (_wcsnicmp(s, L"Path=", 5)) { wcscpy(copy + o, s); if (fb_on) fb_guest_path(copy + o); o += wcslen(copy + o) + 1; }
         wcscpy(copy + o, L"Path="), wcscpy(copy + o + 5, dll_path), o += 5 + dl + 1;
         copy[o] = 0;
         FreeEnvironmentStringsW(e);
