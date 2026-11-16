@@ -1559,7 +1559,7 @@ class Lifter:
                     lines.append(f"{{ uint32_t _ocs = CS_BASE; PUSH32(esp, _seg_cs); {comment}")
                     lines.append(f"  CS_BASE = recomp_sel_base(MEM16(({addr}) + 4));")
                     lines.append(f"  RECOMP_ICALL(CS_BASE + MEM32({addr})); CS_BASE = _ocs; }}")
-                elif ops and ops[0].type == X86_OP_MEM and _is_far_indirect(insn):
+                elif W9X and ops and ops[0].type == X86_OP_MEM and _is_far_indirect(insn):
                     # call m16:32 in flat Win32 code: a call gate (Windows 9x
                     # kernel32's VxDCall goes to VMM through one). The host
                     # answers it (recomp_farcall32, native32 vxd32.c); nonzero
