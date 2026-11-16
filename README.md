@@ -59,6 +59,7 @@ pcrecomp/
     compat/        Win32 -> SDL2 mapping (the original annotated import census;
                    win32hle is the implemented successor)
   templates/       Starter CMakeLists and .gitignore for a new project
+  cmake/           pcrecomp_gen.cmake: adds the generated C to a target, unoptimised
   docs/            Pipeline, philosophy, the hybrid boundary, publishing
 ```
 
@@ -128,7 +129,7 @@ or IDA, whatever the architecture.
 | `translator.py` | `python -m tools`: the default 32-bit pipeline, analyse -> disassemble -> lift -> split into files |
 | `generate.py` | Fast 32-bit generation: one linear sweep, split on known boundaries |
 | `generate64.py` | Whole-PE x86-64 driver: chunked TUs, declarations, dispatch table, import map. It also finishes the catalog (below) |
-| `difftest.py` | Lifted C vs Unicorn for x86-32, every register, flag and byte compared |
+| `difftest.py` | Lifted C vs Unicorn for x86-32, every register, flag and byte compared; `--pe` does it a whole function at a time on a game's own code |
 | `difftest16.py` | The same for x86-16, on raw bytes or a real NE segment (`--ne`) |
 | `difftest64.py` | Lifted C vs the **host CPU** running the original bytes (`difftest64.asm`): registers, memory operands, `lock` atomics |
 
@@ -143,10 +144,12 @@ or IDA, whatever the architecture.
 | Tool | What it does |
 |------|--------------|
 | `ne_parse.py` | Segments, relocations, imports, entry points; flags a VBRUN-only import list as p-code |
-| `ne_decode.py` | NE-aware disassembly with cross-segment far calls and imports resolved; `--ida-json` follows IDA's code map |
+| `ne_codemap.py` | The code map (functions, instruction heads) by recursive descent from the entry table and relocations, jump tables and prologues; the default for `ne_decode`/`ne_link`, no IDA needed |
+| `ne_decode.py` | NE-aware disassembly with cross-segment far calls and imports resolved; `--ida-json` follows an exported code map instead |
 | `ne_xref.py` | Segment call graph, clusters, import usage, `--dot` |
 | `win16.py` | Ordinal -> API name, and the PASCAL stack-purge table keyed by (MODULE, API) |
-| `idt_to_json.py` | The ordinal map, built from the `.idt` files IDA ships, with no IDA run |
+| `wine_spec_to_json.py` | The ordinal map, built from Wine's 16-bit `.spec` files |
+| `idt_to_json.py` | The same map from the `.idt` files IDA ships, if you have IDA |
 | `gen_win16_stubs.py` | Prototypes, plus a correctly purging stub for every import with no shim yet; refuses an import whose purge it does not know |
 | `gen_segments_h.py` | `segments.h` generated from the lifted definitions, so prototypes cannot drift |
 | `gen_unresolved_stubs.py` | Defines the call targets nothing lifted, as stubs that **abort** rather than return |
@@ -165,9 +168,9 @@ or IDA, whatever the architecture.
 | `drm/steamstub.py` | Remove SteamStub 2.0 and 2.x (x86) statically: header, payload and the embedded `steamdrm.dll` are decoded in Python, then `.text` is decrypted (AES, or 2.0's running XOR) and the OEP restored. No Steam, nothing run |
 | `drm/unlzexe.py` | Undo LZEXE 0.90/0.91 on a DOS MZ executable -- decoded directly, nothing is run; `test_unlzexe.py` packs a file to check it |
 | `drm/emu_unpack.py` | Unpack a compressed PE32 (PECompact 2.x, and Valve's Steam2 wrapper built on it) by running its stub under Unicorn to the OEP, then rebuild the import table. Headless: nothing is launched |
-| `assets/extract_wise.py`, `isextract.py`, `is3extract.py`, `extract_cab.sh`, `pk3_inspect.py`, `bin2iso.js` | Wise and InstallShield (3, 5, 6+) installers, CABs, PK3/ZIP, BIN/CUE -> ISO |
+| `assets/extract_wise.py`, `extract_clickteam.py`, `isextract.py`, `is3extract.py`, `extract_cab.sh`, `pk3_inspect.py`, `bin2iso.js` | Wise, Clickteam Install Maker and InstallShield (3, 5, 6+) installers, CABs, PK3/ZIP, BIN/CUE -> ISO |
 | `assets/iso_peek.py` | Read an ISO's directory, locally or **over HTTP range requests**, and pull one file out without downloading the image |
-| `formats/` | FIF/FTC fractal image, M20/MVB, SPAM, DAT and string-table decoders (C) |
+| `formats/` | FIF/FTC fractal image, M20/MVB, SPAM, DAT and string-table decoders (C); LithTech REZ archives (`lithrez`, Python) |
 | `audit_repo.py` | Game material or lifted output tracked in a repo, in HEAD or in history; see [docs/PUBLISHING.md](docs/PUBLISHING.md) |
 
 ### What the 64-bit path does that the 32-bit one never needed
@@ -403,10 +406,39 @@ python tools/disasm/analyze.py GAME.EXE -symbols work/symbols.toml
 # every register, flag and byte of memory. Needs unicorn + a C compiler.
 python tools/lift/difftest.py -v
 
+# The same for a game's own functions: each one's original bytes in Unicorn
+# against its lifted body, every callee and import stubbed (a call stops both
+# sides and compares there), on seeded random and edge-case inputs. --old and
+# --changed test every function whose body changed between two lifts.
+python tools/lift/difftest.py --self-check
+python tools/lift/difftest.py --pe game.exe --gen src/recomp/gen 0x00486794
+python tools/lift/difftest.py --pe game.exe --gen new/gen --old old/gen --changed     -D RECOMP_LOCAL_REGS --cases 200 --seed 1
+
 # The 16-bit CPU model's hand-written flag logic (BCD, ADC/SBB carry-in),
 # against values taken from hardware
 cc -Iruntime/recomp16 runtime/recomp16/cpu_selftest.c -o selftest && ./selftest
 ```
+
+### "My scripted test run is flaky"
+
+Keys sent at wall-clock seconds land early or late as the machine's load
+changes. `runtime/replay/` keys them to the game's own progress instead: the
+host counts frames as it already does (presents, flips, timer ticks), logs
+each input it delivers as `FRAME EVENT` under `--record FILE`, and under
+`--replay FILE` delivers each at the same frame, with `shot FILE` checkpoints
+(a screenshot and an FNV hash) and `end`. `--keys f120:enter,...` is the same
+with frame times. A host whose game reads a wall clock also makes time
+virtual under replay (Jazz Jackrabbit: the PIT advances by lifted work, not
+by the clock), which makes replays bit-identical.
+
+```bash
+cc -DREPLAY_SELFTEST runtime/replay/replay.c -o replay_selftest && ./replay_selftest
+```
+
+Win16 hosts take `--record`/`--replay`/`--keys` before the image argument
+(`runtime/win16/host/main.c` hands them over as `RECOMP_RECORD`,
+`RECOMP_REPLAY`, `RECOMP_FKEYS`). Pilots: Jazz Jackrabbit and KISS Psycho
+Circus, each with a recording in `tests/` and the recipe in `docs/testing.md`.
 
 ### "Did the disassembler find the real functions?"
 
@@ -472,13 +504,16 @@ entirely, in code that is fine. `tools/ne/win16.py` carries the accumulated
 purge table keyed by (MODULE, API); `gen_win16_stubs.py` fails rather than
 generating a stub for an import that has no entry in it.
 
-Names come from IDA, which ships the Win16 ordinal maps as `.idt` files, so no
-IDA run is needed. `win16.py` looks for `work/win16_imports.json`, then
+Names come from Wine's 16-bit `.spec` files (`wine_spec_to_json.py`, which
+downloads them), or from the `.idt` files IDA ships (`idt_to_json.py`); the
+two agree on every ordinal the Win16 recomps import. `win16.py` looks for `work/win16_imports.json`, then
 `analysis/win16_imports.json`, walking up from the project root, then falls
 back to `tools/ne/win16_imports.json`. Without any of them, imports resolve to
 `MODULE_OrdN` and the purge lookups all miss:
 
 ```bash
+python tools/ne/wine_spec_to_json.py -o tools/ne/win16_imports.json
+# or, with IDA installed:
 python tools/ne/idt_to_json.py --ida "C:/Program Files/IDA Professional 9.1" \
                                -o tools/ne/win16_imports.json
 ```
@@ -594,6 +629,10 @@ python tools/disasm/callgraph.py game.exe --bounds bounds.csv --leaves
 
 ### "I have IDA and want its analysis to drive the lifters"
 
+Not needed for NE: `ne_decode` and `ne_link` build their code map natively
+(`tools/ne/ne_codemap.py`), and `tools/ne/test_ne_codemap.py` scores it
+against IDA's exports where those exist. An IDA map, if given, still wins:
+
 ```bash
 # Export IDA's verified code map (functions + instruction heads), then feed it in
 py -3 tools/ida/ida_export.py GAME.EXE code_map.json --key ne
@@ -608,6 +647,8 @@ python tools/ne/ne_decode.py GAME.EXE --ida-json code_map.json
 - `lief` - advanced binary analysis. Optional.
 - `unicorn` - the reference x86 that `lift/difftest.py` and `difftest16.py`
   check the lifted C against. Only needed to run the differential tests.
+  Unicorn is GPL-2: it is a test-time dependency only, installed with pip,
+  never vendored, linked or shipped in any runtime here.
   `difftest64.py` needs no emulator: the reference is the host CPU, built with
   MSVC x64 (`ml64` + `cl`).
 
@@ -648,7 +689,11 @@ pip install capstone pefile lief unicorn cryptography
    against a linker map, a PDB or IDA. Lifting a catalog you have not scored
    means finding its gaps at runtime, 30,000 calls deep, instead of now.
 5. Drop in the appropriate `runtime/` files
-6. Build with CMake, fix, repeat
+6. Build with CMake, fix, repeat. Add the generated C with
+   `include(${PCRECOMP}/cmake/pcrecomp_gen.cmake)` and
+   `pcrecomp_gen_sources(<target>)`: it compiles `src/recomp/gen` at /Od (-O0),
+   minutes instead of half an hour, while the runtime stays optimised.
+   `-DPCRECOMP_GEN_OPT=ON` optimises it too.
 7. Before going public, run `audit_repo.py` and read
    [docs/PUBLISHING.md](docs/PUBLISHING.md). Lifted output never goes in git.
 
@@ -689,6 +734,13 @@ Built on other people's tools, and on published reverse-engineering work:
 - **[Ghidra](https://ghidra-sre.org/)** (Apache-2.0) and **IDA Pro** — hosts for
   the headless scripts in `tools/ghidra/` and `tools/ida/`; function boundaries
   and decompilation.
+- **[Exhume](https://github.com/abedegno/exhume)** (MIT, abedegno) — the
+  methods of `lift/difftest.py --pe` (a single routine's original bytes in
+  Unicorn against its C, on seeded random and edge-case inputs; Exhume's
+  `tools/fuzzasm.py`) and of `runtime/replay/` (input recorded at the
+  program's own clock, replayed at the same point, compared at named
+  checkpoints; its `docs/port.md`, "Verifying a port"). Reimplemented here,
+  no code copied.
 - **Kostya Shishkov** and **Alyssa Milburn** — their published work on the
   FVF/IFS fractal codec family underpins `tools/formats/ftcdecode/`.
 

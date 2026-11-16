@@ -386,7 +386,32 @@ int main(int argc, char *argv[])
     if (getenv("RECOMP_FN_COUNT")) { g_fncount = 1; atexit(fnc_report); }
     if (getenv("RECOMP_WATCH_DS")) g_watch_ds = 1;
     if (getenv("RECOMP_STUB_HITS")) atexit(stub_report);
-    const char *img = (argc > 1) ? argv[1] : RECOMP_IMAGE_PATH;
+    /* A screen saver's switches (/s, /p <hwnd>, /c) come first; screensaver.c. */
+    /* --record FILE / --replay FILE / --keys f120:enter,...: frame-keyed input
+       for the game's host (runtime/replay), handed over as RECOMP_* variables. */
+    while (argc > 2 && (!strcmp(argv[1], "--record") || !strcmp(argv[1], "--replay") || !strcmp(argv[1], "--keys"))) {
+        static char env[3][1024];
+        char full[512];
+        int k = argv[1][2] == 'k' ? 2 : argv[1][4] == 'c' ? 0 : 1;
+        snprintf(env[k], sizeof env[k], "%s=%s", k == 2 ? "RECOMP_FKEYS" : k ? "RECOMP_REPLAY" : "RECOMP_RECORD",
+                 k == 2 ? argv[2] : (GetFullPathNameA(argv[2], sizeof full, full, NULL), full));
+        _putenv(env[k]);
+        argv[2] = argv[0]; argv += 2; argc -= 2;
+    }
+    extern int recomp_scr_args(int, char **);
+    int first = recomp_scr_args(argc, argv);
+    const char *img = (first < argc) ? argv[first] : RECOMP_IMAGE_PATH;
+    /* Installed (a screen saver copied anywhere), the image sits next to the
+       executable, and wins over the build tree's path compiled in. */
+    static char beside[MAX_PATH];
+    if (first >= argc) {
+        DWORD n = GetModuleFileNameA(NULL, beside, MAX_PATH - 16);
+        char *slash = n ? strrchr(beside, 92) : NULL;   /* the last backslash */
+        if (slash) {
+            strcpy(slash + 1, "mem_image.bin");
+            if (GetFileAttributesA(beside) != INVALID_FILE_ATTRIBUTES) img = beside;
+        }
+    }
 
     /* Unbuffered: the engine dies by crash/abort often enough that a lost
      * stdout buffer hides exactly the lines that say where it got to. */
@@ -401,6 +426,7 @@ int main(int argc, char *argv[])
 
     CPU cpu;
     cpu_init(&cpu);
+    if (recomp_game.selector_step > 1) cpu.sel_step = (uint16_t)recomp_game.selector_step;
     g_cpu = &cpu;
 
     /* Flat image + a heap for dynamically allocated selectors (past the image).
@@ -450,11 +476,11 @@ int main(int argc, char *argv[])
         printf("%s init returned (ax=%04X)\n", m->name, cpu.ax);
     }
 
-#ifdef RECOMP_WATCHDOG
-    CreateThread(NULL, 0, watchdog_thread, NULL, 0, NULL);
-#else
-    (void)watchdog_thread;
+#ifndef RECOMP_WATCHDOG
+    if (getenv("RECOMP_WATCHDOG_SECS"))     /* a run can ask for it without a rebuild */
 #endif
+    CreateThread(NULL, 0, watchdog_thread, NULL, 0, NULL);
+    { extern void win16_sim_input_start(void); win16_sim_input_start(); }
 
     /* 2) The host EXE's startup (Borland C0 -> InitTask -> WinMain): window and
      *    message loop, calling into the DLLs through the cross-module calls the
@@ -560,9 +586,17 @@ const RecompModule *recomp_module_of_hinst(uint16_t hinst)
  * dropped, so the caller resumes; on Catz that was enough to run the whole game
  * while the last misses were chased down. RECOMP_DISPATCH_STRICT=1 aborts
  * instead, which is what you want while bringing a new title up. */
+/* A program that builds or loads machine code at run time (compiled sprites,
+ * say) calls into memory nothing was lifted from. A project can run such code
+ * itself -- an interpreter for the few instructions it uses -- by defining this;
+ * 1 = handled, the call's frame already popped. */
+__attribute__((weak)) int recomp_dispatch_miss_hook(CPU *cpu, uint16_t seg, uint16_t off, int far_call)
+{ (void)cpu; (void)seg; (void)off; (void)far_call; return 0; }
+
 static void dispatch_miss(CPU *cpu, uint16_t seg, uint16_t off, int far_call)
 {
     static int told, strict = -1;
+    if (recomp_dispatch_miss_hook(cpu, seg, off, far_call)) return;
     if (strict < 0) strict = getenv("RECOMP_DISPATCH_STRICT") != NULL;
     if (told++ < 32 || strict)
         fprintf(stderr, "[dispatch] %s MISS seg=%u off=%04X\n", far_call ? "far" : "near", seg, off);

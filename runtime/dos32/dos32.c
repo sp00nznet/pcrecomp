@@ -177,7 +177,7 @@ uint64_t g_mm[8];
 xmm_t    g_xmm[8];
 uint32_t g_mxcsr = 0x1F80;
 uint16_t g_seg_cs, g_seg_ds, g_seg_es, g_seg_fs, g_seg_gs, g_seg_ss;
-uint32_t g_fs_base, g_gs_base, g_es_base;
+uint32_t g_fs_base, g_gs_base, g_es_base, g_cs_base;
 ptrdiff_t g_mem_base;
 uint32_t g_cur_func;
 uint32_t g_icall_trace[ICALL_TRACE_SIZE], g_icall_from[ICALL_TRACE_SIZE];
@@ -284,6 +284,35 @@ recomp_func_t recomp_lookup(uint32_t va) {
     return NULL;
 }
 
+/* Code the program loads from files at run time (Sierra's .DRV drivers),
+ * lifted ahead of time at a base of its own (cfg->modules). A read that
+ * fills a buffer with one module's exact bytes records where it lives; calls
+ * into that buffer, or to a cs-relative offset while cs is that buffer, go
+ * to the lifted copy. */
+static const dos32_module* mods;
+static int mod_n;
+static uint32_t mod_load[DOS32_MAX_MODULES];
+
+static void module_loaded(uint32_t p, uint32_t n) {
+    for (int i = 0; i < mod_n; i++)
+        if (n == mods[i].size && !memcmp(LIN(p), mods[i].bytes, n)) {
+            mod_load[i] = p;
+            LOG("dos32: module %d loaded at %08X\n", i, p);
+        }
+}
+
+static recomp_func_t module_lookup(uint32_t va) {
+    for (int i = 0; i < mod_n; i++) {
+        uint32_t at = mod_load[i];
+        if (!at) continue;
+        if (va - at < mods[i].size) return recomp_lookup(mods[i].vbase + va - at);
+        if (g_cs_base == at && va < mods[i].size) return recomp_lookup(mods[i].vbase + va);
+    }
+    return NULL;
+}
+
+uint32_t recomp_sel_base(uint32_t s) { return sel_base(s); }
+
 static int hostvec_n, stub_n;
 static void hostvec_default(void);
 
@@ -294,7 +323,7 @@ static void int_stub(void) { recomp_int(stub_n); g_esp += 4; }
 recomp_func_t recomp_lookup_manual(uint32_t va) {
     if (va - HOSTVEC_VA < 256 * 16) { hostvec_n = (va - HOSTVEC_VA) / 16; return hostvec_default; }
     if (va - 0x1000u < COMMIT_SIZE - 0x1000u && R8(va) == 0xCD && R8(va + 2) == 0xC3) { stub_n = R8(va + 1); return int_stub; }
-    return NULL;
+    return module_lookup(va);
 }
 recomp_func_t recomp_lookup_import(uint32_t va) { (void)va; return NULL; }
 
@@ -374,7 +403,7 @@ typedef struct {
     uint32_t eax, ebx, ecx, edx, esi, edi, ebp, esp;
     uint32_t fk, fa, fb, fcf;
     uint16_t ds, es, fs, gs;
-    uint32_t es_base, fs_base, gs_base, cur;
+    uint32_t es_base, fs_base, gs_base, cs_base, cur;
     double st[8]; int top; uint16_t cw;
 } saved_t;
 
@@ -383,7 +412,7 @@ static void save(saved_t* s) {
     s->esi = g_esi; s->edi = g_edi; s->ebp = g_ebp; s->esp = g_esp;
     s->fk = g_flag_k; s->fa = g_flag_a; s->fb = g_flag_b; s->fcf = g_flag_cf;
     s->ds = g_seg_ds; s->es = g_seg_es; s->fs = g_seg_fs; s->gs = g_seg_gs;
-    s->es_base = g_es_base; s->fs_base = g_fs_base; s->gs_base = g_gs_base;
+    s->es_base = g_es_base; s->fs_base = g_fs_base; s->gs_base = g_gs_base; s->cs_base = g_cs_base;
     s->cur = g_cur_func;
     memcpy(s->st, g_st, sizeof g_st); s->top = g_fp_top; s->cw = g_fpu_cw;
 }
@@ -393,7 +422,7 @@ static void restore(const saved_t* s) {
     g_esi = s->esi; g_edi = s->edi; g_ebp = s->ebp; g_esp = s->esp;
     g_flag_k = s->fk; g_flag_a = s->fa; g_flag_b = s->fb; g_flag_cf = s->fcf;
     g_seg_ds = s->ds; g_seg_es = s->es; g_seg_fs = s->fs; g_seg_gs = s->gs;
-    g_es_base = s->es_base; g_fs_base = s->fs_base; g_gs_base = s->gs_base;
+    g_es_base = s->es_base; g_fs_base = s->fs_base; g_gs_base = s->gs_base; g_cs_base = s->cs_base;
     g_cur_func = s->cur;
     memcpy(g_st, s->st, sizeof g_st); g_fp_top = s->top; g_fpu_cw = s->cw;
 }
@@ -411,6 +440,7 @@ static void call_guest(uint32_t va, int as_irq) {
     recomp_set_seg(0, SEL_DATA);
     recomp_set_seg(4, 0);
     recomp_set_seg(5, 0);
+    g_cs_base = 0;
     g_seg_ds = SEL_DATA;
     g_flag_k = FK_EFLAGS; g_flag_a = 0x202; g_flag_b = 0; g_flag_cf = 0;
     fn();
@@ -556,7 +586,7 @@ void dos32_vesa_custom(int w, int h) { vesa_modes[4].w = (uint16_t)w; vesa_modes
 static void set_mode(int mode, int clear) {
     EnterCriticalSection(&video_lock);
     vmode = mode; vbank = 0; vesa_lfb = 0;
-    if (mode == 0x13) { vw = 320; vh = 200; vpitch = 320; }
+    if (mode == 0x13) { vw = 320; vh = 200; vpitch = 320; seq[2] = 15; seq[4] = 0x0E; crtc[0x0C] = crtc[0x0D] = 0; crtc[0x13] = 40; gc[5] = 0x40; }
     else if (mode < 0x100) { vw = 80; vh = 25; vpitch = 80; }
     else {
         for (int i = 0; i < NVESA; i++)
@@ -581,6 +611,52 @@ static void set_bank(uint32_t bank) {
     LeaveCriticalSection(&video_lock);
 }
 
+/* Mode X (unchained 256-colour VGA). Video memory is four 64 KB planes, kept
+ * in vram. Lifted code reaches A0000 as plain memory, so the window holds one
+ * plane, xw, at a time: when the Map Mask or the Read Map changes, the bytes
+ * the program changed in the window go to every plane the mask selects, and
+ * the window is refilled from the plane now in front (the lowest one written,
+ * or the one read). Write mode 1 copies (the latches) come in through
+ * recomp_vga_movs. A byte written with its old value under a multi-plane mask
+ * reaches only plane xw: a known ceiling, rare in practice. */
+static int xw;                                     /* the plane in the window */
+#define MODEX (vmode == 0x13 && !(seq[4] & 8))
+#define PLANE(p) (vram + (uint32_t)(p) * 0x10000u)
+
+static void modex_flush(void) {
+    uint8_t* win = LIN(0xA0000);
+    uint8_t* base = PLANE(xw);
+    int m = seq[2] & 15;
+    if (m == 1 << xw) { memcpy(base, win, 0x10000); return; }   /* the usual case */
+    for (uint32_t i = 0; i < 0x10000; i += 8) {
+        if (*(uint64_t*)(win + i) == *(uint64_t*)(base + i)) continue;
+        for (uint32_t j = i; j < i + 8; j++)
+            if (win[j] != base[j])
+                for (int p = 0; p < 4; p++) if (m >> p & 1) PLANE(p)[j] = win[j];
+    }
+    memcpy(win, base, 0x10000);
+}
+
+static void modex_show(int plane) {
+    modex_flush();
+    xw = plane & 3;
+    memcpy(LIN(0xA0000), PLANE(xw), 0x10000);
+}
+
+static int lowest(int m) { for (int p = 0; p < 4; p++) if (m >> p & 1) return p; return xw; }
+
+int recomp_vga_movs(uint32_t edi, uint32_t esi, uint32_t n, uint32_t esz, int df) {
+    if (!MODEX || (gc[5] & 3) != 1 || esi - 0xA0000u >= 0x10000u) return 0;
+    modex_flush();      /* the planes are now current; copy on them */
+    int m = seq[2] & 15;
+    uint32_t b = n * esz, d = edi - 0xA0000u, s = esi - 0xA0000u;
+    if (df < 0) { d = d - b + esz; s = s - b + esz; }
+    for (int p = 0; p < 4; p++)
+        if (m >> p & 1) for (uint32_t i = 0; i < b; i++) PLANE(p)[(d + i) & 0xFFFF] = PLANE(p)[(s + i) & 0xFFFF];
+    memcpy(LIN(0xA0000), PLANE(xw), 0x10000);
+    return 1;
+}
+
 int dos32_frame(uint32_t* out, int maxw, int maxh, int* w, int* h) {
     if (vmode < 0x13) return 0;
     uint32_t pal[256];
@@ -590,11 +666,21 @@ int dos32_frame(uint32_t* out, int maxw, int maxh, int* w, int* h) {
     }
     int fw = vw < maxw ? vw : maxw, fh = vh < maxh ? vh : maxh;
     EnterCriticalSection(&video_lock);
+    int modex = MODEX;
+    uint32_t start = (uint32_t)crtc[0x0C] << 8 | crtc[0x0D], xpitch = crtc[0x13] * 2u;
     for (int y = 0; y < fh; y++) {
         uint32_t off = (uint32_t)y * vpitch;
         for (int x = 0; x < fw; x++, off++) {
             uint8_t p;
-            if (vmode == 0x13) p = R8(0xA0000 + off);
+            if (modex) {
+                /* what the program last wrote: the window for plane xw, and
+                 * for the other masked planes where it differs from xw's copy */
+                uint32_t a = (start + (uint32_t)y * xpitch + (x >> 2)) & 0xFFFF;
+                int pl = x & 3;
+                uint8_t wv = R8(0xA0000 + a);
+                p = (pl == xw || ((seq[2] >> pl & 1) && wv != PLANE(xw)[a])) ? wv : PLANE(pl)[a];
+            }
+            else if (vmode == 0x13) p = R8(0xA0000 + off);
             else if (vesa_lfb) p = R8(LFB_VA + off);
             else p = (off >> 16) == vbank ? R8(0xA0000 + (off & 0xFFFF)) : vram[off];
             out[y * fw + x] = pal[p];
@@ -894,6 +980,7 @@ static void int21(regs_t* r) {
         if (h >= NFILES || fh[h] < 0) { FAIL(r, 6); break; }
         int got = _read(fh[h], LIN(p), n);
         if (got < 0) { FAIL(r, 5); break; }
+        if (mod_n) module_loaded(p, (uint32_t)got);
         r->eax = r->rm ? (r->eax & 0xFFFF0000u) | (uint16_t)got : (uint32_t)got; OK(r); break; }
     case 0x40: { int h = BX(r);
         uint32_t n = r->rm ? CX(r) : r->ecx, p = dsdx(r);
@@ -1306,11 +1393,18 @@ static void out8(uint32_t port, uint8_t v) {
     case 0x3C8: dac_w = v; dac_c = 0; return;
     case 0x3C9: dac[dac_w][dac_c] = v & 63; if (++dac_c == 3) { dac_c = 0; dac_w = (dac_w + 1) & 255; } return;
     case 0x3C4: seq_idx = v; return;
-    case 0x3C5: seq[seq_idx & 7] = v;
-        if ((seq_idx & 7) == 4 && !(v & 8) && vmode == 0x13) once("unchained VGA (mode X)", v, 0);
+    case 0x3C5:
+        if ((seq_idx & 7) == 2 && MODEX) { modex_flush(); seq[2] = v; modex_show(lowest(v & 15)); return; }
+        if ((seq_idx & 7) == 4 && vmode == 0x13 && ((seq[4] ^ v) & 8)) {
+            if (!(v & 8)) { memset(vram, 0, 0x40000); xw = 0; memset(LIN(0xA0000), 0, 0x10000); }
+            LOG("dos32: VGA %s\n", v & 8 ? "chained" : "unchained (mode X)");
+        }
+        seq[seq_idx & 7] = v;
         return;
     case 0x3CE: gc_idx = v; return;
-    case 0x3CF: gc[gc_idx & 15] = v; return;
+    case 0x3CF:
+        if ((gc_idx & 15) == 4 && MODEX && (v & 3) != xw) { gc[4] = v; modex_show(v & 3); return; }
+        gc[gc_idx & 15] = v; return;
     case 0x3D4: crtc_idx = v; return;
     case 0x3D5: crtc[crtc_idx & 31] = v; return;
     case 0x3C0: case 0x3C2: case 0x3B4: case 0x3B5: return;
@@ -1339,6 +1433,8 @@ void recomp_outs(uint32_t port, uint32_t va, int size, uint32_t count, int dir) 
 
 void recomp_cli(void) { g_if = 0; }
 void recomp_sti(void) { g_if = 1; dos32_poll(); }
+uint32_t recomp_get_if(void) { return g_if ? 0x200u : 0; }
+void recomp_set_if(uint32_t on) { if (on) recomp_sti(); else g_if = 0; }
 void recomp_hlt(void) { Sleep(1); dos32_poll(); }
 
 /* ---- crashes ------------------------------------------------------------ */
@@ -1467,7 +1563,7 @@ static void put_str(uint32_t at, const char* s) { while (*s) R8(at++) = (uint8_t
     X(g_eax) X(g_ecx) X(g_edx) X(g_esp) X(g_ebx) X(g_esi) X(g_edi) X(g_ebp) \
     X(g_st) X(g_fp_top) X(g_fpu_cw) X(g_mm) X(g_flag_k) X(g_flag_a) X(g_flag_b) X(g_flag_cf) \
     X(g_seg_cs) X(g_seg_ds) X(g_seg_es) X(g_seg_fs) X(g_seg_gs) X(g_seg_ss) \
-    X(g_fs_base) X(g_gs_base) X(g_es_base) \
+    X(g_fs_base) X(g_gs_base) X(g_es_base) X(g_cs_base) X(mod_load) \
     X(sel) X(heap) X(conv) X(pmvec) X(rmvec) X(pic_mask) \
     X(pit_div) X(pit_latch) X(pit_lohi) X(pit_mode_byte) X(shift_flags) \
     X(vmode) X(vw) X(vh) X(vpitch) X(vesa_lfb) X(vbank) \
@@ -1584,6 +1680,8 @@ int dos32_run(const dos32_config* cfg) {
     C = cfg;
     dispatch = cfg->dispatch ? cfg->dispatch : recomp_dispatch_table;
     dispatch_n = cfg->dispatch ? cfg->dispatch_count : recomp_dispatch_count;
+    mods = cfg->modules; mod_n = cfg->module_count < DOS32_MAX_MODULES ? cfg->module_count : DOS32_MAX_MODULES;
+    memset(mod_load, 0, sizeof mod_load); g_cs_base = 0;
     int again = power_on != NULL;
     if (!again) {
         InitializeCriticalSection(&input_lock);

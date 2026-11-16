@@ -51,12 +51,32 @@ calls (`recomp_types.h`, "DOS-extender hooks"):
 | `es:` override | `ES_BASE + addr` | Under DOS/4GW es is a real selector (the PSP) |
 | `ret` to an address the caller did not push | dispatch there | `push x; ret` is a jump; Watcom's `int386x` jumps into a table of `int n; ret` stubs that way |
 
+| `pushf`/`popf`, both widths | the flags word, with IF from the host (`recomp_get_if`/`recomp_set_if`) | `pushf; pop ax; cli ... push ax; popf` saves and restores interrupts |
+| `call m16:32` | push cs, then call the selector's base + offset, with `CS_BASE` set to that base for the call | a driver loaded at run time runs with cs on its buffer |
+| `cs:` override | `CS_BASE + addr` | 0 for the program; the driver's base inside one |
+
 `call_pop` (any mode): a call whose target starts with `pop r32` is a jump
 that hands over its return address (get-EIP, or code that patches its caller),
 so the real address is pushed and control tail-jumps.
 
 ds and ss are flat (base 0), as a Watcom flat-model program keeps them, and the
 lifter does not track them. That is the main limit; see "Ceilings".
+
+## Code loaded at run time
+
+Some programs read code from a file into memory and call it: Sierra's SCI
+interpreter loads its sound and DAC drivers (`*.DRV`) that way. Such code is
+lifted ahead of time, each file at a base of its own that no guest address
+uses (Gabriel Knight's `run_lift.py` uses 0x60000000 up), and the host is
+given the list in `cfg.modules` (`dos32_module`: the base, the file's size
+and its bytes).
+
+A DOS read (`int 21h 3Fh`) that fills a buffer with exactly one module's bytes
+records where it was loaded. From then on, a call to an address in that
+buffer goes to the lifted copy (`base + address - buffer`), and so does a call
+to a small offset while `CS_BASE` is the buffer, which is how such a driver
+calls through its own `cs:` dispatch table. If the program loads the module
+again elsewhere, the newest load wins.
 
 ## Guest memory
 

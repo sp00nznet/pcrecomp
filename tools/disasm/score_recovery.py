@@ -33,6 +33,15 @@ that carry an end address (IDA exports, PDBs) get the better breakdown.
     python score_recovery.py --reference ida_funcs.json --candidate funcs.json
     python score_recovery.py --selftest
 
+Segmented (NE) code maps -- the {seg: {functions, heads, code_ranges}} JSON
+tools/ida/ida_export.py and tools/ne/ne_codemap.py write -- score with --ne.
+Starts are flattened to seg<<16 | offset, function ranges come from the next
+start, and instruction-head agreement is reported beside the function score:
+a head the reference has and the candidate lacks is code never lifted, one the
+candidate adds is (usually) data decoded as code.
+
+    python score_recovery.py --ne --reference ida.json --candidate native.json
+
 Where the reference carries end addresses, function *ends* are scored too, over
 the true positives only -- an end is meaningless for an address where no
 function starts. A wrong end is a different failure from a wrong start and the
@@ -98,6 +107,32 @@ def load_catalog(path):
         out.append((start, _pick(fn, END_KEYS), fn.get('entry_kind', 'start')))
     out.sort()
     return out
+
+
+def load_codemap(path):
+    """(catalog, heads) from an NE code map: catalog as load_catalog returns,
+    each function running to the next start in its segment; heads as a set of
+    seg<<16 | offset."""
+    with open(path) as f:
+        doc = json.load(f)
+    cat, heads = [], set()
+    for seg, v in doc.items():
+        base = int(seg) << 16
+        fs = sorted(set(v.get('functions', ())))
+        for i, a in enumerate(fs):
+            end = fs[i + 1] if i + 1 < len(fs) else 0x10000
+            cat.append((base | a, base | end, 'start'))
+        heads.update(base | h for h in v.get('heads', ()))
+    cat.sort()
+    return cat, heads
+
+
+def score_heads(ref_heads, cand_heads):
+    both = len(ref_heads & cand_heads)
+    return {'ref_heads': len(ref_heads), 'cand_heads': len(cand_heads),
+            'heads_both': both,
+            'head_recall': both / len(ref_heads) if ref_heads else 0.0,
+            'head_precision': both / len(cand_heads) if cand_heads else 0.0}
 
 
 def classify(reference, candidate):
@@ -262,6 +297,9 @@ def demo():
     c10 = classify(ref, [(0x1000, 0x1100, 'start'), (0x1040, 0x1100, 'alias')])
     assert c10['ends_scored'] == 1, c10
 
+    h = score_heads({1, 2, 3, 4}, {2, 3, 4, 9})
+    assert h['heads_both'] == 3 and h['head_recall'] == 0.75 and h['head_precision'] == 0.75, h
+
     print('selftest ok')
 
 
@@ -272,6 +310,8 @@ def main():
     ap.add_argument('--candidate', help='disasm32 catalog to score')
     ap.add_argument('--range', help='restrict to VA range, e.g. 0x401000-0x10A4601')
     ap.add_argument('-o', '--output', help='write the scorecard as JSON')
+    ap.add_argument('--ne', action='store_true',
+                    help='both sides are NE code maps (ida_export / ne_codemap JSON)')
     ap.add_argument('--selftest', action='store_true')
     args = ap.parse_args()
 
@@ -281,8 +321,15 @@ def main():
     if not (args.reference and args.candidate):
         ap.error('need --reference and --candidate, or --selftest')
 
-    ref = load_catalog(args.reference)
-    cand = load_catalog(args.candidate)
+    heads = None
+    if args.ne:
+        ref, rh = load_codemap(args.reference)
+        cand, ch = load_codemap(args.candidate)
+        cand = [(a, None, k) for a, _, k in cand]    # ends: not a claim here
+        heads = score_heads(rh, ch)
+    else:
+        ref = load_catalog(args.reference)
+        cand = load_catalog(args.candidate)
 
     if args.range:
         lo, hi = (int(x, 0) for x in args.range.split('-'))
@@ -319,6 +366,13 @@ def main():
               f"median {counts['end_short_median_bytes']:,} bytes, "
               f"max {counts['end_short_max_bytes']:,})")
         print(f"      long         {counts['end_long']:>9,}  (ran past the real end)")
+
+    if heads:
+        counts.update(heads)
+        print(f"\n  instruction heads  reference {heads['ref_heads']:,}  candidate {heads['cand_heads']:,}"
+              f"  both {heads['heads_both']:,}")
+        print(f"      head recall    {heads['head_recall']:>8.2%}")
+        print(f"      head precision {heads['head_precision']:>8.2%}")
 
     if args.output:
         with open(args.output, 'w') as f:

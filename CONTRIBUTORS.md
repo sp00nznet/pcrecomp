@@ -52,6 +52,12 @@ in the picture, with a HiDPI fix to the cursor warp; and DirectSound's play
 cursor moving between mixes (the movie audio ran a lap ahead). All found and
 proved with Theme Park World on a Mac (cpressland/tpw-recomp).
 
+**Direct3D on the GPU through Metal** (#163): `d3d_metal.m` behind a new
+`d3d_gpu.h` seam, shading as the software rasterizer does, with the flip handed
+to the presenter without the game waiting, and the frame pacing split out of it
+into its own change. Theme Park World on an M1 Pro went from 7 to 80 frames a
+second.
+
 ### Haukur Rósinkranz ([@hauxir](https://github.com/hauxir))
 **win32hle in the browser** (#148): an Emscripten/WebAssembly host for the
 win32hle layer, so a lifted game runs in a web page. The guest image sits in
@@ -88,6 +94,11 @@ lifter's runtime: opt-in caches for indirect calls (loading stalls 3.8 s to
 3.0 s) and the x87 stack as a moving pointer with a function's own pushes in
 locals (+47 % frames in x87-heavy code).
 
+**DirectSound 3D and DirectSound 8** (#176): 3D buffers and the listener
+(distance attenuation and panning, normal and head-relative), `DirectSoundCreate8`
+and the `IDirectSoundBuffer8` methods, with a selftest. Operation Flashpoint
+places its sounds with it.
+
 ### Peter Jorgensen ([@pete-jorgensen](https://github.com/pete-jorgensen))
 **loop and jecxz leaving the function** (#166): `loop`, `loope`, `loopne`,
 `jecxz` and `jcxz` whose target was not a block of the function being lifted
@@ -95,3 +106,4 @@ became a `goto` to a label that did not exist, and the generated C failed to
 compile. They now dispatch with `RECOMP_ITAIL` and return, as `jmp` and `jcc`
 do, through one helper (`_branch_to`), with a test
 (`tools/lift/test_loop_exits.py`). Found on Operation Neptune's `ONWIN32.EXE`.
+A follow-up test covers `jcxz` with the address-size prefix (#191).

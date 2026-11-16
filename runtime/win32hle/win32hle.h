@@ -330,6 +330,7 @@ extern void (*hle_dd_primary_hook)(void);            /* the primary's pixels or 
 int  hle_dd_flipping(void);                          /* 1 inside that hook for a Flip: a frame to show, each one */
 int  hle_dd_surface_pixels(uint32_t obj, uint8_t **px, int *w, int *h, int *pitch, int *bpp);   /* 0: not a surface */
 void hle_dsound_set_master(float gain);              /* 0 mutes */
+int  hle_dsound_buffer_gains(uint32_t buffer, float *l, float *r);   /* a buffer's (or its 3D interface's) left and right gains, for tests */
 /* A host's answer to IDirectDrawSurface::QueryInterface for an interface the
  * surface does not serve itself (a Direct3D texture, a device): the object
  * (AddRef'd), or 0. */

@@ -124,6 +124,7 @@ typedef struct CPU {
     uint32_t  heap_next;   /* bump allocator cursor (flat offset) */
     uint32_t  heap_end;    /* end of usable memory */
     uint16_t  next_sel;    /* next dynamic selector to hand out */
+    uint16_t  sel_step;    /* selector delta between a huge block's 64 KB tiles */
 
     /* Emulated BIOS timer tick (0040:006C), advanced on each read so the
      * game's timer wait/calibration loops make progress. */
@@ -744,6 +745,30 @@ static inline int cpu_alloc_mem(CPU *cpu, uint32_t size) {
     return 1;
 }
 
+/* Map the 64 KB tiles of a huge block at sel, the way Win16 hands back a huge
+ * block: guest code walking past 0xFFFF adds __AHINCR to the selector. Without
+ * the tiles a 1024x640 WinG surface (655,360 bytes) was reachable only for its
+ * first 65,536 -- exactly 64 scanlines -- so everything the engine drew below
+ * that wrapped back over the top of the same surface.
+ *
+ * Tile k is sel + k*sel_step. The default model packs them (1) and the lifter
+ * patches __AHINCR to match; Windows spaced them 8 apart, and a game whose own
+ * code steps huge pointers by a literal 8 (Bermuda Syndrome's blitter shifts
+ * by 3) needs sel_step 8. Selectors between tiles alias the tile below them,
+ * so nothing else is handed them. */
+static inline void cpu_tile_selectors(CPU *cpu, uint16_t sel, uint32_t base, uint32_t bytes) {
+    uint32_t step = cpu->sel_step ? cpu->sel_step : 1;
+    uint32_t next = sel + 1u;
+    for (uint32_t off = 0x10000u; off < bytes; off += 0x10000u) {
+        uint32_t tile = sel + (off >> 16) * step;
+        if (tile + step > 0x10000u) break;
+        for (uint32_t t = next; t < tile; t++) cpu->sel_base[t] = base + off - 0x10000u;
+        cpu->sel_base[tile] = base + off;
+        next = tile + 1;
+    }
+    cpu->next_sel = next > 0xFFFFu ? 0 : (uint16_t)next;
+}
+
 /* Allocate `bytes` from the flat heap and bind a fresh selector to it.
  * Returns the selector (0 on out-of-memory). The region is already zeroed. */
 static inline uint16_t cpu_alloc_selector(CPU *cpu, uint32_t bytes) {
@@ -754,17 +779,7 @@ static inline uint16_t cpu_alloc_selector(CPU *cpu, uint32_t bytes) {
     cpu->heap_next = base + bytes;
     uint16_t sel = cpu->next_sel++;
     cpu->sel_base[sel] = base;
-    /* Blocks larger than a segment need TILED selectors, the way Win16 hands
-     * back a huge block: sel addresses the first 64 KB, sel+1 the next, and so
-     * on, and guest code walking past 0xFFFF increments the selector. Without
-     * the tiles a 1024x640 WinG surface (655,360 bytes) was reachable only for
-     * its first 65,536 -- exactly 64 scanlines -- so everything the engine drew
-     * below that wrapped back over the top of the same surface. */
-    for (uint32_t off = 0x10000u; off < bytes; off += 0x10000u) {
-        if (cpu->next_sel == 0) break;
-        uint16_t tile = cpu->next_sel++;
-        cpu->sel_base[tile] = base + off;
-    }
+    cpu_tile_selectors(cpu, sel, base, bytes);
     return sel;
 }
 

@@ -443,6 +443,8 @@ class Lifter:
         # through edi, which holds while the program keeps es == ds for them.
         if seg == X86_REG_ES and self.dos:
             return f"ES_BASE + ({addr})"
+        if seg == X86_REG_CS and self.dos:
+            return f"CS_BASE + ({addr})"
         return addr
 
     def _fmt_mem_read(self, mem, size: int) -> str:
@@ -901,16 +903,26 @@ class Lifter:
         elif m in ('popad', 'popal'):      # Capstone spells POPAD as 'popal' in 32-bit
             lines.append(f"POPAD(); {comment}")
 
-        elif m == 'pushfd':
+        elif m in ('pushfd', 'pushf'):
             # Pushing a constant 0 was observable: the CRT's CPU detection
             # toggles a bit in the saved EFLAGS and reads it back to decide
             # whether CPUID exists, and a word that never changes answers
             # every such probe the same wrong way. The lazy tuple holds
             # everything the arithmetic flags derive from, so hand it over.
-            lines.append(f"PUSH32(esp, recomp_eflags(_flag_k, _flag_a, _flag_b, _cf, _df)); {comment}")
+            # pushf (16-bit, 66 9C) pushes a word. Under DOS the word carries
+            # IF too: `pushf; pop ax; cli ... push ax; popf` is how a DOS
+            # program saves and restores interrupts, and IF is the host's.
+            fl = "recomp_eflags(_flag_k, _flag_a, _flag_b, _cf, _df)"
+            if self.dos:
+                fl = f"(({fl} & ~0x200u) | recomp_get_if())"
+            push = 'PUSH16' if m == 'pushf' else 'PUSH32'
+            lines.append(f"{push}(esp, {fl}); {comment}")
 
-        elif m == 'popfd':
-            lines.append(f"{{ uint32_t _fl = POP32_VAL(esp); {comment}")
+        elif m in ('popfd', 'popf'):
+            pop = 'POP16_VAL' if m == 'popf' else 'POP32_VAL'
+            lines.append(f"{{ uint32_t _fl = {pop}(esp); {comment}")
+            if self.dos:
+                lines.append("  recomp_set_if(_fl & 0x200u);")
             lines.append(f"  _flag_k = FK_EFLAGS; _flag_a = _fl; _flag_b = 0;")
             lines.append(f"  _cf = _fl & 1u; _df = (_fl & 0x400u) ? -1 : 1; }}")
             # The restored word, not whatever instruction last set the flags,
@@ -1521,8 +1533,13 @@ class Lifter:
                     # call m16:32: CS goes on the stack under the return
                     # address, and the callee's retf takes both off. A DOS
                     # extender's timer and driver callbacks are called this way.
+                    # The selector's base counts: a driver the program loaded
+                    # at run time runs with cs on its buffer, and its offsets
+                    # (and cs: tables) are from there. 0 for the program's own.
                     addr = self._fmt_mem_addr(ops[0].mem)
-                    lines.append(f"PUSH32(esp, _seg_cs); RECOMP_ICALL(MEM32({addr})); {comment}")
+                    lines.append(f"{{ uint32_t _ocs = CS_BASE; PUSH32(esp, _seg_cs); {comment}")
+                    lines.append(f"  CS_BASE = recomp_sel_base(MEM16(({addr}) + 4));")
+                    lines.append(f"  RECOMP_ICALL(CS_BASE + MEM32({addr})); CS_BASE = _ocs; }}")
                 elif ops and ops[0].type == X86_OP_MEM:
                     addr = self._fmt_mem_addr(ops[0].mem)
                     lines.append(f"RECOMP_ICALL(MEM32({addr})); {comment}")
@@ -1580,6 +1597,13 @@ class Lifter:
                     lines.extend(self._computed_jump(
                         f"MEM32({self._fmt_mem_addr(ops[0].mem)})", comment))
                 elif ops and ops[0].type == X86_OP_REG:
+                    if self.computed_ret:
+                        # The other half of a computed return: `pop edx; ...;
+                        # jmp edx` returns by hand (Delphi's _DoneExcept). The
+                        # address it popped is the dummy one a lifted call
+                        # pushed, so it is a return to the lifted caller.
+                        lines.append(f"if ({self._fmt_read(ops[0])} == RECOMP_RETADDR) {{"
+                                     f" RECOMP_FLAGS_OUT(); return; }}")
                     lines.extend(self._computed_jump(self._fmt_read(ops[0]), comment))
                 else:
                     lines.append(f"RECOMP_ITAIL(0); return; /* unresolved */ {comment}")
@@ -1715,7 +1739,10 @@ class Lifter:
 
         elif m == 'fdivp':
             d = self._fpu_popdst(ops)
-            lines.append(f"{{ double _v = fp_pop(); {d} = _v == 0.0 ? {d} : {d} / _v; }} {comment}")
+            # A zero divisor gives the IEEE answer, as on the masked x87 (inf,
+            # or NaN for 0/0) -- not the dividend, which this used to keep, and
+            # only here and in fdivrp (difftest --pe, Crazy Taxi's 0x431244).
+            lines.append(f"{{ double _v = fp_pop(); {d} = {d} / _v; }} {comment}")
 
         elif m == 'fdivr':
             if ops:
@@ -1723,7 +1750,7 @@ class Lifter:
 
         elif m == 'fdivrp':
             d = self._fpu_popdst(ops)
-            lines.append(f"{{ double _v = fp_pop(); {d} = {d} == 0.0 ? _v : _v / {d}; }} {comment}")
+            lines.append(f"{{ double _v = fp_pop(); {d} = _v / {d}; }} {comment}")
 
         elif m == 'fchs':
             lines.append(f"_st[0] = -_st[0]; {comment}")
@@ -1967,7 +1994,7 @@ class Lifter:
 
         elif m == 'fptan':
             # tan into ST(0), then push 1.0 -- the 8087 leaves a ratio behind.
-            lines.append(f"_st[0] = tan(_st[0]); fp_push(1.0); _fpu_cmp = 1; {comment}")
+            lines.append(f"if (fabs(_st[0]) >= 9223372036854775808.0 && !isinf(_st[0])) _fpu_cmp = 0x10400; else {{ _st[0] = tan(_st[0]); fp_push(1.0); _fpu_cmp = 1; }} {comment}")
 
         elif m == 'fpatan':
             lines.append(f"{{ double _x = fp_pop(); _st[0] = atan2(_st[0], _x); }} {comment}")
@@ -1991,6 +2018,21 @@ class Lifter:
             # both sides are no-ops the stack is exactly where it was.
             lines.append(f"/* {m}: FPU state is not a memory image here */ {comment}")
 
+        elif m == 'fbld':
+            addr = self._fmt_mem_addr(ops[0].mem)
+            lines.append(f"fp_push_i64(fp_bcd_ld((const uint8_t*)ADDR({addr}))); {comment}")
+
+        elif m == 'fbstp':
+            addr = self._fmt_mem_addr(ops[0].mem)
+            lines.append(f"{{ int64_t _q = fp_st0_to_i64(_st[0], g_st_i64[0], _fpu_cw); (void)fp_pop(); "
+                         f"fp_bcd_st((uint8_t*)ADDR({addr}), _q); }} {comment}")
+
+        elif m == 'fxtract':
+            # ST(0) = x becomes the exponent, then the significand is pushed:
+            # ST(0) in [1, 2), ST(1) the unbiased exponent (0: -inf, 0).
+            lines.append(f"{{ int _e; double _f = frexp(_st[0], &_e); "
+                         f"_st[0] = _f == 0.0 ? -INFINITY : (double)(_e - 1); fp_push(_f * 2.0); }} {comment}")
+
         elif m == 'fld1':
             lines.append(f"fp_push(1.0); {comment}")
 
@@ -2004,16 +2046,20 @@ class Lifter:
         # argument). The CRT tests it -- `fsin; fnstsw ax; sahf; jp reduce` --
         # and a C2 left over from its own fxam sent every call down the
         # reduction path. _fpu_cmp = 1 is the status word with C2 clear.
+        # Past 2^63 the x87 does not reduce at all: it sets C2 and leaves the
+        # stack as it was (difftest --pe found the lift pushing anyway, so the
+        # stack came out one deeper). 0x10400 is the raw status word, C2 set. A NaN
+        # or infinity is not out of range: it gives a NaN, pushed as usual.
         elif m == 'fsin':
-            lines.append(f"_st[0] = sin(_st[0]); _fpu_cmp = 1; {comment}")
+            lines.append(f"if (fabs(_st[0]) >= 9223372036854775808.0 && !isinf(_st[0])) _fpu_cmp = 0x10400; else {{ _st[0] = sin(_st[0]); _fpu_cmp = 1; }} {comment}")
 
         elif m == 'fcos':
-            lines.append(f"_st[0] = cos(_st[0]); _fpu_cmp = 1; {comment}")
+            lines.append(f"if (fabs(_st[0]) >= 9223372036854775808.0 && !isinf(_st[0])) _fpu_cmp = 0x10400; else {{ _st[0] = cos(_st[0]); _fpu_cmp = 1; }} {comment}")
 
         elif m == 'fsincos':
             # The sine replaces ST(0), then the cosine is pushed: ST(0)=cos,
             # ST(1)=sin. Swapped, MechCommander 2's camera tilt came out wrong.
-            lines.append(f"{{ double _a = _st[0]; _st[0] = sin(_a); fp_push(cos(_a)); }} _fpu_cmp = 1; {comment}")
+            lines.append(f"{{ double _a = _st[0]; if (fabs(_a) >= 9223372036854775808.0 && !isinf(_a)) _fpu_cmp = 0x10400; else {{ _st[0] = sin(_a); fp_push(cos(_a)); _fpu_cmp = 1; }} }} {comment}")
 
         elif m == 'frndint':
             # Round by the control word, like fist. `(double)(int)x` always
@@ -2033,6 +2079,15 @@ class Lifter:
             # (see linear_disassemble_function's resume), and without this the
             # unreachable fallthrough would run the next block's code.
             lines.append(f"/* int3 breakpoint */ return; {comment}")
+
+        elif not self.dos and (m == 'int1' or (m == 'int' and insn.op_str not in ('3', '0x3'))):
+            # A software interrupt faults on NT: `int n` (n != 3) is a #GP,
+            # an access violation; `int1` (icebp) a single step. Protection
+            # code takes the __except block as "no debugger"; a no-op here was
+            # the debugger answer (Flash MX 2004's licensing then killed the
+            # process). RECOMP_TRAP offers the fault to the guest's handlers.
+            code = '0x80000004u' if m == 'int1' else '0xC0000005u'
+            lines.append(f"RECOMP_TRAP({code}, 0x{insn.address:08X}u); {comment}")
 
         elif m == 'cdq':
             lines.append(f"edx = ((int32_t)eax < 0) ? 0xFFFFFFFFu : 0; {comment}")
@@ -2145,7 +2200,11 @@ class Lifter:
                 lines.append(f"_fpu_cw = MEM16({addr}); {comment}")
 
         elif m == 'fninit' or m == 'finit':
-            lines.append(f"/* finit */ {comment}")
+            # The control word goes back to 0x037F. A no-op here left the
+            # runtime's own (Borland's 0x1332), and the classic FPU probe
+            # (`fninit; fnstcw; and 0x103F; cmp 0x3F`) concluded there was no
+            # FPU: kirikiri2 refused to start ("CPU family 4 or lesser").
+            lines.append(f"_fpu_cw = 0x037F; {comment}")
 
         elif m in MMX_BINOPS:
             expr = MMX_BINOPS[m].format(a=self._mm_read(ops[0]), b=self._mm_read(ops[1]))

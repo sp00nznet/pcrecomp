@@ -43,6 +43,7 @@ def main():
         (b"\x47\xe1\xfd", "loope"),    # inc edi; loope -3
         (b"\x47\xe0\xfd", "loopne"),   # inc edi; loopne -3
         (b"\x47\xe3\xfd", "jecxz"),    # inc edi; jecxz -3
+        (b"\x67\xe3\xfd", "jcxz"),     # addr16 prefix: tests CX, not ECX; -3
     ]
     for code, m in cases:
         inside = branch_line(lift(code, {0x1000}), m)

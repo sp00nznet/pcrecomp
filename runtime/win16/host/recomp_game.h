@@ -44,7 +44,8 @@ typedef struct {
     /* PF Magic's engines (Dogz, Catz, Oddballz) ask FindResource by a 4-char
      * tag ("PALT", "STBL") and embed [tag][00 00][0C 00][type][id] records that
      * say which integer type the tag means. Non-zero: scan every module for
-     * them. See ne_resources.c. */
+     * them; 2: the type and id come before the tag ([00 00][0C 00][type][id]
+     * [tag], CivNet). See ne_resources.c. */
     int resource_tags;
 
     /* When a LoadString/FindResource misses in the module it names, search the
@@ -99,6 +100,18 @@ typedef struct {
      * first module entry runs. A DOS-extended game (Jazz Jackrabbit) maps its
      * video memory and starts its window and timers here. NULL: nothing. */
     void (*start)(struct CPU *cpu);
+
+    /* Selector step between the 64 KB tiles of a huge block. 0 or 1: packed,
+     * the default. 8: as Windows, for a game whose own code steps huge
+     * pointers by 8 -- lift it with ne_link.py --selector-step 8 to match.
+     * Bermuda Syndrome: 8. */
+    int selector_step;
+
+    /* GetTickCount/GetCurrentTime/timeGetTime answer the real clock. 0: the
+     * synthetic one (16 ms per call), which keeps calibration waits short. A
+     * game paced by polling the clock (Johnny Castaway's scene scheduler) needs
+     * the real one, or it runs in fast-forward. */
+    int real_clock;
 } RecompGame;
 
 struct CPU;
