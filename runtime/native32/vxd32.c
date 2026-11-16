@@ -46,9 +46,205 @@ static uint32_t vmm_page_reserve(const uint32_t* a) {
     void* p = VirtualAlloc(want, a[1] << 12, MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     return p ? (uint32_t)(uintptr_t)p : 0xFFFFFFFFu;
 }
-/* (page, npages, hpd, pagerdata, flags) */
+/* VMM's registry (Windows 9x keeps it in ring 0). Named from kernel32's
+ * call sites: 11 (hkey, sub, &hk) open, 12 the same create, 13 (hk) close,
+ * 16 (hk, sub) delete key, 18 (hk, i, buf, cch) enum key, 19 (hk, i, name,
+ * &cch, 0, &type, data, &cb) enum value, 1A (hk, name, 0, &type, data, &cb)
+ * query value, 1B (hk, name, 0, type, data, cb) set value. Return codes
+ * are Win32's. Every call goes through pcrecomp's registry box (regbox32):
+ * the guest never writes the real registry. */
+static void* reg_fn(const char* name) { void* f = native32_registry_sandbox_fn(name); return f ? f : (void*)GetProcAddress(GetModuleHandleA("advapi32.dll"), name); }
+#define REG(name, type) ((type)reg_fn(name))
+#define P(i) ((void*)(uintptr_t)a[i])
+static uint32_t vmm_reg_open(const uint32_t* a) {
+    return (uint32_t)REG("RegOpenKeyExA", LONG(WINAPI*)(HKEY, LPCSTR, DWORD, REGSAM, PHKEY))((HKEY)P(0), P(1), 0, KEY_ALL_ACCESS, P(2));
+}
+static uint32_t vmm_reg_create(const uint32_t* a) {
+    return (uint32_t)REG("RegCreateKeyA", LONG(WINAPI*)(HKEY, LPCSTR, PHKEY))((HKEY)P(0), P(1), P(2));
+}
+static uint32_t vmm_reg_close(const uint32_t* a) { return (uint32_t)RegCloseKey((HKEY)P(0)); }
+static uint32_t vmm_reg_delete_key(const uint32_t* a) {
+    return (uint32_t)REG("RegDeleteKeyA", LONG(WINAPI*)(HKEY, LPCSTR))((HKEY)P(0), P(1));
+}
+static uint32_t vmm_reg_enum_key(const uint32_t* a) {
+    return (uint32_t)REG("RegEnumKeyA", LONG(WINAPI*)(HKEY, DWORD, LPSTR, DWORD))((HKEY)P(0), a[1], P(2), a[3]);
+}
+static uint32_t vmm_reg_enum_value(const uint32_t* a) {
+    return (uint32_t)REG("RegEnumValueA", LONG(WINAPI*)(HKEY, DWORD, LPSTR, LPDWORD, LPDWORD, LPDWORD, LPBYTE, LPDWORD))(
+        (HKEY)P(0), a[1], P(2), P(3), NULL, P(5), P(6), P(7));
+}
+static uint32_t vmm_reg_query_value(const uint32_t* a) {
+    return (uint32_t)REG("RegQueryValueExA", LONG(WINAPI*)(HKEY, LPCSTR, LPDWORD, LPDWORD, LPBYTE, LPDWORD))((HKEY)P(0), P(1), NULL, P(3), P(4), P(5));
+}
+static uint32_t vmm_reg_set_value(const uint32_t* a) {
+    return (uint32_t)REG("RegSetValueExA", LONG(WINAPI*)(HKEY, LPCSTR, DWORD, DWORD, const BYTE*, DWORD))((HKEY)P(0), P(1), 0, a[3], P(4), a[5]);
+}
+
+/* VWIN32 1 (p0..p9): VWIN32 hands kernel32 its ring-0 file entry points,
+ * which kernel32 then calls directly (cdecl) for module images and their
+ * pager, plus two data pointers; the return value is one more entry
+ * (-> 0xBFFC9510, the pager's read). Each entry is a tagged address
+ * (0xFEEF0000 + 4 * n) that native32's dispatcher resolves through
+ * native32_w9x_lookup; one not answered yet stops the run with its slot.
+ *   n  kernel32 slot  used at
+ *   0  9500           0xBFFAB95F (3 args)
+ *   1  9508           0xBFF7D83F (1)
+ *   2  953C           0xBFFAB694 (1)
+ *   3  9544           0xBFFAB679 (1)
+ *   4  9550           0xBFFAB68A (1)
+ *   5  950C           0xBFFAB75D (1)
+ *   6  9514           0xBFFABC2F (4, result in ax)
+ *   7  9540           0xBFFAB707 (3)
+ *   8  9338  data, read at 0xBFFC72EE
+ *   9  9334  data, a pointer to a table pointer (0xBFF81D3A)
+ *  10  9510  (return value) the pager's read: (h, offset, buf, n, sel, sel, 13Fh) */
+#define R0F_TAG 0xFEEF0000u
+static const uint32_t g_r0f_slot[] = { 0x9500, 0x9508, 0x953C, 0x9544, 0x9550, 0x950C, 0x9514, 0x9540, 0, 0, 0x9510 };
+static uint32_t g_r0_data8[0x40], g_r0_table9[0x400], *g_r0_data9 = g_r0_table9;
+static uint32_t vwin32_r0_file_entries(const uint32_t* a) {
+    for (int i = 0; i < 8; i++) MEM32(a[i]) = R0F_TAG + 4u * i;
+    MEM32(a[8]) = (uint32_t)(uintptr_t)g_r0_data8;
+    MEM32(a[9]) = (uint32_t)(uintptr_t)&g_r0_data9;
+    return R0F_TAG + 4u * 10;
+}
+/* 2 (mutex) / 3 (mutex): enter and leave a ring-0 mutex (0xBFFC9560 guards
+ * kernel32's mapped-file table: 0xBFFABA34 enters, and the exit leaves
+ * through 3 or, from ring 3, LeaveCriticalSection). One host lock for all.
+ * ponytail: one global lock; key it by mutex if two ever nest across threads. */
+static CRITICAL_SECTION g_r0_mutex;
+static int host_path(uint32_t guest, char* out);   /* the int 21h section below */
+static HANDLE dos_handle(uint16_t h);
+static int new_handle(HANDLE fh);
+static int dos_close(uint16_t h);
+static void r0f_call(uint32_t n) {
+    uint32_t a0 = MEM32(g_esp + 4);
+    static int init;
+    if (!init) { InitializeCriticalSection(&g_r0_mutex); init = 1; }
+    switch (n) {
+    case 2: EnterCriticalSection(&g_r0_mutex); g_esp += 4; if (g_trace > 0) fprintf(stderr, "[vxd] r0 enter mutex %08X\n", a0); return;
+    case 3: LeaveCriticalSection(&g_r0_mutex); g_esp += 4; if (g_trace > 0) fprintf(stderr, "[vxd] r0 leave mutex %08X\n", a0); return;
+    /* 0 (event, -1, 0) waits on and 1 (event) signals kernel32's paging
+     * event (0xBFFC952C); 4 (rec) and 5 (rec) bracket a mapped-file record
+     * (0xBFFAB68A, 0xBFFAB75D). With one guest thread doing its own paging
+     * nothing ever waits. ponytail: no-ops until a second guest thread pages. */
+    case 0: case 1: case 4: case 5: g_esp += 4; g_eax = 0; return;
+    case 6: {   /* (name, mode, sel, sel) open for paging (0xBFFABC2F): ax = handle, high word -1 on failure */
+        char path[MAX_PATH];
+        uint16_t mode = (uint16_t)MEM32(g_esp + 8);
+        HANDLE fh = INVALID_HANDLE_VALUE;
+        if (host_path(a0, path))
+            fh = CreateFileA(path, (mode & 3) ? GENERIC_READ | GENERIC_WRITE : GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+        int h = fh == INVALID_HANDLE_VALUE ? -1 : new_handle(fh);
+        g_eax = h < 0 ? 0xFFFF0002u : (uint32_t)h;
+        if (g_trace > 0) fprintf(stderr, "[vxd] r0 open %s -> %08X\n", path, g_eax);
+        g_esp += 4; return; }
+    case 7: {   /* (handle, sel, sel) close (0xBFFAB707) */
+        dos_close((uint16_t)a0);
+        g_eax = 0; g_esp += 4; return; }
+    case 10: {  /* (handle, offset, buf, n, sel, sel, 13Fh) the pager's read (0xBFF7D8E6): eax = bytes read */
+        HANDLE fh = dos_handle((uint16_t)a0);
+        LARGE_INTEGER at; DWORD got = 0;
+        at.QuadPart = MEM32(g_esp + 8);
+        if (fh && SetFilePointerEx(fh, at, NULL, FILE_BEGIN)) ReadFile(fh, (void*)(uintptr_t)MEM32(g_esp + 12), MEM32(g_esp + 16), &got, NULL);
+        if (g_trace > 0) fprintf(stderr, "[vxd] r0 read h%u @%08X %u -> %u\n", (unsigned)(uint16_t)a0, MEM32(g_esp + 8), MEM32(g_esp + 16), (unsigned)got);
+        g_eax = got; g_esp += 4; return; }
+    }
+    fprintf(stderr, "\n[vxd] VWIN32 ring-0 file entry %u (kernel32 slot 0xBFFC%04X) from sub_%08X: args %08X %08X %08X %08X %08X %08X %08X\n",
+            n, g_r0f_slot[n], g_cur_func, MEM32(g_esp + 4), MEM32(g_esp + 8), MEM32(g_esp + 12), MEM32(g_esp + 16),
+            MEM32(g_esp + 20), MEM32(g_esp + 24), MEM32(g_esp + 28));
+    native32_dump_icalls(8);
+    fflush(stderr);
+    recomp_trace_flush();
+    TerminateProcess(GetCurrentProcess(), 5);
+}
+#define R0F(n) static void r0f_##n(void) { r0f_call(n); }
+R0F(0) R0F(1) R0F(2) R0F(3) R0F(4) R0F(5) R0F(6) R0F(7) R0F(10)
+static void (*const g_r0f[11])(void) = { r0f_0, r0f_1, r0f_2, r0f_3, r0f_4, r0f_5, r0f_6, r0f_7, NULL, NULL, r0f_10 };
+
+/* KRNL386, the 16-bit half of kernel32's flat thunks. Each thunked call is
+ * a stub `mov cl, N; jmp common`, and common (`push ebp; mov ebp, esp; push
+ * ecx; sub esp, 3Ch; push 16-bit args...; call [slot]`) reaches QT_Thunk
+ * through the slot. The host points the slot at K386_TAG, so the call lands
+ * here with N at [ebp-4] and the Pascal-order arguments on the stack (the
+ * last one at esp+4). The answer is dx:ax; the stub's `leave` drops the
+ * arguments. Named from the 32-bit callers; an N not answered stops the run.
+ *   12h (lpBuf:16:16, cb:16) GetSystemDirectory: 0xBFF8DBFE opens
+ *       <it>\unicode.nls */
+#define K386_TAG 0xFEEE8000u
+static void guest_put(uint32_t va, const char* s, size_t max);
+const char* g_w9x_sysdir = "C:\\WINDOWS\\SYSTEM";
+static uint32_t lin16(uint32_t p1616) { return recomp_sel_base(p1616 >> 16) + (p1616 & 0xFFFF); }
+static void krnl386_thunk(void) {
+    uint8_t n = MEM8(g_ebp - 4);
+    uint32_t sp = g_esp + 4;          /* past the return address the call pushed */
+    switch (n) {
+    case 0x12: {
+        uint16_t cb = MEM16(sp);
+        uint32_t buf = lin16(MEM32(sp + 2));
+        size_t len = strlen(g_w9x_sysdir);
+        if (len < cb) guest_put(buf, g_w9x_sysdir, cb);
+        g_eax = (uint32_t)len; g_edx = 0;
+        if (g_trace > 0) fprintf(stderr, "[krnl386] thunk %02X GetSystemDirectory(%08X, %u) = %u\n", n, buf, cb, (unsigned)len);
+        break; }
+    default:
+        fprintf(stderr, "\n[krnl386] unknown thunk %02Xh from sub_%08X: 16-bit args at esp %04X %04X %04X %04X %04X %04X\n",
+                n, g_cur_func, MEM16(sp), MEM16(sp + 2), MEM16(sp + 4), MEM16(sp + 6), MEM16(sp + 8), MEM16(sp + 10));
+        native32_dump_icalls(8);
+        fflush(stderr);
+        recomp_trace_flush();
+        TerminateProcess(GetCurrentProcess(), 5);
+    }
+    g_esp += 4;                        /* the dummy return address */
+}
+uint32_t native32_w9x_krnl386_thunk(void) { return K386_TAG; }
+
+/* The host's recomp_lookup_manual forwards here: VWIN32's entries above. */
+recomp_func_t native32_w9x_lookup(uint32_t va) {
+    if (va == K386_TAG) return krnl386_thunk;
+    if ((va & 0xFFFF0000u) == R0F_TAG && (va & 0xFFFF) < 4 * 11 && !(va & 3)) return g_r0f[(va & 0xFFFF) / 4];
+    return NULL;
+}
+
+/* VMM pagers. kernel32 asks for a stock pager's descriptor (service 4,
+ * (hpd, &pd)), puts its own page-in in it (0xBFF7D84B: module images,
+ * read from the file through VWIN32) and registers the copy (service 3,
+ * (&pd) -> hpd). pd: +00 virgin page-in, +04 tainted page-in, +08 clean
+ * out, +0C dirty out, +10/+14 frees, +18 dirty, +1C type. The stock pagers
+ * (1, 2) are plain zero-fill memory here. */
+#define NPAGERS 16
+static uint32_t g_pd[NPAGERS][8];
+static int g_npd = 3;                      /* 1, 2: VMM's own; ours from 3 */
+static uint32_t vmm_pager_query(const uint32_t* a) {
+    uint32_t* pd = (uint32_t*)(uintptr_t)a[1];
+    if (a[0] == 0 || a[0] >= (uint32_t)g_npd) return 0;
+    memcpy(pd, g_pd[a[0]], 32);
+    if (a[0] < 3) pd[7] = a[0];
+    return 1;
+}
+static uint32_t vmm_pager_register(const uint32_t* a) {
+    if (g_npd == NPAGERS) return 0;
+    memcpy(g_pd[g_npd], (void*)(uintptr_t)a[0], 32);
+    return (uint32_t)g_npd++;
+}
+
+/* (page, npages, hpd, pagerdata, flags). A host has no page faults to page
+ * in on, so a pager with a page-in has it run for every page now:
+ * pagein(&pagerdata, page address, 0), cdecl, pagerdata + i for page i. */
 static uint32_t vmm_page_commit(const uint32_t* a) {
-    return VirtualAlloc((void*)(uintptr_t)(a[0] << 12), a[1] << 12, MEM_COMMIT, PAGE_EXECUTE_READWRITE) != NULL;
+    uint32_t page = a[0], n = a[1], hpd = a[2], data = a[3];
+    if (!VirtualAlloc((void*)(uintptr_t)(page << 12), n << 12, MEM_COMMIT, PAGE_EXECUTE_READWRITE)) return 0;
+    if (hpd >= 3 && hpd < (uint32_t)g_npd && g_pd[hpd][0]) {
+        uint32_t saved[8] = { g_eax, g_ecx, g_edx, g_ebx, g_esp, g_ebp, g_esi, g_edi };
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t d = data + i;   /* per page: the file-mapping pager (0xBFF813F9) keeps the page index in the low 18 bits */
+            uint32_t args[3] = { (uint32_t)(uintptr_t)&d, (page + i) << 12, 0 };
+            if (g_trace > 0) fprintf(stderr, "[vxd]   page-in %08X (pager %u, data %08X)\n", (page + i) << 12, hpd, d);
+            native32_call_guest(g_pd[hpd][0], 3, args);
+        }
+        g_eax = saved[0]; g_ecx = saved[1]; g_edx = saved[2]; g_ebx = saved[3];
+        g_esp = saved[4]; g_ebp = saved[5]; g_esi = saved[6]; g_edi = saved[7];
+    }
+    return 1;
 }
 /* (page, npages, flags) */
 static uint32_t vmm_page_decommit(const uint32_t* a) {
@@ -81,18 +277,50 @@ static HANDLE vmm_heap(void) { static HANDLE h; if (!h) h = HeapCreate(0, 0, 0);
 static uint32_t vmm_heap_alloc(const uint32_t* a) {
     return (uint32_t)(uintptr_t)HeapAlloc(vmm_heap(), (a[1] & 1) ? HEAP_ZERO_MEMORY : 0, a[0] ? a[0] : 1);
 }
+/* VMM service 10h (block, flags): _HeapFree of a service-5 block
+ * (0xBFF7CF3B frees kernel32's ring-0 allocations through it). */
+static uint32_t vmm_heap_free(const uint32_t* a) { return a[0] ? HeapFree(vmm_heap(), 0, (void*)(uintptr_t)a[0]) : 1; }
+
 /* VMM service 6, no arguments: a new memory context, kept in the process
  * database at +1C (beside +24, the PSP's linear address). Every guest
  * process shares the host's one address space: a nonzero cookie. */
 static uint32_t vmm_context_create(const uint32_t* a) { static uint32_t n; (void)a; return 0xC0DE0000u + ++n; }
 
-/* VWIN32 4F (fn, handle): 33h registers a kernel32 object (a process) with
+/* VWIN32 4F (fn, handle, 0, 0): 33h registers a kernel32 object (a process) with
  * VWIN32's ring-0 side, 34h drops it. The host keeps no ring-0 twin. */
 static uint32_t vwin32_obj_fn(const uint32_t* a) { return a[0] == 0x33 || a[0] == 0x34; }
 
 /* VWIN32 32 (obj): kernel32 releases an object's ring-0 part just before it
  * clears the object. Nothing on the host side. */
 static uint32_t vwin32_obj_release(const uint32_t* a) { (void)a; return 0; }
+
+/* VWIN32 64 (pairs, n): after a process's priority class changes
+ * (PDB+A0: 4/8/0Dh/18h), kernel32 hands VWIN32 n {ring-0 thread
+ * (thread+54), priority} pairs to reschedule (0xBFF8F69D). The host's
+ * threads keep their own priority. */
+static uint32_t vwin32_set_priorities(const uint32_t* a) { (void)a; return 0; }
+
+/* VWIN32 21 (r0thread, priority): set a thread's priority in its ring-0
+ * twin and return the field's offset there: CreateThread keeps r0thread +
+ * the result as the TIB's pCurrentPriority (thread+2C, 0xBFF86850). */
+#define R0T_PRIORITY 0x10
+static uint32_t vwin32_set_thread_priority(const uint32_t* a) {
+    if (a[0]) MEM32(a[0] + R0T_PRIORITY) = a[1];
+    return R0T_PRIORITY;
+}
+
+/* VWIN32 60 (waitblk): called on a fresh file object's wait block (made by
+ * 0xBFF7E4BA, 10h bytes, +4 count, +8 manual-reset) at 0xBFF80215, and on a
+ * thread's in its teardown (0xBFF8CC9F). Its neighbours 5E (3 args) and 61
+ * (1) are wrapped the same way (0xBFF92D4D..77). The host keeps no ring-0
+ * wait state: nothing to do, and kernel32 ignores the result.
+ * ponytail: the name is still open; give it one when a caller needs a result. */
+static uint32_t vwin32_wait_block_60(const uint32_t* a) { (void)a; return 0; }
+
+/* VWIN32 30 (waitblk, 1): the first step of kernel32's wait-block destroy
+ * (0xBFF92D19: then it frees +0C and, for type 3, more), e.g. when a file
+ * handle closes. No ring-0 wait state on the host: nothing to release. */
+static uint32_t vwin32_wait_block_destroy(const uint32_t* a) { (void)a; return 0; }
 
 /* VMM service 0B (context): switch to a memory context. One address space. */
 static uint32_t vmm_context_switch(const uint32_t* a) { (void)a; return 0; }
@@ -190,7 +418,8 @@ static uint32_t vwin32_first_thread(const uint32_t* a) {
 #define SET8L(f, v) ((f) = ((f) & 0xFFFFFF00u) | (uint8_t)(v))
 static int g_cf;                  /* the service's CF */
 static void set_cf(int cf) { g_cf = cf; }
-static void dos_fail(uint16_t err) { SET16(g_eax, err); set_cf(1); }
+static uint16_t g_dos_err;
+static void dos_fail(uint16_t err) { SET16(g_eax, err); set_cf(1); g_dos_err = err; }
 
 /* The sandbox: guest C:\ is this host directory, and no guest path may
  * leave it (".." is resolved first, then the prefix is checked). */
@@ -230,6 +459,11 @@ static HANDLE g_fh[NHANDLES];
 static HANDLE dos_handle(uint16_t h) {
     if (h <= 2) return GetStdHandle(h == 0 ? STD_INPUT_HANDLE : h == 1 ? STD_OUTPUT_HANDLE : STD_ERROR_HANDLE);
     return h < NHANDLES ? g_fh[h] : NULL;
+}
+static int dos_close(uint16_t h) {
+    if (h <= 4 || h >= NHANDLES || !g_fh[h]) return h <= 4;
+    CloseHandle(g_fh[h]); g_fh[h] = NULL;
+    return 1;
 }
 static int new_handle(HANDLE fh) {
     for (int i = 5; i < NHANDLES; i++) if (!g_fh[i]) { g_fh[i] = fh; return i; }
@@ -285,17 +519,19 @@ static uint32_t vwin32_int21(const uint32_t* a) {
     uint16_t ax = (uint16_t)g_eax;
     if (g_trace > 0) fprintf(stderr, "[int21] AX=%04X ebx=%08X ecx=%08X edx=%08X esi=%08X edi=%08X\n", ax, g_ebx, g_ecx, g_edx, g_esi, g_edi);
     switch (ah) {
+    case 0xEA:                                                 /* AX=EA00, kernel32 _INIT (0xBFFC6F47): BX -> 0xBFFC9CCC, */
+        if (al == 0) { SET16(g_ebx, 0); return g_eax; }        /* tested before a 'NETQ' check (0xBFF7FC9B): no network */
+        break;
     case 0x0E: SET8L(g_eax, 26); return g_eax;                 /* select drive: 26 letters */
     case 0x19: SET8L(g_eax, 2); return g_eax;                  /* current drive: C: */
     case 0x2A: { SYSTEMTIME t; GetLocalTime(&t);
         SET16(g_ecx, t.wYear); SET16(g_edx, t.wMonth << 8 | t.wDay); SET8L(g_eax, t.wDayOfWeek); return g_eax; }
     case 0x2C: { SYSTEMTIME t; GetLocalTime(&t);
         SET16(g_ecx, t.wHour << 8 | t.wMinute); SET16(g_edx, t.wSecond << 8 | t.wMilliseconds / 10); return g_eax; }
+    case 0x59:                                                 /* extended error: AX code, BH class, BL action, CH locus */
+        SET16(g_eax, g_dos_err); SET16(g_ebx, 0x0D01); g_ecx = (g_ecx & 0xFFFF00FFu) | 0x0200; return g_eax;
     case 0x30: SET16(g_eax, 0x0A07); SET16(g_ebx, 0xFF00); return g_eax;   /* DOS 7.10 */
-    case 0x3E: { uint16_t h = (uint16_t)g_ebx;
-        if (h > 4 && h < NHANDLES && g_fh[h]) { CloseHandle(g_fh[h]); g_fh[h] = NULL; }
-        else if (h > 4) dos_fail(6);
-        return g_eax; }
+    case 0x3E: if (!dos_close((uint16_t)g_ebx)) dos_fail(6); return g_eax;
     case 0x3F: case 0x40: { HANDLE fh = dos_handle((uint16_t)g_ebx); DWORD n = 0;
         if (!fh || fh == INVALID_HANDLE_VALUE) { dos_fail(6); return g_eax; }
         BOOL ok = ah == 0x3F ? ReadFile(fh, (void*)(uintptr_t)g_edx, g_ecx, &n, NULL)
@@ -410,16 +646,32 @@ static const vxd_service_t g_services[] = {
     { 0x002A0010, 2, vwin32_int21, "VWIN32_Int21Dispatch" },
     { 0x002A000C, 1, vwin32_first_thread, "VWIN32_CreateFirstThread" },
     { 0x0001000B, 1, vmm_context_switch, "VMM_ContextSwitch" },
+    { 0x002A0021, 2, vwin32_set_thread_priority, "VWIN32_SetThreadPriority" },
+    { 0x002A0030, 2, vwin32_wait_block_destroy, "VWIN32_DestroyWaitBlock" },
+    { 0x002A0060, 1, vwin32_wait_block_60, "VWIN32_60_WaitBlock" },
+    { 0x002A0064, 2, vwin32_set_priorities, "VWIN32_SetThreadPriorities" },
     { 0x002A0032, 1, vwin32_obj_release, "VWIN32_ReleaseObject" },
-    { 0x002A004F, 2, vwin32_obj_fn, "VWIN32_ObjectFn" },
+    { 0x002A004F, 4, vwin32_obj_fn, "VWIN32_ObjectFn" },
     { 0x00010005, 2, vmm_heap_alloc, "VMM_HeapAllocate" },
     { 0x00010006, 0, vmm_context_create, "VMM_ContextCreate" },
+    { 0x00010010, 2, vmm_heap_free, "VMM_HeapFree" },
     { 0x002A0047, 1, vwin32_set_env, "VWIN32_SetEnvironment" },
     { 0x002A0006, 3, vwin32_set_callbacks, "VWIN32_SetCallbacks" },
     { 0x00010000, 3, vmm_page_reserve, "VMM_PageReserve" },
     { 0x00010001, 5, vmm_page_commit, "VMM_PageCommit" },
     { 0x00010002, 3, vmm_page_decommit, "VMM_PageDecommit" },
     { 0x0001000A, 2, vmm_page_free, "VMM_PageFree" },
+    { 0x00010003, 1, vmm_pager_register, "VMM_PagerRegister" },
+    { 0x002A0001, 10, vwin32_r0_file_entries, "VWIN32_GetRing0FileEntries" },
+    { 0x00010011, 3, vmm_reg_open, "VMM_RegOpenKey" },
+    { 0x00010012, 3, vmm_reg_create, "VMM_RegCreateKey" },
+    { 0x00010013, 1, vmm_reg_close, "VMM_RegCloseKey" },
+    { 0x00010016, 2, vmm_reg_delete_key, "VMM_RegDeleteKey" },
+    { 0x00010018, 4, vmm_reg_enum_key, "VMM_RegEnumKey" },
+    { 0x00010019, 8, vmm_reg_enum_value, "VMM_RegEnumValue" },
+    { 0x0001001A, 6, vmm_reg_query_value, "VMM_RegQueryValueEx" },
+    { 0x0001001B, 6, vmm_reg_set_value, "VMM_RegSetValueEx" },
+    { 0x00010004, 2, vmm_pager_query, "VMM_PagerQuery" },
     { 0x002A004A, 2, vwin32_crst_create, "VWIN32_CreateCrst" },
     { 0x002A0003, 8, vwin32_boot_sels, "VWIN32_BootSelectors" },
     { 0, 0, NULL, NULL },
@@ -534,8 +786,8 @@ int recomp_farcall32(uint32_t ptr) {
         /* the service's CF, as a cmp the caller's jb/jc reads (ZF clear) */
         g_flag_k = FK_CMP; g_flag_a = g_cf ? 0 : 1; g_flag_b = g_cf ? 1 : 0; g_flag_cf = (uint32_t)g_cf;
         if (g_trace)
-            fprintf(stderr, "[vxd] %08X %s(%08X %08X %08X %08X) = %08X  (from sub_%08X)\n",
-                    id, s->name, a[0], a[1], a[2], a[3], r, g_cur_func);
+            fprintf(stderr, "[vxd] %08X %s(%08X %08X %08X %08X) = %08X  (from sub_%08X, esp %08X esi %08X)\n",
+                    id, s->name, a[0], a[1], a[2], a[3], r, g_cur_func, g_esp, g_esi);
         g_eax = r;
         g_esp += 4 + 4u * s->nargs;
         return 1;
