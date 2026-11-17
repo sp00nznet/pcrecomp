@@ -550,13 +550,27 @@ void bios_int16(CPU *cpu) { int_handler(cpu, 0x16); }
  * loads GDI's and USER's), SEG_n becomes that block's selector, so `push
  * cs`, cs:[n] and DGROUP fixups name what KRNL386's own tables know. */
 uint16_t g_w16_segsel[RECOMP_NUM_SEG + 1];
+static uint32_t w16_np(uint16_t sel);
 static void segsel_init(void) {   /* once per process: g_w16_ready is per thread */
     static int done;
     if (done++) return;
+    extern uint32_t (*g_w9x_np_hook)(uint16_t);
+    g_w9x_np_hook = w16_np;
     for (uint16_t n = 0; n <= RECOMP_NUM_SEG; n++) g_w16_segsel[n] = (uint16_t)(n << 3 | 7);
 }
 
 static uint16_t g_alias[8192];
+/* A lifted memory access through a not-present selector (vxd32 recomp_sel_access_base):
+ * KRNL386 marks a discarded or load-on-call segment so, and the CPU's #NP would have it
+ * loaded. USER's GetCodeInfo probes a Win16 app's code segment that way (SOL seg 10).
+ * When sel is bound to a lifted segment, the read goes to that segment's bytes in the
+ * linked image (what a load puts there; relocations are applied), its placeholder SEL(n).
+ * ponytail: reads only make sense; KRNL386 still thinks the segment is not loaded. */
+static uint32_t w16_np(uint16_t sel) {
+    uint16_t n = g_alias[sel >> 3];
+    if (getenv("W16_TRACE")) fprintf(stderr, "[w16] not-present selector %04X read: segment %u\n", sel, n);
+    return n ? recomp_sel_base((uint32_t)n << 3 | 7) : 0;
+}
 
 /* Bind a module's loaded segments to the selectors KRNL386 gave them, read
  * from its own data: sel's arena (KERNEL DGROUP:1234 selector table, in the
@@ -858,7 +872,7 @@ void w16_unwind(CPU *c) {
  * up a chain of tail calls (an indirect dispatch_far has no frame).
  * ponytail: the C-return case assumes the frames between are tail calls. */
 void w16_jmpf(CPU *c, uint16_t sel, uint16_t off) {
-    if ((sel & 4) && sel != g_host_sel && recomp_sel_base(sel) && memcmp((const void *)(uintptr_t)recomp_sel_base(sel), "PCRD", 4)) {
+    if ((sel & 4) && sel != g_host_sel && recomp_sel_base(sel) && (!(native32_w9x_desc(sel)[5] & 0x80) || memcmp((const void *)(uintptr_t)recomp_sel_base(sel), "PCRD", 4))) {   /* not present: no driver of ours (its base is no address) */
         if (recomp_dispatch_lookup(c, seg_of(sel), off)) { w16_unwind(c); return; }   /* ran it: the far jump */
         if (getenv("W16_TRACE")) fprintf(stderr, "[w16] retf to %04X:%04X: a return to a call site\n", sel, off);
         w16_unwind(c);

@@ -1753,12 +1753,25 @@ void native32_w9x_ldt(uint16_t alias_sel, uint32_t* ldt_base) {
     d[5] = 0xF2; d[6] = 0x40;
 }
 
+/* A selector whose descriptor is allocated but not present (P=0): Win16 identity
+ * mode's hook (identity.c w16_np) may give the base a lifted memory access reads
+ * through it instead (recomp_sel_access_base); 0 = none. */
+uint32_t (*g_w9x_np_hook)(uint16_t sel);
 uint32_t recomp_sel_base(uint32_t sel) {
     sel &= 0xFFFF;
     if ((sel & ~7u) == g_ldt_alias) return (uint32_t)(uintptr_t)g_ldt;
     if (!(sel & 4)) return 0;
     const uint8_t* d = g_ldt + (sel & ~7u);
     return d[2] | d[3] << 8 | d[4] << 16 | (uint32_t)d[7] << 24;
+}
+/* The same for a memory access by lifted 16-bit code (cpu.h W16_SEL_BASE): there a
+ * not-present selector is the CPU's #NP. Bookkeeping lookups use recomp_sel_base. */
+uint32_t recomp_sel_access_base(uint32_t sel) {
+    const uint8_t* d = g_ldt + (sel & 0xFFF8u);
+    uint32_t b;
+    if ((sel & 4) && !(d[5] & 0x80) && (d[5] & 0x10) && g_w9x_np_hook && (sel & 0xFFF8u) != g_ldt_alias && (b = g_w9x_np_hook((uint16_t)sel)))
+        return b;
+    return recomp_sel_base(sel);
 }
 
 /* A data selector on [base, base+limit] in the host's LDT: what VWIN32 or

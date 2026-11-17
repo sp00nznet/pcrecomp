@@ -220,12 +220,13 @@ extern unsigned g_ds_run;
  * shares memory with lifted 32-bit code, as Win9x's USER.EXE and user32 do. */
 #ifdef RECOMP_W16_IDENTITY
 uint32_t recomp_sel_base(uint32_t sel);
+uint32_t recomp_sel_access_base(uint32_t sel);   /* a not-present selector raises #NP first (vxd32.c) */
 /* Linear 0-FFFFh (IVT, BIOS data, what Win98 keeps at 1000h) cannot be
  * mapped in a Win11 process: those addresses go to a host block instead
  * (identity.c g_w16_low). */
 extern uint8_t g_w16_low[0x10000];
 static inline uint32_t w16_lin(uint32_t a) { return a < 0x10000u ? (uint32_t)(uintptr_t)(g_w16_low + a) : a; }
-#define W16_SEL_BASE(cpu, sel) ((void)(cpu), recomp_sel_base(sel))
+#define W16_SEL_BASE(cpu, sel) ((void)(cpu), recomp_sel_access_base(sel))
 #define W16_LIN(a) w16_lin(a)
 #else
 #define W16_SEL_BASE(cpu, sel) ((cpu)->sel_base[sel])

@@ -808,8 +808,10 @@ void w16_drv_write(const char *sysdir) {
 
 /* A far call into a segment that holds no lifted code: ours if tagged. */
 int w16_drv_far(CPU *c, uint16_t sel, uint16_t off) {
+    extern uint8_t *native32_w9x_desc(uint16_t);
+    if (!(sel & 4) || !(native32_w9x_desc(sel)[5] & 0x80)) return 0;   /* ours are present; a not-present base is no address */
     const uint8_t *b = (const uint8_t *)(uintptr_t)recomp_sel_base(sel);
-    if (!(sel & 4) || !b || memcmp(b, "PCRD", 4) || b[4] >= NDRV) return 0;
+    if (!b || memcmp(b, "PCRD", 4) || b[4] >= NDRV) return 0;
     drv_t *d = &g_drv[b[4]];
     if (getenv("W16_TRACE")) fprintf(stderr, "[drv] %s %04X:%04X\n", d->name, sel, off);
     if (off == E_LIBENTRY) { libentry(c); return 1; }
