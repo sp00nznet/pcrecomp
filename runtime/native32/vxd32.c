@@ -110,6 +110,11 @@ static LONG CALLBACK resv_fault(EXCEPTION_POINTERS* e) {
         if (at - g_resv[i].base < g_resv[i].size) {
             if (!VirtualQuery((void*)at, &mb, sizeof mb) || mb.State != MEM_RESERVE) break;
             if (!VirtualAlloc((void*)(at & ~(uintptr_t)0xFFF), 0x1000, MEM_COMMIT, PAGE_READWRITE)) break;
+            /* a stack page: the guest TIB's StackLimit follows it down, as Win9x's guard-page
+             * growth does. kernel32's thunk down to 16 bits (0xBFF7240B) checks esp against it
+             * and ExitProcesses on a stack "overflow" (My Computer's window, 8 KB down). */
+            if (g_fs_base && at < MEM32(g_fs_base + 8) && at >= MEM32(g_fs_base + 8) - 0x100000u)
+                MEM32(g_fs_base + 8) = (uint32_t)(at & ~(uintptr_t)0xFFF);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
     return EXCEPTION_CONTINUE_SEARCH;
@@ -1791,6 +1796,13 @@ static const vxd_service_t g_services[] = {
     { 0x002A0036, 1, vwin32_run_thread, "VWIN32_RunThreadUntilBlocked" },
     { 0x002A0009, 1, vwin32_thread_starting, "VWIN32_ThreadStarting" },
     { 0x002A0026, 2, vwin32_link_thread, "VWIN32_LinkThread" },
+    /* 37h (context, code, first): kernel32 tells a debugger about an exception (UnhandledExceptionFilter
+     * 0xBFF9DDA4, the fatal loop 0xBFF724B7); 1 = a debugger took it. None is attached, as on a normal Win98.
+     * ponytail: the argument meanings are read off the two call sites, not documented. */
+    { 0x002A0037, 3, vwin32_link_thread, "VWIN32_DebugNotify" },
+    /* 4Dh (8): ExitThread/ExitProcess end with it instead of 2B when the thread object's +44 has
+     * 30000000h (0xBFF89EAF, 0xBFF8D245). ponytail: taken as 2B (the thread is done); its 8 not read. */
+    { 0x002A004D, 1, vwin32_thread_done, "VWIN32_4D_ThreadDone" },
     { 0x00380023, 3, vcond_init, "VCOND_Init" },
     { 0x0038001F, 0, vcond_new_console, "VCOND_NewConsole" },
     { 0x00380001, 3, vcond_write, "VCOND_Write" },
