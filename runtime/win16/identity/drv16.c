@@ -512,7 +512,7 @@ static DWORD WINAPI input_thread(LPVOID unused) {
             r.ax = (uint16_t)(0x8001 | (up ? 4 : 2)); r.bx = (uint16_t)(x * 0xFFFF / (FB_W - 1)); r.cx = (uint16_t)(y * 0xFFFF / (FB_H - 1)); r.dx = 2;
             r.cs = (uint16_t)(g_ms_proc >> 16); r.ip = (uint16_t)g_ms_proc; r.ss = r.ds = r.es = ss; r.sp = 0x1FF0;
             fprintf(stderr, "[drv] mouse event %04X at %d,%d to %04X:%04X\n", r.ax, x, y, r.cs, r.ip);
-            w16_call(&r);
+            if (!w16_call(&r)) fprintf(stderr, "[drv] mouse proc %04X:%04X is no lifted function\n", r.cs, r.ip);
             mach_leave();
             Sleep(60);
         }

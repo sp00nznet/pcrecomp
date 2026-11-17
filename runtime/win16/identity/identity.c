@@ -1036,7 +1036,7 @@ int w16_call(CPU *r) {
     if (getenv("W16_FN")) g_fncount = 1;
     if (getenv("W16_WSEL")) { g_watch_ds = 1; g_wsel = (uint16_t)strtoul(getenv("W16_WSEL"), 0, 16); }   /* a descriptor watch (recomp_fn_hit) */
     push16(&g_w16, 0); push16(&g_w16, 0);
-    int okc = w16_entry(&g_w16, (uint16_t)(r->cs >> 3), r->ip);
+    int okc = w16_entry(&g_w16, seg_of(r->cs), r->ip);
     *r = g_w16;
     g_w16 = saved;
     return okc;
