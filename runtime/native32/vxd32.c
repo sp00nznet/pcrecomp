@@ -154,8 +154,12 @@ static uint32_t vmm_page_reserve(const uint32_t* a) {
 static void* reg_fn(const char* name) { void* f = native32_registry_sandbox_fn(name); return f ? f : (void*)GetProcAddress(GetModuleHandleA("advapi32.dll"), name); }
 #define REG(name, type) ((type)reg_fn(name))
 #define P(i) ((void*)(uintptr_t)a[i])
-static uint32_t vmm_reg_open(const uint32_t* a) {
-    return (uint32_t)REG("RegOpenKeyExA", LONG(WINAPI*)(HKEY, LPCSTR, DWORD, REGSAM, PHKEY))((HKEY)P(0), P(1), 0, KEY_ALL_ACCESS, P(2));
+static uint32_t vmm_reg_open(const uint32_t* a) {   /* W98_REGTRACE=1: every open and its result */
+    static int tr = -1;
+    uint32_t r = (uint32_t)REG("RegOpenKeyExA", LONG(WINAPI*)(HKEY, LPCSTR, DWORD, REGSAM, PHKEY))((HKEY)P(0), P(1), 0, KEY_ALL_ACCESS, P(2));
+    if (tr < 0) tr = getenv("W98_REGTRACE") != NULL;
+    if (tr) fprintf(stderr, "[reg] open %08X \"%s\" -> %u\n", a[0], a[1] ? (const char*)P(1) : "", r);
+    return r;
 }
 static uint32_t vmm_reg_create(const uint32_t* a) {
     return (uint32_t)REG("RegCreateKeyA", LONG(WINAPI*)(HKEY, LPCSTR, PHKEY))((HKEY)P(0), P(1), P(2));
@@ -168,8 +172,27 @@ static uint32_t vmm_reg_delete_value(const uint32_t* a) {
     return (uint32_t)REG("RegDeleteValueA", LONG(WINAPI*)(HKEY, LPCSTR))((HKEY)P(0), P(1));
 }
 static uint32_t vmm_reg_flush(const uint32_t* a) { (void)a; return 0; }   /* nothing buffered */
+/* 1E _GetDemandPageInfo(DemandInfoStruc*, flags): kernel32's GlobalMemoryStatus (shell32's
+ * ShellExecute asks). ponytail: a fixed 64 MB machine, half free, 128 MB swap unused; the
+ * host's own numbers stay out. */
+static uint32_t vmm_demand_info(const uint32_t* a) {
+    uint32_t d = a[0];
+    for (int i = 0; i < 16; i++) MEM32(d + 4 * i) = 0;
+    MEM32(d + 0x00) = 0x7FFFF;   /* DILin_Total_Count (pages) */
+    MEM32(d + 0x04) = 16384;     /* DIPhys_Count */
+    MEM32(d + 0x08) = 8192;      /* DIFree_Count */
+    MEM32(d + 0x0C) = 8192;      /* DIUnlock_Count */
+    MEM32(d + 0x10) = 0x400000;  /* DILinear_Base_Addr */
+    MEM32(d + 0x14) = 0x70000;   /* DILin_Total_Free */
+    MEM32(d + 0x2C) = 32768;     /* DIPagingFileMax */
+    MEM32(d + 0x30) = 0;         /* DIPagingFileInUse (kernel32: max - this = free) */
+    MEM32(d + 0x34) = 4096;      /* DICommit_Count */
+    return 0;
+}
 static uint32_t vmm_reg_query_value_sub(const uint32_t* a) {   /* RegQueryValue(hkey, subkey, value, &cb): ole32 TreatAs */
-    return (uint32_t)REG("RegQueryValueA", LONG(WINAPI*)(HKEY, LPCSTR, LPSTR, PLONG))((HKEY)P(0), P(1), P(2), P(3));
+    uint32_t r = (uint32_t)REG("RegQueryValueA", LONG(WINAPI*)(HKEY, LPCSTR, LPSTR, PLONG))((HKEY)P(0), P(1), P(2), P(3));
+    if (getenv("W98_REGTRACE")) fprintf(stderr, "[reg] query %08X \"%s\" -> %u\n", a[0], a[1] ? (const char*)P(1) : "", r);
+    return r;
 }
 static uint32_t vmm_reg_enum_key(const uint32_t* a) {
     return (uint32_t)REG("RegEnumKeyA", LONG(WINAPI*)(HKEY, DWORD, LPSTR, DWORD))((HKEY)P(0), a[1], P(2), a[3]);
@@ -179,7 +202,9 @@ static uint32_t vmm_reg_enum_value(const uint32_t* a) {
         (HKEY)P(0), a[1], P(2), P(3), NULL, P(5), P(6), P(7));
 }
 static uint32_t vmm_reg_query_value(const uint32_t* a) {
-    return (uint32_t)REG("RegQueryValueExA", LONG(WINAPI*)(HKEY, LPCSTR, LPDWORD, LPDWORD, LPBYTE, LPDWORD))((HKEY)P(0), P(1), NULL, P(3), P(4), P(5));
+    uint32_t r = (uint32_t)REG("RegQueryValueExA", LONG(WINAPI*)(HKEY, LPCSTR, LPDWORD, LPDWORD, LPBYTE, LPDWORD))((HKEY)P(0), P(1), NULL, P(3), P(4), P(5));
+    if (getenv("W98_REGTRACE")) fprintf(stderr, "[reg] value %08X \"%s\" -> %u\n", a[0], a[1] ? (const char*)P(1) : "", r);
+    return r;
 }
 /* 1D (hk, &subkeys, &maxsubkey, &values, &maxvaluename, &maxvalue): advapi32's
  * RegQueryInfoKeyA (0xBFE81C2B); 15 (hk, sub, type, data, cb): RegSetValueA. */
@@ -1851,6 +1876,7 @@ static const vxd_service_t g_services[] = {
     { 0x00010014, 2, vmm_reg_delete_key, "VMM_RegDeleteKey" },
     { 0x00010016, 2, vmm_reg_delete_value, "VMM_RegDeleteValue" },
     { 0x0001001C, 1, vmm_reg_flush, "VMM_RegFlushKey" },
+    { 0x0001001E, 2, vmm_demand_info, "VMM_GetDemandPageInfo" },
     { 0x00010017, 4, vmm_reg_query_value_sub, "VMM_RegQueryValue" },
     { 0x00010018, 4, vmm_reg_enum_key, "VMM_RegEnumKey" },
     { 0x00010019, 8, vmm_reg_enum_value, "VMM_RegEnumValue" },

@@ -387,6 +387,11 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
                 and cur.mnemonic not in ('int3', 'hlt')):
             gaps[k] = cur.end_address
     leaders = set(leaders) | {a for a in gaps.values() if a in addrs}
+    # A gap's landing is a join point too: the textually preceding instruction is not the one
+    # the goto comes from. Win98 shell32 0x7FCB4EB4 `cmp eax,0x32` jumped past an overlapping
+    # decode (`clc; xor dh,...` at 4EB5) to the `je` at 4EB7, which then tested TEST_Z of that
+    # xor's static state: a .lnk file's pidl was classed "Directory".
+    targets |= {a for a in gaps.values() if a in addrs}
     body_addrs = addrs
 
     # LIFT32_W9X: `push L; ...; ret` with L in this body is a jump to L, not a

@@ -114,6 +114,7 @@ static LONG real_open(const wchar_t* nt, REGSAM sam, HKEY* out) {
     return st < 0 ? (LONG)p_RtlNtStatusToDosError(st) : 0;
 }
 
+static int box_whole(HKEY bk);
 /* The policy, by NT path: create in the box; open the box's, else the real one read-only. */
 static LONG sb_open(const wchar_t* full, REGSAM sam, int create, DWORD opts, HKEY* out, DWORD* disp) {
     wchar_t rel[KP], real[KP];
@@ -122,6 +123,18 @@ static LONG sb_open(const wchar_t* full, REGSAM sam, int create, DWORD opts, HKE
     if (!r) { if (disp) *disp = REG_OPENED_EXISTING_KEY; return 0; }
     if (create) return RegCreateKeyExW(HKEY_CURRENT_USER, rel, 0, NULL, opts & ~REG_OPTION_BACKUP_RESTORE, sam, NULL, out, disp);
     if (in_box(full)) { if (!from_box(full, real)) return r; full = real; }
+    /* a whole key's subtree is whole too: the nearest box ancestor that exists decides
+     * (Win98's Explorer key: the host's MenuOrder\Favorites, MyComputer\NameSpace stay out) */
+    for (wchar_t* sl; (sl = wcsrchr(rel, L'\\')) && (size_t)(sl - rel) > wcslen(g_root_rel); ) {
+        HKEY a;
+        *sl = 0;
+        if (!RegOpenKeyExW(HKEY_CURRENT_USER, rel, 0, KEY_READ, &a)) {
+            int w = box_whole(a);
+            RegCloseKey(a);
+            if (w) return ERROR_FILE_NOT_FOUND;
+            break;
+        }
+    }
     return real_open(full, sam, out);
 }
 
