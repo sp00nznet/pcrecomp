@@ -89,6 +89,23 @@ uint32_t native32_gdi_host(uint32_t g) {
     return g_host[i];
 }
 
+/* A region gdi32 changed client-side (CreateRectRgn, SetRectRgn): RGNATTR
+ * { +0 AttrFlags (0x20 ATTR_RGN_DIRTY), +4 complexity (1 NULLREGION), +8 RECT }
+ * applied to the host's region (explorer's taskbar region was the host's stale
+ * 0,0,1,1). ponytail: only SetWindowRgn calls it; done for every caller in
+ * native32_gdi_host, mspaint faulted at start, so find why before widening */
+uint32_t native32_gdi_rgn(uint32_t g) {
+    int i = (int)(g & 0xFFFF);
+    if (!native32_gdi_host(g)) return 0;
+    uint8_t* r = (uint8_t*)(uintptr_t)MEM32(ea(i) + 12);
+    if (MEM8(ea(i) + 10) == 4 && r && (*(uint32_t*)r & 0x20)) {
+        int32_t* q = (int32_t*)(r + 8);
+        if (*(uint32_t*)(r + 4) == NULLREGION) SetRectRgn((HRGN)(uintptr_t)g_host[i], 0, 0, 0, 0);
+        else SetRectRgn((HRGN)(uintptr_t)g_host[i], q[0], q[1], q[2], q[3]);
+    }
+    return g_host[i];
+}
+
 uint8_t* native32_gdi_attr(uint32_t g) {
     return native32_gdi_host(g) ? (uint8_t*)(uintptr_t)MEM32(ea((int)(g & 0xFFFF)) + 12) : NULL;
 }
@@ -131,6 +148,12 @@ uint32_t native32_gdi_handle(uint32_t h) {
         AT32(attr, 0x18) = AT32(attr, 0x1C) = GetTextColor(d);
         attr[0x38] = (uint8_t)GetROP2(d);
         attr[0x39] = (uint8_t)GetBkMode(d);
+        /* lBkMode, lFillMode, lStretchBltMode: what gdi32's Get* read; its TextOut batch entry
+         * takes the background mode from +0x4C (left 0, it batched TRANSPARENT: timedate's
+         * calendar drew today's date white on white) */
+        AT32(attr, 0x4C) = (uint32_t)GetBkMode(d);
+        AT32(attr, 0x50) = (uint32_t)GetPolyFillMode(d);
+        AT32(attr, 0x54) = (uint32_t)GetStretchBltMode(d);
         AT32(attr, 0x3C) = (uint32_t)p.x;
         AT32(attr, 0x40) = (uint32_t)p.y;
         AT32(attr, 0x78) = AT32(attr, 0x7C) = GetTextAlign(d);
@@ -229,9 +252,12 @@ static void batch(void) {
             COLORREF old = SetBkColor(h, MEM32(e + 4));
             ExtTextOutW(h, 0, 0, MEM32(e + 8), (RECT*)(uintptr_t)(e + 0xC), NULL, 0, NULL);
             SetBkColor(h, old);
-        } else if (cmd == 5) {                                 /* ExtSelectClipRgn { mode, RECT }; mode bit 31: no rect (NULL region) */
+        } else if (cmd == 5) {                                 /* ExtSelectClipRgn { mode, RECT } */
+            /* no rect (a NULL region): mode | 0x08000000, as Windows 2000's gdi32 writes it
+             * (ExtSelectClipRgn(hdc, NULL, RGN_COPY) after DrawText; read as a rect, the
+             * stale entry clipped the rest of the paint: the Start menu showed one item) */
             uint32_t m = MEM32(e + 4);
-            HRGN r = (m & 0x80000000u) ? NULL : CreateRectRgn((int)MEM32(e + 8), (int)MEM32(e + 0xC), (int)MEM32(e + 0x10), (int)MEM32(e + 0x14));
+            HRGN r = (m & 0x88000000u) ? NULL : CreateRectRgn((int)MEM32(e + 8), (int)MEM32(e + 0xC), (int)MEM32(e + 0x10), (int)MEM32(e + 0x14));
             ExtSelectClipRgn((HDC)(uintptr_t)HOST(hdc), r, (int)(m & 0xFF));
             if (r) DeleteObject(r);
         } else if (cmd == 6) {                                 /* select a font: DC_ATTR's is current */
@@ -295,6 +321,15 @@ static uint32_t s_randomrgn(uint32_t* a) { return (uint32_t)GetRandomRgn((HDC)(u
 static uint32_t s_intersectclip(uint32_t* a) {
     return (uint32_t)IntersectClipRect((HDC)(uintptr_t)HOST(a[0]), (int)a[1], (int)a[2], (int)a[3], (int)a[4]);
 }
+/* NtGdiGetAppClipBox(hdc, RECT*): GetClipBox (comctl32's listview paints
+ * only the items inside it: an unanswered 0 drew no desktop icons) */
+static uint32_t s_appclipbox(uint32_t* a) { return (uint32_t)GetClipBox(dc(a[0]), (RECT*)(uintptr_t)a[1]); }
+/* NtGdiSetBoundsRect / NtGdiGetBoundsRect(hdc, RECT*, flags): AnimateWindow
+ * (the Start menu) prints the window into a memory DC and shows it only if
+ * the bounds say something was drawn; NtGdiRectVisible(hdc, RECT*) */
+static uint32_t s_setbounds(uint32_t* a) { return SetBoundsRect(dc(a[0]), (RECT*)(uintptr_t)a[1], a[2]); }
+static uint32_t s_getbounds(uint32_t* a) { return GetBoundsRect(dc(a[0]), (RECT*)(uintptr_t)a[1], a[2]); }
+static uint32_t s_rectvisible(uint32_t* a) { return (uint32_t)RectVisible(dc(a[0]), (RECT*)(uintptr_t)a[1]); }
 static uint32_t s_selectcliprgn(uint32_t* a) {
     return (uint32_t)ExtSelectClipRgn((HDC)(uintptr_t)HOST(a[0]), (HRGN)(uintptr_t)HOST(a[1]), (int)a[2]);
 }
@@ -371,6 +406,29 @@ static uint32_t s_dibitmap(uint32_t* a) {
 /* NtGdiGetRegionData(hrgn, count, RGNDATA*). NtGdiGetDeviceWidth stays
  * unanswered (0): answered with HORZRES, gdisol looped in gdi32 */
 static uint32_t s_rgndata(uint32_t* a) { return GetRegionData((HRGN)(uintptr_t)HOST(a[0]), a[1], (RGNDATA*)(uintptr_t)a[2]); }
+/* NtGdiEqualRgn(a, b) */
+static uint32_t s_equalrgn(uint32_t* a) { return EqualRgn((HRGN)(uintptr_t)HOST(a[0]), (HRGN)(uintptr_t)HOST(a[1])); }
+/* NtGdiPolyPolyDraw(hdc or fill mode, POINT*, ULONG* counts, ccounts, fn): 1
+ * PolyPolygon, 2 PolyPolyline, 3 PolyBezier, 4 PolylineTo, 5 PolyBezierTo, 6
+ * CreatePolyPolygonRgn (the first argument its fill mode; a folder window's
+ * band edges) */
+static uint32_t s_polypolydraw(uint32_t* a) {
+    /* the DC's attributes first (its ROP2, pen, brush): timedate's clock draws and erases its
+     * hands with Polygon under its own ROP2; on the bare host DC they left cyan trails.
+     * fn 6's first argument is a fill mode */
+    HDC h = a[4] == 6 ? NULL : dc(a[0]);
+    const POINT* p = (const POINT*)(uintptr_t)a[1];
+    const DWORD* c = (const DWORD*)(uintptr_t)a[2];
+    switch (a[4]) {
+    case 1: { INT n[64]; uint32_t k = a[3] < 64 ? a[3] : 64; for (uint32_t i = 0; i < k; i++) n[i] = (INT)c[i]; return PolyPolygon(h, p, n, (int)k); }
+    case 2: return PolyPolyline(h, p, c, a[3]);
+    case 3: return PolyBezier(h, p, c[0]);
+    case 4: { BOOL r = PolylineTo(h, p, c[0]); dc_back(a[0]); return r; }
+    case 5: { BOOL r = PolyBezierTo(h, p, c[0]); dc_back(a[0]); return r; }
+    case 6: { INT n[64]; uint32_t k = a[3] < 64 ? a[3] : 64; for (uint32_t i = 0; i < k; i++) n[i] = (INT)c[i]; return GUEST(CreatePolyPolygonRgn(p, n, (int)k, (int)a[0])); }
+    }
+    return 0;
+}
 /* NtGdiCreateDIBSection(hdc, hSection, offset, BITMAPINFO*, usage, cjHeader,
  * fl, colorspace, void** bits): the host's, its bits in this address space.
  * ponytail: a file-mapping section (hSection) is not passed on */
@@ -400,6 +458,24 @@ static uint32_t s_bitmap(uint32_t* a) {
 /* NtGdiExtGetObjectW(h, count, buffer) */
 static uint32_t s_getobject(uint32_t* a) {
     return GetObjectW((HGDIOBJ)(uintptr_t)HOST(a[0]), (int)a[1], (void*)(uintptr_t)a[2]);
+}
+/* NtGdiDoPalette(h, iStart, cEntries, entries, iFunc, bInbound), Windows 2000's
+ * iFunc: 0 AnimatePalette, 1 SetPaletteEntries, 2 GetPaletteEntries,
+ * 3 GetSystemPaletteEntries, 4 GetDIBColorTable, 5 SetDIBColorTable.
+ * comctl32's ImageList blend (a selected icon) takes the colour table of a
+ * palettized image list this way: unanswered, its copy was all black. */
+static uint32_t s_dopalette(uint32_t* a) {
+    void* p = (void*)(uintptr_t)a[3];
+    UINT i = a[1] & 0xFFFF, n = a[2] & 0xFFFF;
+    switch (a[4]) {
+    case 0: return AnimatePalette((HPALETTE)(uintptr_t)HOST(a[0]), i, n, p);
+    case 1: return SetPaletteEntries((HPALETTE)(uintptr_t)HOST(a[0]), i, n, p);
+    case 2: return GetPaletteEntries((HPALETTE)(uintptr_t)HOST(a[0]), i, n, p);
+    case 3: return GetSystemPaletteEntries(dc(a[0]), i, n, p);
+    case 4: return GetDIBColorTable(dc(a[0]), i, n, p);
+    case 5: return SetDIBColorTable(dc(a[0]), i, n, p);
+    }
+    return 0;
 }
 /* NtGdiGetTextMetricsW(hdc, TMW_INTERNAL*, cj): TEXTMETRICW, then zeros */
 static uint32_t s_textmetrics(uint32_t* a) {
@@ -441,6 +517,9 @@ static uint32_t s_dcpoint(uint32_t* a) {
     return 0;
 }
 static uint32_t s_getpixel(uint32_t* a) { return GetPixel(dc(a[0]), (int)a[1], (int)a[2]); }
+/* NtGdiGetBitmapBits(hbm, cb, buf), NtGdiGetNearestColor(hdc, color) */
+static uint32_t s_bitmapbits(uint32_t* a) { return (uint32_t)GetBitmapBits((HBITMAP)(uintptr_t)HOST(a[0]), (LONG)a[1], (void*)(uintptr_t)a[2]); }
+static uint32_t s_nearestcolor(uint32_t* a) { return GetNearestColor(dc(a[0]), a[1]); }
 /* NtGdiStretchDIBitsInternal(hdc, xDst, yDst, cxDst, cyDst, xSrc, ySrc, cxSrc,
  * cySrc, pjInit, pbmi, iUsage, rop, cjMaxInfo, cjMaxBits, hcmXform) */
 static uint32_t s_stretchdib(uint32_t* a) {
@@ -759,19 +838,20 @@ void native32_gdi_install(void) {
         { "NtGdiCreateCompatibleDC", s_compat_dc }, { "NtGdiCreateCompatibleBitmap", s_compat_bitmap },
         { "NtGdiCreatePen", s_pen }, { "NtGdiCreateRectRgn", s_rectrgn }, { "NtGdiCreateDIBitmapInternal", s_dibitmap }, { "NtGdiCreateBitmap", s_bitmap }, { "NtGdiCreatePatternBrushInternal", s_patbrush }, { "NtGdiCreateDIBSection", s_dibsection },
         { "NtGdiGetDCObject", s_dcobject }, { "NtGdiExcludeClipRect", s_excludeclip },
-        { "NtGdiGetRegionData", s_rgndata }, { "NtGdiGetDCforBitmap", s_dcforbitmap }, { "NtGdiSaveDC", s_savedc }, { "NtGdiRestoreDC", s_restoredc },
-        { "NtGdiGetRandomRgn", s_randomrgn }, { "NtGdiIntersectClipRect", s_intersectclip }, { "NtGdiExtSelectClipRgn", s_selectcliprgn }, { "NtGdiCreateSolidBrush", s_brush },
+        { "NtGdiGetRegionData", s_rgndata }, { "NtGdiEqualRgn", s_equalrgn }, { "NtGdiPolyPolyDraw", s_polypolydraw }, { "NtGdiGetDCforBitmap", s_dcforbitmap }, { "NtGdiSaveDC", s_savedc }, { "NtGdiRestoreDC", s_restoredc },
+        { "NtGdiGetRandomRgn", s_randomrgn }, { "NtGdiIntersectClipRect", s_intersectclip }, { "NtGdiGetAppClipBox", s_appclipbox },
+        { "NtGdiSetBoundsRect", s_setbounds }, { "NtGdiGetBoundsRect", s_getbounds }, { "NtGdiRectVisible", s_rectvisible }, { "NtGdiExtSelectClipRgn", s_selectcliprgn }, { "NtGdiCreateSolidBrush", s_brush },
         { "NtGdiSelectBitmap", s_select_bitmap }, { "NtGdiSelectBrush", s_select }, { "NtGdiSelectPen", s_select },
         { "NtGdiSelectFont", s_select }, { "NtGdiDeleteObjectApp", s_delete }, { "NtGdiBitBlt", s_bitblt },
         { "NtGdiLineTo", s_lineto }, { "NtGdiMoveTo", s_moveto }, { "NtGdiSetPixel", s_setpixel },
         { "NtGdiGetDeviceCaps", s_devcaps }, { "NtGdiSetLayout", s_setlayout },
         { "NtGdiSetDIBitsToDeviceInternal", s_setdibits }, { "NtGdiFlush", s_one },
-        { "NtGdiExtGetObjectW", s_getobject }, { "NtGdiComputeXformCoefficients", s_one },
+        { "NtGdiExtGetObjectW", s_getobject }, { "NtGdiDoPalette", s_dopalette }, { "NtGdiComputeXformCoefficients", s_one },
         { "NtGdiGetTextMetricsW", s_textmetrics }, { "NtGdiOpenDCW", s_opendc },
         { "NtGdiHfontCreate", s_font }, { "NtGdiExtTextOutW", s_textout },
         { "NtGdiFlushUserBatch", s_flushbatch }, { "NtGdiGetTextExtent", s_textextent }, { "NtGdiGetTextCharsetInfo", s_charset },
         { "NtGdiGetDCPoint", s_dcpoint }, { "NtGdiGetTextFaceW", s_textface },
-        { "NtGdiEnumFontOpen", s_enumopen }, { "NtGdiEnumFontChunk", s_enumchunk }, { "NtGdiEnumFontClose", s_one }, { "NtGdiGetPixel", s_getpixel },
+        { "NtGdiEnumFontOpen", s_enumopen }, { "NtGdiEnumFontChunk", s_enumchunk }, { "NtGdiEnumFontClose", s_one }, { "NtGdiGetPixel", s_getpixel }, { "NtGdiGetBitmapBits", s_bitmapbits }, { "NtGdiGetNearestColor", s_nearestcolor },
         { "NtGdiStretchDIBitsInternal", s_stretchdib }, { "NtGdiGetCharSet", s_getcharset }, { "NtGdiGetCharWidthW", s_charwidth }, { "NtGdiGetOutlineTextMetricsInternalW", s_otm }, { "NtGdiGetAndSetDCDword", s_getsetdword }, { "NtGdiGetDCDword", s_getdword },
     };
     static const struct { const char* name; void* fn; } hooks[] = {

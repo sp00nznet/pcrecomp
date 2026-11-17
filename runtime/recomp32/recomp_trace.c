@@ -157,10 +157,16 @@ void recomp_trace_enter(uint32_t va) {
         }
     }
     for (unsigned t = 0; t < g_at_n; t++)
-        if (g_at[t] == va)
-            fprintf(stderr, "[args] t%lu %08X %08X %08X %08X\n",
-                    GetCurrentThreadId(), va,
-                    MEM32(g_esp + 4), MEM32(g_esp + 8), MEM32(g_esp + 12));
+        if (g_at[t] == va) {
+            /* and the 16 bytes the first argument points at, when it does
+             * (a CLSID, a string): the pointer alone answers little */
+            uint32_t p = MEM32(g_esp + 4);
+            fprintf(stderr, "[args] t%lu %08X %08X %08X %08X", GetCurrentThreadId(), va,
+                    p, MEM32(g_esp + 8), MEM32(g_esp + 12));
+            if (p >= 0x10000 && !IsBadReadPtr((void*)(uintptr_t)p, 16))
+                fprintf(stderr, "  *%08X %08X %08X %08X", MEM32(p), MEM32(p + 4), MEM32(p + 8), MEM32(p + 12));
+            fputc('\n', stderr);
+        }
     /* Thread-tagged, because the trace interleaves the target's own worker
      * threads with the main one and a flat sequence cannot be read. */
     if (g_calltrace)
@@ -241,7 +247,8 @@ int recomp_trace_arg(int argc, char** argv, int i) {
     const char* a = argv[i];
     if (!strcmp(a, "--calltrace") && i + 1 < argc) {
         g_calltrace = fopen(argv[i + 1], "w");
-        if (g_calltrace) setvbuf(g_calltrace, NULL, _IOFBF, 4u << 20);
+        /* 64 KB: a run ended by TerminateProcess (hiddenrun) loses at most that */
+        if (g_calltrace) setvbuf(g_calltrace, NULL, _IOFBF, 64u << 10);
         else fprintf(stderr, "[trace] cannot write %s\n", argv[i + 1]);
         return 2;
     }

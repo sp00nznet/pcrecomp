@@ -84,6 +84,9 @@ int native32_registry_sandbox(const char* name);
  * native32_nt_proxy_hook (before native32_nt_boot). */
 void native32_registry_sandbox_nt(void (*ovr)(const char*, uint32_t (*)(uint32_t*)),
                                   uint32_t (*fwd)(const char*, uint32_t*), void (*hook)(const char*, void*));
+/* A REG_SZ the guest's own box holds under HKCU\sub (never the real
+ * registry's): 1 and the text in out, 0 if there is no box or no value. */
+int native32_registry_box_sz(const wchar_t* sub, const wchar_t* value, wchar_t* out, unsigned long cch);
 /* A sandbox replacement by its export name (WriteProfileStringW...), or NULL. */
 void* native32_registry_sandbox_fn(const char* name);
 
@@ -144,12 +147,17 @@ void native32_call_guest(uint32_t va, int nargs, const uint32_t* args);
  * register globals from its own threads must too. Nests. */
 void mach_enter(void);
 void mach_leave(void);
+/* Give up every level of the machine around a host call that may wait on
+ * another guest thread; put the same count back after. */
+int mach_release(void);
+void mach_reacquire(int n);
 
 /* A lifted function answered by the host instead, wherever its address is
  * resolved (indirect calls, snapped imports); and a built-in shim by name.
  * A lifted ntdll's RtlUnwind ends in NtContinue, a resume the lift cannot
  * make; native32_nt_boot puts the seh32 one in its place. */
 void native32_replace(uint32_t va, recomp_func_t fn);
+void native32_mute_winmm(void);   /* PCRECOMP_MUTE: a lifted winmm opens no device */
 recomp_func_t native32_shim(const char* name);
 
 /* Name for a native address ("kernel32.dll!CreateFileA"), or NULL. */
@@ -213,6 +221,9 @@ int native32_headless(void);
  * function that registered the frame RtlUnwind last stopped at. That function
  * needs a landing pad (generate.py eh_resume). */
 void native32_seh_continue(uint32_t va);
+void native32_rpc_guard(uint32_t ndr_client_call2, uint32_t ndr_client_call);   /* guest RPC failures end the call (native32.c) */
+void native32_rpc_fail(uint32_t exception_record, uint32_t context);
+int native32_local_unwind2(void);   /* MSVC __local_unwind2 copies in the guest modules: a finally that exits its function (native32.c) */
 extern int native32_guest_seh;   /* 1: RaiseException goes to the guest chain */
 /* A Visual Basic 5/6 guest on the real MSVBVM60/50 (vb6rt.c): the runtime is
  * entered with the guest's registers and stack, and its runtime errors go to
@@ -325,6 +336,7 @@ extern uint8_t* native32_user_psi;   /* csr32.c: SERVERINFO, Windows 2000 layout
 extern uint8_t* native32_user_ahe;   /* csr32.c: the USER handle table */
 extern uint8_t* native32_user_disp;  /* csr32.c: DISPLAYINFO */
 uint32_t native32_gdi_handle(uint32_t host_handle);   /* -> the guest's handle */
+uint32_t native32_gdi_rgn(uint32_t guest_handle);      /* a region's host handle, its RGNATTR applied */
 uint32_t native32_gdi_host(uint32_t guest_handle);     /* -> the host's, 0 if none */
 uint8_t* native32_gdi_attr(uint32_t hdc);
 /* a guest DC as the host's, its attributes applied and the TEB batch flushed (void*: an HDC) */

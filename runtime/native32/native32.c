@@ -7,6 +7,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "native32.h"
 #include "image_loader.h"
@@ -217,6 +218,25 @@ void mach_leave(void) {
     LeaveCriticalSection(&g_mach);
 }
 
+/* A host call that may wait on another guest thread gives up the machine at
+ * every level it holds: inside a window procedure (a callback, depth 2) one
+ * mach_leave still held it, and explorer's main thread, sending to the tray
+ * thread from its WM_CREATE, kept the tray thread from ever running. */
+int mach_release(void) {
+    mstate* m = (mstate*)TlsGetValue(g_mach_tls);
+    int n = m->depth;
+    regs_save(&m->r);
+    m->depth = 0;
+    for (int i = 0; i < n; i++) LeaveCriticalSection(&g_mach);
+    return n;
+}
+
+void mach_reacquire(int n) {
+    mach_enter();                                  /* reloads this thread's registers */
+    for (int i = 1; i < n; i++) EnterCriticalSection(&g_mach);
+    ((mstate*)TlsGetValue(g_mach_tls))->depth = n;
+}
+
 /* RECOMP_BACKEDGE's hand-over: let another guest thread take the machine.
  * Only the outermost claim can give it up; inside a callback the lock is
  * still held further out, and the loop simply runs on. */
@@ -350,6 +370,7 @@ int native32_in_guest(uint32_t va) {
 #define NATIVE32_HELD_ENV "NATIVE32_HELD"
 
 int native32_hold_image(const char* path, uint32_t base) {
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);   /* no box on the real desktop; children inherit it */
     char flag[16], me[MAX_PATH];
     if (GetEnvironmentVariableA(NATIVE32_HELD_ENV, flag, sizeof flag)) {
         SetEnvironmentVariableA(NATIVE32_HELD_ENV, NULL);  /* not passed on to what the guest starts */
@@ -398,6 +419,34 @@ int native32_hold_image(const char* path, uint32_t base) {
         AssignProcessToJobObject(job, pi.hProcess);
     }
     ResumeThread(pi.hThread);
+    if (getenv("NATIVE32_DEBUG_CHILD") && DebugActiveProcess(pi.dwProcessId)) {
+        /* The held process debugged from here: an exception its own handlers
+         * never see (a second chance, an exit unwind's STATUS_UNWIND) is
+         * reported with the lifted function it died in (the same image at
+         * the same base: g_cur_func's address is ours). */
+        DEBUG_EVENT ev;
+        DebugSetProcessKillOnExit(TRUE);
+        while (WaitForDebugEvent(&ev, INFINITE)) {
+            DWORD cont = DBG_CONTINUE;
+            if (ev.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
+                EXCEPTION_RECORD* r = &ev.u.Exception.ExceptionRecord;
+                uint32_t cur = 0;
+                ReadProcessMemory(pi.hProcess, &g_cur_func, &cur, 4, NULL);
+                if (r->ExceptionCode != EXCEPTION_BREAKPOINT)
+                    fprintf(stderr, "[debug] exception %08lX at %p (%s chance) in sub_%08X\n", r->ExceptionCode,
+                            r->ExceptionAddress, ev.u.Exception.dwFirstChance ? "first" : "second", cur);
+                if (r->ExceptionCode != EXCEPTION_BREAKPOINT) cont = DBG_EXCEPTION_NOT_HANDLED;
+            } else if (ev.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT && ev.dwProcessId == pi.dwProcessId) {
+                ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE);
+                break;
+            } else if (ev.dwDebugEventCode == LOAD_DLL_DEBUG_EVENT && ev.u.LoadDll.hFile) {
+                CloseHandle(ev.u.LoadDll.hFile);
+            } else if (ev.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT && ev.u.CreateProcessInfo.hFile) {
+                CloseHandle(ev.u.CreateProcessInfo.hFile);
+            }
+            ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, cont);
+        }
+    }
     WaitForSingleObject(pi.hProcess, INFINITE);
     DWORD code = 1;
     GetExitCodeProcess(pi.hProcess, &code);
@@ -627,14 +676,19 @@ static recomp_func_t dispatch_find(uint32_t va) {
 /* native32_replace: a lifted function answered by the host instead, for every
  * call that resolves its address (indirect calls, imports the guest's own
  * loader snapped). Direct calls inside its own module still reach the lift. */
-#define MAX_REPLACE 32
+#define MAX_REPLACE 256
 static struct { uint32_t va; recomp_func_t fn; } g_replace[MAX_REPLACE];
 static int g_nreplace;
 void native32_replace(uint32_t va, recomp_func_t fn) {
     if (g_nreplace < MAX_REPLACE) g_replace[g_nreplace].va = va, g_replace[g_nreplace++].fn = fn;
+    else { fprintf(stderr, "[native32] native32_replace table full (%d): 0x%08X not replaced\n", MAX_REPLACE, va); abort(); }
 }
 
+static int lu2_is(uint32_t va);
+static int lu2_own(uint32_t va);
+static void lu2_funclet(void);
 recomp_func_t recomp_lookup(uint32_t va) {
+    if (lu2_is(g_cur_func) && va != g_cur_func && !lu2_own(va)) return lu2_funclet;   /* __local_unwind2's funclet call (eh32 section) */
     for (int i = 0; i < g_nreplace; i++)
         if (g_replace[i].va == va) return g_replace[i].fn;
     if (native_module_at(va)) return NULL;    /* its original code runs: recomp_lookup_import */
@@ -1853,6 +1907,7 @@ static void native32_mute(void) {
 }
 
 void native32_init(void) {
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);   /* no box on the real desktop; children inherit it */
     native32_mute();
     eh32_init();
     /* Every Windows -> guest call relies on the guest's code faulting when it
@@ -1895,6 +1950,132 @@ void native32_dump_icalls(int n) {
 #include "eh32.c"
 #include "x87crt.c"
 
+/* ---- MSVC's __local_unwind2, in C ----------------------------------------
+ * The CRT helper that runs a frame's __finally blocks down to a try level
+ * (a `return` out of a __try, and every unwind). A finally block that tests
+ * AbnormalTermination() can end in code it shares with its function's exit
+ * (Windows 2000's ntdll, RtlDosPathNameToNtPathName_U's finally: on a path
+ * it cannot convert it frees its buffer, `mov esp, [ebp-18h]` and returns
+ * FALSE from the function itself). Natively that return leaves
+ * __local_unwind2 behind; lifted, the funclet returns to it as a C call with
+ * esp moved, and its loop read the scope table off the wrong stack (cmd
+ * `dir ""` and the folder window's GetFileAttributesW("") faulted). Here a
+ * funclet that comes back with esp moved has done its function's exit:
+ * the unwind restores its own state and goes on, and the function's own
+ * continuation after the unwind returns the same way (its result in al is
+ * the same failure). Each copy is found by its bytes in every guest module. */
+#define LU2_MAX 16
+static uint32_t g_lu2[LU2_MAX], g_lu2_jmp[LU2_MAX * 4];   /* its entries; its own jumps' targets (lifted as chunks) */
+static int g_nlu2, g_nlu2_jmp;
+/* What its `call [ebx+esi*4+8]` reaches (recomp_lookup while g_cur_func is a
+ * __local_unwind2): the funclet, and a return with esp moved undone. */
+static void lu2_funclet(void) {
+    uint32_t esp = g_esp, ebp = g_ebp, ebx = g_ebx, esi = g_esi, edi = g_edi, fs0 = MEM32(g_fs_base);
+    uint32_t cur = g_cur_func;
+    g_cur_func = 0;                                       /* the funclet itself, not this again */
+    recomp_func_t f = recomp_lookup(MEM32(g_ebx + g_esi * 4 + 8));
+    g_cur_func = cur;
+    if (f) f();
+    if (g_esp != esp + 4) {                               /* it did its function's exit: back to the unwind */
+        g_esp = esp + 4, g_ebp = ebp, g_ebx = ebx, g_esi = esi, g_edi = edi;
+        MEM32(g_fs_base) = fs0;
+    }
+}
+static int lu2_is(uint32_t va) {
+    for (int i = 0; i < g_nlu2; i++) if (g_lu2[i] == va) return 1;
+    return 0;
+}
+static int lu2_own(uint32_t va) {
+    for (int i = 0; i < g_nlu2_jmp; i++) if (g_lu2_jmp[i] == va) return 1;
+    return 0;
+}
+
+/* push ebx; push esi; push edi; mov eax, [esp+10h]; push eax; push -2; push handler;
+ * push fs:[0]; mov fs:[0], esp */
+int native32_local_unwind2(void) {
+    static const uint8_t pre[] = { 0x53, 0x56, 0x57, 0x8B, 0x44, 0x24, 0x10, 0x50, 0x6A, 0xFE, 0x68 };
+    static const uint8_t post[] = { 0x64, 0xFF, 0x35, 0, 0, 0, 0, 0x64, 0x89, 0x25, 0, 0, 0, 0 };
+    for (int i = 0; i < g_mod_n && g_nlu2 < LU2_MAX; i++) {
+        uint8_t* b = (uint8_t*)(uintptr_t)g_mods[i].base;
+        uint32_t size = ((IMAGE_NT_HEADERS32*)(b + ((IMAGE_DOS_HEADER*)b)->e_lfanew))->OptionalHeader.SizeOfImage;
+        for (uint32_t o = 0x1000; o + 40 < size && g_nlu2 < LU2_MAX; o++)
+            if (b[o] == 0x53 && !memcmp(b + o, pre, sizeof pre) && !memcmp(b + o + 15, post, sizeof post) &&
+                recomp_lookup(g_mods[i].base + o)) {
+            {
+                uint32_t va = g_mods[i].base + o;
+                g_lu2[g_nlu2++] = va;
+                for (uint32_t k = o; k < o + 0x60 && k + 6 < size && g_nlu2_jmp < LU2_MAX * 4; k++)
+                    if (b[k] == 0x0F && (b[k + 1] & 0xF0) == 0x80)
+                        g_lu2_jmp[g_nlu2_jmp++] = g_mods[i].base + k + 6 + *(int32_t*)(b + k + 2);
+                    else if ((b[k] & 0xF0) == 0x70 || b[k] == 0xEB)
+                        g_lu2_jmp[g_nlu2_jmp++] = g_mods[i].base + k + 2 + (int8_t)b[k + 1];
+            }
+            }
+    }
+    return g_nlu2;
+}
+
+/* ---- the RPC client call guard ------------------------------------------
+ * A guest MIDL client stub calls NdrClientCall2/NdrClientCall, and the RPC
+ * runtime RAISES a communication failure (RPC_S_SERVER_UNAVAILABLE when the
+ * host refuses the endpoint mapper: no host RPC). Windows 2000's ole32 calls
+ * rpcss with no __except around those stubs: rpcss is always there. Here
+ * it is not, so a failure no guest frame takes ends that call instead: the
+ * __finally blocks the call entered run (an unwind, as RtlUnwind's), and
+ * the stub returns the status, as a [comm_status] procedure does.
+ * native32_rpc_guard(va) wraps one lifted export; native32_rpc_fail is the
+ * unhandled-exception path's question "is a guarded call live?". */
+typedef struct rpc_guard {
+    struct rpc_guard* prev;
+    jmp_buf jb;
+    uint32_t chain, esp, ebx, esi, edi, ebp, func, status;
+    struct recomp_ehframe* frames;
+    cb_guard_t* cb;
+} rpc_guard_t;
+static __declspec(thread) rpc_guard_t* t_rpc_guard;
+static recomp_func_t g_rpc_orig[2];
+
+static void rpc_guarded(int k) {
+    rpc_guard_t g;
+    g.prev = t_rpc_guard, g.chain = MEM32(g_fs_base), g.frames = eh32_frames(), g.cb = t_cb_guard;
+    g.esp = g_esp, g.ebx = g_ebx, g.esi = g_esi, g.edi = g_edi, g.ebp = g_ebp, g.func = g_cur_func;
+    t_rpc_guard = &g;
+    if (!setjmp(g.jb)) g_rpc_orig[k]();                /* the lifted export: pops its return address (cdecl) */
+    else {
+        MEM32(g_fs_base) = g.chain;
+        t_frames = g.frames, t_cb_guard = g.cb;
+        g_esp = g.esp + 4, g_ebx = g.ebx, g_esi = g.esi, g_edi = g.edi, g_ebp = g.ebp, g_cur_func = g.func;
+        g_eax = g.status, g_edx = 0;
+        fprintf(stderr, "[rpc] client call failed with %08X: returned to the stub, not raised\n", g.status);
+    }
+    t_rpc_guard = g.prev;
+}
+static void shim_rpc_call2(void) { rpc_guarded(0); }
+static void shim_rpc_call(void) { rpc_guarded(1); }
+
+void native32_rpc_guard(uint32_t ndr_client_call2, uint32_t ndr_client_call) {
+    recomp_func_t f;
+    if (ndr_client_call2 && (f = recomp_lookup(ndr_client_call2)) != NULL) g_rpc_orig[0] = f, native32_replace(ndr_client_call2, shim_rpc_call2);
+    if (ndr_client_call && (f = recomp_lookup(ndr_client_call)) != NULL) g_rpc_orig[1] = f, native32_replace(ndr_client_call, shim_rpc_call);
+}
+
+/* An RPC status (RPC_S_*, 0x6A4..0x7FF, or its HRESULT) no guest frame took
+ * inside a guarded call: unwind the guest frames the call entered and end
+ * it. Returns only if there is no such call (or a callback is newer). */
+void native32_rpc_fail(uint32_t er, uint32_t ctx) {
+    rpc_guard_t* g = t_rpc_guard;
+    uint32_t code = er ? MEM32(er) : 0, c = (code & 0xFFFF0000u) == 0x80070000u ? code & 0xFFFF : code;
+    if (!g || g->cb != t_cb_guard || c < 0x6A4 || c > 0x7FF) return;
+    MEM32(er + 4) |= SEH_UNWINDING;
+    for (uint32_t reg = MEM32(g_fs_base); reg && reg != 0xFFFFFFFFu && reg != g->chain; ) {
+        seh_call(MEM32(reg + 4), er, reg, ctx);
+        reg = MEM32(reg);
+        MEM32(g_fs_base) = reg;
+    }
+    g->status = c;
+    longjmp(g->jb, 1);
+}
+
 /* native32_headless: see the header. */
 int native32_headless(void) {
     char name[64];
@@ -1926,4 +2107,23 @@ recomp_func_t native32_shim(const char* name) {     /* a built-in shim, by name 
     for (int i = 0; i < (int)(sizeof g_builtin / sizeof g_builtin[0]); i++)
         if (!strcmp(g_builtin[i].name, name)) return g_builtin[i].fn;
     return NULL;
+}
+
+/* PCRECOMP_MUTE with Windows' own winmm lifted: no audio device is ever opened.
+ * The lifted winmm would load the host's drivers (wdmaud) on its first device
+ * call; under the mute it reports no devices and refuses every open
+ * (MMSYSERR_NODRIVER), so a program like Sound Recorder runs without one. */
+static void mm_none0(void) { g_eax = 0; g_esp += 4; }
+static void mm_nodrv5(void) { g_eax = 6; g_esp += 4 + 20; }
+static void mm_nodrv6(void) { g_eax = 6; g_esp += 4 + 24; }
+void native32_mute_winmm(void) {
+    static const char* none[] = { "waveOutGetNumDevs", "waveInGetNumDevs", "midiOutGetNumDevs",
+                                  "midiInGetNumDevs", "mixerGetNumDevs", "auxGetNumDevs" };
+    static const char* open5[] = { "midiOutOpen", "midiInOpen", "mixerOpen" };
+    uint32_t w = native32_module("winmm.dll"), va;
+    if (!w || !getenv("PCRECOMP_MUTE")) return;
+    for (int i = 0; i < 6; i++) if ((va = native32_export(w, none[i]))) native32_replace(va, mm_none0);
+    for (int i = 0; i < 3; i++) if ((va = native32_export(w, open5[i]))) native32_replace(va, mm_nodrv5);
+    if ((va = native32_export(w, "waveOutOpen"))) native32_replace(va, mm_nodrv6);
+    if ((va = native32_export(w, "waveInOpen"))) native32_replace(va, mm_nodrv6);
 }

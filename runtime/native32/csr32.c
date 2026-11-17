@@ -110,6 +110,7 @@ static uint32_t client_connect(uint32_t data, uint32_t capture) {
             ahe = native32_user_ahe = (uint8_t*)VirtualAlloc(NULL, 0xC0000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             disp = native32_user_disp = (uint8_t*)VirtualAlloc(NULL, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             *(uint32_t*)(psi + 8) = 0x10000;                  /* cHandleEntries */
+            *(uint32_t*)(psi + 0x864) = 1;                    /* cCaptures: never 0, so GetCapture asks NtUserGetThreadState(2) */
         }
         MEM32(ci + 0x04) = MEM32(ci + 0x00);
         MEM32(ci + 0x0C) = (uint32_t)(uintptr_t)psi;
@@ -171,8 +172,12 @@ static uint32_t lpc_connect(uint32_t* a, int secure) {
     uint32_t info = a[secure ? 7 : 6];
     int n = name ? MEM16(name) / 2 : 0;
     const wchar_t* s = name ? (const wchar_t*)(uintptr_t)MEM32(name + 4) : L"";
-    if (n < 8 || _wcsnicmp(s + n - 8, L"\\ApiPort", 8))
-        return native32_nt_forward(secure ? "NtSecureConnectPort" : "NtConnectPort", a);
+    if (n < 8 || _wcsnicmp(s + n - 8, L"\\ApiPort", 8)) {
+        /* Any other port is a host service (RPCSS's epmapper, lsass, the
+         * services): a guest never talks to one. As if it were not running. */
+        fprintf(stderr, "[guard] LPC connect to %.*ls: refused\n", n, s);
+        return 0xC0000034u;                                 /* STATUS_OBJECT_NAME_NOT_FOUND */
+    }
     if (cv && MEM32(cv + 4)) {
         void* v = MapViewOfFile((HANDLE)(uintptr_t)MEM32(cv + 4), FILE_MAP_ALL_ACCESS, 0, MEM32(cv + 8), MEM32(cv + 12));
         if (!v) return 0xC0000017u;                       /* STATUS_NO_MEMORY */

@@ -7,23 +7,25 @@ versions follow [SemVer](https://semver.org/).
 
 ### Added
 
-- native32 (Windows 2000 user32/gdi32 layer): window extra bytes kept in the
-  WND (+0x98), GWL_STYLE/GWL_EXSTYLE forwarded (WS_VISIBLE stays the host's),
-  caret, ShowScrollBar, GetKeyState, ScrollWindowEx, TranslateAccelerator,
-  clipboard queries, CallTwoParam 0x5E, CallOneParam 0x1E, GetDoubleClickTime,
-  GetKeyboardLayoutList, GetThreadDesktop; GDI: StretchDIBits, GetCharSet,
-  GetCharWidthW, outline metrics, GetDCDword / GetAndSetDCDword (map mode),
-  font enumeration in Windows 2000's ENUMFONTDATAW, batched TextOut, the
-  viewport origin and map mode from DC_ATTR, the display DEVCAPS gdi32
-  caches, stock objects never forgotten, guest GDI handles in wParam mapped
-  back for a guest procedure. cmdline32: `__p___argv/argc/wargv`, `_acmdln`,
-  `_wcmdln`. Windows 2000's wordpad and mspaint pixel-identical on it.
-- disasm32: a vtable in code names a function even inside a body decoded
-  from data (riched20 0x2070B6E0); a loaded address right after another
-  body's instruction is not this body's data (0x207108C0); nothing starts
-  inside the IAT (wordpad.exe 11,250 -> 8 unimplemented); the MFC
-  message-map rule checks the AFX_MSGMAP_ENTRY fields (mspaint 584 -> 22).
-
+- `runtime/replay/`: input record and replay keyed to the game's own frames
+  or timer ticks, not wall time (`--record`, `--replay`, `--keys f<frame>:...`),
+  with screenshot/hash checkpoints; Win16 hosts take the flags in `main.c`.
+  After Exhume's runtime/replay (MIT). Pilots: Jazz Jackrabbit, KISS.
+- native32: a Windows 2000 userland on a modern host, with only the kernel
+  boundary shimmed. `syscall32.c` (the NT system call gate, booting a lifted
+  ntdll through its own LdrInitializeThunk, guest threads and waits that give
+  up the machine), `csr32.c`, `w32kgdi.c` and `w32kuser.c` (win32k's GDI and
+  USER halves for a lifted gdi32/user32: windows, dialogs, menus, icons,
+  cursors, regions, fonts, DC_ATTR, the `W2K_SCREEN` virtual screen with
+  explorer's taskbar and Start menu), `regbox32.c` (a guest registry sandbox;
+  writes never reach the real registry), the `PCRECOMP_FILEBOX` drive sandbox
+  (`PCRECOMP_GUEST_PATH/ENV/CWD`), host settings refused at the system call,
+  `PCRECOMP_MUTE` covering a lifted winmm, and cmdline32's CRT globals.
+  winmine, sol, freecell, calc, notepad, wordpad and mspaint run on it, the
+  first and the last two pixel-identical. Lifter: the NT system call gate,
+  forwarder exports, SEH filter and `__finally` seeds, `__except` resume
+  points, delay-load seeds, `RECOMP_FLAGS_IN`; disasm32 vtable, IAT and MFC
+  message-map fixes; `tools/pe/rebase.py` drops bound import directories.
 - lift32: a test that `jcxz` (67 E3) leaves the function as `jecxz` does
   (`tools/lift/test_loop_exits.py`; #191, by [@pete-jorgensen](https://github.com/pete-jorgensen)).
 - `tools/pe/vb6.py`: a Visual Basic 5/6 exe's VB header (`VB5!`): native code

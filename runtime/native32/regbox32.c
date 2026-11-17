@@ -91,7 +91,11 @@ static int in_box(const wchar_t* nt) { return prefix(nt, g_root_nt); }
 
 /* real NT path -> the sandbox's, relative to HKCU */
 static void to_box(const wchar_t* nt, wchar_t* rel) {
+    size_t cu = wcslen(g_cu_nt);
     if (in_box(nt)) _snwprintf(rel, KP - 1, L"%ls%ls", g_root_rel, nt + wcslen(g_root_nt));
+    /* the per-user classes (HKCR's other half): one merged HKCR in the box */
+    else if (!_wcsnicmp(nt, g_cu_nt, cu) && prefix(nt + cu, L"_Classes"))
+        _snwprintf(rel, KP - 1, L"%ls\\HKLM\\SOFTWARE\\Classes%ls", g_root_rel, nt + cu + 8);
     else if (prefix(nt, g_cu_nt)) _snwprintf(rel, KP - 1, L"%ls\\HKCU%ls", g_root_rel, nt + wcslen(g_cu_nt));
     else if (prefix(nt, L"\\REGISTRY\\MACHINE")) _snwprintf(rel, KP - 1, L"%ls\\HKLM%ls", g_root_rel, nt + 17);
     else _snwprintf(rel, KP - 1, L"%ls\\NT%ls", g_root_rel, nt);
@@ -107,7 +111,66 @@ static int from_box(const wchar_t* nt, wchar_t* real) {
     real[KP - 1] = 0;
     return 1;
 }
+/* With a lifted ntdll (Windows 2000's own ole32), the host's COM class
+ * registrations are not the guest's: Windows 11's HKCR\CLSID names its own
+ * DLLs (explorerframe.dll for browseui's classes). Under any Classes\CLSID
+ * or Classes\AppID only the box answers, seeded from Windows 2000's own
+ * registration INFs (win2000 tools/reginst.py).
+ * Any other class the box has is answered by the box alone too.
+ * ponytail: Interface/TypeLib and classes only the host has still read the host's. */
+static int g_guest_classes;
+static int host_class_key(const wchar_t* nt) {
+    wchar_t u[KP];
+    /* Keys a box that has them answers whole, never merged with the host's:
+     * the time zones (Windows 11's Display values are @tzres.dll MUI strings)
+     * and Control Panel's namespace (Windows 11's items were nameless folders) */
+    {
+        static const wchar_t* whole[] = { L"\\MICROSOFT\\WINDOWS NT\\CURRENTVERSION\\TIME ZONES",
+                                          L"\\MICROSOFT\\WINDOWS\\CURRENTVERSION\\EXPLORER\\CONTROLPANEL\\NAMESPACE" };
+        static const wchar_t* rels[] = { L"Microsoft\\Windows NT\\CurrentVersion\\Time Zones",
+                                         L"Microsoft\\Windows\\CurrentVersion\\Explorer\\ControlPanel\\NameSpace" };
+        wcsncpy(u, nt, KP - 1), u[KP - 1] = 0, _wcsupr(u);
+        for (int i = 0; i < 2; i++)
+            /* (the per-user Control Panel namespace too: Windows 11 has items there) */
+            if ((!wcsncmp(u, L"\\REGISTRY\\MACHINE\\SOFTWARE", 26) || !wcsncmp(u, L"\\REGISTRY\\USER\\", 15)) && wcsstr(u, whole[i])) {
+                wchar_t rel[KP];
+                HKEY h;
+                _snwprintf(rel, KP - 1, L"%ls\\HKLM\\SOFTWARE\\%ls", g_root_rel, rels[i]);
+                rel[KP - 1] = 0;
+                if (RegOpenKeyExW(HKEY_CURRENT_USER, rel, 0, KEY_READ, &h)) return 0;
+                RegCloseKey(h);
+                return 1;
+            }
+    }
+    if (g_guest_classes < 0 && native32_module("ole32.dll")) g_guest_classes = 1;   /* Windows 2000's own COM, lifted (asked until the guest's modules are mapped) */
+    if (g_guest_classes <= 0) return 0;
+    wcsncpy(u, nt, KP - 1), u[KP - 1] = 0, _wcsupr(u);
+    if (!wcsstr(u, L"CLASSES\\CLSID\\") && !wcsstr(u, L"CLASSES\\WOW6432NODE\\CLSID\\") && !wcsstr(u, L"CLASSES\\APPID\\") &&
+        !wcsstr(u, L"\\CURRENTVERSION\\EXPLORER\\CLSID\\")) {   /* the per-user overrides (Recycle Bin's imageres icons) */
+        /* any other class the box has (Windows 2000's .txt, txtfile, Folder, Drive...):
+         * the box answers it whole, so the host's newer values and subkeys under it
+         * (imageres.dll icons, Win11 verbs) are not seen. A class only the host has
+         * still reads through. */
+        const wchar_t* c = wcsstr(u, L"CLASSES\\");
+        wchar_t rel[KP];
+        HKEY h;
+        size_t n;
+        if (!c) return 0;
+        c += 8;
+        if (!wcsncmp(c, L"WOW6432NODE\\", 12)) c += 12;
+        n = wcscspn(c, L"\\");
+        if (!n) return 0;
+        _snwprintf(rel, KP - 1, L"%ls\\HKLM\\SOFTWARE\\Classes\\%.*ls", g_root_rel, (int)n, nt + (c - u));
+        rel[KP - 1] = 0;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, rel, 0, KEY_READ, &h)) return 0;
+        RegCloseKey(h);
+    }
+    if (getenv("PCRECOMP_REGTRACE")) fprintf(stderr, "[regbox] %ls: the host's class, not the guest's\n", nt);
+    return 1;
+}
 static LONG real_open(const wchar_t* nt, REGSAM sam, HKEY* out) {
+    if (host_class_key(nt)) return ERROR_FILE_NOT_FOUND;
+    if (getenv("PCRECOMP_REGTRACE")) fprintf(stderr, "[regbox] host key read: %ls\n", nt);
     US us = { (USHORT)(wcslen(nt) * 2), (USHORT)(wcslen(nt) * 2), (PWSTR)nt };
     OA oa = { sizeof oa, NULL, &us, 0x40 /* OBJ_CASE_INSENSITIVE */, NULL, NULL };
     LONG st = p_NtOpenKey((HANDLE*)out, (sam & ~WRITE_BITS) | KEY_READ, &oa);
@@ -178,6 +241,8 @@ static LONG WINAPI g_RegOpenKeyExW(HKEY k, LPCWSTR sub, DWORD opt, REGSAM sam, P
         wchar_t rel[KP];
         to_box(full, rel);
         if (!RegOpenKeyExW(HKEY_CURRENT_USER, rel, 0, sam, out)) return 0;
+        if (host_class_key(full)) return ERROR_FILE_NOT_FOUND;
+        if (getenv("PCRECOMP_REGTRACE")) fprintf(stderr, "[regbox] host key read: %ls\n", full);
         return RegOpenKeyExW(k, sub, opt, (sam & ~WRITE_BITS) | KEY_READ, out);
     }
     return sb_open(full, sam, 0, 0, out, NULL);
@@ -386,7 +451,30 @@ static UINT WINAPI g_GetPrivateProfileIntW(LPCWSTR sec, LPCWSTR key, INT def, LP
 }
 static UINT WINAPI g_GetProfileIntW(LPCWSTR sec, LPCWSTR key, INT def) { return g_GetPrivateProfileIntW(sec, key, def, NULL); }
 
+/* SystemParametersInfo from a host DLL in the process (a proxied desk.cpl
+ * rewrote HKCU\Control Panel\Desktop\WindowMetrics): queries only, as the
+ * guest's own (w32kuser.c s_spi). GETs below 0x62 by name; from there and in
+ * the 0x1000/0x2000 ranges they are even. */
+static int spi_is_get(UINT a, void* pv) {
+    static const UINT get[] = { 1, 3, 5, 0xA, 0xE, 0x10, 0x12, 0x16, 0x19, 0x1B, 0x1F, 0x23, 0x26, 0x29, 0x2B, 0x2D,
+        0x30, 0x32, 0x34, 0x36, 0x38, 0x3A, 0x3C, 0x3E, 0x40, 0x42, 0x44, 0x46, 0x48, 0x4A, 0x4F, 0x50, 0x53, 0x54,
+        0x59, 0x5E, 0x5F, 0x73 };
+    if (a == 0xD || a == 0x18) return pv != NULL;
+    if (a >= 0x62) return !(a & 1) || a == 0x73;
+    for (unsigned i = 0; i < sizeof get / sizeof get[0]; i++) if (get[i] == a) return 1;
+    return 0;
+}
+static BOOL WINAPI g_SystemParametersInfoW(UINT a, UINT u, void* pv, UINT w) {
+    if (!spi_is_get(a, pv)) { fprintf(stderr, "[regbox] host SystemParametersInfo 0x%X (a SET) refused\n", a); (void)w; return FALSE; }
+    return SystemParametersInfoW(a, u, pv, 0);
+}
+static BOOL WINAPI g_SystemParametersInfoA(UINT a, UINT u, void* pv, UINT w) {
+    if (!spi_is_get(a, pv)) { fprintf(stderr, "[regbox] host SystemParametersInfo 0x%X (a SET) refused\n", a); (void)w; return FALSE; }
+    return SystemParametersInfoA(a, u, pv, 0);
+}
+
 static const struct { const char* name; void* fn; } g_fns[] = {
+    { "SystemParametersInfoW", g_SystemParametersInfoW }, { "SystemParametersInfoA", g_SystemParametersInfoA },
     { "RegCreateKeyExW", g_RegCreateKeyExW }, { "RegCreateKeyExA", g_RegCreateKeyExA },
     { "RegCreateKeyW", g_RegCreateKeyW }, { "RegCreateKeyA", g_RegCreateKeyA },
     { "RegOpenKeyExW", g_RegOpenKeyExW }, { "RegOpenKeyExA", g_RegOpenKeyExA },
@@ -426,13 +514,13 @@ static const struct { const char* name; void* fn; } g_fns[] = {
  * sandbox's function. Modules loaded later are patched as they load
  * (LdrRegisterDllNotification). ponytail: a host DLL that finds these with
  * GetProcAddress is not covered. */
-static void* g_orig[96][3];
+static void* g_orig[96][4];
 static void patch_slot(void** slot, int delay_unbound, const char* name) {
     DWORD old;
     for (int i = 0; i < NFNS; i++) {
         if (!g_fns[i].fn) continue;
         int hit = delay_unbound ? name && !strcmp(name, g_fns[i].name) : 0;
-        for (int j = 0; !hit && j < 3; j++) hit = g_orig[i][j] && *slot == g_orig[i][j];
+        for (int j = 0; !hit && j < 4; j++) hit = g_orig[i][j] && *slot == g_orig[i][j];
         if (!hit) continue;
         if (VirtualProtect(slot, 4, PAGE_READWRITE, &old)) { *slot = g_fns[i].fn; VirtualProtect(slot, 4, old, &old); }
         return;
@@ -468,14 +556,14 @@ static VOID CALLBACK on_dll(ULONG reason, DLL_NOTE* d, PVOID ctx) {
     if (reason == 1 /* loaded */) patch_module((HMODULE)d->DllBase);
 }
 static void box_host_dlls(void) {
-    const char* dlls[3] = { "advapi32.dll", "kernelbase.dll", "kernel32.dll" };
+    const char* dlls[4] = { "advapi32.dll", "kernelbase.dll", "kernel32.dll", "user32.dll" };
     HMODULE ms[512];
     DWORD got;
     PVOID cookie;
     LONG (WINAPI* reg)(ULONG, void*, PVOID, PVOID*) =
         (void*)GetProcAddress(GetModuleHandleA("ntdll.dll"), "LdrRegisterDllNotification");
     for (int i = 0; i < NFNS && i < 96; i++)
-        for (int j = 0; j < 3; j++) {
+        for (int j = 0; j < 4; j++) {
             HMODULE h = GetModuleHandleA(dlls[j]);
             g_orig[i][j] = h ? (void*)GetProcAddress(h, g_fns[i].name) : NULL;
         }
@@ -490,6 +578,15 @@ void* native32_registry_sandbox_fn(const char* name) {
     for (int i = 0; g_on && i < NFNS; i++)
         if (g_fns[i].fn && !strcmp(g_fns[i].name, name)) return g_fns[i].fn;
     return NULL;
+}
+
+int native32_registry_box_sz(const wchar_t* sub, const wchar_t* value, wchar_t* out, DWORD cch) {
+    wchar_t key[KP];
+    DWORD n = cch * sizeof(wchar_t);
+    if (!g_on) return 0;
+    _snwprintf(key, KP - 1, L"%ls\\HKCU\\%ls", g_root_rel, sub);
+    key[KP - 1] = 0;
+    return !RegGetValueW(HKEY_CURRENT_USER, key, value, RRF_RT_REG_SZ, NULL, out, &n);
 }
 
 int native32_registry_sandbox(const char* name) {
@@ -598,6 +695,7 @@ void native32_registry_sandbox_nt(void (*ovr)(const char*, native32_syscall_fn),
         "NtLoadKey2", "NtReplaceKey", "NtUnloadKey", "NtInitializeRegistry", "NtSaveKeyEx", "NtLoadKeyEx", "NtRenameKey" };
     if (!g_on) return;
     nt_fwd = fwd;
+    g_guest_classes = -1;   /* asked once the guest's modules are mapped */
     ovr("NtCreateKey", nt_create_key);
     ovr("NtOpenKey", nt_open_key);
     ovr("NtSetValueKey", nt_set_value);
