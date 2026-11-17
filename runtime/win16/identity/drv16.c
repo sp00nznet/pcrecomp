@@ -148,12 +148,76 @@ static void disp_colorinfo(CPU *c) {
  * lpOut 0 asks the physical size. Pens: {style, width, color}; brushes: {style, hatch,
  * color, bk, 8x8 pattern}; style < 0 deletes (nothing to free); fonts 0: GDI realizes its
  * own raster fonts (dpNumFonts 0). ponytail: hatched and pattern brushes fill solid in their color. */
+/* Marlett, the one TrueType face Win98's USER needs (caption buttons, scroll arrows,
+ * check marks: DrawFrameControl selects it and draws "0" "1" "2" "r" "6"...). GDI realizes
+ * TrueType through its rasterizer only with dpNumFonts/TC_RA_ABLE TrueType support, which
+ * this display stand-in lacks, so RealizeObject answers a LOGFONT whose face is Marlett
+ * with a device font: Win98's own marlett.ttf (the host copies it to SYSTEM\MARLETT.TT_) (font data, not code)
+ * rasterized at that height by a process-private host GDI font (AddFontMemResourceEx), laid
+ * out as a FNT 3.0 FONTINFO that ExtTextOut and GetCharWidth already read.
+ * ponytail: Marlett only, chars 20h..7Fh, mono, no other TrueType face. */
+static char g_fontdir[512];
+static HANDLE g_marlett;
+static int marlett_build(int lfh, uint8_t *fi) {
+    if (!g_marlett) {
+        char p[600]; snprintf(p, sizeof p, "%s\\MARLETT.TT_", g_fontdir);
+        FILE *f = fopen(p, "rb"); if (!f) return 0;
+        static uint8_t ttf[64 * 1024]; DWORD n = (DWORD)fread(ttf, 1, sizeof ttf, f), cnt = 0; fclose(f);
+        g_marlett = AddFontMemResourceEx(ttf, n, NULL, &cnt);   /* private to this process */
+        if (!g_marlett) return 0;
+    }
+    HDC dc = CreateCompatibleDC(NULL);
+    HFONT hf = CreateFontA(lfh, 0, 0, 0, FW_NORMAL, 0, 0, 0, SYMBOL_CHARSET, 0, 0, NONANTIALIASED_QUALITY, 0, "Marlett");
+    HGDIOBJ of = SelectObject(dc, hf);
+    TEXTMETRICA tm; GetTextMetricsA(dc, &tm);
+    int h = tm.tmHeight, first = 0x20, last = 0x7F, nch = last - first + 1, maxw = 1;
+    INT w[96]; GetCharWidth32A(dc, first, last, w);
+    for (int i = 0; i < nch; i++) if (w[i] > maxw) maxw = w[i];
+    /* the block: FONTINFO (file offset 66 on) + table of nch+1 {width, dword offset} + face + glyphs;
+     * offsets count from 66 bytes before FONTINFO, as in a .FNT file */
+    int tab = 82, face = tab + 6 * (nch + 1), bits = face + 8, size = bits;
+    for (int i = 0; i < nch; i++) size += ((w[i] + 7) / 8) * h;
+    if (fi) {
+        memset(fi, 0, (size_t)size);
+        put16((char *)fi, 0, 0x80);              /* dfType: device-realized */
+        put16((char *)fi, 2, (uint16_t)(h * 72 / 96)); put16((char *)fi, 4, 96); put16((char *)fi, 6, 96);
+        put16((char *)fi, 8, (uint16_t)tm.tmAscent); put16((char *)fi, 10, (uint16_t)tm.tmInternalLeading);
+        put16((char *)fi, 17, FW_NORMAL); fi[19] = SYMBOL_CHARSET;
+        put16((char *)fi, 22, (uint16_t)h); fi[24] = 0x02 | FF_DECORATIVE;   /* variable pitch */
+        put16((char *)fi, 25, (uint16_t)tm.tmAveCharWidth); put16((char *)fi, 27, (uint16_t)maxw);
+        fi[29] = (uint8_t)first; fi[30] = (uint8_t)last; fi[31] = 0; fi[32] = 0;
+        *(uint32_t *)(fi + 39) = 66 + face;     /* dfFace */
+        *(uint32_t *)(fi + 47) = 66 + bits;     /* dfBitsOffset */
+        *(uint32_t *)(fi + 52) = 0x02;          /* dfFlags: DFF_PROPORTIONAL (marks 3.0 here) */
+        memcpy(fi + face, "Marlett", 8);
+        BITMAPINFO bi = { { sizeof(BITMAPINFOHEADER), maxw, -h, 1, 32 } };
+        uint32_t *px; HBITMAP bm = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void **)&px, NULL, 0);
+        HGDIOBJ ob = SelectObject(dc, bm);
+        SetTextColor(dc, RGB(255, 255, 255)); SetBkColor(dc, 0); SetBkMode(dc, OPAQUE);
+        int off = bits;
+        for (int i = 0; i < nch; i++) {
+            uint8_t *e = fi + tab + 6 * i;
+            put16((char *)e, 0, (uint16_t)w[i]); *(uint32_t *)(e + 2) = 66 + off;
+            RECT r = { 0, 0, maxw, h }; char ch = (char)(first + i);
+            ExtTextOutA(dc, 0, 0, ETO_OPAQUE, &r, &ch, 1, NULL); GdiFlush();
+            for (int x = 0; x < w[i]; x++) for (int y = 0; y < h; y++)
+                if (px[y * maxw + x] & 0xFF) fi[off + (x >> 3) * h + y] |= (uint8_t)(0x80 >> (x & 7));
+            off += ((w[i] + 7) / 8) * h;
+        }
+        put16((char *)(fi + tab + 6 * nch), 0, 0);
+        SelectObject(dc, ob); DeleteObject(bm);
+    }
+    SelectObject(dc, of); DeleteObject(hf); DeleteDC(dc);
+    return size;
+}
+
 typedef struct { uint16_t style, width, color, pad; } ppen_t;
 typedef struct { uint16_t style, hatch, color, bk; uint16_t pat[64]; } pbrush_t;
 static void disp_realize(CPU *c) {
     int16_t style = (int16_t)arg16(c, 6);
     uint32_t in = argfar(c, 4), out = argfar(c, 2);
     int sz = style == 1 ? (int)sizeof(ppen_t) : style == 2 ? (int)sizeof(pbrush_t) : 0;
+    if (style == 3 && getenv("W16_TRACE")) { const uint8_t *lf = (const uint8_t *)farptr(in); fprintf(stderr, "[drv] DISPLAY.RealizeObject font h %d \"%.32s\" out %08X\n", *(const int16_t *)lf, lf + 18, out); }
     if (style > 0 && out && sz) {
         const uint8_t *li = (const uint8_t *)farptr(in);
         if (style == 1) {
@@ -167,6 +231,11 @@ static void disp_realize(CPU *c) {
             for (int i = 0; i < 64; i++) b->pat[i] = b->color;
             if (b->style > 1 && getenv("W16_TRACE")) fprintf(stderr, "[drv] DISPLAY brush style %u: solid\n", b->style);
         }
+    }
+    if (style == 3 && !_stricmp((const char *)farptr(in) + 18, "Marlett")) {   /* a device font (above) */
+        int lfh = *(const int16_t *)farptr(in);
+        sz = marlett_build(lfh, out ? (uint8_t *)farptr(out) : NULL);
+        if (getenv("W16_TRACE")) fprintf(stderr, "[drv] DISPLAY Marlett h %d: device font, %d bytes%s\n", lfh, sz, out ? " written" : "");
     }
     c->ax = (uint16_t)(style > 0 ? sz : 1); c->dx = 0;
     ret_far(c, 18);
@@ -725,6 +794,7 @@ static size_t ne_build(int idx) {
 
 /* Write each stand-in to <sysdir>\<NAME>.DRV (the guest's own tree). */
 void w16_drv_write(const char *sysdir) {
+    snprintf(g_fontdir, sizeof g_fontdir, "%s", sysdir);
     for (int i = 0; i < NDRV; i++) {
         char path[512];
         snprintf(path, sizeof path, "%s\\%s.DRV", sysdir, g_drv[i].name);
