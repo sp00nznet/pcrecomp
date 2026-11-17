@@ -1617,6 +1617,7 @@ typedef struct uobj {
     int icx, icy;
     uint32_t tid;                                 /* the creating thread: its queue gets the window's posted messages */
     int kid;                                      /* a launched child's top-level window, shown here for the taskbar: kid + 1 */
+    rc_t restore;                                 /* a minimized window's rect (wrel) to come back to */
 } uobj_t;
 static uint32_t cur_tid(void) { return g_fs_base ? MEM32(MEM32(g_fs_base + 0x18) + 0x24) : 0; }
 static uobj_t g_u[MAXU];
@@ -1851,6 +1852,17 @@ static uint32_t call_hook(uint32_t proc, uint32_t id, uint32_t code, uint32_t w,
 static void post(uint32_t h, uint32_t m, uint32_t w, uint32_t l) {
     if ((g_qt + 1) % QN == g_qh) { fprintf(stderr, "[user] queue full\n"); return; }
     g_q[g_qt] = (qmsg_t){ h, m, w, l, ntp_clock_ms(), g_ptx, g_pty };
+    g_qt = (g_qt + 1) % QN;
+}
+/* TranslateMessage's WM_CHAR: posted, and NT takes posted messages before the input queue, so it
+ * goes ahead of the keys and clicks still waiting (at the end, a quick "notepad" + Return reached
+ * IDOK with "no" in the box). ponytail: one ring for both, the input found by message number */
+static void post_ahead_of_input(uint32_t h, uint32_t m, uint32_t w, uint32_t l) {
+    int i = g_qh;
+    for (; i != g_qt; i = (i + 1) % QN) if ((g_q[i].m >= 0x100 && g_q[i].m <= 0x109 && g_q[i].m != 0x102) || (g_q[i].m >= 0x200 && g_q[i].m <= 0x20E)) break;
+    if (i == g_qt || (g_qt + 1) % QN == g_qh) { post(h, m, w, l); return; }
+    for (int j = g_qt; j != i; ) { int p = (j - 1 + QN) % QN; g_q[j] = g_q[p]; j = p; }
+    g_q[i] = (qmsg_t){ h, m, w, l, ntp_clock_ms(), g_ptx, g_pty };
     g_qt = (g_qt + 1) % QN;
 }
 typedef struct { uint32_t h, id, elapse, due, proc; int on; } timer_t_;
@@ -2237,22 +2249,48 @@ static int setpos(uobj_t* u, int x, int y, int cx, int cy, uint32_t fl) {
     return 1;
 }
 static void kid_activate(uobj_t* u);
+static void kid_raise_shell(uobj_t* u);
+static uint32_t reg_msg(const uint16_t* name);
+static uint32_t shell_msg(void) { static const uint16_t n[] = { 'S', 'H', 'E', 'L', 'L', 'H', 'O', 'O', 'K', 0 }; return reg_msg(n); }
 static void activate(uobj_t* u) {
     if (g_active == u->h) return;
     if (u->kid) kid_activate(u);                  /* (the taskbar's button for a child's window) */
+    else kid_raise_shell(u);
     uint32_t old = g_active;
     g_active = u->h;
     TRACE("[user] activate %08X (style %08X), was %08X\n", u->h, u->style, old);
     if (W(old)) { send(old, 0x86, 0, 0); send(old, 6, 0, u->h); }
     send(u->h, 0x86, 1, 0);                                           /* WM_NCACTIVATE */
     send(u->h, 6, 1, old);                                            /* WM_ACTIVATE WA_ACTIVE */
+    /* the foreground changed: the taskbar's shell hook hears it (HSHELL_WINDOWACTIVATED), as from
+     * win32k; its buttons show which is active, and a click on the active one minimizes */
+    if (W(g_shellhook) && u->parent == g_desktop && g_active == u->h) post(g_shellhook, shell_msg(), 4, u->h);
     if (g_active == u->h && (!g_focus || !W(g_focus))) {
         g_focus = u->h;
         send(u->h, 7, 0, 0);                                          /* WM_SETFOCUS */
     }
 }
+static void kid_show(uobj_t* u, int cmd);
+#define WS_MINIMIZE 0x20000000u
 static uint32_t show(uobj_t* u, int cmd) {
     int was = (u->style & WS_VISIBLE) != 0;
+    if (u->kid) kid_show(u, cmd);                 /* (a stand-in: the child's window does it) */
+    /* minimized, as win32k: WS_MINIMIZE, the window parked at -32000 (still visible), deactivated;
+     * SW_RESTORE, or showing it again, puts it back. ponytail: no WM_SIZE(SIZE_MINIMIZED), no icon on the desktop */
+    if (!(u->style & WS_CHILD) && (cmd == 2 || cmd == 6 || cmd == 7 || cmd == 11)) {
+        if (!(u->style & WS_MINIMIZE)) {
+            u->restore = u->wrel, u->style |= WS_MINIMIZE;
+            if (!u->kid) setpos(u, -32000, -32000, 0, 0, SWP_NOSIZE | 0x10 | (was ? 0 : SWP_SHOWWINDOW));
+            else u->style |= WS_VISIBLE, wnd_sync(u);
+            if (g_active == u->h) { send(u->h, 0x86, 0, 0); send(u->h, 6, 0, 0); g_active = 0; }
+        }
+        return (uint32_t)was;
+    }
+    if ((u->style & WS_MINIMIZE) && cmd) {
+        u->style &= ~WS_MINIMIZE;
+        if (!u->kid) setpos(u, u->restore.l, u->restore.t, 0, 0, SWP_NOSIZE | 0x10);
+        else wnd_sync(u);
+    }
     if (!cmd) {
         if (!was) return 0;
         send(u->h, 0x18, 0, 0);                                       /* WM_SHOWWINDOW FALSE */
@@ -2356,6 +2394,8 @@ static uint32_t defproc(uobj_t* u, uint32_t m, uint32_t w, uint32_t l) {
     case 0x10: destroy(u); return 0;                                 /* WM_CLOSE */
     case 0x112:                                                      /* WM_SYSCOMMAND */
         if ((w & 0xFFF0) == 0xF060) send(u->h, 0x10, 0, 0);          /* SC_CLOSE */
+        if ((w & 0xFFF0) == 0xF020) show(u, 6);                      /* SC_MINIMIZE */
+        if ((w & 0xFFF0) == 0xF120) show(u, 9);                      /* SC_RESTORE */
         if ((w & 0xFFF0) == 0xF100) keymenu(u, l);                   /* SC_KEYMENU: the menu of that letter */
         return 0;
     case 0x84: {                                                     /* WM_NCHITTEST */
@@ -2798,13 +2838,22 @@ typedef struct { uint8_t virt; uint16_t key, cmd; } accel_t;
 static accel_t* g_acc[MAXU];
 static int g_nacc[MAXU];
 static uint8_t g_keys[256];                       /* live: keys down (VK), and the character each one typed */
-static uint16_t g_keychar[256];
+/* the character each key-down typed, in arrival order: TranslateMessage takes the first one for its
+ * key, so a burst (W then w) does not overwrite a character before its WM_KEYDOWN is translated */
+static struct { uint8_t vk; uint16_t ch; } g_keychar[64];
+static uint32_t g_kch_h, g_kch_t;
 static uint32_t s_translate(uint32_t* a) {       /* NtUserTranslateMessage(MSG*, flags): WM_KEYDOWN -> WM_CHAR */
     uint32_t m = a[0], k = MEM32(m + 8);
     if (MEM32(m + 4) != 0x100) return 0;
-    if (k < 256 && g_keychar[k]) { post(MEM32(m), 0x102, g_keychar[k], MEM32(m + 12)); return 1; }
-    if ((k >= '0' && k <= '9') || k == ' ' || k == 13 || k == 8 || k == 27) post(MEM32(m), 0x102, k, MEM32(m + 12));
-    else if (k >= 'A' && k <= 'Z') post(MEM32(m), 0x102, k + 32, MEM32(m + 12));
+    for (uint32_t i = g_kch_h; i != g_kch_t; i++)
+        if (g_keychar[i % 64].vk == k) {
+            uint16_t ch = g_keychar[i % 64].ch;
+            g_kch_h = i + 1;
+            if (ch) { post_ahead_of_input(MEM32(m), 0x102, ch, MEM32(m + 12)); return 1; }
+            break;
+        }
+    if ((k >= '0' && k <= '9') || k == ' ' || k == 13 || k == 8 || k == 27) post_ahead_of_input(MEM32(m), 0x102, k, MEM32(m + 12));
+    else if (k >= 'A' && k <= 'Z') post_ahead_of_input(MEM32(m), 0x102, k + 32, MEM32(m + 12));
     return 1;
 }
 static uint32_t s_settimer(uint32_t* a) {        /* NtUserSetTimer(hwnd, id, elapse, proc) */
@@ -2870,6 +2919,20 @@ static uint32_t s_check_menu(uint32_t* a) {      /* NtUserCheckMenuItem(hmenu, i
     it->state = (it->state & ~8u) | (a[2] & 8);
     menu_sync(own);
     return old;
+}
+/* NtUserSetMenuDefaultItem(hmenu, item, fByPos): MFS_DEFAULT on that item of this menu only, off on the
+ * others (-1: none). user32's GetMenuDefaultItem reads it client-side; shell32's "invoke the default
+ * verb" (the Start menu's items) found none and gave up */
+static uint32_t s_menu_default(uint32_t* a) {
+    uobj_t* m = U(a[0], W2K_TYPE_MENU);
+    if (!m) return 0;
+    int k = -1;
+    for (int i = 0; i < m->nitems && a[1] != 0xFFFFFFFFu; i++)
+        if (a[2] ? (uint32_t)i == a[1] : m->items[i].id == a[1]) { k = i; break; }
+    if (k < 0 && a[1] != 0xFFFFFFFFu) return 0;
+    for (int i = 0; i < m->nitems; i++) m->items[i].state = (m->items[i].state & ~0x1000u) | (i == k ? 0x1000u : 0);
+    menu_sync(m);
+    return 1;
 }
 static uint32_t s_enable_menu(uint32_t* a) {     /* NtUserEnableMenuItem(hmenu, id, flags) */
     uobj_t* m = U(a[0], W2K_TYPE_MENU), *own = m;
@@ -3549,6 +3612,30 @@ static void user_connect(uint32_t index, uint32_t ci, uint32_t len) {
         MEM16(g_psi + SI_LOGPIXELS) = 96;
         MEM32(g_psi + SI_PREFMASK) = 0;
         MEM32(g_psi + SI_GCLBORDER) = 1;               /* the sizing border setting (AdjustWindowRect: 4-pixel thick frames) */
+        /* the message box reads these client-side (SoftModalMessageBox): the caption and message
+         * fonts (Tahoma 8, here MS Sans Serif as s_font maps it), the message font's average
+         * character size (GetCharDimensions: a-z A-Z) and the button width, 50 dialog units */
+        for (int bold = 0; bold < 2; bold++) {
+            gobj_t* o = gnew(GDI_FONT, 1);
+            if (!o) break;
+            o->height = -11, o->font = fnt_pick("MS Sans Serif", -11);
+            o->bold = bold && (o->font < 0 || g_fnt[o->font].weight < 600);
+            MEM32(g_psi + (bold ? SI_HCAPTIONFONT : SI_HMSGFONT)) = o->h;
+            if (bold || o->font < 0) continue;
+            const fnt_t* F = &g_fnt[o->font];
+            int sum = 0;
+            for (int c = 0; c < 26; c++) sum += fnt_cw(F, 'a' + c) + fnt_cw(F, 'A' + c);
+            MEM32(g_psi + SI_CXMSGFONT) = (uint32_t)((sum / 26 + 1) / 2), MEM32(g_psi + SI_CYMSGFONT) = (uint32_t)F->h;
+            MEM32(g_psi + SI_MAXBTNSIZE) = MEM32(g_psi + SI_CXMSGFONT) * 50 / 4;
+        }
+        /* the buttons' names (MBStrings: szName[16], uID IDOK.., uStr), win32k.sys's message-table
+         * strings 0xB7..0xC1, as win32k copies them in */
+        static const char* const mb[] = { "OK", "Cancel", "&Abort", "&Retry", "&Ignore", "&Yes", "&No", "&Close", "Help", "&Try Again", "&Continue" };
+        for (uint32_t i = 0; i < 11; i++) {
+            uint32_t e = g_psi + SI_MBSTRINGS + 0x28 * i;
+            for (int c = 0; mb[i][c]; c++) MEM16(e + 2 * c) = (uint8_t)mb[i][c];
+            MEM32(e + 0x20) = i + 1, MEM32(e + 0x24) = 0xB7 + i;
+        }
         w2k_monitor(g_disp, g_mon, g_cx, g_cy, g_cy);   /* (the work area: the screen, until the taskbar sets it) */
         /* the desktop window */
         uobj_t* d = unew(W2K_TYPE_WINDOW, WND_SIZE);
@@ -3867,7 +3954,6 @@ static void key_in(uint32_t vk, int down, uint32_t ch, uint32_t keycode, uint32_
     uint32_t alt = (state & Mod1Mask) != 0;
     if (!vk || kid_key(vk, down, ch, keycode, state)) return;
     g_keys[vk] = (uint8_t)down;
-    if (down) g_keychar[vk] = (uint16_t)ch;
     uint32_t lp = 1 | (keycode - 8) << 16 | (down ? 0 : 0xC0000000u);
     uint32_t to = W(g_focus) ? g_focus : g_active ? g_active : g_main;
     if (!rc_empty(&g_popup) && vk != 16 && vk != 17 && vk != 18) { if (down) popup_key(vk); return; }
@@ -3876,6 +3962,11 @@ static void key_in(uint32_t vk, int down, uint32_t ch, uint32_t keycode, uint32_
         return;
     }
     if (vk == 18) return;
+    if (down) {
+        if (g_kch_t - g_kch_h >= 64) g_kch_h++;
+        g_keychar[g_kch_t % 64].vk = (uint8_t)vk, g_keychar[g_kch_t % 64].ch = (uint16_t)ch;
+        g_kch_t++;
+    }
     post(to, down ? 0x100 : 0x101, vk, lp);
 }
 static void x_key(XKeyEvent* e, int down) {
@@ -3905,7 +3996,7 @@ static void x_key(XKeyEvent* e, int down) {
 typedef struct { int l, t, r, b; uint32_t h; uint16_t text[64]; } shm_win_t;
 typedef struct { uint32_t kind, a, b, c, d, e; } shm_ev_t;        /* 1 mouse (type, x, y, button, state), 2 key (vk, down, ch, keycode, state) */
 typedef struct {
-    uint32_t magic, cx, cy, frames, nwin, activate;
+    uint32_t magic, cx, cy, frames, nwin, activate, show_h, show_cmd;
     shm_win_t win[SHM_WINS];
     uint32_t ih, it;
     shm_ev_t ev[SHM_EVS];
@@ -3914,10 +4005,13 @@ typedef struct {
 #define SHM_PX(s) ((uint32_t*)((uint8_t*)(s) + SHM_OFF))
 static shm_hdr_t* g_shm;                          /* this process's own, when it is a child */
 static shm_hdr_t* shm_map(const char* path, int create, int cx, int cy, size_t* len);
-typedef struct { shm_hdr_t* s; size_t len; int pid; uint32_t remote[SHM_WINS], proxy[SHM_WINS]; char path[600]; } kid_t;
+typedef struct { shm_hdr_t* s; size_t len; int pid, shown; uint32_t z, remote[SHM_WINS], proxy[SHM_WINS]; char path[600]; } kid_t;
 #define MAXKID 8
 static kid_t g_kid[MAXKID];
 static int g_kfocus = -1, g_kgrab = -1;
+/* the stacking between the shell's own windows and each child's: the last one clicked or activated
+ * is on top. ponytail: the shell's windows are one layer (all of them, not the screen-sized desktop) */
+static uint32_t g_zseq, g_shell_z;
 int w2kx_child(const char* path) {
     if (!g_live || g_shm) return -1;
     for (int k = 0; k < MAXKID; k++) {
@@ -3926,7 +4020,7 @@ int w2kx_child(const char* path) {
         if (!(c->s = shm_map(path, 1, g_cx, g_cy, &c->len))) { perror(path); return -1; }
         c->s->cx = (uint32_t)g_cx, c->s->cy = (uint32_t)g_cy, c->s->magic = SHM_MAGIC;
         snprintf(c->path, sizeof c->path, "%s", path);
-        c->pid = 0;
+        c->pid = 0, c->z = ++g_zseq;
         return k;
     }
     return -1;
@@ -3947,23 +4041,44 @@ static int shell_topmost_at(int x, int y) {       /* one of the shell's own topm
     }
     return 0;
 }
-static int kid_at(int x, int y) {
-    for (int k = MAXKID - 1; k >= 0; k--) {
+static int shell_window(uobj_t* u) {      /* one of the shell's top-level windows that stacks with the children's */
+    return u->type == W2K_TYPE_WINDOW && !u->kid && u->parent == g_desktop && u->h != g_desktop && !(u->ex & 8)
+        && !(u->wr.l <= 0 && u->wr.t <= 0 && u->wr.r >= g_cx && u->wr.b >= g_cy);
+}
+static int shell_layer(uobj_t* u) { return shell_window(u) && visible(u); }
+static int kid_at(int x, int y) {                 /* the topmost child at the point, unless a shell window is above it there */
+    int best = -1;
+    for (int k = 0; k < MAXKID; k++) {
         shm_hdr_t* s = g_kid[k].s;
-        if (!s || !s->frames) continue;
-        for (int i = (int)s->nwin - 1; i >= 0 && i < SHM_WINS; i--)
-            if (x >= s->win[i].l && x < s->win[i].r && y >= s->win[i].t && y < s->win[i].b) return k;
+        if (!s || !s->frames || (best >= 0 && g_kid[k].z < g_kid[best].z)) continue;
+        for (int i = 0; i < (int)s->nwin && i < SHM_WINS; i++)
+            if (x >= s->win[i].l && x < s->win[i].r && y >= s->win[i].t && y < s->win[i].b) { best = k; break; }
     }
-    return -1;
+    if (best >= 0 && g_shell_z > g_kid[best].z)
+        for (int i = 2; i < MAXU; i++)
+            if (shell_layer(&g_u[i]) && x >= g_u[i].wr.l && x < g_u[i].wr.r && y >= g_u[i].wr.t && y < g_u[i].wr.b) return -1;
+    return best;
 }
 /* the shell's x_mouse: 1 when the event went to a child */
+static void kid_foreground(int k, uint32_t remote);
 static int kid_mouse(int type, int x, int y, unsigned button, unsigned state) {
     if (g_shm) return 0;
     int k = g_kgrab;
     if (k < 0 && !g_capture && !shell_topmost_at(x, y)) k = kid_at(x, y);
     if (type == ButtonPress) g_kfocus = k;        /* (a click on the shell's own takes the keyboard back) */
-    if (k < 0) return 0;
-    if (type == ButtonPress) g_kgrab = k;
+    if (k < 0) {
+        uint32_t pt[2] = { (uint32_t)x, (uint32_t)y };
+        uobj_t* t = type == ButtonPress ? W(top_of(s_frompoint(pt))) : NULL;
+        if (t) kid_raise_shell(t);
+        return 0;
+    }
+    if (type == ButtonPress) {
+        shm_hdr_t* s = g_kid[k].s;
+        g_kgrab = k;
+        for (int i = (int)s->nwin - 1; i >= 0; i--)        /* the window under the click, top first */
+            if (s->win[i].h && x >= s->win[i].l && x < s->win[i].r && y >= s->win[i].t && y < s->win[i].b) { kid_foreground(k, s->win[i].h); break; }
+        g_kid[k].z = ++g_zseq;
+    }
     if (type == ButtonRelease) g_kgrab = -1;
     kid_send(k, 1, (uint32_t)type, (uint32_t)x, (uint32_t)y, button, state);
     return 1;
@@ -3977,9 +4092,29 @@ static void kid_activate(uobj_t* u) {             /* the taskbar's button: the c
     kid_t* c = &g_kid[u->kid - 1];
     if (!c->s) return;
     for (int i = 0; i < SHM_WINS; i++) if (c->proxy[i] == u->h) c->s->activate = c->remote[i];
-    g_kfocus = u->kid - 1;
+    g_kfocus = u->kid - 1, c->z = ++g_zseq;
 }
-static uint32_t shell_msg(void) { static const uint16_t n[] = { 'S', 'H', 'E', 'L', 'L', 'H', 'O', 'O', 'K', 0 }; return reg_msg(n); }
+static void kid_raise_shell(uobj_t* u) { if (shell_window(u)) g_shell_z = ++g_zseq; }   /* (a dialog is activated before it shows) */
+/* a child's window became the foreground (it was clicked, or is new): its stand-in is the active window
+ * here, and the taskbar hears it. The old one is told by posted messages: it may be another thread's
+ * (the closing Run dialog's), and a send from here hung */
+static void kid_foreground(int k, uint32_t remote) {
+    kid_t* c = &g_kid[k];
+    uobj_t* u = NULL;
+    for (int i = 0; i < SHM_WINS && !u; i++) if (c->remote[i] && c->remote[i] == remote) u = W(c->proxy[i]);
+    g_kfocus = k, c->z = ++g_zseq;
+    if (!u || g_active == u->h) return;
+    uint32_t old = g_active;
+    g_active = u->h;
+    if (W(old)) post(old, 0x86, 0, 0), post(old, 6, 0, u->h);
+    if (W(g_shellhook)) post(g_shellhook, shell_msg(), 4, u->h);   /* HSHELL_WINDOWACTIVATED */
+}
+static void kid_show(uobj_t* u, int cmd) {        /* ShowWindow on a stand-in (the taskbar's minimize/restore): the child's window */
+    kid_t* c = &g_kid[u->kid - 1];
+    if (!c->s) return;
+    for (int i = 0; i < SHM_WINS; i++) if (c->proxy[i] == u->h) c->s->show_cmd = (uint32_t)cmd, c->s->show_h = c->remote[i];
+    if ((cmd == 2 || cmd == 6 || cmd == 7 || cmd == 11) && g_kfocus == u->kid - 1) g_kfocus = -1;
+}
 static void kid_proxy_gone(kid_t* c, int i) {
     uobj_t* u = W(c->proxy[i]);
     if (u) {
@@ -4036,6 +4171,7 @@ static void kid_poll(void) {
             fprintf(stderr, "[live] child %d window %08X: stand-in %08X\n", c->pid, w->h, u->h);
             fprintf(stderr, "[live] HSHELL_WINDOWCREATED (message %X) to %08X\n", shell_msg(), g_shellhook);
             if (W(g_shellhook)) post(g_shellhook, shell_msg(), 1, u->h);   /* HSHELL_WINDOWCREATED */
+            if (!c->shown++) kid_foreground(k, w->h);     /* a new program's first window takes the foreground (and the keys) */
         }
     }
 }
@@ -4046,12 +4182,20 @@ static void put_rect(uint32_t* o, const uint32_t* px, rc_t r) {   /* COLORREF to
 }
 /* the shell's presented frame: the children's windows over it, then its own topmost ones again */
 static void kid_compose(uint32_t* o) {
-    int any = 0;
-    for (int k = 0; k < MAXKID; k++) {
+    int any = 0, shell = 0;
+    for (uint32_t last = 0;;) {                   /* the children by z, the shell's windows at their place */
+        int k = -1;
+        for (int j = 0; j < MAXKID; j++)
+            if (g_kid[j].s && g_kid[j].s->frames && g_kid[j].z > last && (k < 0 || g_kid[j].z < g_kid[k].z)) k = j;
+        if (!shell && any && (k < 0 || g_shell_z < g_kid[k].z) && g_shell_z > last) {
+            for (int i = 2; i < MAXU; i++) if (shell_layer(&g_u[i])) put_rect(o, g_screen.px, g_u[i].wr);
+            shell = 1;
+        }
+        if (k < 0) break;
         shm_hdr_t* s = g_kid[k].s;
-        if (!s || !s->frames) continue;
         for (uint32_t i = 0; i < s->nwin && i < SHM_WINS; i++, any = 1)
             put_rect(o, SHM_PX(s), (rc_t){ s->win[i].l, s->win[i].t, s->win[i].r, s->win[i].b });
+        last = g_kid[k].z;
     }
     for (int i = 2; any && i < MAXU; i++) {
         uobj_t* u = &g_u[i];
@@ -4079,7 +4223,12 @@ static void shm_present(void) {
     g_xshown = host_ms();
 }
 static int shm_idle(uint32_t now, uint32_t next) {
-    if (g_shm->activate) { uobj_t* u = W(g_shm->activate); g_shm->activate = 0; if (u) activate(u); }
+    if (g_shm->show_h) { uobj_t* u = W(g_shm->show_h); int cmd = (int)g_shm->show_cmd; g_shm->show_h = 0; if (u) show(u, cmd); }
+    if (g_shm->activate) {                        /* (the taskbar's button on a minimized window restores it) */
+        uobj_t* u = W(g_shm->activate);
+        g_shm->activate = 0;
+        if (u && (u->style & WS_MINIMIZE)) show(u, 9); else if (u) activate(u);
+    }
     if (host_ms() - g_xshown >= 15) shm_present();
     int any = 0;
     for (uint32_t h; (h = g_shm->ih) != __atomic_load_n(&g_shm->it, __ATOMIC_ACQUIRE); any = 1) {
@@ -4113,6 +4262,7 @@ static int live_idle(uint32_t now, uint32_t next) {
         XNextEvent(g_xd, &e);
         switch (e.type) {
         case Expose: g_xshown = 0; break;
+        case MappingNotify: XRefreshKeyboardMapping(&e.xmapping); break;   /* (xdotool rebinds scratch keycodes) */
         case ButtonPress: case ButtonRelease: x_mouse(e.type, e.xbutton.x, e.xbutton.y, e.xbutton.button, e.xbutton.state); break;
         case MotionNotify: x_mouse(e.type, e.xmotion.x, e.xmotion.y, 0, e.xmotion.state); break;
         case KeyPress: case KeyRelease: x_key(&e.xkey, e.type == KeyPress); break;
@@ -4126,6 +4276,8 @@ static int live_idle(uint32_t now, uint32_t next) {
 }
 #else
 static void kid_activate(uobj_t* u) { (void)u; }
+static void kid_show(uobj_t* u, int cmd) { (void)u, (void)cmd; }
+static void kid_raise_shell(uobj_t* u) { (void)u; }
 int w2kx_child(const char* path) { (void)path; return -1; }
 void w2kx_child_pid(int k, int pid) { (void)k, (void)pid; }
 static int live_idle(uint32_t now, uint32_t next) {
@@ -4192,7 +4344,7 @@ void w2kx_install(int cx, int cy, const char* fontdir) {
         { "NtGdiGetTextFaceW", s_textface }, { "NtGdiEnumFontOpen", s_enumfont_open }, { "NtGdiEnumFontChunk", s_enumfont_chunk },
         /* USER */
         { "NtUserRegisterClassExWOW", s_register_class }, { "NtUserGetClassInfo", s_classinfo },
-        { "NtUserCreateWindowEx", s_create_window }, { "NtUserDestroyWindow", s_destroy }, { "NtUserShowWindow", s_show },
+        { "NtUserCreateWindowEx", s_create_window }, { "NtUserDestroyWindow", s_destroy }, { "NtUserShowWindow", s_show }, { "NtUserShowWindowAsync", s_show },
         { "NtUserMoveWindow", s_move }, { "NtUserDeferWindowPos", s_deferpos }, { "NtUserEndDeferWindowPosEx", s_one_u },
         { "NtUserSetParent", s_setparent }, { "NtUserSelectPalette", s_selpal }, { "NtUserSetWindowPos", s_setpos }, { "NtUserInvalidateRect", s_invalidate },
         { "NtUserRedrawWindow", s_redraw }, { "NtUserBeginPaint", s_beginpaint }, { "NtUserEndPaint", s_endpaint },
@@ -4214,7 +4366,7 @@ void w2kx_install(int cx, int cy, const char* fontdir) {
         { "NtUserTranslateAccelerator", s_translate_accel }, { "NtUserSetWindowsHookEx", s_sethook }, { "NtUserUnhookWindowsHookEx", s_unhook },
         { "NtUserCallNextHookEx", s_zero_u }, { "NtUserAttachThreadInput", s_one },   /* (one input state for all threads) */
         { "NtUserSetProp", s_setprop }, { "NtUserRemoveProp", s_removeprop },
-        { "NtUserFillWindow", s_fill_window }, { "NtUserWindowFromPoint", s_frompoint }, { "NtUserChildWindowFromPointEx", s_childfrompoint }, { "NtUserSetMenuDefaultItem", s_one_u }, { "NtUserGetWindowPlacement", s_getplacement },
+        { "NtUserFillWindow", s_fill_window }, { "NtUserWindowFromPoint", s_frompoint }, { "NtUserChildWindowFromPointEx", s_childfrompoint }, { "NtUserSetMenuDefaultItem", s_menu_default }, { "NtUserGetWindowPlacement", s_getplacement },
         { "NtUserSetWindowPlacement", s_setplacement }, { "NtUserSystemParametersInfo", s_spi }, { "NtUserGetKeyState", s_keystate },
         { "NtUserGetAsyncKeyState", s_keystate }, { "NtUserShowCaret", s_showcaret }, { "NtUserHideCaret", s_hidecaret },
         { "NtUserCreateCaret", s_createcaret }, { "NtUserGetKeyboardLayoutList", s_zero_u },

@@ -835,6 +835,25 @@ static uint32_t s_query_info_file(uint32_t* a) {
     case 0x11: MEM32(b) = 0; n = 4; break;                                                /* EaInformation */
     case 0x10: MEM32(b) = 0x0000FFFFu; n = 4; break;                                     /* Mode */
     case 6: *(uint64_t*)(uintptr_t)b = (uint64_t)st.st_ino; n = 8; break;               /* Internal */
+    case 0x23: {                                                                          /* AttributeTag: attributes, no reparse tag */
+        uint8_t t[40];
+        if (len < 8) return ST_INFO_LENGTH;
+        put_basic((uint32_t)(uintptr_t)t, &st);
+        MEM32(b) = *(uint32_t*)(t + 32), MEM32(b + 4) = 0, n = 8;
+        break;
+    }
+    case 0x12: {                                                                          /* All (GetFileInformationByHandle) */
+        if (len < 0x60) return ST_INFO_LENGTH;
+        uint32_t q[5] = { a[0], a[1], b + 40, 24, 5 }, r[5] = { a[0], a[1], b + 64, 8, 6 }, p[5] = { a[0], a[1], b + 80, 8, 0xE };
+        put_basic(b, &st);                                                                /* Basic, Standard, Internal, Ea 0, Access, Position, Mode, Alignment, Name */
+        s_query_info_file(q), s_query_info_file(r), s_query_info_file(p);
+        MEM32(b + 76) = 0x001F01FFu;
+        uint32_t nq[5] = { a[0], a[1], b + 96, len - 96, 9 };
+        uint32_t st9 = s_query_info_file(nq);
+        n = len - 96 >= 4 + MEM32(b + 96) ? 100 + MEM32(b + 96) : len;
+        iosb_set(a[1], st9, n);
+        return st9;
+    }
     default:
         fprintf(stderr, "[ntposix] NtQueryInformationFile class %u\n", cls);
         return ST_INVALID_INFO_CLASS;
@@ -1172,9 +1191,10 @@ static uint32_t s_create_thread(uint32_t* a) {
     memcpy((void*)(uintptr_t)t->teb, (void*)(uintptr_t)g_teb, 0x2000);   /* (the first thread's, USER's thread info with it) */
     memset((void*)(uintptr_t)(t->teb + 0xE10), 0, 64 * 4);              /* but its own TlsSlots, empty (MFC keeps each thread's state there) */
     /* and none of the first thread's per-thread pointers: ReservedForOle (ole32's SOleTlsData:
-     * shared, CoSetState on one thread released another's oleaut32 state) and TlsExpansionSlots */
-    MEM32(t->teb + 0xF80) = 0, MEM32(t->teb + 0xF94) = 0;
-    MEM32(t->teb + 0xF94) = 0;                                           /* TlsExpansionSlots */
+     * shared, CoSetState on one thread released another's oleaut32 state), ReservedForNtRpc (rpcrt4's
+     * thread object: a thread's exit freed the first thread's, a fault after shell32's execute thread),
+     * WinSockData and TlsExpansionSlots */
+    MEM32(t->teb + 0xF80) = 0, MEM32(t->teb + 0xF1C) = 0, MEM32(t->teb + 0xF6C) = 0, MEM32(t->teb + 0xF94) = 0;
     t->tid = g_tid + 4 * ++next;
     MEM32(t->teb + 0x00) = 0xFFFFFFFFu;
     MEM32(t->teb + 0x04) = MEM32(a[6] + 8), MEM32(t->teb + 0x08) = MEM32(a[6] + 12);
@@ -1282,6 +1302,7 @@ static uint32_t s_remove_iocomp(uint32_t* a) {
 
 /* the global atom table (GlobalAddAtom): NtAddAtom/NtFindAtom(Name, Length in bytes, Atom*), NtDeleteAtom(Atom) */
 static char* g_atom[0x1000];
+static uint32_t g_atomref[0x1000];               /* (NT counts references: GlobalDeleteAtom drops one) */
 static uint32_t atom_op(uint32_t* a, int add) {
     char n[512];
     uint32_t len = a[1] / 2 > 255 ? 255 : a[1] / 2;
@@ -1297,6 +1318,7 @@ static uint32_t atom_op(uint32_t* a, int add) {
         if (fr < 0) return ST_NO_MEMORY;
         g_atom[i = fr] = strdup(n);
     }
+    if (add) g_atomref[i]++;
     if (a[2]) MEM16(a[2]) = (uint16_t)(0xC000 + i);
     return 0;
 }
@@ -1304,7 +1326,7 @@ static uint32_t s_add_atom(uint32_t* a) { return atom_op(a, 1); }
 static uint32_t s_find_atom(uint32_t* a) { return atom_op(a, 0); }
 static uint32_t s_delete_atom(uint32_t* a) {
     uint32_t i = (a[0] & 0xFFFF) - 0xC000;
-    if (i < 0x1000) { free(g_atom[i]); g_atom[i] = NULL; }
+    if (i < 0x1000 && g_atom[i] && !--g_atomref[i]) { free(g_atom[i]); g_atom[i] = NULL; }
     return 0;
 }
 

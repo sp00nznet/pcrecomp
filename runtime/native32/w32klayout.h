@@ -58,6 +58,12 @@ enum { W2K_TYPE_FREE, W2K_TYPE_WINDOW, W2K_TYPE_MENU, W2K_TYPE_CURSOR, W2K_TYPE_
 #define SI_CXSYSFONT    0x800
 #define SI_CYSYSFONT    0x804
 #define SI_GCLBORDER    0x7E4  /* gclBorder */
+#define SI_MAXBTNSIZE   0x1D8  /* wMaxBtnSize (the message box's buttons) */
+#define SI_MBSTRINGS    0x1DC  /* MBStrings[11]: 0x28 each */
+#define SI_CXMSGFONT    0x808  /* cxMsgFontChar, cyMsgFontChar */
+#define SI_CYMSGFONT    0x80C
+#define SI_HCAPTIONFONT 0x854
+#define SI_HMSGFONT     0x858
 #define SI_LOGPIXELS    0xE4A
 #define SI_PREFMASK     0xE50
 #define SI_SIZE         0x10000
