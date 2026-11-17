@@ -3068,6 +3068,41 @@ static uint32_t s_threaddesk(uint32_t* a) { (void)a; return 0x128; }
 static uint32_t s_one_u(uint32_t* a) { (void)a; return 1; }
 static uint32_t s_selpal(uint32_t* a) { (void)a; return g_stock[15]; }   /* NtUserSelectPalette: the default palette stays */
 static uint32_t s_zero_u(uint32_t* a) { (void)a; return 0; }
+/* window properties: WND +0x68 ppropList, which user32's GetProp reads client-side (PROPLIST
+ * cEntries, iFirstFree, then PROP { hData, atomKey, fs }). comctl32 keeps each subclassed
+ * window's SUBCLASS_HEADER there: without them it lost the header and restored DefWindowProc
+ * as the "original" procedure (the Start menu's toolbars answered nothing).
+ * ponytail: 32 entries per window, allocated once in the desktop heap (never given back) */
+#define WND_PPROPLIST 0x68
+#define NPROP 32
+static uint32_t s_setprop(uint32_t* a) {         /* NtUserSetProp(hwnd, atom, hData) */
+    uobj_t* u = W(a[0]);
+    if (!u || !(a[1] & 0xFFFF)) return 0;
+    uint32_t pl = MEM32(u->obj + WND_PPROPLIST);
+    if (!pl) pl = desk_alloc(8 + 8 * NPROP), MEM32(pl) = NPROP, MEM32(u->obj + WND_PPROPLIST) = pl;
+    uint32_t n = MEM32(pl + 4), i = 0;
+    while (i < n && MEM16(pl + 8 + 8 * i + 4) != (uint16_t)a[1]) i++;
+    if (i == n) {
+        if (n == NPROP) return 0;
+        MEM32(pl + 4) = n + 1, MEM16(pl + 8 + 8 * i + 4) = (uint16_t)a[1], MEM16(pl + 8 + 8 * i + 6) = 0;
+    }
+    MEM32(pl + 8 + 8 * i) = a[2];
+    return 1;
+}
+static uint32_t s_removeprop(uint32_t* a) {      /* NtUserRemoveProp(hwnd, atom): its hData */
+    uobj_t* u = W(a[0]);
+    uint32_t pl = u ? MEM32(u->obj + WND_PPROPLIST) : 0;
+    if (!pl) return 0;
+    uint32_t n = MEM32(pl + 4);
+    for (uint32_t i = 0; i < n; i++)
+        if (MEM16(pl + 8 + 8 * i + 4) == (uint16_t)a[1]) {
+            uint32_t h = MEM32(pl + 8 + 8 * i);
+            memmove((void*)(uintptr_t)(pl + 8 + 8 * i), (void*)(uintptr_t)(pl + 8 + 8 * (i + 1)), 8 * (n - i - 1));
+            MEM32(pl + 4) = n - 1;
+            return h;
+        }
+    return 0;
+}
 /* NtGdiCreateHalftonePalette(hdc): a true-colour screen has no palette to build; the default
  * one (DeleteObject on a stock object succeeds and does nothing) */
 static uint32_t s_halftone(uint32_t* a) { (void)a; return g_stock[15]; }
@@ -3800,7 +3835,7 @@ void w2kx_install(int cx, int cy, const char* fontdir) {
         { "NtUserModifyUserStartupInfoFlags", s_one_u }, { "NtUserGetDoubleClickTime", s_dblclick },
         { "NtUserRegisterWindowMessage", s_register_msg }, { "NtUserCreateAcceleratorTable", s_accel },
         { "NtUserTranslateAccelerator", s_translate_accel }, { "NtUserSetWindowsHookEx", s_sethook }, { "NtUserUnhookWindowsHookEx", s_unhook },
-        { "NtUserCallNextHookEx", s_zero_u }, { "NtUserSetProp", s_one_u }, { "NtUserRemoveProp", s_zero_u },
+        { "NtUserCallNextHookEx", s_zero_u }, { "NtUserSetProp", s_setprop }, { "NtUserRemoveProp", s_removeprop },
         { "NtUserFillWindow", s_fill_window }, { "NtUserWindowFromPoint", s_frompoint }, { "NtUserGetWindowPlacement", s_getplacement },
         { "NtUserSetWindowPlacement", s_setplacement }, { "NtUserSystemParametersInfo", s_spi }, { "NtUserGetKeyState", s_keystate },
         { "NtUserGetAsyncKeyState", s_keystate }, { "NtUserShowCaret", s_showcaret }, { "NtUserHideCaret", s_hidecaret },
