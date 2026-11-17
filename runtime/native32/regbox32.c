@@ -149,6 +149,11 @@ static HKEY box_of(HKEY k, int* is_box) {
     to_box(nt, rel);
     return RegOpenKeyExW(HKEY_CURRENT_USER, rel, 0, KEY_READ, &h) ? NULL : h;
 }
+/* A box key holding a value named "pcrecomp:whole" is the guest's whole: a value it lacks
+ * is not looked up in the real key (Win98 USER's Control Panel\Colors: missing means its
+ * own defaults, and the host's are Windows 11's). ponytail: the marker shows in an
+ * enumeration of the key. */
+static int box_whole(HKEY bk) { return !RegQueryValueExW(bk, L"pcrecomp:whole", NULL, NULL, NULL, NULL); }
 #define done(x) do { if (tmp) RegCloseKey(tmp); return (x); } while (0)
 
 static wchar_t* wide(const char* s, wchar_t* buf) {
@@ -266,7 +271,7 @@ static LONG WINAPI g_RegQueryValueExW(HKEY k, LPCWSTR v, LPDWORD r, LPDWORD t, L
     LONG e;
     if (!o) return RegQueryValueExW(k, v, r, t, d, n);
     e = RegQueryValueExW(b ? k : o, v, r, t, d, n);
-    if (e == ERROR_FILE_NOT_FOUND) e = RegQueryValueExW(b ? o : k, v, r, t, d, n);
+    if (e == ERROR_FILE_NOT_FOUND && !box_whole(b ? k : o)) e = RegQueryValueExW(b ? o : k, v, r, t, d, n);
     RegCloseKey(o);
     return e;
 }
@@ -276,7 +281,7 @@ static LONG WINAPI g_RegQueryValueExA(HKEY k, LPCSTR v, LPDWORD r, LPDWORD t, LP
     LONG e;
     if (!o) return RegQueryValueExA(k, v, r, t, d, n);
     e = RegQueryValueExA(b ? k : o, v, r, t, d, n);
-    if (e == ERROR_FILE_NOT_FOUND) e = RegQueryValueExA(b ? o : k, v, r, t, d, n);
+    if (e == ERROR_FILE_NOT_FOUND && !box_whole(b ? k : o)) e = RegQueryValueExA(b ? o : k, v, r, t, d, n);
     RegCloseKey(o);
     return e;
 }

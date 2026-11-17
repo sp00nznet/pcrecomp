@@ -645,9 +645,43 @@ static uint16_t seg_of(uint16_t sel) {
     if (i <= RECOMP_NUM_SEG) return i;
     if (!g_alias[i]) {
         uint32_t b = recomp_sel_base(sel);
+        if (native32_w9x_desc(sel)[5] & 0x80)   /* a not-present one's base is no address (GDI 071F's reads 01000000) */
         for (uint16_t n = 1; n <= RECOMP_NUM_SEG; n++)
             if (recomp_sel_base(g_w16_segsel[n]) == b) { g_alias[i] = n; break; }
         if (!g_alias[i]) w16_rebind(sel, 0);
+        if (!g_alias[i]) {
+            /* A not-present selector (a load-on-call or discarded segment) has no arena
+             * to name its owner: a far call into it is the CPU's #NP, which has KRNL386
+             * load it. Its handle is in its module's segment table, though: find the
+             * module through each lifted module's DGROUP (bound, so its arena is known)
+             * and run the lifted segment (gdi32's thunk A5 -> GDI 071F:0AA4, Explorer's
+             * GetTextExtentPoint). ponytail: KRNL386 still has the segment unloaded. */
+            for (int m = 0; m < RECOMP_NUM_MODULES && !g_alias[i]; m++) {
+                const RecompModule *rm = &RECOMP_MODULES[m];
+                uint16_t dg = g_w16_segsel[rm->dgroup];
+                if (!rm->dgroup || dg == (uint16_t)(rm->dgroup << 3 | 7)) continue;
+                uint16_t kd = RECOMP_MODULES[0].dgroup;
+                uint32_t kdg = recomp_sel_base(g_w16_segsel[kd]);
+                uint32_t bm = kdg ? recomp_sel_base(*(uint16_t *)(uintptr_t)(kdg + 0x121E)) : 0;
+                uint32_t tab = kdg ? *(uint32_t *)(uintptr_t)(kdg + 0x1234) : 0;
+                uint32_t a = bm ? *(uint32_t *)(uintptr_t)(bm + tab + ((uint32_t)(dg & ~7) >> 1)) : 0;
+                const uint8_t *ne = a ? (const uint8_t *)(uintptr_t)recomp_sel_base(*(uint16_t *)(uintptr_t)(bm + a + 0x12) | 1) : NULL;
+                if (getenv("W16_NPDBG")) {
+                    fprintf(stderr, "[np] %04X: %s dg %04X a %08X ne %p", sel, rm->name, dg, a, (const void *)ne);
+                    if (ne && ne[0] == 'N') { const uint8_t *st2 = ne + *(uint16_t *)(ne + 0x22); for (int q = 0; q < *(uint16_t *)(ne + 0x1C); q++) fprintf(stderr, " %04X/%04X", *(uint16_t *)(st2 + q * 10 + 8), *(uint16_t *)(st2 + q * 10 + 4)); }
+                    fprintf(stderr, "\n");
+                }
+                if (!ne || ne[0] != 'N' || ne[1] != 'E') continue;
+                uint16_t cnt = *(uint16_t *)(ne + 0x1C);
+                const uint8_t *st = ne + *(uint16_t *)(ne + 0x22);
+                for (uint16_t s = 0; s < cnt && rm->first_seg + s <= rm->last_seg; s++)
+                    if ((*(uint16_t *)(st + s * 10 + 8) | 7) == (sel | 7)) {
+                        g_alias[i] = (uint16_t)(rm->first_seg + s);
+                        if (getenv("W16_TRACE")) fprintf(stderr, "[w16] not-present %04X: %s seg %u (lifted %u)\n", sel, rm->name, s + 1, g_alias[i]);
+                        break;
+                    }
+            }
+        }
     }
     return g_alias[i];
 }

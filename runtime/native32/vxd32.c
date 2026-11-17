@@ -473,6 +473,37 @@ static void ft_stub(void) {
     recomp_lookup(0xBFF7268Du)();
 }
 
+/* The same two stubs already rewritten (shell32's INSTDATA 0x7FD38508/28,
+ * whose file bytes are int3 filler: its thunks arrive patched). Recognized
+ * by their bytes, never run: the table and the target are read out of them.
+ *   QT: 33 C9 8A 4D FC 8B 14 8D <table> B8 <target> FF E0
+ *   FT: 0F B6 D1 8B 14 95 <table> 68 <target> C3 */
+static __declspec(thread) uint32_t t_patched;
+static int is_qt_patched(uint32_t va) {
+    static const uint8_t h[] = { 0x33, 0xC9, 0x8A, 0x4D, 0xFC, 0x8B, 0x14, 0x8D };
+    return va >= 0x10000 && !IsBadReadPtr((void *)(uintptr_t)va, 0x13) && !memcmp((const void *)(uintptr_t)va, h, sizeof h) &&
+           MEM8(va + 12) == 0xB8 && MEM8(va + 17) == 0xFF && MEM8(va + 18) == 0xE0;
+}
+static int is_ft_patched(uint32_t va) {
+    static const uint8_t h[] = { 0x0F, 0xB6, 0xD1, 0x8B, 0x14, 0x95 };
+    return va >= 0x10000 && !IsBadReadPtr((void *)(uintptr_t)va, 0x10) && !memcmp((const void *)(uintptr_t)va, h, sizeof h) &&
+           MEM8(va + 10) == 0x68 && MEM8(va + 15) == 0xC3;
+}
+static void qt_patched(void) {
+    uint32_t va = t_patched;
+    g_ecx = MEM8(g_ebp - 4);
+    g_edx = MEM32(MEM32(va + 8) + g_ecx * 4);
+    g_eax = MEM32(va + 13);
+    if (g_trace > 0 || getenv("W16_TRACE")) fprintf(stderr, "[qt] patched thunk %02X -> %04X:%04X (stub %08X)\n", g_ecx, g_edx >> 16, g_edx & 0xFFFF, va);
+    recomp_lookup(g_eax)();
+}
+static void ft_patched(void) {
+    uint32_t va = t_patched;
+    g_edx = MEM32(MEM32(va + 6) + (g_ecx & 0xFF) * 4);
+    if (g_trace > 0 || getenv("W16_TRACE")) fprintf(stderr, "[ft] patched thunk %02X -> %04X:%04X (stub %08X)\n", g_ecx & 0xFF, g_edx >> 16, g_edx & 0xFFFF, va);
+    recomp_lookup(MEM32(va + 11))();
+}
+
 /* The host's recomp_lookup_manual forwards here: VWIN32's entries above. */
 recomp_func_t native32_w9x_lookup(uint32_t va) {
     if (va == K386_TAG) return krnl386_thunk;
@@ -480,6 +511,8 @@ recomp_func_t native32_w9x_lookup(uint32_t va) {
     if (va == MBOX_TAG) return guest_message_box;
     if (is_qt_stub(va)) { t_qt_stub = va; return qt_stub; }
     if (is_ft_stub(va)) { t_ft_stub = va; return ft_stub; }
+    if (is_qt_patched(va)) { t_patched = va; return qt_patched; }
+    if (is_ft_patched(va)) { t_patched = va; return ft_patched; }
     if ((va & 0xFFFF0000u) == R0F_TAG && (va & 0xFFFF) < 4 * 11 && !(va & 3)) return g_r0f[(va & 0xFFFF) / 4];
     return NULL;
 }
@@ -653,6 +686,7 @@ static uint32_t vwin32_create_thread(const uint32_t* a) {
  * returns here (lifted code returns in C): the frame's next word is where
  * it was going (0xBFF868EC), entered as a jump. */
 #define R0T_READY  0x2C
+#define R0T_SUSP   0x5C      /* suspend count (VWIN32 1A/1B) */
 #define R0T_PARKED 0x30      /* host event: the thread blocked or ended */
 #define R0T_WAKE   0x34
 #define R0T_KILL   0x50      /* a termination block queued by VWIN32 B */      /* host event: what a blocked thread sleeps on */
@@ -753,13 +787,25 @@ static uint32_t vwin32_ready_thread(const uint32_t* a) {
     if (!a[0]) return 0;
     MEM32(a[0] + R0T_READY) = 1;
     if (g_trace > 0) fprintf(stderr, "[vxd] thread %08X ready\n", MEM32(a[0] + R0T_THREAD));
-    start_thread(a[0]);
+    if (!MEM32(a[0] + R0T_SUSP)) start_thread(a[0]);
     return 0;
+}
+
+/* VWIN32 1A (r0) SuspendThread, 1B (r0) ResumeThread: the previous count
+ * (CreateThread with CREATE_SUSPENDED calls 1A on the new thread before it
+ * is readied, 0xBFF868D6). A suspended thread is not started until resumed.
+ * ponytail: a thread already running is only counted, not stopped. */
+static uint32_t vwin32_suspend(const uint32_t* a) { return a[0] ? MEM32(a[0] + R0T_SUSP)++ : (uint32_t)-1; }
+static uint32_t vwin32_resume(const uint32_t* a) {
+    if (!a[0]) return (uint32_t)-1;
+    uint32_t n = MEM32(a[0] + R0T_SUSP);
+    if (n && !--MEM32(a[0] + R0T_SUSP) && MEM32(a[0] + R0T_READY)) start_thread(a[0]);
+    return n;
 }
 
 static uint32_t vwin32_run_thread(const uint32_t* a) {
     uint32_t r0 = a[0];
-    if (!r0 || !MEM32(r0 + R0T_READY)) return 0;
+    if (!r0 || !MEM32(r0 + R0T_READY) || MEM32(r0 + R0T_SUSP)) return 0;
     start_thread(r0);
     w9x_wait((HANDLE)(uintptr_t)MEM32(r0 + R0T_PARKED), INFINITE);
     return 0;
@@ -1085,6 +1131,11 @@ static uint32_t vwin32_queue_to_thread(const uint32_t* a) {
 /* VWIN32 58 (x): a dying thread's +58 handed back (0xBFF89C97, then
  * cleared; the result unread). Nothing on the host holds it. */
 static uint32_t vwin32_release_58(const uint32_t* a) { (void)a; return 0; }
+/* VWIN32 59 (p, delta): InterlockedIncrement/Decrement's form for a CPU
+ * without xadd (kernel32 0xBFF7434E/75, picked at boot through 0xBFFC9E24):
+ * add under the machine lock (one guest thread runs at a time) and return
+ * the new value. */
+static uint32_t vwin32_interlocked_add(const uint32_t* a) { return MEM32(a[0]) += a[1]; }
 
 /* VWIN32 2C (ebx at entry): the end of 0C's +24 thread-termination routine
  * (0xBFF89A4E), handing ring 0 back the ebx it was entered with. Here the
@@ -1144,6 +1195,13 @@ static uint32_t vwin32_thread_starting(const uint32_t* a) { (void)a; return 0; }
  * task; the result is not read. ponytail: unknown meaning (a stack/commit
  * size for the thread?); answered 0 and nothing kept. */
 static uint32_t vwin32_13(const uint32_t* a) { (void)a; return 0; }
+/* VWIN32 11 (psp seg, psp sel, &dos handle, 1, krnl psp, &flags): CreateFileMapping
+ * on a file (0xBFF81C7B), before it keeps the file's DOS handle: read as moving
+ * the handle from the caller's PSP to kernel32's, so the mapping outlives the
+ * caller's own close. DOS handles here are one table for every PSP, so the
+ * handle stays as it is; flags 0 (bit 1 would make kernel32 note a new PSP
+ * selector). ponytail: meaning read off the arguments, not VWIN32. */
+static uint32_t vwin32_11(const uint32_t* a) { MEM32(a[5]) = 0; return 0; }
 
 /* REBOOT (VxD 9) 0 (proc 0xBFFAA127, r0 thread): kernel32's service thread
  * (0xBFF91B3D) hands it its Ctrl+Alt+Del ("close program") callback. The
@@ -1520,6 +1578,12 @@ static uint32_t vwin32_int21(const uint32_t* a) {
                        SET16(g_ecx, t); SET16(g_edx, d); return g_eax; }
         if (al == 1) { DosDateTimeToFileTime((WORD)g_edx, (WORD)g_ecx, &l); LocalFileTimeToFileTime(&l, &ft);
                        if (!SetFileTime(fh, NULL, NULL, &ft)) dos_fail(host_err()); return g_eax; }
+        if (al >= 4 && al <= 7) {   /* DOS 7: 4/5 set/get last access (date only), 6/7 get/set creation (+ SI: 10 ms units, unused) */
+            if (al == 5 || al == 6) { GetFileTime(fh, al == 6 ? &ft : NULL, al == 5 ? &ft : NULL, NULL); FileTimeToLocalFileTime(&ft, &l);
+                                      FileTimeToDosDateTime(&l, &d, &t); SET16(g_ecx, al == 5 ? 0 : t); SET16(g_edx, d); return g_eax; }
+            DosDateTimeToFileTime((WORD)g_edx, al == 4 ? 0 : (WORD)g_ecx, &l); LocalFileTimeToFileTime(&l, &ft);
+            if (!SetFileTime(fh, al == 7 ? &ft : NULL, al == 4 ? &ft : NULL, NULL)) dos_fail(host_err());
+            return g_eax; }
         break; }
     case 0x71:
         switch (al) {
@@ -1654,6 +1718,7 @@ static const vxd_service_t g_services[] = {
     { 0x002A002B, 0, vwin32_thread_done, "VWIN32_ThreadDone" },
     { 0x002A000D, 3, vwin32_queue_to_thread, "VWIN32_QueueToThread" },
     { 0x002A0058, 1, vwin32_release_58, "VWIN32_58_Release" },
+    { 0x002A0059, 2, vwin32_interlocked_add, "VWIN32_InterlockedAdd" },
     { 0x002A002C, 1, vwin32_term_done, "VWIN32_TermDone" },
     { 0x00010020, 1, vmm_20_release, "VMM_20_Release" },
     { 0x0001001F, 2, vmm_1f_sleep, "VMM_1F_Sleep" },
@@ -1672,6 +1737,9 @@ static const vxd_service_t g_services[] = {
     { 0x002A0020, 1, vwin32_fpu_info, "VWIN32_GetCoprocessor" },
     { 0x002A0021, 2, vwin32_set_thread_priority, "VWIN32_SetThreadPriority" },
     { 0x002A0013, 2, vwin32_13, "VWIN32_13" },
+    { 0x002A0011, 6, vwin32_11, "VWIN32_11" },
+    { 0x002A001A, 1, vwin32_suspend, "VWIN32_SuspendThread" },
+    { 0x002A001B, 1, vwin32_resume, "VWIN32_ResumeThread" },
     { 0x00090000, 2, reboot_0, "REBOOT_0" },
     { 0x00090001, 2, reboot_0, "REBOOT_1" },
     { 0x002A0030, 2, vwin32_wait_block_destroy, "VWIN32_DestroyWaitBlock" },
@@ -1705,6 +1773,10 @@ static const vxd_service_t g_services[] = {
     { 0x00010002, 3, vmm_page_decommit, "VMM_PageDecommit" },
     { 0x0001000A, 2, vmm_page_free, "VMM_PageFree" },
     { 0x0001000D, 4, vmm_page_modify, "VMM_PageModifyPermissions" },
+    /* VMM 9 (page, n, 10h): UnmapViewOfFile on a view in a shared arena (0xBFF83DCA, result
+     * not read), before the view's bookkeeping goes. Every view of a mapping is the same
+     * host memory here: nothing to flush or drop. ponytail: read as _PageFlush, not checked */
+    { 0x00010009, 3, vmm_28, "VMM_9 (unmap flush)" },
     { 0x00010028, 0, vmm_28, "VMM_28" },
     { 0x00010003, 1, vmm_pager_register, "VMM_PagerRegister" },
     { 0x002A0001, 10, vwin32_r0_file_entries, "VWIN32_GetRing0FileEntries" },
