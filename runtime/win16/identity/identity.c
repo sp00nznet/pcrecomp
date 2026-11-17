@@ -434,6 +434,28 @@ static void int2f(CPU *c) {
 int native32_w9x_int21(uint32_t eax, uint32_t ecx);
 
 void dos_int21(CPU *c) {
+    /* Exec goes to the guest's own int 21h hook when it set one: KRNL386's
+     * WinExec (seg2 2A68) builds an exec block and does int 21h 4B00, and
+     * KRNL386's handler (set with 2521h) turns it into LoadModule (which is
+     * where a PE goes to kernel32's CreateProcess). A 4Bh it chains back
+     * lands here again and goes to the host (no DOS VM).
+     * ponytail: only 4Bh takes the hook; every other AH is answered here
+     * as before (the hook's file-handle work would replace ours). */
+    static int in_hook;
+    if (c->ah == 0x4B && !in_hook && g_vec[0x21] && (uint16_t)(g_vec[0x21] >> 16) != host_sel()) {
+        void dispatch_far(CPU *cpu, uint16_t sel, uint16_t off);
+        in_hook = 1;
+        static uint16_t seg_of(uint16_t sel);
+        uint16_t sel = (uint16_t)(g_vec[0x21] >> 16), sp0;
+        push16(c, c->flags); push16(c, host_sel()); push16(c, 0);   /* the handler's iret pops these */
+        sp0 = c->sp;
+        dispatch_far(c, sel, (uint16_t)g_vec[0x21]);
+        /* its dispatch `ret`s into the AH's handler (seg1 8624), as under w16_farcall */
+        while (c->sp < sp0)
+            if (!recomp_dispatch_lookup(c, seg_of(sel), c->ret_ip)) w16_stop("int 21h hook ret into, seg:off", seg_of(sel), c->ret_ip);
+        in_hook = 0;
+        return;
+    }
     switch (c->ah) {
     case 0x25: g_vec[c->al] = (uint32_t)c->ds << 16 | c->dx; ok(c); return;
     case 0x35:   /* never set: the host's own handler for that vector */
