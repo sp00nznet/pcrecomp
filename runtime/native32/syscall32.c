@@ -816,6 +816,13 @@ static uint32_t ovr_create_section(uint32_t* a) {
             fprintf(stderr, "[guard] %ls: host network/device/volume DLL: not mapped\n", path);
             return 0xC0000022u;
         }
+        /* the host's code page converters (c_is2022, c_g18030, c_gsm7, c_iscii: Nls\CodePage
+         * names kernel32 loads when charmap enumerates code pages); refused, the code page
+         * is not installed */
+        if (leaf && !_wcsnicmp(leaf + 1, L"c_", 2)) {
+            fprintf(stderr, "[guard] %ls: a host code page DLL: not mapped\n", path);
+            return 0xC0000022u;
+        }
         if (host_com_server(path)) {
             fprintf(stderr, "[guard] %ls: a host COM server or applet: not mapped\n", path);
             return 0xC0000022u;                                              /* STATUS_ACCESS_DENIED */

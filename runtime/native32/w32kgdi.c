@@ -148,6 +148,12 @@ uint32_t native32_gdi_handle(uint32_t h) {
         AT32(attr, 0x18) = AT32(attr, 0x1C) = GetTextColor(d);
         attr[0x38] = (uint8_t)GetROP2(d);
         attr[0x39] = (uint8_t)GetBkMode(d);
+        /* lBkMode, lFillMode, lStretchBltMode: what gdi32's Get* read; its TextOut batch entry
+         * takes the background mode from +0x4C (left 0, it batched TRANSPARENT: timedate's
+         * calendar drew today's date white on white) */
+        AT32(attr, 0x4C) = (uint32_t)GetBkMode(d);
+        AT32(attr, 0x50) = (uint32_t)GetPolyFillMode(d);
+        AT32(attr, 0x54) = (uint32_t)GetStretchBltMode(d);
         AT32(attr, 0x3C) = (uint32_t)p.x;
         AT32(attr, 0x40) = (uint32_t)p.y;
         AT32(attr, 0x78) = AT32(attr, 0x7C) = GetTextAlign(d);
@@ -407,15 +413,18 @@ static uint32_t s_equalrgn(uint32_t* a) { return EqualRgn((HRGN)(uintptr_t)HOST(
  * CreatePolyPolygonRgn (the first argument its fill mode; a folder window's
  * band edges) */
 static uint32_t s_polypolydraw(uint32_t* a) {
-    HDC dc = (HDC)(uintptr_t)HOST(a[0]);
+    /* the DC's attributes first (its ROP2, pen, brush): timedate's clock draws and erases its
+     * hands with Polygon under its own ROP2; on the bare host DC they left cyan trails.
+     * fn 6's first argument is a fill mode */
+    HDC h = a[4] == 6 ? NULL : dc(a[0]);
     const POINT* p = (const POINT*)(uintptr_t)a[1];
     const DWORD* c = (const DWORD*)(uintptr_t)a[2];
     switch (a[4]) {
-    case 1: { INT n[64]; uint32_t k = a[3] < 64 ? a[3] : 64; for (uint32_t i = 0; i < k; i++) n[i] = (INT)c[i]; return PolyPolygon(dc, p, n, (int)k); }
-    case 2: return PolyPolyline(dc, p, c, a[3]);
-    case 3: return PolyBezier(dc, p, c[0]);
-    case 4: return PolylineTo(dc, p, c[0]);
-    case 5: return PolyBezierTo(dc, p, c[0]);
+    case 1: { INT n[64]; uint32_t k = a[3] < 64 ? a[3] : 64; for (uint32_t i = 0; i < k; i++) n[i] = (INT)c[i]; return PolyPolygon(h, p, n, (int)k); }
+    case 2: return PolyPolyline(h, p, c, a[3]);
+    case 3: return PolyBezier(h, p, c[0]);
+    case 4: { BOOL r = PolylineTo(h, p, c[0]); dc_back(a[0]); return r; }
+    case 5: { BOOL r = PolyBezierTo(h, p, c[0]); dc_back(a[0]); return r; }
     case 6: { INT n[64]; uint32_t k = a[3] < 64 ? a[3] : 64; for (uint32_t i = 0; i < k; i++) n[i] = (INT)c[i]; return GUEST(CreatePolyPolygonRgn(p, n, (int)k, (int)a[0])); }
     }
     return 0;

@@ -2108,3 +2108,22 @@ recomp_func_t native32_shim(const char* name) {     /* a built-in shim, by name 
         if (!strcmp(g_builtin[i].name, name)) return g_builtin[i].fn;
     return NULL;
 }
+
+/* PCRECOMP_MUTE with Windows' own winmm lifted: no audio device is ever opened.
+ * The lifted winmm would load the host's drivers (wdmaud) on its first device
+ * call; under the mute it reports no devices and refuses every open
+ * (MMSYSERR_NODRIVER), so a program like Sound Recorder runs without one. */
+static void mm_none0(void) { g_eax = 0; g_esp += 4; }
+static void mm_nodrv5(void) { g_eax = 6; g_esp += 4 + 20; }
+static void mm_nodrv6(void) { g_eax = 6; g_esp += 4 + 24; }
+void native32_mute_winmm(void) {
+    static const char* none[] = { "waveOutGetNumDevs", "waveInGetNumDevs", "midiOutGetNumDevs",
+                                  "midiInGetNumDevs", "mixerGetNumDevs", "auxGetNumDevs" };
+    static const char* open5[] = { "midiOutOpen", "midiInOpen", "mixerOpen" };
+    uint32_t w = native32_module("winmm.dll"), va;
+    if (!w || !getenv("PCRECOMP_MUTE")) return;
+    for (int i = 0; i < 6; i++) if ((va = native32_export(w, none[i]))) native32_replace(va, mm_none0);
+    for (int i = 0; i < 3; i++) if ((va = native32_export(w, open5[i]))) native32_replace(va, mm_nodrv5);
+    if ((va = native32_export(w, "waveOutOpen"))) native32_replace(va, mm_nodrv6);
+    if ((va = native32_export(w, "waveInOpen"))) native32_replace(va, mm_nodrv6);
+}

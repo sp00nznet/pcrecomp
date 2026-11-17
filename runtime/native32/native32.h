@@ -157,6 +157,7 @@ void mach_reacquire(int n);
  * A lifted ntdll's RtlUnwind ends in NtContinue, a resume the lift cannot
  * make; native32_nt_boot puts the seh32 one in its place. */
 void native32_replace(uint32_t va, recomp_func_t fn);
+void native32_mute_winmm(void);   /* PCRECOMP_MUTE: a lifted winmm opens no device */
 recomp_func_t native32_shim(const char* name);
 
 /* Name for a native address ("kernel32.dll!CreateFileA"), or NULL. */
