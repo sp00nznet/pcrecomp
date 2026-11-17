@@ -247,7 +247,7 @@ static void disp_exttextout(CPU *c) {
         }
         width += adv;
     }
-    if (getenv("W16_TRACE")) fprintf(stderr, "[drv] DISPLAY.ExtTextOut %d,%d n %d \"%.*s\" -> %dx%d v%d\n", x0, y0, count, n, str, width, h, v3 ? 3 : 2);
+    if (getenv("W16_TRACE")) fprintf(stderr, "[drv] DISPLAY.ExtTextOut %d,%d n %d \"%.*s\" -> %dx%d v%d fg %04X bg %04X%s\n", x0, y0, count, n, str, width, h, v3 ? 3 : 2, fg, bg, opaque ? " opaque" : "");
     c->ax = (uint16_t)width; c->dx = (uint16_t)h; ret_far(c, 40);
 }
 
@@ -503,7 +503,8 @@ static void ms_inquire(CPU *c) {
  * 1 moved, 2 left down, 4 left up), bx/cx = x/y scaled to 0..FFFFh, dx = buttons.
  * A host thread takes the machine for each call, as an interrupt would.
  * "key C@T": C pressed and released through KEYBOARD.Enable's proc (al vk, ah 80h up, bl scan).
- * ponytail: left clicks and unshifted keys, on a private 8 KB 16-bit stack. */
+ * "text STR@T": each character, shifted ones between a Shift press and release.
+ * ponytail: left clicks and Shift-only keys, on a private 8 KB 16-bit stack. */
 static uint32_t g_ms_proc;
 int w16_call(CPU *r);
 void mach_enter(void);
@@ -517,18 +518,31 @@ static DWORD WINAPI input_thread(LPVOID unused) {
         int x, y; double t; char k;
         extern int g_fncount;
         if (getenv("W16_FN_INPUT") || getenv("W16_ARGS")) g_fncount = 1;   /* W16_FN's function trace from the first event on */
-        if (sscanf(s, " key %c@%lf", &k, &t) == 2) {   /* a press and release through KEYBOARD.Enable's proc */
+        char txt[128] = "";
+        if (sscanf(s, " key %c@%lf", &k, &t) == 2) txt[0] = k, txt[1] = 0;
+        else if (sscanf(s, " text %127[^@]@%lf", txt, &t) != 2) txt[0] = 0;
+        if (txt[0]) {   /* "key C@T" one key, "text STR@T" each character; shifted ones under a Shift press */
             while (GetTickCount() - t0 < (DWORD)(t * 1000)) Sleep(20);
-            UINT vk = k == '+' ? VK_ADD : k == '*' ? VK_MULTIPLY : k == '-' ? VK_SUBTRACT : k == '/' ? VK_DIVIDE : LOBYTE(VkKeyScanA(k));   /* ponytail: unshifted keys only */
-            for (int up = 0; up < 2 && g_kb_proc; up++) {
-                mach_enter();
-                CPU r; cpu_init(&r);
-                r.ax = (uint16_t)(vk | (up ? 0x8000 : 0)); r.bx = (uint16_t)MapVirtualKeyA(vk, 0);   /* al vk, ah 80h on release; bl scan */
-                r.cs = (uint16_t)(g_kb_proc >> 16); r.ip = (uint16_t)g_kb_proc; r.ss = r.ds = r.es = ss; r.sp = 0x1FF0;
-                fprintf(stderr, "[drv] key event %04X (%c) to %04X:%04X\n", r.ax, k, r.cs, r.ip);
-                if (!w16_call(&r)) fprintf(stderr, "[drv] keyboard proc %04X:%04X is no lifted function\n", r.cs, r.ip);
-                mach_leave();
-                Sleep(60);
+            for (const char *p = txt; *p; p++) {
+                k = *p;
+                SHORT sc = VkKeyScanA(k);
+                UINT vk = k == '+' && !p[1] && p == txt ? VK_ADD : k == '*' && p == txt && !p[1] ? VK_MULTIPLY
+                        : k == '-' && p == txt && !p[1] ? VK_SUBTRACT : k == '/' && p == txt && !p[1] ? VK_DIVIDE : LOBYTE(sc);
+                int shift = vk == LOBYTE(sc) && (HIBYTE(sc) & 1);   /* ponytail: Shift only, no Ctrl/Alt combinations */
+                uint16_t ev[4], n = 0;
+                if (shift) ev[n++] = VK_SHIFT;
+                ev[n++] = (uint16_t)vk; ev[n++] = (uint16_t)(vk | 0x8000);
+                if (shift) ev[n++] = VK_SHIFT | 0x8000;
+                for (int i = 0; i < n && g_kb_proc; i++) {
+                    mach_enter();
+                    CPU r; cpu_init(&r);
+                    r.ax = ev[i]; r.bx = (uint16_t)MapVirtualKeyA(ev[i] & 0xFF, 0);   /* al vk, ah 80h on release; bl scan */
+                    r.cs = (uint16_t)(g_kb_proc >> 16); r.ip = (uint16_t)g_kb_proc; r.ss = r.ds = r.es = ss; r.sp = 0x1FF0;
+                    fprintf(stderr, "[drv] key event %04X (%c) to %04X:%04X\n", r.ax, k, r.cs, r.ip);
+                    if (!w16_call(&r)) fprintf(stderr, "[drv] keyboard proc %04X:%04X is no lifted function\n", r.cs, r.ip);
+                    mach_leave();
+                    Sleep(60);
+                }
             }
             continue;
         }
