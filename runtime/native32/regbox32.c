@@ -119,8 +119,40 @@ static int from_box(const wchar_t* nt, wchar_t* real) {
  * Any other class the box has is answered by the box alone too.
  * ponytail: Interface/TypeLib and classes only the host has still read the host's. */
 static int g_guest_classes;
+/* Keys the guest's OS owns: never the host's, whether or not the box has them
+ * (the host's Shell Folders name C:\Users\<user>\OneDrive\..., its Environment
+ * and ProfileList the host's user). The box's seed answers them (win2000
+ * tools/profile.py); a key the box lacks is simply absent. */
+static int os_owned_key(const wchar_t* nt) {
+    static const wchar_t* cu[] = { L"\\SOFTWARE\\MICROSOFT\\WINDOWS\\CURRENTVERSION\\EXPLORER",
+        L"\\SOFTWARE\\MICROSOFT\\WINDOWS\\CURRENTVERSION\\POLICIES", L"\\ENVIRONMENT", L"\\VOLATILE ENVIRONMENT" };
+    static const wchar_t* lm[] = { L"\\MICROSOFT\\WINDOWS\\CURRENTVERSION\\EXPLORER\\SHELL FOLDERS",
+        L"\\MICROSOFT\\WINDOWS\\CURRENTVERSION\\EXPLORER\\USER SHELL FOLDERS",
+        L"\\MICROSOFT\\WINDOWS\\CURRENTVERSION\\POLICIES", L"\\MICROSOFT\\WINDOWS NT\\CURRENTVERSION\\PROFILELIST" };
+    wchar_t u[KP];
+    const wchar_t* r;
+    size_t cn = wcslen(g_cu_nt), n;
+    wcsncpy(u, nt, KP - 1), u[KP - 1] = 0, _wcsupr(u);
+    if (!_wcsnicmp(nt, g_cu_nt, cn) && (!nt[cn] || nt[cn] == L'\\')) {
+        for (int i = 0; i < 4; i++)
+            if (n = wcslen(cu[i]), !wcsncmp(u + cn, cu[i], n) && (!u[cn + n] || u[cn + n] == L'\\')) return 1;
+        return 0;
+    }
+    if (!wcsncmp(u, L"\\REGISTRY\\MACHINE\\SYSTEM\\", 25) && (r = wcsstr(u, L"\\CONTROL\\SESSION MANAGER\\ENVIRONMENT")))
+        return !r[36] || r[36] == L'\\';
+    if (wcsncmp(u, L"\\REGISTRY\\MACHINE\\SOFTWARE", 26)) return 0;
+    r = u + 26;
+    if (!wcsncmp(r, L"\\WOW6432NODE", 12)) r += 12;
+    for (int i = 0; i < 4; i++)
+        if (n = wcslen(lm[i]), !wcsncmp(r, lm[i], n) && (!r[n] || r[n] == L'\\')) return 1;
+    return 0;
+}
 static int host_class_key(const wchar_t* nt) {
     wchar_t u[KP];
+    if (os_owned_key(nt)) {
+        if (getenv("PCRECOMP_REGTRACE")) fprintf(stderr, "[regbox] %ls: the guest OS's key, not the host's\n", nt);
+        return 1;
+    }
     /* Keys a box that has them answers whole, never merged with the host's:
      * the time zones (Windows 11's Display values are @tzres.dll MUI strings)
      * and Control Panel's namespace (Windows 11's items were nameless folders) */
@@ -361,6 +393,30 @@ static LONG WINAPI g_RegQueryValueA(HKEY k, LPCSTR sub, LPSTR d, PLONG n) {
     if (h != k) RegCloseKey(h);
     return r;
 }
+/* RegGetValue (kernelbase's own open, not boxed otherwise: the host's shell32
+ * read Shell Folders through it): opened through the box, the box's value first */
+static LONG get_value(HKEY k, const void* sub, const void* v, DWORD f, LPDWORD t, PVOID d, LPDWORD n, int w) {
+    HKEY h = k, o;
+    int b;
+    LONG r = 0;
+    DWORD n0 = n ? *n : 0;
+    if (sub && (w ? *(const wchar_t*)sub : *(const char*)sub))
+        r = w ? g_RegOpenKeyExW(k, sub, 0, KEY_READ, &h) : g_RegOpenKeyExA(k, sub, 0, KEY_READ, &h);
+    if (r) return r;
+#define GV(x) (w ? RegGetValueW(x, NULL, v, f, t, d, n) : RegGetValueA(x, NULL, v, f, t, d, n))
+    o = box_of(h, &b);
+    if (!o) r = GV(h);
+    else {
+        r = GV(b ? h : o);
+        if (r == ERROR_FILE_NOT_FOUND) { if (n) *n = n0; r = GV(b ? o : h); }
+        RegCloseKey(o);
+    }
+#undef GV
+    if (h != k) RegCloseKey(h);
+    return r;
+}
+static LONG WINAPI g_RegGetValueW(HKEY k, LPCWSTR sub, LPCWSTR v, DWORD f, LPDWORD t, PVOID d, LPDWORD n) { return get_value(k, sub, v, f, t, d, n, 1); }
+static LONG WINAPI g_RegGetValueA(HKEY k, LPCSTR sub, LPCSTR v, DWORD f, LPDWORD t, PVOID d, LPDWORD n) { return get_value(k, sub, v, f, t, d, n, 0); }
 
 /* Refused outright: whole-hive and security operations. */
 #define DENY(n, ...) static LONG WINAPI deny##n(__VA_ARGS__) { fprintf(stderr, "[regbox] refused a registry write\n"); return ERROR_ACCESS_DENIED; }
@@ -485,6 +541,7 @@ static const struct { const char* name; void* fn; } g_fns[] = {
     { "RegDeleteKeyW", g_RegDeleteKeyW }, { "RegDeleteKeyA", g_RegDeleteKeyA },
     { "RegQueryValueExW", g_RegQueryValueExW }, { "RegQueryValueExA", g_RegQueryValueExA },
     { "RegQueryValueW", g_RegQueryValueW }, { "RegQueryValueA", g_RegQueryValueA },
+    { "RegGetValueW", g_RegGetValueW }, { "RegGetValueA", g_RegGetValueA },
     { "RegUnLoadKeyW", deny2 }, { "RegUnLoadKeyA", deny2 }, { "RegOverridePredefKey", deny2 },
     { "RegDeleteTreeW", deny2 }, { "RegDeleteTreeA", deny2 },
     { "RegLoadKeyW", deny3 }, { "RegLoadKeyA", deny3 }, { "RegRestoreKeyW", deny3 }, { "RegRestoreKeyA", deny3 },
