@@ -319,6 +319,7 @@ class Lifter:
         self._push_ret = None
         self._push_jmp = False     # the last stack op was a push (see lift_instruction)
         self._branch_targets = None   # generate.py: this body's branch targets
+        self._body_addrs = None       # generate.py: this body's instruction addresses
         # Call targets whose first instruction is `pop r32` (see the call case).
         self.call_pop = call_pop or set()
         self._patched_imm = None
@@ -1683,7 +1684,11 @@ class Lifter:
 
         elif m == 'jmp':
             target = insn.get_branch_target()
-            if W9X and target and self._push_ret is not None and self.lifted and target in self.lifted:
+            # (Only a jump that leaves the body: shell32 7FCBD2BD `push [ebp+20h]; push IID; push IID;
+            # jmp 7FCBD0E6` jumps back into its own GetUIObjectOf with arguments, and the GUIDs are
+            # "functions" only because shell32's data sits in .text.)
+            if (W9X and target and self._push_ret is not None and self.lifted and target in self.lifted
+                    and target not in (self._labels if self._labels is not None else self._body_addrs or ())):
                 lines.append(f"RECOMP_ITAIL(0x{target:08X}u); RECOMP_ITAIL(0x{self._push_ret:08X}u); return; /* a call returning to the pushed function */ {comment}")
             elif target and self._labels is not None and target not in self._labels:
                 # Branch leaves the function: a tail call, or a run of bytes that

@@ -414,6 +414,7 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
     targets |= push_ret
 
     lifter._branch_targets = targets | leaders
+    lifter._body_addrs = addrs
     skip = False
     for k, insn in enumerate(instructions):
         if label_all or insn.address in leaders:
