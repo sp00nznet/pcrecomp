@@ -108,6 +108,7 @@ class Instruction:
     fpu: bytes = b''        # x87: ESC opcode + modrm/disp (emulator INTs normalised)
     emu87_int: int = 0      # 0x34..0x3D when this came from an 8087-emulator INT
     addr32: bool = False    # 67h: 32-bit addressing -- ECX/ESI/EDI for loops and strings
+    op32: bool = False      # operand size 32 (66h in 16-bit code; the default in a use32 segment)
 
     # For overlay calls (INT 3Fh)
     overlay_num: int = -1
@@ -175,7 +176,10 @@ def _near(target: int) -> int:
 class Decoder:
     """16-bit x86 instruction decoder."""
 
-    def __init__(self, data: bytes, base_offset: int = 0):
+    def __init__(self, data: bytes, base_offset: int = 0, use32: bool = False):
+        # use32: a 32-bit code segment (NE segment flag 2000h, Win9x GDI's DIB engine):
+        # 32-bit operands and addresses by default, 66h/67h select 16-bit ones
+        self.use32 = use32
         self.data = data
         self.base = base_offset
         self.pos = 0
@@ -350,8 +354,8 @@ class Decoder:
         # Handle prefixes
         seg_override = ''
         rep_prefix = ''
-        self.op32 = False     # 0x66 operand-size override (16<->32)
-        self.addr32 = False   # 0x67 address-size override
+        self.op32 = self.use32     # 0x66 operand-size override (16<->32)
+        self.addr32 = self.use32   # 0x67 address-size override
         while self.pos < len(self.data):
             b = self.data[self.pos]
             if b == 0x26:
@@ -374,9 +378,9 @@ class Decoder:
                 # perfectly ordinary movs that follow it.
                 seg_override = 'gs'; self.pos += 1
             elif b == 0x66:
-                self.op32 = True; self.pos += 1   # operand-size override
+                self.op32 = not self.use32; self.pos += 1   # operand-size override
             elif b == 0x67:
-                self.addr32 = True; self.pos += 1  # address-size override
+                self.addr32 = not self.use32; self.pos += 1  # address-size override
             elif b == 0x9B and self.pos + 1 < len(self.data)                     and 0xD8 <= self.data[self.pos + 1] <= 0xDF:
                 # FWAIT immediately before an ESC opcode is part of that x87
                 # instruction, and IDA marks the head on the 0x9B. Decoding it
@@ -438,11 +442,11 @@ class Decoder:
         elif opcode in (0x06, 0x0E, 0x16, 0x1E):
             sreg = (opcode >> 3) & 3
             inst.mnemonic = 'push'
-            inst.op1 = Operand(type=OpType.SREG, reg=sreg, size=2)
+            inst.op1 = Operand(type=OpType.SREG, reg=sreg, size=4 if self.op32 else 2)
         elif opcode in (0x07, 0x17, 0x1F):
             sreg = (opcode >> 3) & 3
             inst.mnemonic = 'pop'
-            inst.op1 = Operand(type=OpType.SREG, reg=sreg, size=2)
+            inst.op1 = Operand(type=OpType.SREG, reg=sreg, size=4 if self.op32 else 2)
 
         # DAA, DAS, AAA, AAS
         elif opcode == 0x27: inst.mnemonic = 'daa'
@@ -604,7 +608,7 @@ class Decoder:
 
         # CALL far ptr
         elif opcode == 0x9A:
-            off = self._u16()
+            off = self._u32() if self.op32 else self._u16()
             seg = self._u16()
             inst.mnemonic = 'call'
             inst.op1 = Operand(type=OpType.FAR, disp=off, far_seg=seg, size=4)
@@ -867,21 +871,21 @@ class Decoder:
 
         # CALL rel16
         elif opcode == 0xE8:
-            rel = self._s16()
+            rel = self._s32() if self.op32 else self._s16()
             target = _near(self.pos + rel)
             inst.mnemonic = 'call'
             inst.op1 = Operand(type=OpType.REL16, disp=target, size=2)
 
         # JMP rel16
         elif opcode == 0xE9:
-            rel = self._s16()
+            rel = self._s32() if self.op32 else self._s16()
             target = _near(self.pos + rel)
             inst.mnemonic = 'jmp'
             inst.op1 = Operand(type=OpType.REL16, disp=target, size=2)
 
         # JMP far
         elif opcode == 0xEA:
-            off = self._u16()
+            off = self._u32() if self.op32 else self._u16()
             seg = self._u16()
             inst.mnemonic = 'jmp'
             inst.op1 = Operand(type=OpType.FAR, disp=off, far_seg=seg, size=4)
@@ -965,7 +969,7 @@ class Decoder:
             CC = ['o','no','b','ae','e','ne','be','a','s','ns','p','np','l','ge','le','g']
             if 0x80 <= op2b <= 0x8F:          # Jcc near rel16
                 inst.mnemonic = 'j' + CC[op2b - 0x80]
-                rel = self._s16()
+                rel = self._s32() if self.op32 else self._s16()
                 inst.op1 = Operand(type=OpType.REL16, disp=_near(self.pos + rel), size=2)
             elif 0x90 <= op2b <= 0x9F:        # SETcc r/m8
                 _, rm, _ = self._decode_modrm(False, seg_override)
@@ -1023,6 +1027,8 @@ class Decoder:
             elif op2b in (0xA0, 0xA1, 0xA8, 0xA9):   # PUSH/POP FS/GS
                 inst.mnemonic = 'push' if op2b in (0xA0, 0xA8) else 'pop'
                 inst.op1 = Operand(type=OpType.SREG, reg=(4 if op2b in (0xA0, 0xA1) else 5), size=2)
+            elif op2b in (0x0B, 0xFF):        # UD2 / UD0 (386: no ModRM): #UD on purpose
+                inst.mnemonic = 'ud'          # (KRNL386 BootStrap raises it to continue in its handler)
             elif op2b == 0x1F:                # multi-byte NOP
                 self._decode_modrm(True, seg_override)
                 inst.mnemonic = 'nop'
@@ -1038,6 +1044,7 @@ class Decoder:
         inst.length = self.pos - start
         inst.raw = self.data[start:self.pos]
         inst.addr32 = self.addr32
+        inst.op32 = self.op32
         return inst
 
     def decode_range(self, start: int, end: int):

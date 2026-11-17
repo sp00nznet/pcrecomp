@@ -26,6 +26,32 @@ versions follow [SemVer](https://semver.org/).
   forwarder exports, SEH filter and `__finally` seeds, `__except` resume
   points, delay-load seeds, `RECOMP_FLAGS_IN`; disasm32 vtable, IAT and MFC
   message-map fixes; `tools/pe/rebase.py` drops bound import directories.
+- Win16 identity (Win98): VWIN32 01 sets CurTDB (DGROUP:122C) to the next task;
+  dispatch_far follows a retf that popped another frame (a task switch-in);
+  int 31h 0300 for 2F/160B; the SHELL VxD's PM API (19h/1Bh/1Ch); kernel32
+  int 21h 60h. ne_parse resolves moveable internal references (segment FFh)
+  through the entry table.
+- ne_lift, Win16 identity mode: jumps into another lifted function are
+  trampolined (each function is a wrapper loop around its body, NAME__b;
+  RECOMP_TAIL leaves the next body in cpu->tail), so a 16-bit loop that spans
+  function blocks no longer grows the C stack. Normal mode output unchanged.
+- native32 (Windows 2000 user32/gdi32 layer): window extra bytes kept in the
+  WND (+0x98), GWL_STYLE/GWL_EXSTYLE forwarded (WS_VISIBLE stays the host's),
+  caret, ShowScrollBar, GetKeyState, ScrollWindowEx, TranslateAccelerator,
+  clipboard queries, CallTwoParam 0x5E, CallOneParam 0x1E, GetDoubleClickTime,
+  GetKeyboardLayoutList, GetThreadDesktop; GDI: StretchDIBits, GetCharSet,
+  GetCharWidthW, outline metrics, GetDCDword / GetAndSetDCDword (map mode),
+  font enumeration in Windows 2000's ENUMFONTDATAW, batched TextOut, the
+  viewport origin and map mode from DC_ATTR, the display DEVCAPS gdi32
+  caches, stock objects never forgotten, guest GDI handles in wParam mapped
+  back for a guest procedure. cmdline32: `__p___argv/argc/wargv`, `_acmdln`,
+  `_wcmdln`. Windows 2000's wordpad and mspaint pixel-identical on it.
+- disasm32: a vtable in code names a function even inside a body decoded
+  from data (riched20 0x2070B6E0); a loaded address right after another
+  body's instruction is not this body's data (0x207108C0); nothing starts
+  inside the IAT (wordpad.exe 11,250 -> 8 unimplemented); the MFC
+  message-map rule checks the AFX_MSGMAP_ENTRY fields (mspaint 584 -> 22).
+
 - lift32: a test that `jcxz` (67 E3) leaves the function as `jecxz` does
   (`tools/lift/test_loop_exits.py`; #191, by [@pete-jorgensen](https://github.com/pete-jorgensen)).
 - `tools/pe/vb6.py`: a Visual Basic 5/6 exe's VB header (`VB5!`): native code

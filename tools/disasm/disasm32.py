@@ -273,7 +273,18 @@ def table_entries(read, table, is_code, limit=256):
 
 
 # `jmp dword ptr [idx*4 + table]`; with a base register the disp is not the table
-_TABLE_JMP = re.compile(r"dword ptr \[\w+\*4 \+ (0x[0-9a-f]+)\]$")
+# `jmp [reg*4 + table]`, or a byte-offset index into a cs: table (user32
+# 0xBFF55BDA, hand-written: `jmp cs:[edx + 0xBFF55BE1]`, capstone prints
+# the displacement negative; so it does for a table above 2 GB, comctl32 0xBFE9B664
+# `jmp [eax*4 - 0x401644B9]`).
+_TABLE_JMP = re.compile(r"dword ptr (?:\[\w+\*4 ([+-]) (0x[0-9a-f]+)\]|cs:\[\w+ ([+-]) (0x[0-9a-f]+)\])$")
+
+
+def table_va(m):
+    """The table address a _TABLE_JMP match names."""
+    sign, v = (m.group(1), m.group(2)) if m.group(2) else (m.group(3), m.group(4))
+    v = int(v, 16)
+    return (-v if sign == '-' else v) & 0xFFFFFFFF
 
 
 # Bytes decoded per linear scan inside a function. Straight-line code longer
@@ -425,10 +436,14 @@ class Disassembler:
         # A NUL-terminated ASCII name is not code either: `push offset
         # "GetLayout"` ahead of GetProcAddress (mspaint), whose bytes decode
         # and ran on into the vtable after it.
+        # Unless it opens with two register pushes ('P'..'W'): `push ebx;
+        # push esi; push edi; push 0` reads "SVWj\0" (MPREXE's thread start
+        # 0x005010C3, pushed ahead of its CreateThread wrapper).
         n = 0
         while n < len(data) and 0x20 <= data[n] < 0x7F:
             n += 1
-        if n >= 4 and n < len(data) and data[n] == 0:
+        pushes = len(data) >= 2 and 0x50 <= data[0] <= 0x57 and 0x50 <= data[1] <= 0x57
+        if n >= 4 and n < len(data) and data[n] == 0 and not pushes:
             return False
         n = 0      # and UTF-16 (L"gdi32.dll" right after it)
         while 2 * n + 1 < len(data) and 0x20 <= data[2 * n] < 0x7F and data[2 * n + 1] == 0:
@@ -1461,7 +1476,7 @@ def drop_mid_instruction_entries(read_va, functions, code_start, code_end,
                         t = int(op, 16) if op.startswith("0x") else None
                         sw = _TABLE_JMP.search(op) if m == "jmp" and t is None else None
                         if sw:
-                            for arm in table_entries(read_va, int(sw.group(1), 16),
+                            for arm in table_entries(read_va, table_va(sw),
                                                      lambda v: code_start <= v < code_end):
                                 if addr <= arm < code_end and arm - addr < REACH \
                                    and arm not in seen:
@@ -1610,7 +1625,7 @@ def close_dispatch_targets(read_va, functions, code_start, code_end,
                 if sw:
                     # A switch arm past a clamp is a dispatch too (MFC's
                     # 0x004A4B70, cut by chunks it calls, lost 0x004A5025).
-                    for t in table_entries(read_va, int(sw.group(1), 16),
+                    for t in table_entries(read_va, table_va(sw),
                                            lambda v: code_start <= v < code_end):
                         if not (addr <= t < end or t in functions or (inside and inside(t))):
                             wanted.add(t)

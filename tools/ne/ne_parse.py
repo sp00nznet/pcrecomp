@@ -79,6 +79,11 @@ class Segment:
         return bool(self.flags & 0x0100)
 
     @property
+    def use32(self) -> bool:
+        """A 32-bit code segment (NS32BIT): Win9x GDI's DIB-engine segments."""
+        return bool(self.flags & 0x2000) and self.is_code
+
+    @property
     def is_discardable(self) -> bool:
         return bool(self.flags & 0x1000)
 
@@ -324,6 +329,21 @@ def parse_ne(filepath: str) -> NEHeader:
                     seg.relocations.append(rel)
                     reloc_off += 8
 
+        # A fixup may run past the file's bytes into the zero-filled tail the
+        # loader allocates (GDI seg 43 ends in `jmp far KERNEL.630` whose
+        # selector word is beyond file_size 2433h, alloc 2435h). Pad the data
+        # with that tail so the instruction decodes and the fixup lands.
+        if seg.data and seg.relocations:
+            sizes = {0: 1, 2: 2, 3: 4, 5: 2, 11: 6, 13: 4}
+            need = max(r.offset + sizes.get(r.src_type, 2) for r in seg.relocations)
+            alloc = seg.alloc_size or 0x10000
+            if len(seg.data) < need <= alloc:
+                seg.data = seg.data + bytes(need - len(seg.data))
+        # So may an instruction: GDI seg 11 ends in `ret 2` whose last 00 is
+        # past file_size 2EEEh (alloc 2EEFh). A code segment gets its tail.
+        if seg.data and seg.is_code and seg.alloc_size and len(seg.data) < seg.alloc_size:
+            seg.data = seg.data + bytes(seg.alloc_size - len(seg.data))
+
         ne.segments.append(seg)
 
     # --- Module Reference Table + Import Name Table ---
@@ -398,6 +418,16 @@ def parse_ne(filepath: str) -> NEHeader:
                 ne.entries.append(entry)
                 ordinal += 1
                 pos += 3
+
+    # A moveable internal reference (segment FFh) names an entry ordinal:
+    # resolve it to that entry's segment:offset, which is what the loader
+    # patches in (Win98 SHELL.DLL has 47).
+    by_ord = {e.ordinal: e for e in ne.entries}
+    for s in ne.segments:
+        for r in s.relocations:
+            e = by_ord.get(getattr(r, 'ordinal', 0)) if (r.flags & 3) == 0 and r.target_seg == 0xFF else None
+            if e and 1 <= e.segment < 0xFE:
+                r.target_seg, r.target_off = e.segment, e.offset
 
     # Map names to entries
     all_names = ne.resident_names + ne.nonresident_names

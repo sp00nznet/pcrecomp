@@ -135,7 +135,30 @@ typedef struct CPU {
 
     /* Halt flag */
     int halted;
+
+    /* Win16 identity mode: the offset the last near ret or retf popped. A near
+     * call site that pushed another one was returned past (a callee that pops
+     * its return address and returns to its caller's caller, GDI seg 5
+     * AC05/AC24): it returns too. */
+    uint16_t  ret_ip;
+
+    /* Win16 identity mode: the body a tail jump left for its trampoline. */
+    void    (*tail)(struct CPU *);
 } CPU;
+
+/* Identity mode: a jump into another lifted function (a tail jump, a jcc or a
+ * fall-through across a block) must not grow the C stack -- a 16-bit loop that
+ * spans blocks (KRNL386's scheduler, seg1 5F21 -> 73B4 -> 5F57) would overflow
+ * it. ne_lift emits each function as a public wrapper that runs a loop and a
+ * body (NAME__b); a tail jump leaves the next body in cpu->tail and returns.
+ * Every caller -- lifted calls, dispatch, the runtime -- calls the wrapper. */
+#define RECOMP_TAIL(f) { cpu->tail = f##__b; return; }
+static __inline void recomp_tramp(CPU *cpu, void (*f)(CPU *)) {
+    do { cpu->tail = 0; f(cpu); f = cpu->tail; } while (f);
+}
+void w16_retpast(CPU *c, uint16_t ip, const char *fn);   /* identity.c: W16_TRACE logs it */
+#define W16_RETPAST(c, ip) w16_retpast((c), (ip), __func__)
+void w16_retjump(CPU *c, uint16_t seg, uint16_t ip);    /* identity.c: run what a ret-jump returned into */
 
 /* Print the guest call stack. Defined in main.c. */
 void dump_guest_stack(CPU *cpu, int max);
@@ -190,8 +213,27 @@ extern unsigned g_ds_run;
  * at startup. Dynamically allocated selectors (TSXLIB memory alloc) get fresh
  * entries in sel_base. Unmapped selectors point at an isolated guard region.
  */
+/* Identity mode (RECOMP_W16_IDENTITY, a 32-bit host): cpu->mem is 0, so a
+ * flat address is the host address, and a selector's base comes from the
+ * host's descriptor table (native32's LDT on Windows 9x, the one kernel32
+ * writes and MapSL reads), not from cpu->sel_base. Lifted 16-bit code then
+ * shares memory with lifted 32-bit code, as Win9x's USER.EXE and user32 do. */
+#ifdef RECOMP_W16_IDENTITY
+uint32_t recomp_sel_base(uint32_t sel);
+uint32_t recomp_sel_access_base(uint32_t sel);   /* a not-present selector raises #NP first (vxd32.c) */
+/* Linear 0-FFFFh (IVT, BIOS data, what Win98 keeps at 1000h) cannot be
+ * mapped in a Win11 process: those addresses go to a host block instead
+ * (identity.c g_w16_low). */
+extern uint8_t g_w16_low[0x10000];
+static inline uint32_t w16_lin(uint32_t a) { return a < 0x10000u ? (uint32_t)(uintptr_t)(g_w16_low + a) : a; }
+#define W16_SEL_BASE(cpu, sel) ((void)(cpu), recomp_sel_access_base(sel))
+#define W16_LIN(a) w16_lin(a)
+#else
+#define W16_SEL_BASE(cpu, sel) ((cpu)->sel_base[sel])
+#define W16_LIN(a) (a)
+#endif
 static inline uint32_t seg_off(CPU *cpu, uint16_t seg, uint16_t off) {
-    return cpu->sel_base[seg] + off;
+    return W16_LIN(W16_SEL_BASE(cpu, seg) + off);
 }
 
 /* LAR/LSL: protected-mode selector queries the engine uses to validate a far
@@ -202,16 +244,32 @@ static inline uint32_t seg_off(CPU *cpu, uint16_t seg, uint16_t off) {
  * Returns 1 (valid) and fills *out, else 0. cpu_lar reports data-segment access
  * rights (0x9300: present, DPL0, data, writable -- executable bit 0x800 clear);
  * cpu_lsl reports a full 64K segment limit. */
-static inline int cpu_lar(CPU *cpu, uint16_t sel, uint16_t *out) {
+#ifdef RECOMP_W16_IDENTITY
+void w16_raise(CPU *cpu, int n, uint16_t cs, uint16_t ip);   /* identity.c: exception n at cs:ip */
+int recomp_lar32(uint16_t sel, uint32_t* rights);
+int recomp_lsl32(uint16_t sel, uint32_t* limit);
+/* *out is the 32-bit result (lar: rights bits 8-23; lsl: the byte limit);
+ * a 16-bit destination keeps its low word, as on the CPU. */
+static inline int cpu_lar(CPU *cpu, uint16_t sel, uint32_t *out) {
+    (void)cpu;
+    return recomp_lar32(sel, out);
+}
+static inline int cpu_lsl(CPU *cpu, uint16_t sel, uint32_t *out) {
+    (void)cpu;
+    return recomp_lsl32(sel, out);
+}
+#else
+static inline int cpu_lar(CPU *cpu, uint16_t sel, uint32_t *out) {
     if (sel == 0 || cpu->sel_base[sel] == RECOMP_GUARD_BASE) return 0;
     *out = 0x9300;
     return 1;
 }
-static inline int cpu_lsl(CPU *cpu, uint16_t sel, uint16_t *out) {
+static inline int cpu_lsl(CPU *cpu, uint16_t sel, uint32_t *out) {
     if (sel == 0 || cpu->sel_base[sel] == RECOMP_GUARD_BASE) return 0;
     *out = 0xFFFF;
     return 1;
 }
+#endif
 
 /* Not all of the address space is plain memory. A planar VGA in an unchained
  * mode turns one byte address into four pixels, one per plane, so a write there
@@ -332,7 +390,7 @@ static inline void mem_write32(CPU *cpu, uint16_t seg, uint16_t off, uint32_t va
  * a big limit does under 386 Enhanced mode. */
 #define ADDR32(x) ((uint32_t)(x))
 static inline uint8_t mem_read8_32(CPU *cpu, uint16_t seg, uint32_t off) {
-    uint32_t a = cpu->sel_base[seg] + off;
+    uint32_t a = W16_LIN(W16_SEL_BASE(cpu, seg) + off);
 #ifdef RECOMP_MEM_HOOK
     uint8_t v;
     if (recomp_mem_read8(cpu, a, &v)) return v;
@@ -340,7 +398,7 @@ static inline uint8_t mem_read8_32(CPU *cpu, uint16_t seg, uint32_t off) {
     return cpu->mem[a];
 }
 static inline void mem_write8_32(CPU *cpu, uint16_t seg, uint32_t off, uint8_t v) {
-    uint32_t a = cpu->sel_base[seg] + off;
+    uint32_t a = W16_LIN(W16_SEL_BASE(cpu, seg) + off);
 #ifdef RECOMP_MEM_HOOK
     if (recomp_mem_write8(cpu, a, v)) return;
 #endif
@@ -363,12 +421,24 @@ static inline void mem_write32_32(CPU *cpu, uint16_t seg, uint32_t off, uint32_t
 
 /* ── Stack operations ──────────────────────────────────────── */
 
+/* A big (B-bit) stack: KRNL386 switches to a flat 32-bit stack to call
+ * kernel32 (seg001_6500); push/pop then move esp. Checked only when esp's
+ * high half is set, so a 16-bit stack pays one compare. */
+#ifdef RECOMP_W16_IDENTITY
+int w16_ss_big(uint16_t ss);
+#define W16_BIGSTACK(cpu) (((cpu)->esp >> 16) && w16_ss_big((cpu)->ss))
+#else
+#define W16_BIGSTACK(cpu) 0
+#endif
+
 static inline void push16(CPU *cpu, uint16_t val) {
+    if (W16_BIGSTACK(cpu)) { cpu->esp -= 2; mem_write16_32(cpu, cpu->ss, cpu->esp, val); return; }
     cpu->sp -= 2;
     mem_write16(cpu, cpu->ss, cpu->sp, val);
 }
 
 static inline uint16_t pop16(CPU *cpu) {
+    if (W16_BIGSTACK(cpu)) { uint16_t v = mem_read16_32(cpu, cpu->ss, cpu->esp); cpu->esp += 2; return v; }
     uint16_t val = mem_read16(cpu, cpu->ss, cpu->sp);
     cpu->sp += 2;
     return val;
@@ -376,11 +446,13 @@ static inline uint16_t pop16(CPU *cpu) {
 
 /* 32-bit stack ops (operand-size 0x66 prefix). SP is still 16-bit. */
 static inline void push32(CPU *cpu, uint32_t val) {
+    if (W16_BIGSTACK(cpu)) { cpu->esp -= 4; mem_write32_32(cpu, cpu->ss, cpu->esp, val); return; }
     cpu->sp -= 4;
     mem_write32(cpu, cpu->ss, cpu->sp, val);
 }
 
 static inline uint32_t pop32(CPU *cpu) {
+    if (W16_BIGSTACK(cpu)) { uint32_t v = mem_read32_32(cpu, cpu->ss, cpu->esp); cpu->esp += 4; return v; }
     uint32_t val = mem_read32(cpu, cpu->ss, cpu->sp);
     cpu->sp += 4;
     return val;

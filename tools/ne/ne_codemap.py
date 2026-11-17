@@ -69,6 +69,25 @@ _PROLOGUES = [re.compile(p, re.S) for p in (
 )]
 
 
+def _retf_target(recent):
+    """The offset of a `push <sel>; push <off>; retf` far jump, when <off> is
+    an immediate: `push imm16`, or `mov r16, imm16; push r16` (not o32)."""
+    if len(recent) < 3 or recent[-2].mnemonic != 'push' or recent[-2].raw[:1] == b'\x66':
+        return None
+    p = recent[-2].op1
+    if p is None:
+        return None
+    if p.type in (OpType.IMM8, OpType.IMM16):
+        return p.disp & 0xFFFF
+    if p.type != OpType.REG16:
+        return None
+    for i in recent[-3:-6:-1]:   # the nearest write to that register
+        o1, o2 = i.op1, i.op2
+        if o1 is not None and o1.type == OpType.REG16 and o1.reg == p.reg:
+            return o2.disp & 0xFFFF if i.mnemonic == 'mov' and o2 is not None and o2.type == OpType.IMM16 else None
+    return None
+
+
 class _Bad(Exception):
     """A speculative seed reached something that is not code."""
 
@@ -77,7 +96,7 @@ class _Seg:
     def __init__(self, seg):
         self.seg = seg
         self.data = seg.data
-        self.dec = Decoder(seg.data, base_offset=0)
+        self.dec = Decoder(seg.data, base_offset=0, use32=getattr(seg, 'use32', False))
         self.owner = bytearray(len(seg.data))   # 0 free, 1 code, 2 data
         self.heads = {}                          # off -> length
         self.funcs = set()
@@ -113,6 +132,22 @@ class CodeMap:
             return None
         return inst
 
+    def _pops_ret(self, s, off):
+        """A callee that opens `pop r16` and, on its straight line, `jmp r16`
+        through the same register: it returns by jumping to the popped address."""
+        i0 = self._decode(s, off)
+        if not (i0 and i0.mnemonic == 'pop' and i0.op1 is not None and i0.op1.type == OpType.REG16):
+            return False
+        p = off + i0.length
+        for _ in range(16):
+            i = self._decode(s, p)
+            if i is None or i.mnemonic in _STOP or i.mnemonic == 'call':
+                return False
+            if i.mnemonic == 'jmp':
+                return i.op1 is not None and i.op1.type == OpType.REG16 and i.op1.reg == i0.op1.reg
+            p += i.length
+        return False
+
     def _far_target(self, s, off, inst):
         """(seg, off) a direct far call/jmp at `off` resolves to, or None."""
         r = s.relocs.get(off + 1)
@@ -143,15 +178,22 @@ class CodeMap:
         # The bound: `cmp idx, N` on the register that ends up in bx, found by
         # walking back through `shl/add bx` and `mov bx, reg`. A cmp on anything
         # else (or one older than bx's last load) bounds some other test.
-        idx = 3
+        idx, scaled = 3, False
         for prev in reversed(recent[-12:-1]):
             o1, o2 = prev.op1, prev.op2
+            if prev.mnemonic == 'xchg' and o2 is not None and o2.type == OpType.REG16 and o2.reg == idx:
+                o1, o2 = o2, o1               # `xchg ax, bx` (93h) names bx second: USER seg 3 48F4
             if o1 is None or o1.type != OpType.REG16 or o1.reg != idx:
                 continue
             if prev.mnemonic == 'cmp':
                 if o2 is not None and o2.type in (OpType.IMM8, OpType.IMM16):
                     n = (o2.disp & 0xFFFF) + 1
+                    if not scaled:            # a byte offset, not an index: USER seg 4 4789
+                        n = (n + 1) // 2      # (`shr ax, 3; cmp ax, 32h; xchg bx, ax`)
                 break
+            if prev.mnemonic in ('shl', 'sal') or (prev.mnemonic == 'add' and o2 is not None
+                                                   and o2.type == OpType.REG16 and o2.reg == idx):
+                scaled = True
             if prev.mnemonic in ('mov', 'xchg') and o2 is not None and o2.type == OpType.REG16:
                 idx = o2.reg
             elif prev.mnemonic not in ('shl', 'sal', 'add', 'dec', 'inc', 'sub', 'and', 'test'):
@@ -198,6 +240,13 @@ class CodeMap:
                 continue
             if is_func:
                 log.append(('w' if is_func == 2 else 'f', s, off, 0))
+                # A call says code starts here; a jump table's extent was a
+                # guess (GDI seg 1: a table guessed over 75A0..7607 hid the
+                # function at 7600 that 7860 calls). The call wins.
+                e = off
+                while is_func is True and e < len(s.data) and s.owner[e] == 2:
+                    e += 1
+                s.owner[off:e] = bytes(e - off)
             recent = list(ctx[0]) if ctx else []   # the path here: jump-table guards
             if len(ctx) > 1 and off not in s.heads:
                 # A jump-table entry is a guess at the table's extent: one that
@@ -232,6 +281,11 @@ class CodeMap:
                         raise _Bad('branch out of segment', sidx, off)
                     if m == 'call':
                         work.append((sidx, t, True))
+                        if self._pops_ret(s, t):
+                            # the callee jmps back through dispatch_near (USER
+                            # seg 54 9BE0: `pop bx; ...; jmp bx`): the return
+                            # address is a function of its own
+                            work.append((sidx, nxt, True))
                     else:
                         work.append((sidx, t, False, recent[-12:]))
                         log.append(('j', s, t, 0))
@@ -254,6 +308,14 @@ class CodeMap:
                                 for t in sorted({t for _, t in tgts}, reverse=True))
                     break
                 elif m in _STOP or (m == 'int' and op is not None and (op.disp & 0xFF) == 0x20):
+                    # `push <selector>; push imm16; retf` is a far jump whose
+                    # selector is data (KRNL386 BootStrap: push [259A]; push
+                    # B711h; retf into segment 1 as it reloaded it): the
+                    # offset is taken to be in this segment.
+                    # (or `push ax; mov ax, imm16; push ax; retf`).
+                    t = _retf_target(recent) if m == 'retf' and op is None else None
+                    if t is not None and t < len(s.data):
+                        work.append((sidx, t, True))
                     break
                 off = nxt
 

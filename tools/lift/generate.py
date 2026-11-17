@@ -30,7 +30,7 @@ import lift32
 from pe_analyze import analyze_pe, build_iat_map
 from lift32 import Lifter
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32
-from capstone.x86 import X86_OP_IMM, X86_OP_MEM
+from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_REG_CS
 from disasm32 import decode
 
 
@@ -332,6 +332,13 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
     lines.append('')
 
     lifter._flag_state = None
+    lifter._seg_fn = lifter.seg_function(instructions)   # LIFT32_W9X: reloads ds/es
+    # LIFT32_W9X: every function addresses its stack through ss's base, not
+    # only those that load ss: kernel32's 16->32 dispatcher (0xBFF71903) runs
+    # its first pushes on the 16-bit caller's stack and loads ss in a block
+    # catalogued as another function. ponytail: one add per stack access;
+    # SS_BASE is 0 on a flat stack.
+    lifter._ss_fn = lift32.W9X
 
     # An indirect jump inside a function (a switch/jump table) can compute a
     # target that lands on ANY instruction in it, so when one is present every
@@ -380,8 +387,34 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
                 and cur.mnemonic not in ('int3', 'hlt')):
             gaps[k] = cur.end_address
     leaders = set(leaders) | {a for a in gaps.values() if a in addrs}
+    # A gap's landing is a join point too: the textually preceding instruction is not the one
+    # the goto comes from. Win98 shell32 0x7FCB4EB4 `cmp eax,0x32` jumped past an overlapping
+    # decode (`clc; xor dh,...` at 4EB5) to the `je` at 4EB7, which then tested TEST_Z of that
+    # xor's static state: a .lnk file's pidl was classed "Directory".
+    targets |= {a for a in gaps.values() if a in addrs}
     body_addrs = addrs
 
+    # LIFT32_W9X: `push L; ...; ret` with L in this body is a jump to L, not a
+    # return (Windows 98 kernel32 runs an inline finally that way: 0xBFF850F4
+    # pushes 0xBFF85117 and the block ends in a bare `ret`). A lifted `ret`
+    # returns from the C function, so it left the frame on the stack and the
+    # service thread's APC loop overflowed its stack. Each such L gets a label,
+    # and every bare `ret` here first checks the stack top against them.
+    push_ret, push_ret_far = set(), set()
+    if lift32.W9X:
+        for k, i in enumerate(instructions):
+            nxt_i = instructions[k + 1] if k + 1 < len(instructions) else None
+            if i.mnemonic == 'push' and not (nxt_i is not None and nxt_i.mnemonic == 'jmp'):
+                t = i.get_branch_target()
+                if t is not None and t in addrs and t != i.end_address:
+                    push_ret.add(t)
+                elif t is not None and lifter.lifted is not None and t in lifter.lifted and t > va:
+                    push_ret_far.add(t)   # the catalog made the continuation its own entry
+    leaders = set(leaders) | push_ret
+    targets |= push_ret
+
+    lifter._branch_targets = targets | leaders
+    lifter._body_addrs = addrs
     skip = False
     for k, insn in enumerate(instructions):
         if label_all or insn.address in leaders:
@@ -409,7 +442,17 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
         tgt = insn.get_branch_target() if insn.is_jump else None
         if tgt is not None and tgt <= insn.address and tgt in addrs:
             lines.append('    RECOMP_BACKEDGE();')
+        if (push_ret or push_ret_far) and insn.mnemonic in ('ret', 'retn') and not insn.op_str:
+            for t in sorted(push_ret):
+                lines.append(f'    if (MEM32(esp) == 0x{t:08X}u) {{ esp += 4; goto L_{t:08X}; }} /* push 0x{t:08X}; ret */')
+            for t in sorted(push_ret_far):
+                lines.append(f'    if (MEM32(esp) == 0x{t:08X}u) {{ esp += 4; RECOMP_FLAGS_OUT(); RECOMP_ITAIL(0x{t:08X}u); return; }} /* push 0x{t:08X}; ret */')
         for line in lifter.lift_instruction(insn):
+            if lifter._ss_fn:   # pushes and pops through ss's base (recomp_types.h PUSH32_SS)
+                line = (line.replace('PUSH32(esp,', 'PUSH32_SS(esp,').replace('PUSH16(esp,', 'PUSH16_SS(esp,')
+                        .replace('POP32(esp,', 'POP32_SS(esp,').replace('POP32_VAL(esp)', 'POP32_SS_VAL(esp)')
+                        .replace('POP16_VAL(esp)', 'POP16_SS_VAL(esp)')
+                        .replace('RECOMP_CALL(', 'RECOMP_CALL_SS(').replace('RECOMP_ICALL(', 'RECOMP_ICALL_SS('))
             lines.append(f'    {line}')
         if k in gaps:
             t = gaps[k]
@@ -515,7 +558,9 @@ def _jump_table(ins, code, code_start, lo, hi, limit=1024, read=None):
     if not ins.operands or ins.operands[0].type != X86_OP_MEM:
         return []
     mem = ins.operands[0].mem
-    if mem.base or not mem.index or mem.scale != 4:
+    # or a byte-offset index into a cs: table (user32 0xBFF55BDA: `jmp cs:[edx + table]`)
+    cs_bytes = mem.segment == X86_REG_CS and mem.base and not mem.index
+    if not cs_bytes and (mem.base or not mem.index or mem.scale != 4):
         return []
     disp = mem.disp & 0xFFFFFFFF
     if read is not None and not 0 <= disp - code_start < len(code):

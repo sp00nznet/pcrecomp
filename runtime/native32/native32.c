@@ -31,6 +31,7 @@ xmm_t     g_xmm[8];
 uint32_t  g_mxcsr = 0x1F80;
 uint32_t  g_fs_base, g_gs_base;
 ptrdiff_t g_mem_base = 0;
+uint32_t g_es_base, g_cs_base, g_ds_base, g_ss_base;   /* Win9x segment bases (vxd32.c sets them) */
 uint32_t  g_cur_func;
 uint32_t  g_icall_trace[ICALL_TRACE_SIZE], g_icall_from[ICALL_TRACE_SIZE];
 uint32_t  g_icall_trace_idx, g_icall_count;
@@ -41,6 +42,10 @@ uint32_t native32_fs_mirror_lo, native32_fs_mirror_hi;
 
 typedef struct {
     uint32_t eax, ecx, edx, esp, ebx, esi, edi, ebp, fs, cur;
+    /* segment state is per thread too: Win9x guests (kernel32's threads,
+     * KRNL386's TIB) each run on their own fs/ss, and a wait switches threads */
+    uint16_t seg[6];
+    uint32_t gs, es_b, cs_b, ds_b, ss_b;
     double   st[8];
     int      fp_top;
     uint16_t fpu_cw;
@@ -53,6 +58,8 @@ static void regs_save(regs_t* r) {
     r->eax = g_eax; r->ecx = g_ecx; r->edx = g_edx; r->esp = g_esp;
     r->ebx = g_ebx; r->esi = g_esi; r->edi = g_edi; r->ebp = g_ebp;
     r->fs = g_fs_base; r->cur = g_cur_func;
+    r->seg[0] = g_seg_cs; r->seg[1] = g_seg_ds; r->seg[2] = g_seg_es; r->seg[3] = g_seg_fs; r->seg[4] = g_seg_gs; r->seg[5] = g_seg_ss;
+    r->gs = g_gs_base; r->es_b = g_es_base; r->cs_b = g_cs_base; r->ds_b = g_ds_base; r->ss_b = g_ss_base;
     memcpy(r->st, g_st, sizeof g_st); r->fp_top = g_fp_top; r->fpu_cw = g_fpu_cw;
     memcpy(r->mm, g_mm, sizeof g_mm);
     memcpy(r->xmm, g_xmm, sizeof g_xmm); r->mxcsr = g_mxcsr;
@@ -62,6 +69,8 @@ static void regs_load(const regs_t* r) {
     g_eax = r->eax; g_ecx = r->ecx; g_edx = r->edx; g_esp = r->esp;
     g_ebx = r->ebx; g_esi = r->esi; g_edi = r->edi; g_ebp = r->ebp;
     g_fs_base = r->fs; g_cur_func = r->cur;
+    g_seg_cs = r->seg[0]; g_seg_ds = r->seg[1]; g_seg_es = r->seg[2]; g_seg_fs = r->seg[3]; g_seg_gs = r->seg[4]; g_seg_ss = r->seg[5];
+    g_gs_base = r->gs; g_es_base = r->es_b; g_cs_base = r->cs_b; g_ds_base = r->ds_b; g_ss_base = r->ss_b;
     memcpy(g_st, r->st, sizeof g_st); g_fp_top = r->fp_top; g_fpu_cw = r->fpu_cw;
     memcpy(g_mm, r->mm, sizeof g_mm);
     memcpy(g_xmm, r->xmm, sizeof g_xmm); g_mxcsr = r->mxcsr;
@@ -174,6 +183,7 @@ static void WINAPI tslot_free(void* v) {
     InterlockedExchange(&g_tid[k], 0);
 }
 
+extern void (*native32_on_enter)(void);
 void mach_enter(void) {
     if (!t_slot) {
         t_slot = tslot(GetCurrentThreadId(), 1) + 1;
@@ -203,15 +213,17 @@ void mach_enter(void) {
          * read off the end of it. With 64 bytes of headroom it did, and faulted
          * whenever ASLR left the next page unmapped: the selftest crashed on
          * about two runs in three. */
+        regs_save(&m->r);                 /* selectors as they stood (a new thread used to inherit them) */
         m->r.esp = lo + GUEST_STACK - BRIDGE_SLOTS * 4 - 64;
         m->r.fs = make_tib(lo, lo + GUEST_STACK);
         m->r.fpu_cw = 0x027F;
         m->r.mxcsr = 0x1F80;              /* exceptions masked, round to nearest */
         TlsSetValue(g_mach_tls, m);
     }
-    if (m->depth++ == 0) regs_load(&m->r);
+    if (m->depth++ == 0) { regs_load(&m->r); if (native32_on_enter) native32_on_enter(); }
 }
 
+void (*native32_on_enter)(void);
 void mach_leave(void) {
     mstate* m = (mstate*)TlsGetValue(g_mach_tls);
     if (--m->depth == 0) regs_save(&m->r);
@@ -235,6 +247,20 @@ void mach_reacquire(int n) {
     mach_enter();                                  /* reloads this thread's registers */
     for (int i = 1; i < n; i++) EnterCriticalSection(&g_mach);
     ((mstate*)TlsGetValue(g_mach_tls))->depth = n;
+}
+
+DWORD native32_wait(HANDLE h, DWORD ms) {
+    mstate* m = (mstate*)TlsGetValue(g_mach_tls);
+    int depth = m ? m->depth : 0;
+    regs_t r;
+    uint32_t fk = g_flag_k, fa = g_flag_a, fb = g_flag_b, fc = g_flag_cf;
+    regs_save(&r);
+    for (int i = 0; i < depth; i++) LeaveCriticalSection(&g_mach);
+    DWORD rc = WaitForSingleObject(h, ms);
+    for (int i = 0; i < depth; i++) EnterCriticalSection(&g_mach);
+    regs_load(&r);
+    g_flag_k = fk; g_flag_a = fa; g_flag_b = fb; g_flag_cf = fc;
+    return rc;
 }
 
 /* RECOMP_BACKEDGE's hand-over: let another guest thread take the machine.
@@ -368,6 +394,10 @@ int native32_in_guest(uint32_t va) {
  * variable, so it never launches again; the standard handles are passed on
  * explicitly, so a harness reading a pipe sees the child's output. */
 #define NATIVE32_HELD_ENV "NATIVE32_HELD"
+static uint32_t g_hold_range[8][2];   /* native32_hold_range: more spans the relaunch reserves */
+void native32_hold_range(uint32_t base, uint32_t size) {
+    for (int i = 0; i < 8; i++) if (!g_hold_range[i][1]) { g_hold_range[i][0] = base; g_hold_range[i][1] = size; return; }
+}
 
 int native32_hold_image(const char* path, uint32_t base) {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);   /* no box on the real desktop; children inherit it */
@@ -395,20 +425,29 @@ int native32_hold_image(const char* path, uint32_t base) {
     for (int i = 0; i < 3; i++)
         if (std[i] && std[i] != INVALID_HANDLE_VALUE) SetHandleInformation(std[i], HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
     GetModuleFileNameA(NULL, me, MAX_PATH);
-    SetEnvironmentVariableA(NATIVE32_HELD_ENV, "1");
-    BOOL made = CreateProcessA(me, GetCommandLineA(), NULL, NULL, TRUE, CREATE_SUSPENDED, NULL, NULL, &si, &pi);
-    SetEnvironmentVariableA(NATIVE32_HELD_ENV, NULL);
-    if (!made) {
-        fprintf(stderr, "[native32] cannot start the host again (error %lu)\n", GetLastError());
-        return 0;
-    }
-    if (!VirtualAllocEx(pi.hProcess, (void*)(uintptr_t)base, span, MEM_RESERVE, PAGE_NOACCESS)) {
-        fprintf(stderr, "[native32] 0x%08X+0x%X is taken at process start (error %lu): link the host "
-                "with a small /STACK and run the lifted code on a thread with a large one\n",
-                base, span, GetLastError());
+    /* With an ASLR host, bottom-up randomization can put the suspended
+     * child's first allocations in a span we hold: start it again (a few
+     * tries; a /DYNAMICBASE:NO host puts them at the bottom every time). */
+    for (int tries = 0;; tries++) {
+        SetEnvironmentVariableA(NATIVE32_HELD_ENV, "1");
+        BOOL made = CreateProcessA(me, GetCommandLineA(), NULL, NULL, TRUE, CREATE_SUSPENDED, NULL, NULL, &si, &pi);
+        SetEnvironmentVariableA(NATIVE32_HELD_ENV, NULL);
+        if (!made) {
+            fprintf(stderr, "[native32] cannot start the host again (error %lu)\n", GetLastError());
+            return 0;
+        }
+        int held = VirtualAllocEx(pi.hProcess, (void*)(uintptr_t)base, span, MEM_RESERVE, PAGE_NOACCESS) != NULL;
+        for (int r = 0; held && r < 8 && g_hold_range[r][1]; r++)
+            held = VirtualAllocEx(pi.hProcess, (void*)(uintptr_t)g_hold_range[r][0], g_hold_range[r][1], MEM_RESERVE, PAGE_NOACCESS) != NULL;
+        if (held) break;
+        DWORD err = GetLastError();
         TerminateProcess(pi.hProcess, 1);
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
+        if (tries < 8) continue;
+        fprintf(stderr, "[native32] 0x%08X+0x%X (or the native32_hold_range span) is taken at process start "
+                "(error %lu): link the host with a small /STACK and run the lifted code on a thread with a large one\n",
+                base, span, err);
         return 0;
     }
     HANDLE job = CreateJobObjectA(NULL, NULL);
@@ -663,14 +702,51 @@ static void native_bridge(void) {
     SetLastError(last_error);
 }
 
-static recomp_func_t dispatch_find(uint32_t va) {
-    uint32_t lo = 0, hi = recomp_dispatch_count;
+static recomp_func_t table_find(const recomp_dispatch_entry_t *t, uint32_t n, uint32_t va) {
+    uint32_t lo = 0, hi = n;
     while (lo < hi) {
-        uint32_t mid = lo + (hi - lo) / 2, m = recomp_dispatch_table[mid].address;
-        if (m == va) return recomp_dispatch_table[mid].func;
+        uint32_t mid = lo + (hi - lo) / 2, m = t[mid].address;
+        if (m == va) return t[mid].func;
         if (m < va) lo = mid + 1; else hi = mid;
     }
     return NULL;
+}
+#ifdef RECOMP_PARTS
+/* A host built with pcrecomp_gen_parts: each lifted module is its own DLL
+ * next to the exe (RECOMP_PARTS="a.dll,b.dll"), with its own dispatch table
+ * (recomp_part_dispatch). They load on the first lookup, after the guest's
+ * address ranges are taken. The exe stays small: one image of every lift
+ * outgrew what CreateProcess maps (error 308). */
+static struct { const recomp_dispatch_entry_t *t; uint32_t n, lo, hi; } g_parts[64];
+static int g_nparts;
+static INIT_ONCE g_parts_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK parts_load(PINIT_ONCE o, PVOID a, PVOID *c) {
+    (void)o; (void)a; (void)c;
+    char dir[MAX_PATH], path[MAX_PATH], list[] = RECOMP_PARTS, *ctx;
+    GetModuleFileNameA(NULL, dir, MAX_PATH);
+    char *e = strrchr(dir, '\\'); if (e) e[1] = 0;
+    for (char *p = strtok_s(list, ",", &ctx); p && g_nparts < 64; p = strtok_s(NULL, ",", &ctx)) {
+        snprintf(path, sizeof path, "%s%s", dir, p);
+        HMODULE h = LoadLibraryExA(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+        typedef const recomp_dispatch_entry_t *(*getf)(uint32_t *);
+        getf g = h ? (getf)(void *)GetProcAddress(h, "recomp_part_dispatch") : NULL;
+        if (!g) { fprintf(stderr, "[native32] part %s did not load (error %lu)\n", path, GetLastError()); fflush(stderr); TerminateProcess(GetCurrentProcess(), 3); }
+        int k = g_nparts++;
+        g_parts[k].t = g(&g_parts[k].n);
+        g_parts[k].lo = g_parts[k].n ? g_parts[k].t[0].address : 1;
+        g_parts[k].hi = g_parts[k].n ? g_parts[k].t[g_parts[k].n - 1].address : 0;
+    }
+    return TRUE;
+}
+#endif
+static recomp_func_t dispatch_find(uint32_t va) {
+    recomp_func_t f = table_find(recomp_dispatch_table, recomp_dispatch_count, va);
+#ifdef RECOMP_PARTS
+    InitOnceExecuteOnce(&g_parts_once, parts_load, NULL, NULL);
+    for (int i = 0; !f && i < g_nparts; i++)
+        if (va >= g_parts[i].lo && va <= g_parts[i].hi) f = table_find(g_parts[i].t, g_parts[i].n, va);
+#endif
+    return f;
 }
 
 /* native32_replace: a lifted function answered by the host instead, for every

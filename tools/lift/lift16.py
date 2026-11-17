@@ -56,6 +56,10 @@ def _sreg(op: Operand) -> str:
         return _cseg()
     return f'cpu->{SREG_NAMES[op.reg]}'
 
+# addr32 string ops lifted with 32-bit esi/edi: mnemonic -> (kind, width)
+_A32_STR = {f'{k}{c}': (k, w) for k in ('movs', 'stos', 'lods', 'scas', 'cmps') for c, w in (('b', 8), ('w', 16), ('d', 32))}
+_A32_ACC = {8: 'cpu->al', 16: 'cpu->ax', 32: 'cpu->eax'}
+
 def _wsz(op: Operand) -> str:
     """Operand width suffix for flag/temp helpers: '8' | '16' | '32'."""
     if op is None:
@@ -88,29 +92,35 @@ def _mem_addr(op: Operand) -> tuple:
         scale = getattr(op, 'scale', 1)
         parts.append(f'cpu->{op.index}' + (f' * {scale}' if scale > 1 else ''))
 
+    # A 32-bit base or index (`es:[edi]`, an operand-size 386 routine in a
+    # 16-bit program) addresses past 64 KB of a selector whose limit allows it:
+    # Win16 games blit whole WinG surfaces that way, KRNL386 walks its arenas
+    # as `[eax+8]`. The sum and the displacement are then 32-bit, not wrapped
+    # to 16. ADDR32(...) marks the offset for _read/_write, which use the
+    # 32-bit-offset accessors; anywhere else it is just the value.
+    a32 = any(r and str(r).startswith('e') for r in (op.base, op.index))
+    # a 67h [disp32] / moffs32 past 64K (GDI's `mov ebx, ds:[10060h]` into
+    # its Local32 header) is a 32-bit offset too
+    a32 = a32 or (not parts and op.disp > 0xFFFF)
+    mask, cast, u = (0xFFFFFFFF, 'uint32_t', 'u') if a32 else (0xFFFF, 'uint16_t', '')
     if op.disp:
         if op.disp < 0:
-            disp_str = f'- 0x{(-op.disp) & 0xFFFF:X}'
+            disp_str = f'- 0x{(-op.disp) & mask:X}{u}'
         else:
-            disp_str = f'+ 0x{op.disp & 0xFFFF:X}'
+            disp_str = f'+ 0x{op.disp & mask:X}{u}'
         if parts:
-            off = f'(uint16_t)({" + ".join(parts)} {disp_str})'
+            off = f'({cast})({" + ".join(parts)} {disp_str})'
         else:
-            off = f'0x{op.disp & 0xFFFF:X}'
+            off = f'0x{op.disp & mask:X}{u}'
     elif parts:
         if len(parts) == 1:
             off = parts[0]
         else:
-            off = f'(uint16_t)({" + ".join(parts)})'
+            off = f'({cast})({" + ".join(parts)})'
     else:
         off = '0'
 
-    # A 32-bit base or index (`es:[edi]`, an operand-size 386 routine in a
-    # 16-bit program) addresses past 64 KB of a selector whose limit allows it:
-    # Win16 games blit whole WinG surfaces that way. ADDR32(...) marks the offset
-    # for _read/_write, which use the 32-bit-offset accessors; anywhere else it
-    # is just the value.
-    if any(r and str(r).startswith('e') for r in (op.base, op.index)):
+    if a32:
         off = f'ADDR32({off})'
     return seg, off
 
@@ -317,9 +327,22 @@ class Lifter:
 
         # 67h on a string op makes it walk ESI/EDI and count ECX, which the
         # forms below do not model. Say so rather than lift its 16-bit twin.
+        # movs/stos/lods are modelled: esi/edi step through the _32 accessors.
+        if getattr(inst, 'addr32', False) and m in _A32_STR:
+            k, w = _A32_STR[m]
+            n = w // 8
+            step = f'(df(cpu) ? -{n} : {n})'
+            src = f'mem_read{w}_32(cpu, {_ssg}, cpu->esi)'
+            body = {'movs': f'mem_write{w}_32(cpu, cpu->es, cpu->edi, {src}); cpu->esi += {step}; cpu->edi += {step};',
+                    'stos': f'mem_write{w}_32(cpu, cpu->es, cpu->edi, ({_A32_ACC[w]})); cpu->edi += {step};',
+                    'lods': f'{_A32_ACC[w]} = {src}; cpu->esi += {step};',
+                    'scas': f'flags_cmp{w}(cpu, {_A32_ACC[w]}, mem_read{w}_32(cpu, cpu->es, cpu->edi)); cpu->edi += {step};',
+                    'cmps': f'flags_cmp{w}(cpu, {src}, mem_read{w}_32(cpu, cpu->es, cpu->edi)); '
+                            f'cpu->esi += {step}; cpu->edi += {step};'}[k]
+            self._emit(body, orig)
+            return
         if getattr(inst, 'addr32', False) and (
-                m[:4] in ('movs', 'stos', 'lods', 'scas', 'cmps', 'outs') or m[:3] == 'ins'
-                or m == 'xlat'):
+                m[:4] in ('outs', 'insb', 'insw', 'insd') or m == 'xlat'):   # not movsx: m[:4] == 'movs'
             self._emit(f'/* UNHANDLED: addr32 {m} */', orig)
             return
 
@@ -329,7 +352,7 @@ class Lifter:
             self._emit(_write(op1, _read(op2)), orig)
 
         elif m == 'xchg':
-            self._emit(f'{{ uint16_t _t = {_read(op1)}; '
+            self._emit(f'{{ uint{_wsz(op1)}_t _t = {_read(op1)}; '
                        f'{_write(op1, _read(op2))} '
                        f'{_write(op2, "_t")} }}', orig)
 
@@ -357,6 +380,11 @@ class Lifter:
             sreg = {'lds': 'cpu->ds', 'les': 'cpu->es', 'lss': 'cpu->ss',
                     'lfs': 'cpu->fs', 'lgs': 'cpu->gs'}[m]
             seg, off = _mem_addr(op2)
+            if _wsz(op1) == '32':   # o32: m16:32, a dword offset then the selector at +4
+                self._emit(f'{{ uint32_t _o = mem_read32(cpu, {seg}, {off}); '
+                           f'uint16_t _s = mem_read16(cpu, {seg}, (uint16_t)({off} + 4)); '
+                           f'{_reg32(op1)} = _o; {sreg} = _s; }}', orig)
+                return
             self._emit(f'{{ uint16_t _o = mem_read16(cpu, {seg}, {off}); '
                        f'uint16_t _s = mem_read16(cpu, {seg}, (uint16_t)({off} + 2)); '
                        f'{_reg16(op1)} = _o; {sreg} = _s; }}', orig)
@@ -1168,17 +1196,20 @@ class Lifter:
             w = int(_wsz(op1))
             seg, off = _mem_addr(op1)
             sh = 4 if w == 16 else 5
+            # a 32-bit address (GDI's `btr word ds:[edi], dx`) stays 32-bit
+            a32 = off.startswith('ADDR32(')
+            _at, _sf = ('uint32_t', '_32') if a32 else ('uint16_t', '')
             setexpr = {'bt': None,
                        'bts': f'_v | ((uint{w}_t)1 << _b)',
                        'btr': f'_v & ~((uint{w}_t)1 << _b)',
                        'btc': f'_v ^ ((uint{w}_t)1 << _b)'}[m]
             body = (f'{{ int{w}_t _i = (int{w}_t){_read(op2)}; '
-                    f'uint16_t _a = (uint16_t)(({off}) + (_i >> {sh}) * {w // 8}); '
+                    f'{_at} _a = ({_at})(({off}) + (_i >> {sh}) * {w // 8}); '
                     f'uint8_t _b = (uint8_t)(_i & {w - 1}); '
-                    f'uint{w}_t _v = mem_read{w}(cpu, {seg}, _a); '
+                    f'uint{w}_t _v = mem_read{w}{_sf}(cpu, {seg}, _a); '
                     f'cpu->flags = (cpu->flags & ~FLAG_CF) | (((_v >> _b) & 1) ? FLAG_CF : 0); ')
             if setexpr:
-                body += f'mem_write{w}(cpu, {seg}, _a, (uint{w}_t)({setexpr})); '
+                body += f'mem_write{w}{_sf}(cpu, {seg}, _a, (uint{w}_t)({setexpr})); '
             self._emit(body + '}', orig)
 
         elif m in ('bt', 'bts', 'btr', 'btc'):
@@ -1197,12 +1228,12 @@ class Lifter:
             self._emit(body, orig)
 
         elif m in ('verr', 'verw'):                     # ZF = the selector is usable
-            self._emit(f'{{ uint16_t _ar; if (cpu_lar(cpu, (uint16_t)({_read(op1)}), &_ar)) '
+            self._emit(f'{{ uint32_t _ar; if (cpu_lar(cpu, (uint16_t)({_read(op1)}), &_ar)) '
                        f'cpu->flags |= FLAG_ZF; else cpu->flags &= ~FLAG_ZF; }}', orig)
 
         elif m in ('lar', 'lsl'):                       # load access rights / segment limit
             helper = 'cpu_lar' if m == 'lar' else 'cpu_lsl'
-            body = (f'{{ uint16_t _ar; if ({helper}(cpu, (uint16_t)({_read(op2)}), &_ar)) '
+            body = (f'{{ uint32_t _ar; if ({helper}(cpu, (uint16_t)({_read(op2)}), &_ar)) '
                     f'{{ {_write(op1, "_ar")} cpu->flags |= FLAG_ZF; }} '
                     f'else cpu->flags &= ~FLAG_ZF; }}')
             self._emit(body, orig)
@@ -1267,18 +1298,23 @@ class Lifter:
                 # does it); a bare return leaves those 6 bytes on the stack.
                 # Opt-in: a runtime that calls an ISR directly must push a
                 # FLAGS/CS/IP frame first, like the CPU does.
-                self._emit('cpu->sp += 4; cpu->flags = pop16(cpu); return;', orig)
+                # ret_ip: the offset it pops (a ret-jump's caller waits for it)
+                self._emit('cpu->ret_ip = pop16(cpu); cpu->sp += 2; cpu->flags = pop16(cpu); return;', orig)
             else:
                 self._emit('/* iret - return from interrupt */', orig)
                 self._emit('return;')
 
         elif m == 'enter':
             size_val = op1.disp
-            self._emit(f'push16(cpu, cpu->bp); cpu->bp = cpu->sp; '
-                       f'cpu->sp -= 0x{size_val:X};', orig)
+            if getattr(inst, 'op32', False):   # o32: ebp; the frame pointer still from sp (a 16-bit stack)
+                self._emit(f'push32(cpu, cpu->ebp); cpu->bp = cpu->sp; cpu->sp -= 0x{size_val:X};', orig)
+            else:
+                self._emit(f'push16(cpu, cpu->bp); cpu->bp = cpu->sp; '
+                           f'cpu->sp -= 0x{size_val:X};', orig)
 
         elif m == 'leave':
-            self._emit('cpu->sp = cpu->bp; cpu->bp = pop16(cpu);', orig)
+            self._emit('cpu->sp = cpu->bp; cpu->ebp = pop32(cpu);' if getattr(inst, 'op32', False)
+                       else 'cpu->sp = cpu->bp; cpu->bp = pop16(cpu);', orig)
 
         elif m == 'in':
             if op2 and op2.type == OpType.IMM8:
@@ -1589,7 +1625,8 @@ class Lifter:
         for inst in instructions:
             if inst.prefix == 'rep' and inst.mnemonic in ('movsb','movsw','movsd','stosb','stosw','stosd','outsb','outsw','insb','insw'):
                 self._emit_label(inst.address)
-                self._emit(f'while (cpu->cx != 0) {{ cpu->cx--;', f'rep {inst.mnemonic}')
+                _rc = 'cpu->ecx' if getattr(inst, 'addr32', False) else 'cpu->cx'   # 67h: rep counts ecx
+                self._emit(f'while ({_rc} != 0) {{ {_rc}--;', f'rep {inst.mnemonic}')
                 self.indent += 1
                 # Emit the string op body (set address to -1 to avoid duplicate label)
                 stripped = Instruction()
@@ -1601,7 +1638,8 @@ class Lifter:
                 self._emit('}')
             elif inst.prefix == 'rep' and inst.mnemonic in ('scasb','scasw','scasd','cmpsb','cmpsw','cmpsd'):
                 self._emit_label(inst.address)
-                self._emit(f'while (cpu->cx != 0) {{ cpu->cx--;', f'repz {inst.mnemonic}')
+                _rc = 'cpu->ecx' if getattr(inst, 'addr32', False) else 'cpu->cx'   # 67h: counts ecx
+                self._emit(f'while ({_rc} != 0) {{ {_rc}--;', f'repz {inst.mnemonic}')
                 self.indent += 1
                 stripped = Instruction()
                 stripped.__dict__.update(inst.__dict__)
@@ -1613,7 +1651,8 @@ class Lifter:
                 self._emit('}')
             elif inst.prefix == 'repnz' and inst.mnemonic in ('scasb','scasw','scasd','cmpsb','cmpsw','cmpsd'):
                 self._emit_label(inst.address)
-                self._emit(f'while (cpu->cx != 0) {{ cpu->cx--;', f'repnz {inst.mnemonic}')
+                _rc = 'cpu->ecx' if getattr(inst, 'addr32', False) else 'cpu->cx'   # 67h: counts ecx
+                self._emit(f'while ({_rc} != 0) {{ {_rc}--;', f'repnz {inst.mnemonic}')
                 self.indent += 1
                 stripped = Instruction()
                 stripped.__dict__.update(inst.__dict__)

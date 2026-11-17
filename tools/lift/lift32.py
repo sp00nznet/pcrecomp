@@ -7,6 +7,7 @@ PUSH32/POP32 macros, MEM* memory access, pattern-matched condition
 generation from flag-setters to flag-consumers.
 """
 
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 try:                                    # as tools.lift.lift32 (difftest) or from tools/lift
@@ -254,6 +255,10 @@ def _is_far_indirect(insn) -> bool:
     return i + 1 < len(b) and b[i] == 0xFF and ((b[i + 1] >> 3) & 7) in (3, 5)
 
 
+# LIFT32_W9X=1: Windows 9x system code (kernel32): a flat `retf` is a far jump
+# (see 'retf') and es is a real selector (it writes the LDT through an alias).
+W9X = __import__('os').environ.get('LIFT32_W9X') == '1'
+
 # Lifted only with Lifter(dos=True); see Lifter._lift_dos.
 DOS_OPS = {'int', 'iretd', 'in', 'out', 'insb', 'insw', 'insd', 'outsb', 'outsw', 'outsd',
            'cli', 'sti', 'hlt'}
@@ -307,11 +312,21 @@ class Lifter:
         # needs RECOMP_RETADDR to be a value no such push makes. DOS mode
         # always has it.
         self.computed_ret = computed_ret
+        # LIFT32_W9X: `push <function>; ...; jmp <function>` is a call whose
+        # return is the pushed function (user32's window-proc relay BFF53955:
+        # push BFF53981; push proc; jmp BFF58150, an import jump). The jump
+        # comes back as a C return, so the pushed function runs next.
+        self._push_ret = None
+        self._push_jmp = False     # the last stack op was a push (see lift_instruction)
+        self._branch_targets = None   # generate.py: this body's branch targets
+        self._body_addrs = None       # generate.py: this body's instruction addresses
         # Call targets whose first instruction is `pop r32` (see the call case).
         self.call_pop = call_pop or set()
         self._patched_imm = None
         self._patched_disp = None   # (placeholder, expr) for a patched disp32
         self._labels = None        # block starts of the function being lifted
+        self._seg_fn = False       # LIFT32_W9X: this function reloads ds/es
+        self._ss_fn = False        # LIFT32_W9X: this function reloads ss
         self._jump_targets = None  # arms its switch tables dispatch to
         self._flag_state = None  # (setter_mnemonic, operands_str)
         self._flag_seq = 0       # bumped whenever the flags are written
@@ -394,7 +409,11 @@ class Lifter:
             # Segment registers and FPU ST(i) - use as comment
             if X86_REG_ST0 <= r <= X86_REG_ST0 + 7:
                 return f"_st[{r - X86_REG_ST0}] = {value}"
-            if self.dos and r in DOS_SEG_IDX:
+            if W9X and r == X86_REG_SS:
+                return f"recomp_set_seg(2, {value})"
+            if (self.dos and r in DOS_SEG_IDX) or (W9X and r in (X86_REG_ES, X86_REG_DS, X86_REG_FS, X86_REG_GS)):
+                if W9X and r == X86_REG_DS:
+                    return f"recomp_set_seg(3, {value})"
                 return f"recomp_set_seg({DOS_SEG_IDX[r]}, {value})"
             # Segment registers - no-op in flat mode
             if r in (11, 17, 28, 29, 30, 49):
@@ -404,7 +423,7 @@ class Lifter:
             return self._fmt_mem_write(op.mem, op.size, value)
         return f"??? = {value}"
 
-    def _fmt_mem_addr(self, mem) -> str:
+    def _fmt_mem_addr(self, mem, lea=False) -> str:
         """Format the effective address calculation for a memory operand."""
         parts = []
         if mem.base != 0:
@@ -428,6 +447,14 @@ class Lifter:
         if not parts:
             parts.append("0")
         addr = ' + '.join(parts)
+        # 67h in 32-bit code: a 16-bit address ([bx], [bp+si]...) wraps at 64K
+        # and ignores the registers' upper halves (kernel32's ThunkConnect16
+        # helper reads `gs:[bx]` after `lgs bx`, with ebx's high word set).
+        # ponytail: a bare 67h [disp16] (no register) is not caught.
+        if mem.base in REG_NAMES_16 or mem.index in REG_NAMES_16:
+            addr = f"(uint16_t)({addr})"
+        if lea:   # lea is the offset alone: no segment base (kernel32's `lea esi, ds:[esi+9]` on a 16-bit ds)
+            return addr
         # Segment override: fs/gs are thread-relative (TIB/TEB) and must NOT be
         # treated as flat. Route them through a runtime base so e.g. `fs:[0]`
         # (the SEH chain head) reads the simulated TIB instead of VA 0.
@@ -441,7 +468,14 @@ class Lifter:
         # the PSP and environment through it. ds/ss/cs stay flat (base 0).
         # ponytail: explicit es: overrides only; stos/movs still write flat
         # through edi, which holds while the program keeps es == ds for them.
-        if seg == X86_REG_ES and self.dos:
+        # A function that loads ss (Win9x QT_Thunk: the 16-bit stack is an
+        # alias of the 32-bit one, sp = esp - base) addresses esp/ebp through
+        # SS_BASE, 0 again once ss is flat.
+        if self._ss_fn and seg in (0, X86_REG_SS) and mem.base in (X86_REG_ESP, X86_REG_EBP):
+            return f"SS_BASE + ({addr})"
+        if self._seg_fn and seg in (0, X86_REG_DS) and mem.base not in (X86_REG_ESP, X86_REG_EBP):
+            return f"DS_BASE + ({addr})"
+        if seg == X86_REG_ES and (self.dos or W9X):
             return f"ES_BASE + ({addr})"
         if seg == X86_REG_CS and self.dos:
             return f"CS_BASE + ({addr})"
@@ -475,7 +509,7 @@ class Lifter:
 
     def _fmt_lea(self, mem) -> str:
         """Format LEA (just the address calculation, no memory access)."""
-        return self._fmt_mem_addr(mem)
+        return self._fmt_mem_addr(mem, lea=True)
 
     @staticmethod
     def _string_cmp_base(insn, m):
@@ -766,8 +800,31 @@ class Lifter:
     def lift_instruction(self, insn) -> list:
         """Lift one instruction, recording the runtime flag kind if it wrote flags."""
         seq0 = self._flag_seq
+        stops = self._branch_targets if self._branch_targets is not None else self._labels
+        if stops is None or insn.address in stops:
+            self._push_jmp = False   # a ret others branch to returns for them
         self._insn_flag_width = 32    # only this instruction's _flag_capture narrows it
         lines = self._lift_instruction(insn)
+        m, ops = insn.mnemonic, insn.operands
+        # `push x; [mov r, y]; ret` is a jump to x (ole32's delay-load failure
+        # path 7F44C4E7: `push [eax+8]; mov eax, 8; ret` into a `ret 18h` stub
+        # that pops the caller's arguments). Lifted as a return, the stub never
+        # ran and the caller's stack came back 1Ch short.
+        self._push_jmp = m == 'push' or (self._push_jmp and m in ('mov', 'movzx') and not (
+            ops and ops[0].type == X86_OP_REG and ops[0].reg in (X86_REG_ESP, X86_REG_SP, X86_REG_EBP)))
+        if W9X:
+            if m == 'push' and ops and ops[0].type == X86_OP_IMM and self.lifted and ops[0].imm in self.lifted:
+                self._push_ret = ops[0].imm
+            elif not (m in ('push', 'mov', 'movzx', 'xchg') and not (ops and ops[0].type == X86_OP_REG
+                                                                   and ops[0].reg in (X86_REG_ESP, X86_REG_SP))):
+                self._push_ret = None
+        if self._seg_fn and next((b for b in insn.bytes if b not in (0x66, 0x67, 0xF2, 0xF3)), 0) in range(0xA4, 0xB0):
+            # a string op where ds/es are real selectors: es:[edi], ds:[esi]
+            fix = lambda t: (re.sub(r'\b(MEM8|MEM16|MEM32)\(edi\)', r'\1(ES_BASE + edi)', t)
+                             .replace('(esi)', '(DS_BASE + esi)')
+                             .replace('recomp_rep_movs(edi, esi', 'recomp_rep_movs(ES_BASE + edi, DS_BASE + esi')
+                             .replace('ADDR(edi', 'ADDR(ES_BASE + edi'))
+            lines = [fix(t) for t in lines]
         if self._flag_seq != seq0 and self._flag_state is not None:
             fk = FLAG_KIND.get(self._flag_state[0], 'FK_CMP')
             if self._insn_flag_width < 32:
@@ -826,7 +883,14 @@ class Lifter:
         if m == 'mov':
             if len(ops) == 2:
                 val = self._fmt_read(ops[1])
-                lines.append(f"{self._fmt_write(ops[0], val)}; {comment}")
+                if W9X and ops[0].type == X86_OP_REG and ops[0].reg == X86_REG_SP:
+                    # `mov ss, dx; mov sp, si` (kernel32's 16->32 return,
+                    # 0xBFF714AC): a 16-bit (B=0) stack uses sp alone, but
+                    # SS_BASE + esp reads all 32 bits, so the top goes then.
+                    # A 32-bit ss keeps it (the same code returns to one).
+                    lines.append(f"SET_LO16(esp, {val}); if (!recomp_ss_big()) esp &= 0xFFFFu; {comment}")
+                else:
+                    lines.append(f"{self._fmt_write(ops[0], val)}; {comment}")
 
         elif m == 'movzx':
             if len(ops) == 2:
@@ -893,7 +957,9 @@ class Lifter:
                     if ops[0].type == X86_OP_REG:
                         r = reg_name(ops[0].reg)
                         lines[-1] = f"{r} = POP32_VAL(esp); {comment}"
-                        if self.dos and ops[0].reg in DOS_SEG_IDX:
+                        if W9X and ops[0].reg == X86_REG_DS:
+                            lines[-1] = f"recomp_set_seg(3, POP32_VAL(esp)); {comment}"
+                        elif (self.dos and ops[0].reg in DOS_SEG_IDX) or (W9X and ops[0].reg in (X86_REG_ES, X86_REG_FS, X86_REG_GS)):
                             lines[-1] = (f"recomp_set_seg({DOS_SEG_IDX[ops[0].reg]}, POP32_VAL(esp));"
                                          f" {comment}")
 
@@ -1540,6 +1606,19 @@ class Lifter:
                     lines.append(f"{{ uint32_t _ocs = CS_BASE; PUSH32(esp, _seg_cs); {comment}")
                     lines.append(f"  CS_BASE = recomp_sel_base(MEM16(({addr}) + 4));")
                     lines.append(f"  RECOMP_ICALL(CS_BASE + MEM32({addr})); CS_BASE = _ocs; }}")
+                elif W9X and ops and ops[0].type == X86_OP_MEM and _is_far_indirect(insn):
+                    # call m16:32 in flat Win32 code: a call gate (Windows 9x
+                    # kernel32's VxDCall goes to VMM through one). The host
+                    # answers it (recomp_farcall32, native32 vxd32.c); nonzero
+                    # means it returned to the caller's caller (the gate pops
+                    # the service's arguments), so this body is done.
+                    # An inline gate call pushes its own continuation as that
+                    # return address (`push next; mov eax, id; call fword`,
+                    # kernel32 0xBFF9CAB4): then the body goes on after it.
+                    addr = self._fmt_mem_addr(ops[0].mem)
+                    nxt = insn.address + insn.size
+                    lines.append(f"RECOMP_REGS_OUT(); {{ uint32_t _gr = MEM32(esp); if (recomp_farcall32({addr})) {{ RECOMP_REGS_IN();"
+                                 f" if (_gr != 0x{nxt:08X}u) return; }} else RECOMP_REGS_IN(); }} {comment}")
                 elif ops and ops[0].type == X86_OP_MEM:
                     addr = self._fmt_mem_addr(ops[0].mem)
                     lines.append(f"RECOMP_ICALL(MEM32({addr})); {comment}")
@@ -1557,14 +1636,20 @@ class Lifter:
             # any stdcall callee-cleanup bytes (ret N -> esp += 4 + N). Without the
             # +4 the simulated ESP drifts down 4 bytes per call and eventually the
             # 0xDEAD0000 dummy return address gets read as a function argument.
-            if self.dos or self.computed_ret:
+            if (self.dos or self.computed_ret) and not self._push_jmp:
                 # `push target; ret` is a computed jump, and Watcom's int386x
                 # makes one into its table of `int N; ret` stubs. A return
                 # address the caller did not push is not ours to pop: it is
                 # where control goes, with the stack as it was before the push.
-                lines.append(f"if (MEM32(esp) != RECOMP_RETADDR) {{ uint32_t _rt = MEM32(esp); esp += 4;"
+                n = ops[0].imm if ops and ops[0].type == X86_OP_IMM else 0
+                at = "SS_BASE + esp" if self._ss_fn else "esp"
+                lines.append(f"if (MEM32({at}) != RECOMP_RETADDR) {{ uint32_t _rt = MEM32({at}); esp += {4 + n};"
                              f" RECOMP_FLAGS_OUT(); RECOMP_RET_JUMP(_rt); return; }}")
-            if ops and ops[0].type == X86_OP_IMM:
+            if self._push_jmp and not ops:
+                at = "SS_BASE + esp" if self._ss_fn else "esp"
+                lines.append(f"{{ uint32_t _rt = MEM32({at}); esp += 4; RECOMP_FLAGS_OUT();"
+                             f" RECOMP_RET_JUMP(_rt); return; }} /* push; ret: a jump */ {comment}")
+            elif ops and ops[0].type == X86_OP_IMM:
                 n = ops[0].imm
                 lines.append(f"RECOMP_FLAGS_OUT(); esp += {4 + n}; return; {comment}")
             else:
@@ -1576,12 +1661,36 @@ class Lifter:
                 # above pushed both. Outside DOS mode nothing pushes a CS.
                 n = ops[0].imm if ops and ops[0].type == X86_OP_IMM else 0
                 lines.append(f"RECOMP_FLAGS_OUT(); esp += {8 + n}; return; /* far return */ {comment}")
+            elif W9X:
+                # Windows 9x kernel32 enters ring-0 helpers (VWIN32's table at
+                # its KEXP header) by `push cs; push ret; push target; retf`:
+                # a far jump. The host runs its own targets (recomp_retf32, a
+                # far routine that comes back by retf to the pushed return);
+                # anything else is guest code, tail-dispatched. The return
+                # points must be seeded functions.
+                # `66 CB` (o16 retf) pops a 16:16 target packed in one dword,
+                # into 16-bit code; the 16-bit side comes back by a 32-bit retf.
+                pop = 4 if bytes(insn.bytes)[0] == 0x66 else 8
+                if ops and ops[0].type == X86_OP_IMM:
+                    pop += ops[0].imm   # retf N: user32's relay return (BFF53912 `retf 6`) pops its 16-bit args
+                sp = "SS_BASE + esp" if self._ss_fn else "esp"
+                lines.append(f"{{ uint32_t _ft = MEM32({sp}); esp += {pop}; RECOMP_REGS_OUT(); {comment}")
+                lines.append(f"  if (recomp_retf32(_ft)) {{ RECOMP_REGS_IN(); _ft = MEM32({sp}); esp += 8; }} else RECOMP_REGS_IN();")
+                lines.append("  RECOMP_FLAGS_OUT();")
+                lines.append("RECOMP_ITAIL(_ft); return;")   # its own line: generate.py rewrites it whole
+                lines.append("}")
             else:
                 lines.append(f"return; /* far return */ {comment}")
 
         elif m == 'jmp':
             target = insn.get_branch_target()
-            if target and self._labels is not None and target not in self._labels:
+            # (Only a jump that leaves the body: shell32 7FCBD2BD `push [ebp+20h]; push IID; push IID;
+            # jmp 7FCBD0E6` jumps back into its own GetUIObjectOf with arguments, and the GUIDs are
+            # "functions" only because shell32's data sits in .text.)
+            if (W9X and target and self._push_ret is not None and self.lifted and target in self.lifted
+                    and target not in (self._labels if self._labels is not None else self._body_addrs or ())):
+                lines.append(f"RECOMP_ITAIL(0x{target:08X}u); RECOMP_ITAIL(0x{self._push_ret:08X}u); return; /* a call returning to the pushed function */ {comment}")
+            elif target and self._labels is not None and target not in self._labels:
                 # Branch leaves the function: a tail call, or a run of bytes that
                 # was never really code. Either way there is no label to jump to,
                 # so dispatch and return instead of emitting an undefined goto.
@@ -2144,6 +2253,20 @@ class Lifter:
                 size = self._fmt_read(ops[0])
                 lines.append(f"PUSH32(esp, ebp); ebp = esp; esp -= {size}; {comment}")
 
+        elif W9X and m in ('lsl', 'lar', 'verr', 'verw'):
+            # Selector queries against the host's LDT (native32 vxd32.c):
+            # kernel32's MapSL checks a selector's limit with lsl. ZF says valid.
+            sel = f"(uint16_t)({self._fmt_read(ops[-1])})"
+            if m in ('lsl', 'lar'):
+                dst = self._fmt_write(ops[0], "_v")
+                body = f"uint32_t _v; uint32_t _zf = recomp_{m}32({sel}, &_v) ? 0x40u : 0; if (_zf) {dst};"
+            else:
+                body = f"uint32_t _v; uint32_t _zf = recomp_lar32({sel}, &_v) ? 0x40u : 0;"
+            lines.append(f"{{ {body} "
+                         f"_flag_a = (recomp_eflags(_flag_k, _flag_a, _flag_b, _cf, _df) & ~0x40u) | _zf; "
+                         f"_flag_b = 0; _flag_k = FK_EFLAGS; }} {comment}")
+            self._flag_state = None
+
         elif m == 'cpuid':
             lines.append(f"CPUID(eax, ebx, ecx, edx); {comment}")
 
@@ -2182,7 +2305,19 @@ class Lifter:
             if len(ops) >= 2 and ops[1].type == X86_OP_MEM:
                 addr = self._fmt_mem_addr(ops[1].mem)
                 seg = {'les': X86_REG_ES, 'lfs': X86_REG_FS, 'lgs': X86_REG_GS}.get(m)
-                if self.dos and seg:
+                if W9X:
+                    # The selector loads with its base (kernel32's 16->32
+                    # dispatcher goes back to the caller's stack by `lss sp,
+                    # [esp]`); a 16-bit destination takes m16:16. ponytail:
+                    # `lss sp` zero-extends esp, which a 16-bit (B=0) stack
+                    # ignores the top of anyway.
+                    w = ops[0].size == 2
+                    idx = {'les': 0, 'lss': 2, 'lds': 3, 'lfs': 4, 'lgs': 5}[m]
+                    dst = 'esp = _o' if (m == 'lss' and w) else self._fmt_write(ops[0], '_o')
+                    lines.append(f"{{ uint32_t _o = {'MEM16' if w else 'MEM32'}({addr}); "
+                                 f"uint16_t _s = MEM16({addr} + {2 if w else 4}); {dst}; "
+                                 f"recomp_set_seg({idx}, _s); }} {comment}")
+                elif self.dos and seg:
                     lines.append(f"recomp_set_seg({DOS_SEG_IDX[seg]}, MEM16({addr} + 4)); "
                                  f"{self._fmt_write(ops[0], f'MEM32({addr})')}; {comment}")
                 else:
@@ -2378,6 +2513,24 @@ class Lifter:
         lines.append("} }")
         return lines
 
+    @staticmethod
+    def ss_function(instructions) -> bool:
+        """LIFT32_W9X: a function that loads ss (QT_Thunk's switch to the
+        16-bit stack alias) addresses esp/ebp through SS_BASE."""
+        return W9X and any(i.mnemonic == 'lss' or
+                           (i.mnemonic in ('mov', 'pop') and i.op_str.split(',')[0].strip() == 'ss')
+                           for i in instructions)
+
+    @staticmethod
+    def seg_function(instructions) -> bool:
+        """LIFT32_W9X: a function that loads ds or es addresses through them
+        (kernel32 copies the DOS environment with ds = its selector). The rest
+        stay flat: es == ds == ss there."""
+        return W9X and any(
+            i.mnemonic in ('lds', 'les') or
+            (i.mnemonic in ('mov', 'pop') and i.op_str.split(',')[0].strip() in ('ds', 'es'))
+            for i in instructions)
+
     def lift_function(self, func) -> str:
         """Lift an entire function to C code."""
         lines = []
@@ -2394,6 +2547,10 @@ class Lifter:
         # A plain global store; the ring-buffer half only exists under -DRECOMP_TRACE.
         lines.append(f"    RECOMP_ENTER(0x{func.address:08X}u);")
         lines.append(f"")
+
+        _ins = [i for b in func.blocks.values() for i in b.instructions]
+        self._seg_fn = self.seg_function(_ins)
+        self._ss_fn = self.ss_function(_ins)
 
         # Emit blocks in address order
         self._labels = set(func.blocks.keys())

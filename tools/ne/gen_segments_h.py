@@ -66,7 +66,20 @@ def main():
          " * Protected-mode NE selectors map to flat-memory bases at runtime.",
          " * Placeholder: selector == NE segment index. Replace with a real",
          " * selector->base table when the protected-mode memory model lands. */"]
-    L += [f"#define SEG_{n} ((uint16_t){n})" for n in range(1, max_seg + 1)]
+    ident = os.environ.get("NE_IDENTITY_SEL") == "1"   # see gen_image.IDENTITY
+    if ident:   # the selector KRNL386's loader gave segment n (identity.c w16_rebind)
+        L += ["extern uint16_t g_w16_segsel[];"]
+        L += [f"#define SEG_{n} (g_w16_segsel[{n}])" for n in range(1, max_seg + 1)]
+        L += ["void w16_retf32(CPU *cpu);   /* an o32 retf (into flat 32-bit code) */"]
+        L += ["int w16_retf(CPU *cpu);   /* a retf into a stub KRNL386 generated: run it */"]
+        L += ["void w16_retf_call(CPU *cpu);   /* push cont; push target; retf: a far call */"]
+        L += ["void w16_farcall(CPU *cpu, void (*f)(CPU *));   /* a direct far call (w16_unwind lands here) */",
+              "void w16_jmpf(CPU *cpu, uint16_t sel, uint16_t off);   /* push; retf: a far jump, or a return to a call site */"]
+        L += ["void w16_segin(uint16_t n);   /* a direct far call into segment n: bind it first */",
+              "extern __declspec(thread) uint16_t g_w16_callseg;   /* the segment of the far call being made (w16_farcall) */",
+              "#define W16_SEGIN(n) do { g_w16_callseg = (n); if (g_w16_segsel[n] == (uint16_t)((n) << 3 | 7)) w16_segin(n); } while (0)"]
+    else:
+        L += [f"#define SEG_{n} ((uint16_t){n})" for n in range(1, max_seg + 1)]
     L.append("")
 
     total = 0
@@ -74,6 +87,8 @@ def main():
         names = by_seg[seg]
         L.append(f"/* seg{seg:03d} ({len(names)} functions) */")
         L += [f"void {n}(CPU *cpu);" for n in names]
+        if ident:   # the bodies RECOMP_TAIL jumps to (ne_lift's trampoline)
+            L += [f"void {n}__b(CPU *cpu);" for n in names]
         L.append("")
         total += len(names)
     L.append(f"#endif /* {args.guard} */")

@@ -106,6 +106,11 @@ void native32_init(void);
  * The host's /STACK must be small (256 KB) so the child's first stack fits
  * below base: run the lifted code on a thread with a large stack. */
 int native32_hold_image(const char* path, uint32_t base);
+/* One more span for that relaunch to reserve before the child's loader runs
+ * (call it before native32_hold_image); the child commits it with
+ * VirtualAlloc(MEM_COMMIT). Win16 identity mode holds 0x10000-0x10FFFF so
+ * real-mode memory sits at linear = paragraph * 16. */
+void native32_hold_range(uint32_t base, uint32_t size);   /* up to 8 spans, one per call */
 
 /* Give this process a 16-bit (or 8-bit) DirectDraw. On a 32-bit desktop
  * DirectDraw enumerates and sets only 32-bit modes, so a game that wants
@@ -151,6 +156,16 @@ void mach_leave(void);
  * another guest thread; put the same count back after. */
 int mach_release(void);
 void mach_reacquire(int n);
+
+/* Called when a thread takes the machine (outermost mach_enter), after its
+ * registers are back: vxd32 makes it VWIN32's current thread there too. */
+extern void (*native32_on_enter)(void);
+
+/* Block a guest thread from inside a host answer (a VxD service, an
+ * import): its registers are kept, the machine lock is released however deep
+ * this thread holds it, h is waited on (WaitForSingleObject), and the lock
+ * and registers come back. Other guest threads run meanwhile. */
+DWORD native32_wait(HANDLE h, DWORD ms);
 
 /* A lifted function answered by the host instead, wherever its address is
  * resolved (indirect calls, snapped imports); and a built-in shim by name.
