@@ -914,7 +914,8 @@ void native32_w9x_switch_to(uint32_t r0) {
     if (g_trace > 0) fprintf(stderr, "[vxd] switch from %08X to r0 %08X (thread %08X; this r0 %08X)\n", g_cur[0], r0, r0 ? MEM32(r0 + R0T_THREAD) : 0, t_r0 ? t_r0 : g_boot_r0);
     if (!r0 || r0 == (t_r0 ? t_r0 : g_boot_r0)) return;   /* to itself: nothing to switch */
     {
-        if (!MEM32(r0 + R0T_PARKED)) { MEM32(r0 + R0T_READY) = 1; start_thread(r0); }
+        /* the boot thread runs on the host's own thread: never started here, only woken */
+        if (!MEM32(r0 + R0T_PARKED) && r0 != g_boot_r0) { MEM32(r0 + R0T_READY) = 1; start_thread(r0); }
         else {
             if (!MEM32(r0 + R0T_WAKE)) MEM32(r0 + R0T_WAKE) = (uint32_t)(uintptr_t)CreateEventA(NULL, FALSE, FALSE, NULL);
             SetEvent((HANDLE)(uintptr_t)MEM32(r0 + R0T_WAKE));

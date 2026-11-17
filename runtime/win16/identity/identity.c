@@ -338,6 +338,17 @@ static void host_far(CPU *c, uint16_t off) {
     }
     case 0x07:   /* KERNEL.451 VWIN32_EventSet (seg001_78E3) and 479 (seg001_7903): ebx = the event */
         SetEvent((HANDLE)(uintptr_t)c->ebx); ok(c); return;
+    case 0x11: case 0x10: {   /* Win16 idle (seg001_75BF): no task ready, block until 10 (seg001_75D5,
+                    * PostEvent while 13E6 bit 0 says the scheduler idles) wakes it. One host event;
+                    * the machine is given up while waiting, so the input and timer threads run */
+        static HANDLE idle;
+        if (!idle) idle = CreateEventA(NULL, FALSE, FALSE, NULL);
+        if (c->ah == 0x10) { SetEvent(idle); ok(c); return; }
+        uint32_t native32_w9x_wait(void *h, uint32_t ms);
+        CPU sv = *c;
+        native32_w9x_wait(idle, INFINITE);
+        *c = sv; ok(c); return;
+    }
     case 0x0C:   /* KRNL386 registers with VWIN32 once kernel32 is up (seg001_6F7B): es = its code,
                   * bx/cx/dx/di/bp entry offsets in it (8D71, 0ACE, 0C2B, 7C44, 7CAA), esi =
                   * DGROUP:1338. eax comes back and goes (seg001_53FF) into the table at
@@ -409,6 +420,9 @@ static void host_far(CPU *c, uint16_t off) {
 static void int2f(CPU *c) {
     switch (c->ax) {
     case 0x4A16: case 0x4A17: case 0x4A18:   /* IO.SYS boot log open/write/close (KRNL386 seg002_4B5C): no BOOTLOG.TXT, ax unchanged */
+        return;
+    case 0x1689:   /* Windows idle (KRNL386's idle path seg001_6095, bx = 0 or -1): a hint to the
+                    * VMM to release the time slice; VWIN32 11 right after does the blocking. No-op */
         return;
     case 0x4A32:   /* IO.SYS service bl (USER seg072_3742: bl=5, result unread); ponytail: a no-op, ax unchanged */
         return;

@@ -573,6 +573,7 @@ static void ms_inquire(CPU *c) {
  * A host thread takes the machine for each call, as an interrupt would.
  * "key C@T": C pressed and released through KEYBOARD.Enable's proc (al vk, ah 80h up, bl scan).
  * "text STR@T": each character, shifted ones between a Shift press and release.
+ * "drag X,Y,X2,Y2@T": press at X,Y, eight moves to X2,Y2, release there.
  * ponytail: left clicks and Shift-only keys, on a private 8 KB 16-bit stack. */
 static uint32_t g_ms_proc;
 int w16_call(CPU *r);
@@ -615,17 +616,22 @@ static DWORD WINAPI input_thread(LPVOID unused) {
             }
             continue;
         }
-        if (sscanf(s, " click %d,%d@%lf", &x, &y, &t) != 3) { fprintf(stderr, "[drv] W16_INPUT: cannot read \"%s\"\n", s); break; }
+        int x2, y2, drag = sscanf(s, " drag %d,%d,%d,%d@%lf", &x, &y, &x2, &y2, &t) == 5;
+        if (!drag && sscanf(s, " click %d,%d@%lf", &x, &y, &t) != 3) { fprintf(stderr, "[drv] W16_INPUT: cannot read \"%s\"\n", s); break; }
+        if (!drag) x2 = x, y2 = y;
         while (GetTickCount() - t0 < (DWORD)(t * 1000)) Sleep(20);
-        /* move, then press, then release: USER's proc queues the button messages before it
-         * takes a move in the same call, so a press with the move bit lands where the cursor was */
-        static const uint16_t st[3] = { 0x8001, 0x8002, 0x8004 };
-        for (int up = 0; up < 3; up++) {
+        /* move, then press, then (a drag: moves in 8 steps to X2,Y2) release: USER's proc queues the
+         * button messages before it takes a move in the same call, so a press with the move bit
+         * lands where the cursor was */
+        for (int i = 0; i < (drag ? 11 : 3); i++) {
+            int last = i == (drag ? 10 : 2), step = drag && i >= 2 && !last ? i - 1 : last ? 8 : 0;
+            int px = x + (x2 - x) * step / 8, py = y + (y2 - y) * step / 8;
             mach_enter();
             CPU r; cpu_init(&r);
-            r.ax = st[up]; r.bx = (uint16_t)(x * 0xFFFF / (FB_W - 1)); r.cx = (uint16_t)(y * 0xFFFF / (FB_H - 1)); r.dx = 2;
+            r.ax = i == 0 ? 0x8001 : i == 1 ? 0x8002 : last ? 0x8004 : 0x8001;
+            r.bx = (uint16_t)(px * 0xFFFF / (FB_W - 1)); r.cx = (uint16_t)(py * 0xFFFF / (FB_H - 1)); r.dx = 2;
             r.cs = (uint16_t)(g_ms_proc >> 16); r.ip = (uint16_t)g_ms_proc; r.ss = r.ds = r.es = ss; r.sp = 0x1FF0;
-            fprintf(stderr, "[drv] mouse event %04X at %d,%d to %04X:%04X\n", r.ax, x, y, r.cs, r.ip);
+            fprintf(stderr, "[drv] mouse event %04X at %d,%d to %04X:%04X\n", r.ax, px, py, r.cs, r.ip);
             if (!w16_call(&r)) fprintf(stderr, "[drv] mouse proc %04X:%04X is no lifted function\n", r.cs, r.ip);
             mach_leave();
             Sleep(60);
