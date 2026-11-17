@@ -196,7 +196,7 @@ static void fon_load(const char* path) {
  * off the hinted output Windows draws; cp1252 only; composites keep offsets,
  * not scale; glyphs are cut at their advance.
  * ====================================================================== */
-typedef struct { char fam[32]; const uint8_t* d; uint32_t glyf, loca, hmtx, cmap4; int upem, longloca, nhm, asc, desc, avgw, maxw, weight, fixed; } ttf_t;
+typedef struct { char fam[32]; const uint8_t* d; uint32_t glyf, loca, hmtx, cmap4; int symbol, upem, longloca, nhm, asc, desc, avgw, maxw, weight, fixed; } ttf_t;
 static ttf_t g_ttf[8];
 static int g_nttf;
 static uint16_t rbe16(const uint8_t* p) { return (uint16_t)(p[0] << 8 | p[1]); }
@@ -231,7 +231,8 @@ static void ttf_load(const char* path) {
     T->fixed = post ? rbe32(d + post + 12) != 0 : 0;
     for (int i = 0; i < rbe16(d + cmap + 2); i++) {                /* (3,1) format 4 */
         const uint8_t* e = d + cmap + 4 + 8 * i;
-        if (rbe16(e) == 3 && rbe16(e + 2) == 1 && rbe16(d + cmap + rbe32(e + 4)) == 4) T->cmap4 = cmap + rbe32(e + 4);
+        if (rbe16(e) == 3 && rbe16(e + 2) <= 1 && rbe16(d + cmap + rbe32(e + 4)) == 4 && (!T->cmap4 || rbe16(e + 2) == 1))
+            T->cmap4 = cmap + rbe32(e + 4), T->symbol = rbe16(e + 2) == 0;   /* (3,0): a symbol font (Marlett), char c at U+F000+c */
     }
     const uint8_t* nt = d + name;
     for (int i = 0; i < rbe16(nt + 2); i++) {                      /* the family name (1), Windows Unicode */
@@ -373,7 +374,7 @@ static int ttf_pick(const char* face, int height) {
     size_t tot = 0;
     int gl[256];
     for (int c = 0; c < 256; c++) {
-        uint32_t u = c >= 0x80 && c < 0xA0 ? cp1252[c - 0x80] : (uint32_t)c;
+        uint32_t u = T->symbol ? 0xF000u + c : c >= 0x80 && c < 0xA0 ? cp1252[c - 0x80] : (uint32_t)c;
         int g = gl[c] = u ? ttf_glyph(T, u) : 0;
         int adv = rbe16(T->d + T->hmtx + 4 * (g < T->nhm ? g : T->nhm - 1));
         F->w[c] = (uint16_t)(int)(adv * sc + .5f), F->off[c] = (uint32_t)tot;
@@ -1615,6 +1616,7 @@ typedef struct uobj {
     uint32_t mask, color;
     int icx, icy;
     uint32_t tid;                                 /* the creating thread: its queue gets the window's posted messages */
+    int kid;                                      /* a launched child's top-level window, shown here for the taskbar: kid + 1 */
 } uobj_t;
 static uint32_t cur_tid(void) { return g_fs_base ? MEM32(MEM32(g_fs_base + 0x18) + 0x24) : 0; }
 static uobj_t g_u[MAXU];
@@ -1623,6 +1625,14 @@ static uint32_t g_psi, g_ahe, g_disp, g_mon, g_desk, g_deskinfo, g_threadinfo, g
 #define DESK_SIZE (8u << 20)
 static uint32_t g_desktop;                        /* the desktop window's handle */
 static uint32_t g_focus, g_capture, g_active, g_main;
+static uint32_t g_shellhook;                      /* RegisterShellHookWindow's window (the taskbar) */
+/* user32 answers GetCapture and GetCursorPos client-side from SERVERINFO: GetCapture is 0 unless
+ * gpsi->cCaptures (+0x864) is set, GetCursorPos copies gpsi->ptCursor (+0x7D4). With neither kept,
+ * browseui's menu filter saw no capture on a click and only took it back (the click on a Start
+ * menu item did nothing) */
+static int g_ptx, g_pty;                         /* the cursor, in screen coordinates (each MSG's pt) */
+static void set_capture(uint32_t h) { g_capture = h; if (g_psi) MEM32(g_psi + 0x864) = h ? 1u : 0u; }
+static void set_cursor(int x, int y) { g_ptx = x, g_pty = y; if (g_psi) MEM32(g_psi + 0x7D4) = (uint32_t)x, MEM32(g_psi + 0x7D8) = (uint32_t)y; }
 
 static uint32_t desk_alloc(uint32_t n) {
     uint32_t p = g_desk + g_desk_top;
@@ -1823,7 +1833,6 @@ static void broadcast(uint32_t m, uint32_t w, uint32_t l, int posted);
 
 /* ---- the queue, timers ---------------------------------------------------- */
 typedef struct { uint32_t h, m, w, l, t; int px, py; } qmsg_t;
-static int g_ptx, g_pty;                         /* the cursor, in screen coordinates (each MSG's pt) */
 #define QN 1024
 static qmsg_t g_q[QN];
 static int g_qh, g_qt, g_quit, g_quitcode;
@@ -2178,6 +2187,18 @@ static void invalidate(uobj_t* u, int erase) {
     for (int i = 2; i < MAXU; i++)
         if (g_u[i].type == W2K_TYPE_WINDOW && g_u[i].parent == u->h) invalidate(&g_u[i], erase);
 }
+static int child_of(uint32_t c, uint32_t p);
+/* a window left a part of the screen (hidden, moved, destroyed): what was under it repaints there
+ * (the Start menu stayed drawn after it hid for Run). ponytail: whole windows, not just the part */
+static void expose(rc_t r, uint32_t gone) {
+    if (rc_empty(&r)) return;
+    for (int i = 2; i < MAXU; i++) {
+        uobj_t* u = &g_u[i];
+        if (u->type != W2K_TYPE_WINDOW || u->h == gone || child_of(u->h, gone) || !visible(u)) continue;
+        rc_t x = rc_and(u->wr, r);
+        if (!rc_empty(&x)) set_dirty(u, 1), u->ncdirty = 1, u->erase = 1;
+    }
+}
 static void calcsize(uobj_t* u) {                /* WM_NCCALCSIZE(FALSE, the window rect) */
     uint32_t rr[4];
     rc_t w = u->wrel;
@@ -2199,7 +2220,8 @@ static int setpos(uobj_t* u, int x, int y, int cx, int cy, uint32_t fl) {
     if (fl & SWP_NOMOVE) wp[2] = (uint32_t)u->wrel.l, wp[3] = (uint32_t)u->wrel.t;
     if (fl & SWP_NOSIZE) wp[4] = (uint32_t)(u->wrel.r - u->wrel.l), wp[5] = (uint32_t)(u->wrel.b - u->wrel.t);
     send(u->h, 0x46, 0, (uint32_t)(uintptr_t)wp);                     /* WM_WINDOWPOSCHANGING */
-    rc_t old = u->wrel;
+    rc_t old = u->wrel, oldscr = u->wr;
+    int wasvis = visible(u);
     u->wrel = (rc_t){ (int)wp[2], (int)wp[3], (int)wp[2] + (int)wp[4], (int)wp[3] + (int)wp[5] };
     int moved = old.l != u->wrel.l || old.t != u->wrel.t, sized = old.r - old.l != u->wrel.r - u->wrel.l || old.b - old.t != u->wrel.b - u->wrel.t;
     if (fl & SWP_SHOWWINDOW) u->style |= WS_VISIBLE;
@@ -2207,14 +2229,17 @@ static int setpos(uobj_t* u, int x, int y, int cx, int cy, uint32_t fl) {
     if (fl & SWP_HIDEWINDOW) u->style &= ~WS_VISIBLE;
     if (sized || moved || (fl & SWP_FRAMECHANGED)) calcsize(u);
     wnd_sync(u);
+    if (wasvis && (!visible(u) || moved || sized)) expose(oldscr, visible(u) ? 0 : u->h);
     if (!(fl & SWP_NOREDRAW) && (sized || moved || (fl & (SWP_FRAMECHANGED | SWP_SHOWWINDOW)))) invalidate(u, 1);
     if (!moved) wp[6] |= SWP_NOMOVE;
     if (!sized) wp[6] |= SWP_NOSIZE;
     send(u->h, 0x47, 0, (uint32_t)(uintptr_t)wp);                     /* WM_WINDOWPOSCHANGED */
     return 1;
 }
+static void kid_activate(uobj_t* u);
 static void activate(uobj_t* u) {
     if (g_active == u->h) return;
+    if (u->kid) kid_activate(u);                  /* (the taskbar's button for a child's window) */
     uint32_t old = g_active;
     g_active = u->h;
     TRACE("[user] activate %08X (style %08X), was %08X\n", u->h, u->style, old);
@@ -2252,9 +2277,10 @@ static void destroy(uobj_t* u) {
     for (int i = 2; i < MAXU; i++)
         if (g_u[i].type == W2K_TYPE_WINDOW && (g_u[i].parent == h || g_u[i].owner == h)) destroy(&g_u[i]);
     if (!W(h)) return;
+    if (visible(u)) expose(u->wr, h);
     send(h, 0x82, 0, 0);                                              /* WM_NCDESTROY */
     if (g_focus == h) g_focus = 0;
-    if (g_capture == h) g_capture = 0;
+    if (g_capture == h) set_capture(0);
     if (g_active == h) g_active = 0;
     for (int i = 0; i < MAXT; i++) if (g_tm[i].h == h) g_tm[i].on = 0;
     ufree(u);
@@ -2339,7 +2365,9 @@ static uint32_t defproc(uobj_t* u, uint32_t m, uint32_t w, uint32_t l) {
         if (y >= u->wr.t && y < u->cr.t) return 2;                   /* HTCAPTION */
         return 0;
     }
-    case 0x21: return 1;                                             /* WM_MOUSEACTIVATE: MA_ACTIVATE */
+    case 0x21:                                                       /* WM_MOUSEACTIVATE: the parent's answer, else MA_ACTIVATE */
+        if ((u->style & WS_CHILD) && W(u->parent)) { uint32_t r = send(u->parent, 0x21, w, l); if (r) return r; }
+        return 1;
     case 0x20: return 0;                                             /* WM_SETCURSOR */
     case 0x06: if (w & 0xFFFF) { g_focus = u->h; } return 0;         /* WM_ACTIVATE */
     case 0x31: return g_stock[17];                                   /* WM_GETFONT: none set, DEFAULT_GUI_FONT */
@@ -2715,7 +2743,11 @@ static int next_msg(uint32_t msg, uint32_t hw, uint32_t lo, uint32_t hi, int rem
 /* WH_GETMESSAGE(HC_ACTION, PM_REMOVE or not, MSG*) on the hooking thread: the Start menu's
  * CMBMsgFilter sees (and redirects) the mouse there */
 static void getmsg_hook(uint32_t msg, uint32_t remove) {
+    uint32_t m = MEM32(msg + 4), h0 = MEM32(msg);
     if (g_gmhook && (!g_gmtid || g_gmtid == cur_tid())) call_hook(g_gmhook, 3, 0, remove, msg);
+    if (m >= 0x201 && m <= 0x205)
+        TRACE("[user] mouse %04X to %08X: after the hook %04X to %08X lp %08X pt %d,%d (capture %08X)\n", m, h0, MEM32(msg + 4), MEM32(msg), MEM32(msg + 12),
+              (int)MEM32(msg + 20), (int)MEM32(msg + 24), g_capture);
 }
 static uint32_t s_getmessage(uint32_t* a) {      /* NtUserGetMessage(MSG*, hwnd, min, max) */
     while (!next_msg(a[0], a[1], a[2], a[3], 1)) script_idle();
@@ -2914,7 +2946,7 @@ static uint32_t s_call_noparam(uint32_t* a) {
     case 1: return menu_new(1);                  /* CreatePopupMenu */
     case 2: g_caret.hwnd = 0; return 1;          /* DestroyCaret */
     case 5: return 0;                            /* GetMessagePos */
-    case 8: g_capture = 0; return 1;             /* ReleaseCapture */
+    case 8: set_capture(0); return 1;            /* ReleaseCapture */
     case 0x12: return 0;                         /* ClientThreadSetup asks: a new thread */
     case 0x15: return 0;                         /* MsgWaitForMultipleObjectsEx: clear the wake mask (none kept) */
     }
@@ -2936,7 +2968,15 @@ static uint32_t s_call_oneparam(uint32_t* a) {
     /* 0x1D GetInputEvent(wake mask): MsgWaitForMultipleObjects waits on it with its handles.
      * ponytail: always signalled (the caller then peeks; every peek lets time pass), so a
      * message wait never sleeps; a real per-queue event when idle CPU matters */
-    case 0x1D: { static uint32_t ev; if (!ev) ev = ntp_event(1, 1); return ev; }
+    case 0x1D: {
+        /* a wait for sent messages only (QS_SENDMESSAGE 0x40) never wakes: sends are direct calls here.
+         * (The tray waits up to 10 s that way for the Run dialog's ready event, which shell32 never sets
+         * here; with the always-signalled event its MsgWait never timed out and the tray thread hung) */
+        static uint32_t ev, never;
+        if (!(a[0] & ~0x40u)) { if (!never) never = ntp_event(0, 1); return never; }
+        if (!ev) ev = ntp_event(1, 1);
+        return ev;
+    }
     case 0x21: return 1;                         /* LockSetForegroundWindow */
     }
     fprintf(stderr, "[user] NtUserCallOneParam(%08X, 0x%X) not answered\n", a[0], a[1]);
@@ -2949,7 +2989,8 @@ static uint32_t s_call_twoparam(uint32_t* a) {
 }
 static uint32_t s_call_hwnd(uint32_t* a) {       /* NtUserCallHwnd(hwnd, index) */
     if (a[1] == 0x3D) return 1;                   /* SetMsgBox: the dialog is a message box (win32k only marks it) */
-    if (a[1] == 0x3C || a[1] == 0x39) return 1;   /* Register/DeregisterShellHookWindow. ponytail: no HSHELL_* sent yet */
+    if (a[1] == 0x3C) { g_shellhook = a[0]; return 1; }   /* RegisterShellHookWindow: HSHELL_* for the children's windows */
+    if (a[1] == 0x39) { if (g_shellhook == a[0]) g_shellhook = 0; return 1; }
     fprintf(stderr, "[user] NtUserCallHwnd index 0x%X not answered\n", a[1]);
     return 0;
 }
@@ -3006,6 +3047,14 @@ static uint32_t s_scrollwindow(uint32_t* a) {
     return 2;                                     /* SIMPLEREGION */
 }
 /* NtUserGetClassName(hwnd, bReal, UNICODE_STRING* out): the length copied, without the NUL */
+static uint32_t s_internaltext(uint32_t* a) {   /* NtUserInternalGetWindowText(hwnd, buf, cch) */
+    uobj_t* u = W(a[0]);
+    if (!u || !a[1] || (int)a[2] <= 0) return 0;
+    int n = 0;
+    for (; n < (int)a[2] - 1 && u->text[n]; n++) MEM16(a[1] + 2 * n) = u->text[n];
+    MEM16(a[1] + 2 * n) = 0;
+    return (uint32_t)n;
+}
 static uint32_t s_classname(uint32_t* a) {
     uobj_t* u = W(a[0]);
     uint32_t s = a[2];
@@ -3089,7 +3138,7 @@ static uint32_t s_setfocus(uint32_t* a) {
     if (W(a[0])) send(a[0], 7, old, 0);          /* WM_SETFOCUS */
     return old;
 }
-static uint32_t s_setcapture(uint32_t* a) { uint32_t o = g_capture; g_capture = a[0]; return o; }
+static uint32_t s_setcapture(uint32_t* a) { uint32_t o = g_capture; set_capture(a[0]); return o; }
 static uint32_t s_setactive(uint32_t* a) {       /* a child is not activated (mspaint asks for its view's) */
     uint32_t o = g_active;
     uobj_t* u = W(a[0]);
@@ -3240,7 +3289,23 @@ static uint32_t s_drawcaptiontemp(uint32_t* a) {
 }
 static uint32_t s_keystate(uint32_t* a) { return a[0] < 256 && g_keys[a[0]] ? 0xFF80u : 0; }
 static uint32_t s_dblclick(uint32_t* a) { (void)a; return 500; }
-static uint32_t s_register_msg(uint32_t* a) { (void)a; static uint32_t n = 0xC100; return n++; }
+/* NtUserRegisterWindowMessage(UNICODE_STRING*): one number per name (the shell hook's "SHELLHOOK") */
+static uint16_t g_rmsg[64][40];
+static int g_nrmsg;
+static uint32_t reg_msg(const uint16_t* name) {
+    for (int i = 0; i < g_nrmsg; i++) if (!u16icmp(g_rmsg[i], name)) return 0xC100u + (uint32_t)i;
+    if (g_nrmsg >= 64) return 0xC100u + 63;
+    u16cpy(g_rmsg[g_nrmsg], name, 40);
+    return 0xC100u + (uint32_t)g_nrmsg++;
+}
+static uint32_t s_register_msg(uint32_t* a) {
+    uint16_t n[40] = { 0 };
+    uint32_t len = a[0] ? MEM16(a[0]) / 2 : 0, b = a[0] ? MEM32(a[0] + 4) : 0;
+    for (uint32_t i = 0; i < len && i < 39 && b; i++) n[i] = MEM16(b + 2 * i);
+    uint32_t r = reg_msg(n);
+    if (g_trace) { char t[40]; int i = 0; for (; i < 39 && n[i]; i++) t[i] = (char)n[i]; t[i] = 0; fprintf(stderr, "[user] RegisterWindowMessage %s: %X\n", t, r); }
+    return r;
+}
 static uint32_t s_accel(uint32_t* a) {           /* NtUserCreateAcceleratorTable(ACCEL*, n): 6-byte entries */
     uobj_t* c = unew(W2K_TYPE_ACCEL, 0x20);
     if (!c) return 0;
@@ -3356,19 +3421,37 @@ static uint32_t ctlcolor(uint32_t parent, uint32_t hwnd, uint32_t hdc, uint32_t 
 }
 static uint32_t s_ctlbrush(uint32_t* a) { uobj_t* u = W(a[0]); return u ? ctlcolor(u->parent, a[0], a[1], a[2]) : 0; }
 static uint32_t s_ctlcolor(uint32_t* a) { return ctlcolor(a[0], a[1], a[2], a[3]); }
-static uint32_t s_frompoint(uint32_t* a) {       /* NtUserWindowFromPoint(x, y) */
-    uint32_t r = g_desktop;
-    int rtop = 0;
+/* WindowFromPoint: the top-level window there (a topmost one first, then the active one, then the
+ * newest), then down through its visible children to the deepest one there. (Taking the last slot
+ * that held the point answered a parent whose child had an older slot.) ponytail: no z-order
+ * among siblings (the newest wins), no HTTRANSPARENT, disabled children still count */
+static int at(uobj_t* u, int x, int y) { return u->type == W2K_TYPE_WINDOW && !u->kid && visible(u) && x >= u->wr.l && x < u->wr.r && y >= u->wr.t && y < u->wr.b; }
+static uint32_t frompoint(int x, int y) {
+    uobj_t* best = NULL;
+    int bs = -1;
     for (int i = 2; i < MAXU; i++) {
         uobj_t* u = &g_u[i];
-        if (u->type == W2K_TYPE_WINDOW && visible(u) && (int)a[0] >= u->wr.l && (int)a[0] < u->wr.r && (int)a[1] >= u->wr.t && (int)a[1] < u->wr.b) {
-            uobj_t* t = u;                                /* a topmost tree (the taskbar) is above the others */
-            while (W(t->parent) && t->parent != g_desktop) t = W(t->parent);
-            int top = (t->ex & 8) != 0;
-            if (top >= rtop) r = u->h, rtop = top;
-        }
+        if (u->parent != g_desktop || u->h == g_desktop || !at(u, x, y)) continue;
+        int sc = (u->ex & 8 ? 4 : 0) | (u->h == g_active ? 2 : 0);
+        if (sc >= bs) best = u, bs = sc;
     }
-    return r;
+    if (!best) return g_desktop;
+    for (uobj_t* in = best; in; ) {
+        best = in, in = NULL;
+        for (int i = 2; i < MAXU; i++) if (g_u[i].parent == best->h && at(&g_u[i], x, y)) in = &g_u[i];
+    }
+    return best->h;
+}
+static uint32_t s_frompoint(uint32_t* a) { return frompoint((int)a[0], (int)a[1]); }   /* NtUserWindowFromPoint(x, y) */
+/* NtUserChildWindowFromPointEx(parent, x, y in its client, CWP_* flags): the child there, else the parent.
+ * ponytail: CWP_SKIPINVISIBLE (1) always, the other skips ignored */
+static uint32_t s_childfrompoint(uint32_t* a) {
+    uobj_t* p = W(a[0]);
+    if (!p) return 0;
+    int x = p->cr.l + (int)a[1], y = p->cr.t + (int)a[2];
+    if (x < p->cr.l || x >= p->cr.r || y < p->cr.t || y >= p->cr.b) return 0;
+    for (int i = 2; i < MAXU; i++) if (g_u[i].parent == p->h && at(&g_u[i], x, y)) return g_u[i].h;
+    return p->h;
 }
 static uint32_t s_getplacement(uint32_t* a) {    /* NtUserGetWindowPlacement(hwnd, WINDOWPLACEMENT*) */
     uobj_t* u = W(a[0]);
@@ -3532,7 +3615,7 @@ int w2kx_script_arg(int argc, char** argv, int i) {
 }
 static uint32_t top_window(void) {                /* the newest visible top-level window */
     for (int i = MAXU - 1; i >= 2; i--)
-        if (g_u[i].type == W2K_TYPE_WINDOW && g_u[i].parent == g_desktop && (g_u[i].style & WS_VISIBLE)) return g_u[i].h;
+        if (g_u[i].type == W2K_TYPE_WINDOW && !g_u[i].kid && g_u[i].parent == g_desktop && (g_u[i].style & WS_VISIBLE)) return g_u[i].h;
     return g_main;
 }
 static void shot(uint32_t ms) {
@@ -3583,7 +3666,7 @@ static void run_event(ev_t* e) {
         sscanf(e->arg, "%d,%d", &x, &y);
         uint32_t pt[2] = { (uint32_t)x, (uint32_t)y };
         uobj_t* u = W(g_capture && W(g_capture) ? g_capture : s_frompoint(pt));   /* the capture first, as win32k */
-        g_ptx = x, g_pty = y;
+        set_cursor(x, y);
         fprintf(stderr, "[script] sclick %d,%d: window %08X\n", x, y, u ? u->h : 0);
         if (!u || u->h == g_desktop) break;
         uint32_t cl = (uint32_t)((y - u->cr.t) << 16 | ((x - u->cr.l) & 0xFFFF));
@@ -3658,6 +3741,8 @@ static Atom g_xdel;
 static uint32_t g_xlast, g_xshown, g_xdown_ms, g_xdown_h;
 static int g_xdown_x, g_xdown_y;
 static uint32_t host_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint32_t)(t.tv_sec * 1000 + t.tv_nsec / 1000000); }
+static int kid_mouse(int type, int x, int y, unsigned button, unsigned state);
+static void kid_compose(uint32_t* o);
 static void x_open(void) {
     if (!(g_xd = XOpenDisplay(NULL))) { fprintf(stderr, "[live] no X display (DISPLAY=%s)\n", getenv("DISPLAY") ? getenv("DISPLAY") : ""); exit(1); }
     int sc = DefaultScreen(g_xd);
@@ -3676,6 +3761,7 @@ static void x_present(void) {                    /* COLORREF (0x00BBGGRR) to the
     uint32_t* o = (uint32_t*)g_xi->data;
     for (int i = 0; i < g_cx * g_cy; i++) { uint32_t c = g_screen.px[i]; o[i] = (c & 0xFF) << 16 | (c & 0xFF00) | (c >> 16 & 0xFF); }
     caret_overlay(o);
+    kid_compose(o);
     XPutImage(g_xd, g_xw, g_xgc, g_xi, 0, 0, 0, 0, (unsigned)g_cx, (unsigned)g_cy);
     XFlush(g_xd);
     g_xshown = host_ms();
@@ -3714,6 +3800,7 @@ static void x_popup_click(int x, int y) {
 static void x_mouse(int type, int x, int y, unsigned button, unsigned state) {
     uint32_t mk = (state & Button1Mask ? 1 : 0) | (state & Button3Mask ? 2 : 0) | (state & ShiftMask ? 4 : 0) | (state & ControlMask ? 8 : 0);
     if (type != MotionNotify && button > 3) return;          /* the wheel */
+    if (kid_mouse(type, x, y, button, state)) return;
     if (type == MotionNotify && !rc_empty(&g_popup) && x >= g_popup.l && x < g_popup.r && y >= g_popup.t && y < g_popup.b) {
         uobj_t* p = U(g_popup_menu, W2K_TYPE_MENU);                 /* hot-tracking */
         int sel = -1;
@@ -3730,14 +3817,22 @@ static void x_mouse(int type, int x, int y, unsigned button, unsigned state) {
         popup_close();
     }
     uint32_t pt[2] = { (uint32_t)x, (uint32_t)y }, h = g_capture ? g_capture : s_frompoint(pt);
-    g_ptx = x, g_pty = y;
+    set_cursor(x, y);
     uobj_t* u = W(h);
     if (!u || h == g_desktop) return;
     uint32_t sl = (uint32_t)(y << 16 | (x & 0xFFFF));
     int client = g_capture || (x >= u->cr.l && x < u->cr.r && y >= u->cr.t && y < u->cr.b);
-    if (type == ButtonPress) {
+    /* a click activates its top-level window (WM_MOUSEACTIVATE first), but not while a window has the
+     * capture: the Start menu's BaseBar holds it, and activating the BaseBar deactivated the tray,
+     * which closed the menu before the click reached its item */
+    if (type == ButtonPress && !g_capture) {
         uobj_t* t = W(top_of(h));
-        if (t && t->h != g_active) activate(t);
+        if (t && t->h != g_active) {
+            uint32_t ht = client ? 1 : send(h, 0x84, 0, sl);
+            uint32_t ma = send(h, 0x21, t->h, (button == 3 ? 0x204u : button == 2 ? 0x207u : 0x201u) << 16 | (ht & 0xFFFF));
+            if (ma == 4) return;                              /* MA_NOACTIVATEANDEAT */
+            if (ma != 3 && W(t->h)) activate(t);
+        }
     }
     if (!client) {
         if (type != ButtonPress || button != 1) return;
@@ -3767,15 +3862,13 @@ static void x_mouse(int type, int x, int y, unsigned button, unsigned state) {
     }
     post(h, m, mk, cl);
 }
-static void x_key(XKeyEvent* e, int down) {
-    KeySym k = XLookupKeysym(e, 0), dummy;
-    char ch[8] = "";
-    int n = down ? XLookupString(e, ch, sizeof ch, &dummy, NULL) : 0;
-    uint32_t vk = x_vk(k), alt = (e->state & Mod1Mask) != 0;
-    if (!vk) return;
+static int kid_key(uint32_t vk, int down, uint32_t ch, uint32_t keycode, uint32_t state);
+static void key_in(uint32_t vk, int down, uint32_t ch, uint32_t keycode, uint32_t state) {
+    uint32_t alt = (state & Mod1Mask) != 0;
+    if (!vk || kid_key(vk, down, ch, keycode, state)) return;
     g_keys[vk] = (uint8_t)down;
-    if (down) g_keychar[vk] = n == 1 && !(e->state & ControlMask) ? (uint8_t)ch[0] : 0;
-    uint32_t lp = 1 | (uint32_t)(e->keycode - 8) << 16 | (down ? 0 : 0xC0000000u);
+    if (down) g_keychar[vk] = (uint16_t)ch;
+    uint32_t lp = 1 | (keycode - 8) << 16 | (down ? 0 : 0xC0000000u);
     uint32_t to = W(g_focus) ? g_focus : g_active ? g_active : g_main;
     if (!rc_empty(&g_popup) && vk != 16 && vk != 17 && vk != 18) { if (down) popup_key(vk); return; }
     if (down && (vk == 0x79 || (alt && vk >= 'A' && vk <= 'Z'))) {   /* F10, Alt+letter: the menu */
@@ -3785,9 +3878,227 @@ static void x_key(XKeyEvent* e, int down) {
     if (vk == 18) return;
     post(to, down ? 0x100 : 0x101, vk, lp);
 }
+static void x_key(XKeyEvent* e, int down) {
+    KeySym k = XLookupKeysym(e, 0), dummy;
+    char ch[8] = "";
+    int n = down ? XLookupString(e, ch, sizeof ch, &dummy, NULL) : 0;
+    key_in(x_vk(k), down, n == 1 && !(e->state & ControlMask) ? (uint8_t)ch[0] : 0, e->keycode, e->state);
+}
+
+/* ---- one screen: the launched runners' windows in the shell's X window ----------------------
+ * The shell (the process with the X window) makes each child a shared surface before it starts
+ * it: a file in the scratch directory, mapped by both. The child draws as always into its own
+ * framebuffer and copies it there with the list of its top-level windows; the shell puts those
+ * rectangles over its own screen (under its topmost windows: the taskbar, the Start menu) and
+ * sends the child the mouse over them and the keyboard while one of them is active. Each child
+ * window gets a stand-in window here (no size, never drawn) that the taskbar's shell hook is told
+ * about (HSHELL_WINDOWCREATED / DESTROYED), so it has a button; the button activates the child's.
+ * ponytail: the children's windows are above all of the shell's but its topmost ones; whole-frame
+ * copies every 15 ms (no damage tracking); the input ring drops events when full. */
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#define SHM_MAGIC 0x324B5753u
+#define SHM_WINS 16
+#define SHM_EVS 256
+typedef struct { int l, t, r, b; uint32_t h; uint16_t text[64]; } shm_win_t;
+typedef struct { uint32_t kind, a, b, c, d, e; } shm_ev_t;        /* 1 mouse (type, x, y, button, state), 2 key (vk, down, ch, keycode, state) */
+typedef struct {
+    uint32_t magic, cx, cy, frames, nwin, activate;
+    shm_win_t win[SHM_WINS];
+    uint32_t ih, it;
+    shm_ev_t ev[SHM_EVS];
+} shm_hdr_t;
+#define SHM_OFF (((uint32_t)sizeof(shm_hdr_t) + 4095) & ~4095u)
+#define SHM_PX(s) ((uint32_t*)((uint8_t*)(s) + SHM_OFF))
+static shm_hdr_t* g_shm;                          /* this process's own, when it is a child */
+static shm_hdr_t* shm_map(const char* path, int create, int cx, int cy, size_t* len);
+typedef struct { shm_hdr_t* s; size_t len; int pid; uint32_t remote[SHM_WINS], proxy[SHM_WINS]; char path[600]; } kid_t;
+#define MAXKID 8
+static kid_t g_kid[MAXKID];
+static int g_kfocus = -1, g_kgrab = -1;
+int w2kx_child(const char* path) {
+    if (!g_live || g_shm) return -1;
+    for (int k = 0; k < MAXKID; k++) {
+        kid_t* c = &g_kid[k];
+        if (c->s) continue;
+        if (!(c->s = shm_map(path, 1, g_cx, g_cy, &c->len))) { perror(path); return -1; }
+        c->s->cx = (uint32_t)g_cx, c->s->cy = (uint32_t)g_cy, c->s->magic = SHM_MAGIC;
+        snprintf(c->path, sizeof c->path, "%s", path);
+        c->pid = 0;
+        return k;
+    }
+    return -1;
+}
+void w2kx_child_pid(int k, int pid) { if (k >= 0 && k < MAXKID) g_kid[k].pid = pid; }
+static void kid_send(int k, uint32_t kind, uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e) {
+    shm_hdr_t* s = g_kid[k].s;
+    uint32_t t = s->it, h = __atomic_load_n(&s->ih, __ATOMIC_ACQUIRE);
+    if (t - h >= SHM_EVS) return;
+    s->ev[t % SHM_EVS] = (shm_ev_t){ kind, a, b, c, d, e };
+    __atomic_store_n(&s->it, t + 1, __ATOMIC_RELEASE);
+}
+static int shell_topmost_at(int x, int y) {       /* one of the shell's own topmost windows (the taskbar, the Start menu) */
+    for (int i = 2; i < MAXU; i++) {
+        uobj_t* u = &g_u[i];
+        if (u->type == W2K_TYPE_WINDOW && !u->kid && u->parent == g_desktop && (u->ex & 8) && visible(u)
+            && x >= u->wr.l && x < u->wr.r && y >= u->wr.t && y < u->wr.b) return 1;
+    }
+    return 0;
+}
+static int kid_at(int x, int y) {
+    for (int k = MAXKID - 1; k >= 0; k--) {
+        shm_hdr_t* s = g_kid[k].s;
+        if (!s || !s->frames) continue;
+        for (int i = (int)s->nwin - 1; i >= 0 && i < SHM_WINS; i--)
+            if (x >= s->win[i].l && x < s->win[i].r && y >= s->win[i].t && y < s->win[i].b) return k;
+    }
+    return -1;
+}
+/* the shell's x_mouse: 1 when the event went to a child */
+static int kid_mouse(int type, int x, int y, unsigned button, unsigned state) {
+    if (g_shm) return 0;
+    int k = g_kgrab;
+    if (k < 0 && !g_capture && !shell_topmost_at(x, y)) k = kid_at(x, y);
+    if (type == ButtonPress) g_kfocus = k;        /* (a click on the shell's own takes the keyboard back) */
+    if (k < 0) return 0;
+    if (type == ButtonPress) g_kgrab = k;
+    if (type == ButtonRelease) g_kgrab = -1;
+    kid_send(k, 1, (uint32_t)type, (uint32_t)x, (uint32_t)y, button, state);
+    return 1;
+}
+static int kid_key(uint32_t vk, int down, uint32_t ch, uint32_t keycode, uint32_t state) {
+    if (g_shm || g_kfocus < 0 || !g_kid[g_kfocus].s) return 0;
+    kid_send(g_kfocus, 2, vk, (uint32_t)down, ch, keycode, state);
+    return 1;
+}
+static void kid_activate(uobj_t* u) {             /* the taskbar's button: the child's window comes up and takes the keys */
+    kid_t* c = &g_kid[u->kid - 1];
+    if (!c->s) return;
+    for (int i = 0; i < SHM_WINS; i++) if (c->proxy[i] == u->h) c->s->activate = c->remote[i];
+    g_kfocus = u->kid - 1;
+}
+static uint32_t shell_msg(void) { static const uint16_t n[] = { 'S', 'H', 'E', 'L', 'L', 'H', 'O', 'O', 'K', 0 }; return reg_msg(n); }
+static void kid_proxy_gone(kid_t* c, int i) {
+    uobj_t* u = W(c->proxy[i]);
+    if (u) {
+        if (W(g_shellhook)) post(g_shellhook, shell_msg(), 2, u->h);       /* HSHELL_WINDOWDESTROYED */
+        destroy(u);
+    }
+    c->proxy[i] = c->remote[i] = 0;
+}
+/* the shell, each pass: new and gone child windows (stand-ins and shell hook), children that exited */
+static void kid_poll(void) {
+    for (int k = 0; k < MAXKID; k++) {
+        kid_t* c = &g_kid[k];
+        if (!c->s) continue;
+        int st, gone = c->pid > 0 && waitpid(c->pid, &st, WNOHANG) == c->pid;
+        for (int i = 0; i < SHM_WINS; i++) {               /* stand-ins whose window is no longer listed */
+            if (!c->remote[i]) continue;
+            int found = 0;
+            for (uint32_t j = 0; !gone && j < c->s->nwin && j < SHM_WINS; j++) found |= c->s->win[j].h == c->remote[i];
+            if (!found) kid_proxy_gone(c, i);
+        }
+        if (gone) {
+            fprintf(stderr, "[live] child %d exited\n", c->pid);
+            munmap(c->s, c->len), unlink(c->path);
+            memset(c, 0, sizeof *c);
+            if (g_kfocus == k) g_kfocus = -1;
+            if (g_kgrab == k) g_kgrab = -1;
+            continue;
+        }
+        for (uint32_t j = 0; j < c->s->nwin && j < SHM_WINS; j++) {
+            shm_win_t* w = &c->s->win[j];
+            if (!w->h) continue;                           /* (a dropped-down menu: no button) */
+            int i = 0, f = -1;
+            for (; i < SHM_WINS; i++) if (c->remote[i] == w->h) break;
+            if (i < SHM_WINS) {                            /* the title may change: HSHELL_REDRAW */
+                uobj_t* u = W(c->proxy[i]);
+                if (u && memcmp(u->text, w->text, sizeof w->text)) {
+                    memcpy(u->text, w->text, sizeof w->text), u->text[63] = 0, wnd_sync(u);
+                    if (W(g_shellhook)) post(g_shellhook, shell_msg(), 6, u->h);
+                }
+                continue;
+            }
+            for (i = 0; i < SHM_WINS && f < 0; i++) if (!c->remote[i]) f = i;
+            uobj_t* d = W(g_desktop), *u = f >= 0 && d ? unew(W2K_TYPE_WINDOW, WND_SIZE) : NULL;
+            if (!u) continue;
+            static uint32_t dwp;
+            if (!dwp) dwp = ntp_export(ntp_module("user32.dll"), "DefWindowProcW");
+            /* WS_OVERLAPPEDWINDOW | WS_VISIBLE, WS_EX_WINDOWEDGE; no thread of ours (sends go through win32k) */
+            u->cls = d->cls, u->style = 0x10CF0000u, u->ex = 0x100, u->parent = g_desktop, u->kid = k + 1, u->tid = 0;
+            memcpy(u->text, w->text, sizeof w->text), u->text[63] = 0;
+            MEM32(u->obj + WND_PROC) = dwp;
+            MEM32(u->obj + WND_PCLS) = MEM32(d->obj + WND_PCLS);
+            wnd_sync(u);
+            c->remote[f] = w->h, c->proxy[f] = u->h;
+            fprintf(stderr, "[live] child %d window %08X: stand-in %08X\n", c->pid, w->h, u->h);
+            fprintf(stderr, "[live] HSHELL_WINDOWCREATED (message %X) to %08X\n", shell_msg(), g_shellhook);
+            if (W(g_shellhook)) post(g_shellhook, shell_msg(), 1, u->h);   /* HSHELL_WINDOWCREATED */
+        }
+    }
+}
+static void put_rect(uint32_t* o, const uint32_t* px, rc_t r) {   /* COLORREF to the visual's 0x00RRGGBB */
+    r = rc_and(r, (rc_t){ 0, 0, g_cx, g_cy });
+    for (int y = r.t; y < r.b; y++)
+        for (int x = r.l; x < r.r; x++) { uint32_t c = px[(size_t)y * g_cx + x]; o[(size_t)y * g_cx + x] = (c & 0xFF) << 16 | (c & 0xFF00) | (c >> 16 & 0xFF); }
+}
+/* the shell's presented frame: the children's windows over it, then its own topmost ones again */
+static void kid_compose(uint32_t* o) {
+    int any = 0;
+    for (int k = 0; k < MAXKID; k++) {
+        shm_hdr_t* s = g_kid[k].s;
+        if (!s || !s->frames) continue;
+        for (uint32_t i = 0; i < s->nwin && i < SHM_WINS; i++, any = 1)
+            put_rect(o, SHM_PX(s), (rc_t){ s->win[i].l, s->win[i].t, s->win[i].r, s->win[i].b });
+    }
+    for (int i = 2; any && i < MAXU; i++) {
+        uobj_t* u = &g_u[i];
+        if (u->type == W2K_TYPE_WINDOW && !u->kid && u->parent == g_desktop && (u->ex & 8) && visible(u)) put_rect(o, g_screen.px, u->wr);
+    }
+}
+/* the child, instead of an X window: its frame and windows out, the shell's input in */
+static void shm_present(void) {
+    uint32_t* o = SHM_PX(g_shm);
+    memcpy(o, g_screen.px, (size_t)g_cx * g_cy * 4);
+    caret_overlay(o);
+    uint32_t n = 0;
+    for (int pass = 0; pass < 2; pass++)              /* the active window last: on top */
+        for (int i = 2; i < MAXU && n < SHM_WINS; i++) {
+            uobj_t* u = &g_u[i];
+            if (u->type != W2K_TYPE_WINDOW || u->parent != g_desktop || u->h == g_desktop || !(u->style & WS_VISIBLE) || rc_empty(&u->wr)) continue;
+            if ((u->h == g_active) != pass) continue;
+            shm_win_t* w = &g_shm->win[n++];
+            w->l = u->wr.l, w->t = u->wr.t, w->r = u->wr.r, w->b = u->wr.b, w->h = u->h;
+            memcpy(w->text, u->text, sizeof w->text), w->text[63] = 0;
+        }
+    if (!rc_empty(&g_popup) && n < SHM_WINS) g_shm->win[n++] = (shm_win_t){ g_popup.l, g_popup.t, g_popup.r, g_popup.b, 0, { 0 } };
+    g_shm->nwin = n;
+    __atomic_add_fetch(&g_shm->frames, 1, __ATOMIC_RELEASE);
+    g_xshown = host_ms();
+}
+static int shm_idle(uint32_t now, uint32_t next) {
+    if (g_shm->activate) { uobj_t* u = W(g_shm->activate); g_shm->activate = 0; if (u) activate(u); }
+    if (host_ms() - g_xshown >= 15) shm_present();
+    int any = 0;
+    for (uint32_t h; (h = g_shm->ih) != __atomic_load_n(&g_shm->it, __ATOMIC_ACQUIRE); any = 1) {
+        shm_ev_t e = g_shm->ev[h % SHM_EVS];
+        __atomic_store_n(&g_shm->ih, h + 1, __ATOMIC_RELEASE);
+        if (e.kind == 1) x_mouse((int)e.a, (int)e.b, (int)e.c, e.d, e.e);
+        else if (e.kind == 2) key_in(e.a, (int)e.b, e.c, e.d, e.e);
+    }
+    if (!any) usleep((next == UINT32_MAX || next - now > 15 ? 15 : next - now) * 1000);
+    uint32_t t = host_ms(), d = t - g_xlast;
+    g_xlast = t;
+    if (d) ntp_clock_advance(d);
+    return 1;
+}
 static int live_idle(uint32_t now, uint32_t next) {
     if (!g_live) return 0;
+    if (g_shm) return shm_idle(now, next);
     if (!g_xd) x_open();
+    kid_poll();
     if (host_ms() - g_xshown >= 15) x_present();
     int wait = next == UINT32_MAX || next - now > 15 ? 15 : (int)(next - now);
     if (!XPending(g_xd)) {
@@ -3814,6 +4125,9 @@ static int live_idle(uint32_t now, uint32_t next) {
     return 1;
 }
 #else
+static void kid_activate(uobj_t* u) { (void)u; }
+int w2kx_child(const char* path) { (void)path; return -1; }
+void w2kx_child_pid(int k, int pid) { (void)k, (void)pid; }
 static int live_idle(uint32_t now, uint32_t next) {
     (void)now, (void)next;
     if (g_live) { fprintf(stderr, "[live] built without X11 (-DW2K_X11 -lX11)\n"); exit(1); }
@@ -3821,15 +4135,36 @@ static int live_idle(uint32_t now, uint32_t next) {
 }
 #endif
 
+#ifdef W2K_X11
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+static shm_hdr_t* shm_map(const char* path, int create, int cx, int cy, size_t* len) {
+    int fd = open(path, create ? O_RDWR | O_CREAT | O_EXCL : O_RDWR, 0600);
+    if (fd < 0) return NULL;
+    if (!create) { struct stat st; if (fstat(fd, &st) || (size_t)st.st_size < SHM_OFF) { close(fd); return NULL; } *len = (size_t)st.st_size; }
+    else { *len = SHM_OFF + (size_t)cx * cy * 4; if (ftruncate(fd, (off_t)*len)) { close(fd); return NULL; } }
+    void* m = mmap(NULL, *len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    return m == MAP_FAILED ? NULL : (shm_hdr_t*)m;
+}
+#endif
 void w2kx_install(int cx, int cy, const char* fontdir) {
     char p[1024];
     g_trace = getenv("NATIVE32_SYSCALLS") != NULL;
+#ifdef W2K_X11
+    const char* sp = getenv("W2K_SHM");                 /* a launched child: the shell's surface and its screen size */
+    size_t len = 0;
+    if (sp && (g_shm = shm_map(sp, 0, 0, 0, &len)) && (g_shm->magic != SHM_MAGIC || len < SHM_OFF + (size_t)g_shm->cx * g_shm->cy * 4)) g_shm = NULL;
+    if (g_shm) cx = (int)g_shm->cx, cy = (int)g_shm->cy, fprintf(stderr, "[live] drawing into the shell's screen (%s)\n", sp);
+    unsetenv("W2K_SHM");
+#endif
     g_cx = cx, g_cy = cy;
     bm_init(&g_screen, cx, cy, 0);
     for (int i = 0; i < cx * cy; i++) g_screen.px[i] = w2k_colors_2000[1];   /* COLOR_BACKGROUND */
     snprintf(p, sizeof p, "%s/sserife.fon", fontdir), fon_load(p);
     snprintf(p, sizeof p, "%s/vgasys.fon", fontdir), fon_load(p);
-    static const char* const ttfs[] = { "lucon.ttf", "tahoma.ttf", "tahomabd.ttf", "arial.ttf", "times.ttf", "cour.ttf" };
+    static const char* const ttfs[] = { "lucon.ttf", "tahoma.ttf", "tahomabd.ttf", "arial.ttf", "times.ttf", "cour.ttf", "marlett.ttf" };
     for (unsigned i = 0; i < sizeof ttfs / sizeof ttfs[0]; i++) snprintf(p, sizeof p, "%s/%s", fontdir, ttfs[i]), ttf_load(p);
     ntp_csr_connect = user_connect;
     ntp_win32k_pre = pre;
@@ -3879,11 +4214,11 @@ void w2kx_install(int cx, int cy, const char* fontdir) {
         { "NtUserTranslateAccelerator", s_translate_accel }, { "NtUserSetWindowsHookEx", s_sethook }, { "NtUserUnhookWindowsHookEx", s_unhook },
         { "NtUserCallNextHookEx", s_zero_u }, { "NtUserAttachThreadInput", s_one },   /* (one input state for all threads) */
         { "NtUserSetProp", s_setprop }, { "NtUserRemoveProp", s_removeprop },
-        { "NtUserFillWindow", s_fill_window }, { "NtUserWindowFromPoint", s_frompoint }, { "NtUserGetWindowPlacement", s_getplacement },
+        { "NtUserFillWindow", s_fill_window }, { "NtUserWindowFromPoint", s_frompoint }, { "NtUserChildWindowFromPointEx", s_childfrompoint }, { "NtUserSetMenuDefaultItem", s_one_u }, { "NtUserGetWindowPlacement", s_getplacement },
         { "NtUserSetWindowPlacement", s_setplacement }, { "NtUserSystemParametersInfo", s_spi }, { "NtUserGetKeyState", s_keystate },
         { "NtUserGetAsyncKeyState", s_keystate }, { "NtUserShowCaret", s_showcaret }, { "NtUserHideCaret", s_hidecaret },
         { "NtUserCreateCaret", s_createcaret }, { "NtUserGetKeyboardLayoutList", s_zero_u },
-        { "NtUserGetControlBrush", s_ctlbrush }, { "NtUserGetClassName", s_classname }, { "NtUserFindWindowEx", s_findwindow }, { "NtUserScrollWindowEx", s_scrollwindow },
+        { "NtUserGetControlBrush", s_ctlbrush }, { "NtUserGetClassName", s_classname }, { "NtUserInternalGetWindowText", s_internaltext }, { "NtUserFindWindowEx", s_findwindow }, { "NtUserScrollWindowEx", s_scrollwindow },
         { "NtUserUnregisterClass", s_unregister_class }, { "NtUserCountClipboardFormats", s_zero_u }, { "NtUserGetControlColor", s_ctlcolor },
         { "NtUserGetIconInfo", s_iconinfo }, { "NtUserDrawCaptionTemp", s_drawcaptiontemp },
         { "NtUserRegisterHotKey", s_one_u }, { "NtUserUnregisterHotKey", s_one_u },   /* no system-wide hotkeys here */

@@ -16,5 +16,11 @@ void w2kx_install(int cx, int cy, const char* fontdir);
 int w2kx_script_arg(int argc, char** argv, int i);
 /* after the loader: the thread becomes a GUI thread (user32's ClientThreadSetup) */
 void w2kx_start(void);
+/* one screen (live): a launched runner draws into the shell's X window. Before the fork the shell
+ * makes the child's shared surface (a file in the scratch directory: its screen, its top-level
+ * windows, the input the shell sends it); the child finds it in W2K_SHM. -1: not composited
+ * (no live window here, or this process is itself a child) */
+int w2kx_child(const char* path);
+void w2kx_child_pid(int k, int pid);
 
 #endif
