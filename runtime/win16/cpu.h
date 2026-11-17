@@ -250,26 +250,40 @@ int recomp_lar32(uint16_t sel, uint32_t* rights);
 int recomp_lsl32(uint16_t sel, uint32_t* limit);
 /* *out is the 32-bit result (lar: rights bits 8-23; lsl: the byte limit);
  * a 16-bit destination keeps its low word, as on the CPU. */
-static inline int cpu_lar(CPU *cpu, uint16_t sel, uint32_t *out) {
+static inline int cpu_lar32(CPU *cpu, uint16_t sel, uint32_t *out) {
     (void)cpu;
     return recomp_lar32(sel, out);
 }
-static inline int cpu_lsl(CPU *cpu, uint16_t sel, uint32_t *out) {
+static inline int cpu_lsl32(CPU *cpu, uint16_t sel, uint32_t *out) {
     (void)cpu;
     return recomp_lsl32(sel, out);
 }
 #else
-static inline int cpu_lar(CPU *cpu, uint16_t sel, uint32_t *out) {
+static inline int cpu_lar32(CPU *cpu, uint16_t sel, uint32_t *out) {
     if (sel == 0 || cpu->sel_base[sel] == RECOMP_GUARD_BASE) return 0;
     *out = 0x9300;
     return 1;
 }
-static inline int cpu_lsl(CPU *cpu, uint16_t sel, uint32_t *out) {
+static inline int cpu_lsl32(CPU *cpu, uint16_t sel, uint32_t *out) {
     if (sel == 0 || cpu->sel_base[sel] == RECOMP_GUARD_BASE) return 0;
     *out = 0xFFFF;
     return 1;
 }
 #endif
+
+/* Older lifts pass a uint16_t destination, newer ones uint32_t: write only its width. */
+static inline int cpu_lar_n(CPU *cpu, uint16_t sel, void *out, size_t w) {
+    uint32_t v = 0; int r = cpu_lar32(cpu, sel, &v);
+    if (r) { if (w == 2) *(uint16_t *)out = (uint16_t)v; else *(uint32_t *)out = v; }
+    return r;
+}
+#define cpu_lar(c, s, o) cpu_lar_n((c), (s), (o), sizeof *(o))
+static inline int cpu_lsl_n(CPU *cpu, uint16_t sel, void *out, size_t w) {
+    uint32_t v = 0; int r = cpu_lsl32(cpu, sel, &v);
+    if (r) { if (w == 2) *(uint16_t *)out = (uint16_t)v; else *(uint32_t *)out = v; }
+    return r;
+}
+#define cpu_lsl(c, s, o) cpu_lsl_n((c), (s), (o), sizeof *(o))
 
 /* Not all of the address space is plain memory. A planar VGA in an unchained
  * mode turns one byte address into four pixels, one per plane, so a write there

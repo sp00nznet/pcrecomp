@@ -165,7 +165,7 @@ extern void (*native32_on_enter)(void);
  * import): its registers are kept, the machine lock is released however deep
  * this thread holds it, h is waited on (WaitForSingleObject), and the lock
  * and registers come back. Other guest threads run meanwhile. */
-DWORD native32_wait(HANDLE h, DWORD ms);
+unsigned long native32_wait(void *h, unsigned long ms);   /* DWORD/HANDLE: no windows.h here */
 
 /* A lifted function answered by the host instead, wherever its address is
  * resolved (indirect calls, snapped imports); and a built-in shim by name.
