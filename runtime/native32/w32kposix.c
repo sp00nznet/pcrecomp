@@ -45,6 +45,7 @@
 
 static int g_trace;
 static uint32_t g_cbt;                        /* the WH_CBT hook procedure (s_sethook) */
+static uint32_t g_gmhook, g_gmtid;            /* WH_GETMESSAGE's, and its thread (browseui's menu filter) */
 #define TRACE(...) do { if (g_trace) fprintf(stderr, __VA_ARGS__); } while (0)
 
 typedef struct { int l, t, r, b; } rc_t;
@@ -1613,7 +1614,9 @@ typedef struct uobj {
     /* a cursor / icon */
     uint32_t mask, color;
     int icx, icy;
+    uint32_t tid;                                 /* the creating thread: its queue gets the window's posted messages */
 } uobj_t;
+static uint32_t cur_tid(void) { return g_fs_base ? MEM32(MEM32(g_fs_base + 0x18) + 0x24) : 0; }
 static uobj_t g_u[MAXU];
 static uint16_t g_uuniq[MAXU];
 static uint32_t g_psi, g_ahe, g_disp, g_mon, g_desk, g_deskinfo, g_threadinfo, g_desk_top, g_defmsgs;
@@ -1643,6 +1646,7 @@ static uobj_t* unew(int type, uint32_t size) {
             u->type = (uint8_t)type, u->h = (uint32_t)i | (uint32_t)g_uuniq[i] << 16;
             u->obj = desk_alloc(size);
             MEM32(u->obj) = u->h;
+            u->tid = cur_tid();
             w2k_ahe_set(g_ahe, u->h, u->obj, (uint8_t)type, g_threadinfo);
             return u;
         }
@@ -1818,13 +1822,26 @@ static uint32_t send(uint32_t h, uint32_t m, uint32_t w, uint32_t l) {
 static void broadcast(uint32_t m, uint32_t w, uint32_t l, int posted);
 
 /* ---- the queue, timers ---------------------------------------------------- */
-typedef struct { uint32_t h, m, w, l, t; } qmsg_t;
+typedef struct { uint32_t h, m, w, l, t; int px, py; } qmsg_t;
+static int g_ptx, g_pty;                         /* the cursor, in screen coordinates (each MSG's pt) */
 #define QN 1024
 static qmsg_t g_q[QN];
 static int g_qh, g_qt, g_quit, g_quitcode;
+/* a hook procedure, called straight: CallNextHookEx reads CLIENTINFO's phkCurrent (TEB +0x6EC,
+ * less the client delta at +0x6E8): a HOOK with no next (+0x14) and flag 1 (+0x20) makes it
+ * return 0. ponytail: one hook per kind, no chain */
+static uint32_t call_hook(uint32_t proc, uint32_t id, uint32_t code, uint32_t w, uint32_t l) {
+    static uint32_t hk;
+    if (!hk) hk = ntp_alloc(0x40), MEM8(hk + 0x20) = 1;
+    uint32_t teb = MEM32(g_fs_base + 0x18), svk = MEM32(teb + 0x6EC), svc = MEM32(teb + 0x6FC), ha[3] = { code, w, l };
+    MEM32(teb + 0x6EC) = hk + MEM32(teb + 0x6E8), MEM32(teb + 0x6FC) = id << 16;
+    uint32_t r = ntp_guest(proc, 3, ha);
+    MEM32(teb + 0x6EC) = svk, MEM32(teb + 0x6FC) = svc;
+    return r;
+}
 static void post(uint32_t h, uint32_t m, uint32_t w, uint32_t l) {
     if ((g_qt + 1) % QN == g_qh) { fprintf(stderr, "[user] queue full\n"); return; }
-    g_q[g_qt] = (qmsg_t){ h, m, w, l, ntp_clock_ms() };
+    g_q[g_qt] = (qmsg_t){ h, m, w, l, ntp_clock_ms(), g_ptx, g_pty };
     g_qt = (g_qt + 1) % QN;
 }
 typedef struct { uint32_t h, id, elapse, due, proc; int on; } timer_t_;
@@ -2520,16 +2537,8 @@ static uint32_t s_create_window(uint32_t* a) {
     }
     uint32_t h = u->h;
     if (g_cbt) {                                  /* HCBT_CREATEWND(hwnd, CBT_CREATEWND { lpcs, hwndInsertAfter }) */
-        uint32_t cbt[2] = { (uint32_t)(uintptr_t)cs, 0 }, ha[3] = { 3, h, (uint32_t)(uintptr_t)cbt };
-        /* CallNextHookEx reads CLIENTINFO's phkCurrent (TEB +0x6EC, less the
-         * client delta at +0x6E8): a HOOK with no next (+0x14) and flag 1 (+0x20)
-         * makes it return 0 */
-        static uint32_t hk;
-        if (!hk) hk = ntp_alloc(0x40), MEM8(hk + 0x20) = 1;
-        uint32_t teb = MEM32(g_fs_base + 0x18), svk = MEM32(teb + 0x6EC), svc = MEM32(teb + 0x6FC);
-        MEM32(teb + 0x6EC) = hk + MEM32(teb + 0x6E8), MEM32(teb + 0x6FC) = 5u << 16;
-        uint32_t r = ntp_guest(g_cbt, 3, ha);
-        MEM32(teb + 0x6EC) = svk, MEM32(teb + 0x6FC) = svc;
+        uint32_t cbt[2] = { (uint32_t)(uintptr_t)cs, 0 };
+        uint32_t r = call_hook(g_cbt, 5, 3, h, (uint32_t)(uintptr_t)cbt);
         if (r) { if (W(h)) destroy(W(h)); return 0; }
         if (!W(h)) return 0;
     }
@@ -2664,9 +2673,10 @@ static int next_msg(uint32_t msg, uint32_t hw, uint32_t lo, uint32_t hi, int rem
     for (int i = g_qh; i != g_qt; i = (i + 1) % QN) {
         qmsg_t* q = &g_q[i];
         if (hw && q->h != hw && !child_of(q->h, hw)) continue;
+        if (W(q->h) && W(q->h)->tid && W(q->h)->tid != cur_tid()) continue;   /* another thread's window */
         if ((lo || hi) && (q->m < lo || q->m > hi)) continue;
         MEM32(msg) = q->h, MEM32(msg + 4) = q->m, MEM32(msg + 8) = q->w, MEM32(msg + 12) = q->l;
-        MEM32(msg + 16) = q->t, MEM32(msg + 20) = (uint32_t)(int16_t)(q->l & 0xFFFF), MEM32(msg + 24) = (uint32_t)(int16_t)(q->l >> 16);
+        MEM32(msg + 16) = q->t, MEM32(msg + 20) = (uint32_t)q->px, MEM32(msg + 24) = (uint32_t)q->py;
         if (remove) {                                          /* out of the ring, order kept */
             for (int j = i; j != g_qh; ) { int p = (j - 1 + QN) % QN; g_q[j] = g_q[p]; j = p; }
             g_qh = (g_qh + 1) % QN;
@@ -2702,12 +2712,18 @@ static int next_msg(uint32_t msg, uint32_t hw, uint32_t lo, uint32_t hi, int rem
         }
     return 0;
 }
+/* WH_GETMESSAGE(HC_ACTION, PM_REMOVE or not, MSG*) on the hooking thread: the Start menu's
+ * CMBMsgFilter sees (and redirects) the mouse there */
+static void getmsg_hook(uint32_t msg, uint32_t remove) {
+    if (g_gmhook && (!g_gmtid || g_gmtid == cur_tid())) call_hook(g_gmhook, 3, 0, remove, msg);
+}
 static uint32_t s_getmessage(uint32_t* a) {      /* NtUserGetMessage(MSG*, hwnd, min, max) */
     while (!next_msg(a[0], a[1], a[2], a[3], 1)) script_idle();
+    getmsg_hook(a[0], 1);
     return MEM32(a[0] + 4) != 0x12;
 }
 static uint32_t s_peekmessage(uint32_t* a) {     /* NtUserPeekMessage(MSG*, hwnd, min, max, flags) */
-    if (next_msg(a[0], a[1], a[2], a[3], a[4] & 1)) return 1;
+    if (next_msg(a[0], a[1], a[2], a[3], a[4] & 1)) { getmsg_hook(a[0], a[4] & 1); return 1; }
     script_idle();                                /* (a program polling must still see time pass) */
     return 0;
 }
@@ -3057,7 +3073,8 @@ static uint32_t s_setlong(uint32_t* a) {
     case -6: old = u->inst; u->inst = a[2]; wnd_sync(u); return old;         /* GWL_HINSTANCE */
     case -21: old = MEM32(u->obj + WND_USERDATA); MEM32(u->obj + WND_USERDATA) = a[2]; return old;
     }
-    if (i >= 0 && !(MEM8(u->obj + 0x16) & 1) && (uint32_t)i + 4 <= MEM32(u->obj + WND_CBEXTRA) && i + 4 <= WND_SIZE - WND_EXTRA) {
+    /* a dialog keeps its DIALOG at extra +4 (user32 owns it); DWL_MSGRESULT 0 and DWL_USER 8 are stored */
+    if (i >= 0 && !((MEM8(u->obj + 0x16) & 1) && i == 4) && (uint32_t)i + 4 <= MEM32(u->obj + WND_CBEXTRA) && i + 4 <= WND_SIZE - WND_EXTRA) {
         old = MEM32(u->obj + WND_EXTRA + i);
         MEM32(u->obj + WND_EXTRA + i) = a[2];
         return old;
@@ -3257,9 +3274,14 @@ static uint32_t s_translate_accel(uint32_t* a) {
 
 static uint32_t s_sethook(uint32_t* a) {
     if (a[3] == 5) { g_cbt = a[4]; return 0x00010001u + 0x105; }
+    if (a[3] == 3) { g_gmhook = a[4], g_gmtid = a[2]; return 0x00010001u + 0x103; }
     return 0x00010001u + 0x100;
 }
-static uint32_t s_unhook(uint32_t* a) { if (a[0] == 0x00010001u + 0x105) g_cbt = 0; return 1; }
+static uint32_t s_unhook(uint32_t* a) {
+    if (a[0] == 0x00010001u + 0x105) g_cbt = 0;
+    if (a[0] == 0x00010001u + 0x103) g_gmhook = 0;
+    return 1;
+}
 /* NtUserEnumDisplayMonitors(hdc, clip, MONITORENUMPROC, data): the one monitor, to the guest's
  * proc (as w32kuser.c). ponytail: hdc and the clip ignored */
 static uint32_t s_enum_monitors(uint32_t* a) {
@@ -3560,7 +3582,9 @@ static void run_event(ev_t* e) {
         int x = 0, y = 0;
         sscanf(e->arg, "%d,%d", &x, &y);
         uint32_t pt[2] = { (uint32_t)x, (uint32_t)y };
-        uobj_t* u = W(s_frompoint(pt));
+        uobj_t* u = W(g_capture && W(g_capture) ? g_capture : s_frompoint(pt));   /* the capture first, as win32k */
+        g_ptx = x, g_pty = y;
+        fprintf(stderr, "[script] sclick %d,%d: window %08X\n", x, y, u ? u->h : 0);
         if (!u || u->h == g_desktop) break;
         uint32_t cl = (uint32_t)((y - u->cr.t) << 16 | ((x - u->cr.l) & 0xFFFF));
         post(u->h, 0x201, 1, cl), post(u->h, 0x202, 0, cl);
@@ -3706,6 +3730,7 @@ static void x_mouse(int type, int x, int y, unsigned button, unsigned state) {
         popup_close();
     }
     uint32_t pt[2] = { (uint32_t)x, (uint32_t)y }, h = g_capture ? g_capture : s_frompoint(pt);
+    g_ptx = x, g_pty = y;
     uobj_t* u = W(h);
     if (!u || h == g_desktop) return;
     uint32_t sl = (uint32_t)(y << 16 | (x & 0xFFFF));
@@ -3852,7 +3877,8 @@ void w2kx_install(int cx, int cy, const char* fontdir) {
         { "NtUserModifyUserStartupInfoFlags", s_one_u }, { "NtUserGetDoubleClickTime", s_dblclick },
         { "NtUserRegisterWindowMessage", s_register_msg }, { "NtUserCreateAcceleratorTable", s_accel },
         { "NtUserTranslateAccelerator", s_translate_accel }, { "NtUserSetWindowsHookEx", s_sethook }, { "NtUserUnhookWindowsHookEx", s_unhook },
-        { "NtUserCallNextHookEx", s_zero_u }, { "NtUserSetProp", s_setprop }, { "NtUserRemoveProp", s_removeprop },
+        { "NtUserCallNextHookEx", s_zero_u }, { "NtUserAttachThreadInput", s_one },   /* (one input state for all threads) */
+        { "NtUserSetProp", s_setprop }, { "NtUserRemoveProp", s_removeprop },
         { "NtUserFillWindow", s_fill_window }, { "NtUserWindowFromPoint", s_frompoint }, { "NtUserGetWindowPlacement", s_getplacement },
         { "NtUserSetWindowPlacement", s_setplacement }, { "NtUserSystemParametersInfo", s_spi }, { "NtUserGetKeyState", s_keystate },
         { "NtUserGetAsyncKeyState", s_keystate }, { "NtUserShowCaret", s_showcaret }, { "NtUserHideCaret", s_hidecaret },
