@@ -1502,7 +1502,7 @@ static uint32_t s_flushbatch(uint32_t* a) { (void)a; w2k_gdi_batch(MEM32(g_fs_ba
  * USER: objects, windows, classes
  * ====================================================================== */
 #define MAXU 0x2000
-typedef struct { uint32_t type, state, id, sub; uint16_t text[64]; int x, w; } item_t;
+typedef struct { uint32_t type, state, id, sub, data, bmp; uint16_t text[64]; int x, w; } item_t;
 typedef struct uobj {
     uint8_t type;
     uint32_t h, obj;                              /* the handle; the object in the desktop heap */
@@ -1513,6 +1513,7 @@ typedef struct uobj {
     rc_t cin;                                     /* the client rect within the window rect */
     rc_t wr, cr;                                  /* both on the screen */
     int dirty, ncdirty, erase;
+    int ansi;                                     /* an ANSI window procedure (win32k's WFANSIPROC) */
     int sizemove;                                 /* WM_SIZE and WM_MOVE still to send, at the first show (as win32k's WFSENDSIZEMOVE) */
     int sb[2][4];                                 /* WS_HSCROLL / WS_VSCROLL: min, max, page, pos */
     uint16_t text[128];
@@ -1563,6 +1564,7 @@ static void ufree(uobj_t* u) { w2k_ahe_clear(g_ahe, u->h); free(u->items); u->ty
 typedef struct {
     uint16_t name[64];
     uint16_t atom, fnid;
+    int ansi;                                     /* CSF_ANSIPROC (2): RegisterClassA */
     uint32_t proc, style, extra, inst, bg, icon, iconsm, menu, cls;
 } cls_t;
 #define MAXC 64
@@ -1721,6 +1723,9 @@ static uint32_t send(uint32_t h, uint32_t m, uint32_t w, uint32_t l) {
     if (!pfn || !g_dcm) return defproc(u, m, w, l);
     return call_proc(u, pfn, m, w, l);
 }
+/* HWND_BROADCAST: the top-level windows, which here are all the guest's own (another
+ * process's windows are in another runner) */
+static void broadcast(uint32_t m, uint32_t w, uint32_t l, int posted);
 
 /* ---- the queue, timers ---------------------------------------------------- */
 typedef struct { uint32_t h, m, w, l, t; } qmsg_t;
@@ -2043,8 +2048,13 @@ static void keymenu(uobj_t* u, uint32_t ch) {
 }
 
 /* ---- window operations ---------------------------------------------------- */
+/* WND +0x64, hrgnUpdate: user32's GetUpdateRect/GetUpdateRgn answer "nothing to paint"
+ * client-side when it is NULL (comctl32's list view then skips its WM_PAINT). A dirty window
+ * holds win32k's HRGN_FULL (1), the whole window */
+#define WND_HRGNUPDATE 0x64
+static void set_dirty(uobj_t* u, int d) { u->dirty = d; MEM32(u->obj + WND_HRGNUPDATE) = d ? 1u : 0u; }
 static void invalidate(uobj_t* u, int erase) {
-    u->dirty = u->ncdirty = 1;
+    set_dirty(u, 1), u->ncdirty = 1;
     u->erase |= erase;
     for (int i = 2; i < MAXU; i++)
         if (g_u[i].type == W2K_TYPE_WINDOW && g_u[i].parent == u->h) invalidate(&g_u[i], erase);
@@ -2185,12 +2195,19 @@ static uint32_t defproc(uobj_t* u, uint32_t m, uint32_t w, uint32_t l) {
         return (uint32_t)n;
     }
     case 0x0E: return (uint32_t)u16len_(u->text);                    /* WM_GETTEXTLENGTH */
-    case 0x47:                                                       /* WM_WINDOWPOSCHANGED */
-        if (!(MEM32(l + 24) & SWP_NOMOVE)) send(u->h, 3, 0, (uint32_t)((u->cr.t - (W(u->parent) ? W(u->parent)->cr.t : 0)) << 16 |
+    case 0x47: {                                                     /* WM_WINDOWPOSCHANGED */
+        /* a window still owing its first WM_SIZE/WM_MOVE (win32k's WFSENDSIZEMOVE) gets them
+         * here once it is visible, even from a SWP_NOSIZE|SWP_NOMOVE show (SetWindowPos
+         * SWP_SHOWWINDOW: the desktop's DefView, whose WM_SIZE sizes its list view) */
+        uint32_t fl = MEM32(l + 24);
+        if (u->sizemove && (u->style & WS_VISIBLE)) u->sizemove = 0, fl &= ~(uint32_t)(SWP_NOSIZE | SWP_NOMOVE);
+        if (!(fl & SWP_NOMOVE)) send(u->h, 3, 0, (uint32_t)((u->cr.t - (W(u->parent) ? W(u->parent)->cr.t : 0)) << 16 |
                                                            ((u->cr.l - (W(u->parent) ? W(u->parent)->cr.l : 0)) & 0xFFFF)));
-        if (!(MEM32(l + 24) & (SWP_NOSIZE | SWP_NOMOVE))) u->sizemove = 0;
-        if (!(MEM32(l + 24) & SWP_NOSIZE)) send(u->h, 5, 0, (uint32_t)((u->cr.b - u->cr.t) << 16 | ((u->cr.r - u->cr.l) & 0xFFFF)));
+        if (!(fl & (SWP_NOSIZE | SWP_NOMOVE))) u->sizemove = 0;
+        if (!(fl & SWP_NOSIZE)) send(u->h, 5, 0, (uint32_t)((u->cr.b - u->cr.t) << 16 | ((u->cr.r - u->cr.l) & 0xFFFF)));
         return 0;
+    }
+    case 0x55: return l == 3 ? (u->ansi ? 1u : 2u) : 0;             /* WM_NOTIFYFORMAT NF_QUERY: NFR_ANSI / NFR_UNICODE */
     case 0x10: destroy(u); return 0;                                 /* WM_CLOSE */
     case 0x112:                                                      /* WM_SYSCOMMAND */
         if ((w & 0xFFF0) == 0xF060) send(u->h, 0x10, 0, 0);          /* SC_CLOSE */
@@ -2223,7 +2240,7 @@ static uint32_t paint_dc(uobj_t* u, uint32_t ps) {
     if (!d) return 0;
     int erased = 0;
     if (u->erase) { u->erase = 0; erased = send(u->h, 0x14, d->h, 0) != 0; }
-    u->dirty = 0;
+    set_dirty(u, 0);
     if (ps) {
         memset((void*)(uintptr_t)ps, 0, 64);
         MEM32(ps) = d->h, MEM32(ps + 4) = !erased;
@@ -2235,7 +2252,9 @@ static uint32_t paint_dc(uobj_t* u, uint32_t ps) {
 /* ---- menus ------------------------------------------------------------------ */
 static void menu_sync(uobj_t* m) {
     uint32_t o = m->obj;
-    if (!MEM32(o + MENU_RGITEMS)) MEM32(o + MENU_RGITEMS) = desk_alloc(64 * ITEM_SIZE);
+    /* the 64 ITEMs, then each one's text (ITEM +0x18 lpstr, +0x1C cch: user32's GetMenuItemInfo and
+     * GetMenuString read them client-side; the Start menu's band takes its items so) */
+    if (!MEM32(o + MENU_RGITEMS)) MEM32(o + MENU_RGITEMS) = desk_alloc(64 * (ITEM_SIZE + 128));
     MEM32(o + MENU_PSELF) = o;
     MEM32(o + MENU_CITEMS) = (uint32_t)m->nitems;
     for (int i = 0; i < m->nitems && i < 64; i++) {
@@ -2244,6 +2263,11 @@ static void menu_sync(uobj_t* m) {
         memset((void*)(uintptr_t)it, 0, ITEM_SIZE);
         MEM32(it) = m->items[i].type, MEM32(it + 4) = m->items[i].state, MEM32(it + 8) = m->items[i].id;
         MEM32(it + 0xC) = s ? s->obj : 0;
+        uint32_t t = MEM32(o + MENU_RGITEMS) + 64 * ITEM_SIZE + i * 128;
+        int n = u16len_(m->items[i].text);
+        memcpy((void*)(uintptr_t)t, m->items[i].text, 2 * n + 2);
+        if (n) MEM32(it + 0x18) = t, MEM32(it + 0x1C) = (uint32_t)n;
+        MEM32(it + 0x20) = m->items[i].data, MEM32(it + 0x40) = m->items[i].bmp;
     }
 }
 static item_t* menu_item(uobj_t* m, uint32_t item, int bypos, uobj_t** owner) {
@@ -2289,6 +2313,7 @@ static uint32_t s_register_class(uint32_t* a) {
     memset(c, 0, sizeof *c);
     if (name < 0x10000) c->atom = (uint16_t)name;
     else { u16cpy(c->name, UNI(name), 64); c->atom = g_atom++; }
+    c->ansi = (a[4] & 2) != 0;
     c->fnid = (uint16_t)a[3], c->style = MEM32(wc + 4), c->proc = MEM32(wc + 8), c->extra = MEM32(wc + 0x10);
     c->inst = MEM32(wc + 0x14), c->icon = MEM32(wc + 0x18), c->bg = MEM32(wc + 0x20), c->iconsm = MEM32(wc + 0x2C);
     c->menu = a[2] ? MEM32(a[2] + 4) : 0;
@@ -2371,6 +2396,7 @@ static uint32_t s_create_window(uint32_t* a) {
     }
     u->wrel = (rc_t){ x, y, x + cx, y + cy };
     MEM32(u->obj + WND_PROC) = c->proc;
+    u->ansi = c->ansi;
     MEM32(u->obj + WND_PCLS) = c->cls;
     MEM32(u->obj + WND_CBEXTRA) = c->extra;
     if (c->fnid) MEM16(u->obj + WND_FNID) = 0;                  /* (user32 sets it with NtUserSetWindowFNID) */
@@ -2450,7 +2476,7 @@ static void update(uobj_t* u);
 static uint32_t s_redraw(uint32_t* a) {
     uobj_t* u = a[0] ? W(a[0]) : NULL;
     if (!u) return a[0] == 0;
-    if (a[3] & 1) u->dirty = 1, u->erase |= (a[3] & 4) != 0;
+    if (a[3] & 1) set_dirty(u, 1), u->erase |= (a[3] & 4) != 0;
     if (a[3] & 0x400) u->ncdirty = 1;
     if (a[3] & 0x100) update(u);
     return 1;
@@ -2483,8 +2509,15 @@ static uint32_t s_setmenu(uint32_t* a) {         /* NtUserSetMenu(hwnd, hmenu, r
 }
 
 /* messages */
+static void broadcast(uint32_t m, uint32_t w, uint32_t l, int posted) {
+    for (int i = 2; i < MAXU; i++)
+        if (g_u[i].type == W2K_TYPE_WINDOW && g_u[i].parent == g_desktop) {
+            if (posted) post(g_u[i].h, m, w, l);
+            else send(g_u[i].h, m, w, l);
+        }
+}
 static uint32_t s_post(uint32_t* a) {
-    if (a[0] == 0xFFFF) return 1;                              /* HWND_BROADCAST: nobody else here */
+    if (a[0] == 0xFFFF) { broadcast(a[1], a[2], a[3], 1); return 1; }
     post(a[0], a[1], a[2], a[3]);
     return 1;
 }
@@ -2492,7 +2525,7 @@ static uint32_t s_message_call(uint32_t* a) {    /* NtUserMessageCall(hwnd, msg,
     uobj_t* u = W(a[0]);
     if (a[5] == FNID_DEFWINDOWPROC) return u ? defproc(u, a[1], a[2], a[3]) : 0;
     if (a[5] >= FNID_SENDMESSAGE && a[5] <= FNID_SENDMESSAGE + 4) {
-        if (a[0] == 0xFFFF) return 0;
+        if (a[0] == 0xFFFF) { broadcast(a[1], a[2], a[3], 0); return 1; }
         return send(a[0], a[1], a[2], a[3]);
     }
     static uint32_t seen[8];
@@ -2500,6 +2533,19 @@ static uint32_t s_message_call(uint32_t* a) {    /* NtUserMessageCall(hwnd, msg,
     for (k = 0; k < 8 && seen[k] && seen[k] != a[5]; k++) ;
     if (k < 8 && !seen[k]) { seen[k] = a[5]; fprintf(stderr, "[user] NtUserMessageCall fnid 0x%X (msg 0x%X): DefWindowProc's\n", a[5], a[1]); }
     return u ? defproc(u, a[1], a[2], a[3]) : 0;
+}
+/* NtUserGetUpdateRect(hwnd, RECT*, erase): the client area while it is dirty */
+static uint32_t s_update_rect(uint32_t* a) {
+    uobj_t* u = W(a[0]);
+    int d = u && u->dirty;
+    if (a[1]) rc_put(a[1], d ? (rc_t){ 0, 0, u->cr.r - u->cr.l, u->cr.b - u->cr.t } : (rc_t){ 0, 0, 0, 0 });
+    return (uint32_t)d;
+}
+/* NtUserSendNotifyMessage(hwnd, msg, w, l): one thread here, so it is a send */
+static uint32_t s_send_notify(uint32_t* a) {
+    if (a[0] == 0xFFFF) broadcast(a[1], a[2], a[3], 0);
+    else send(a[0], a[1], a[2], a[3]);
+    return 1;
 }
 static int script_idle(void);
 static int child_of(uint32_t c, uint32_t p) { for (uobj_t* u = W(c); u; u = W(u->parent)) if (u->h == p) return 1; return 0; }
@@ -2529,7 +2575,7 @@ static int next_msg(uint32_t msg, uint32_t hw, uint32_t lo, uint32_t hi, int rem
             if (u->type != W2K_TYPE_WINDOW || !(u->dirty || u->ncdirty) || !visible(u)) continue;
             /* an empty window has an empty update region: no WM_PAINT (comctl32's toolbar paints
              * nothing at zero width and never calls BeginPaint, so its WM_PAINT came forever) */
-            if (rc_empty(&u->cr)) u->dirty = 0;
+            if (rc_empty(&u->cr)) set_dirty(u, 0);
             if (rc_empty(&u->wr)) u->ncdirty = 0;
             if (!(u->dirty || u->ncdirty)) continue;
             if (hw && u->h != hw && !child_of(u->h, hw)) continue;
@@ -2567,7 +2613,7 @@ static uint32_t s_dispatch(uint32_t* a) {        /* NtUserDispatchMessage(MSG*) 
     if (MEM32(m + 4) == 0x0F && W(MEM32(m))) {
         uobj_t* u = W(MEM32(m));
         uint32_t r = send(u->h, 0x0F, 0, 0);
-        if (W(MEM32(m)) && u->dirty) u->dirty = 0;            /* (a WM_PAINT that never called BeginPaint) */
+        if (W(MEM32(m))) set_dirty(u, 0), u->ncdirty = 0;      /* (a WM_PAINT that never called BeginPaint) */
         return r;
     }
     return send(MEM32(m), MEM32(m + 4), MEM32(m + 8), MEM32(m + 12));
@@ -2649,6 +2695,8 @@ static uint32_t s_menu_item(uint32_t* a) {
     if (mask & 1) it->state = MEM32(mi + 0xC);                      /* MIIM_STATE */
     if (mask & 2) it->id = MEM32(mi + 0x10);                        /* MIIM_ID */
     if (mask & 4) it->sub = MEM32(mi + 0x14);                       /* MIIM_SUBMENU */
+    if (mask & 0x20) it->data = MEM32(mi + 0x20);                   /* MIIM_DATA */
+    if (mask & 0x80) it->bmp = MEM32(mi + 0x2C);                    /* MIIM_BITMAP */
     if ((mask & 0x50) && a[5] && MEM32(a[5] + 4)) {                 /* MIIM_TYPE / MIIM_STRING */
         int n = MEM16(a[5]) / 2;
         for (int i = 0; i < n && i < 63; i++) it->text[i] = MEM16(MEM32(a[5] + 4) + 2 * i), it->text[i + 1] = 0;
@@ -2674,6 +2722,18 @@ static uint32_t s_enable_menu(uint32_t* a) {     /* NtUserEnableMenuItem(hmenu, 
     it->state = (it->state & ~3u) | (a[2] & 3);
     menu_sync(own);
     return old;
+}
+/* NtUserRemoveMenu / NtUserDeleteMenu(hmenu, item, flags): MF_BYPOSITION 0x400, else by command.
+ * ponytail: DeleteMenu leaves a submenu alive (no one holds it after) */
+static uint32_t s_remove_menu(uint32_t* a) {
+    uobj_t* m = U(a[0], W2K_TYPE_MENU), *own = m;
+    item_t* it = menu_item(m, a[1], (a[2] & 0x400) != 0, &own);
+    if (!it) return 0;
+    int i = (int)(it - own->items);
+    memmove(it, it + 1, sizeof *it * (own->nitems - i - 1));
+    own->nitems--;
+    menu_sync(own);
+    return 1;
 }
 static uint32_t s_destroy_menu(uint32_t* a) { uobj_t* m = U(a[0], W2K_TYPE_MENU); if (m) ufree(m); return m != NULL; }
 /* NtUserGetMenuItemRect(hwnd, hmenu, item, RECT*): a menu bar item on the screen */
@@ -2731,6 +2791,7 @@ static uint32_t s_call_noparam(uint32_t* a) {
     case 5: return 0;                            /* GetMessagePos */
     case 8: g_capture = 0; return 1;             /* ReleaseCapture */
     case 0x12: return 0;                         /* ClientThreadSetup asks: a new thread */
+    case 0x15: return 0;                         /* MsgWaitForMultipleObjectsEx: clear the wake mask (none kept) */
     }
     fprintf(stderr, "[user] NtUserCallNoParam %u not answered\n", a[0]);
     return 0;
@@ -2870,7 +2931,7 @@ static uint32_t s_setlong(uint32_t* a) {
     uint32_t old = 0;
     if (!u) return 0;
     switch (i) {
-    case -4: old = MEM32(u->obj + WND_PROC); MEM32(u->obj + WND_PROC) = a[2]; return old;   /* GWL_WNDPROC */
+    case -4: old = MEM32(u->obj + WND_PROC); MEM32(u->obj + WND_PROC) = a[2]; u->ansi = a[3] != 0; return old;   /* GWL_WNDPROC */
     case -16: old = u->style; u->style = (a[2] & ~WS_VISIBLE) | (u->style & WS_VISIBLE) | (a[2] & WS_VISIBLE); wnd_sync(u); return old;
     case -20: old = u->ex; u->ex = a[2]; wnd_sync(u); return old;
     case -12: old = u->id; u->id = a[2]; wnd_sync(u); return old;            /* GWL_ID */
@@ -3121,9 +3182,15 @@ static uint32_t s_ctlbrush(uint32_t* a) { uobj_t* u = W(a[0]); return u ? ctlcol
 static uint32_t s_ctlcolor(uint32_t* a) { return ctlcolor(a[0], a[1], a[2], a[3]); }
 static uint32_t s_frompoint(uint32_t* a) {       /* NtUserWindowFromPoint(x, y) */
     uint32_t r = g_desktop;
+    int rtop = 0;
     for (int i = 2; i < MAXU; i++) {
         uobj_t* u = &g_u[i];
-        if (u->type == W2K_TYPE_WINDOW && visible(u) && (int)a[0] >= u->wr.l && (int)a[0] < u->wr.r && (int)a[1] >= u->wr.t && (int)a[1] < u->wr.b) r = u->h;
+        if (u->type == W2K_TYPE_WINDOW && visible(u) && (int)a[0] >= u->wr.l && (int)a[0] < u->wr.r && (int)a[1] >= u->wr.t && (int)a[1] < u->wr.b) {
+            uobj_t* t = u;                                /* a topmost tree (the taskbar) is above the others */
+            while (W(t->parent) && t->parent != g_desktop) t = W(t->parent);
+            int top = (t->ex & 8) != 0;
+            if (top >= rtop) r = u->h, rtop = top;
+        }
     }
     return r;
 }
@@ -3158,7 +3225,17 @@ static void logfont(uint32_t p, int h, int weight) {
 static uint32_t s_spi(uint32_t* a) {
     uint32_t p = a[2];
     switch (a[0]) {
-    case 0x30: if (p) rc_put(p, (rc_t){ 0, 0, g_cx, g_cy - 28 }); return 1;      /* SPI_GETWORKAREA */
+    case 0x30: if (p) memcpy((void*)(uintptr_t)p, (void*)(uintptr_t)(g_mon + 0x20), 16); return 1;   /* SPI_GETWORKAREA */
+    case 0x2F:                                   /* SPI_SETWORKAREA: the taskbar docking; SPIF_SENDCHANGE tells the windows */
+        if (p) memcpy((void*)(uintptr_t)(g_mon + 0x20), (void*)(uintptr_t)p, 16);
+        else w2k_monitor(g_disp, g_mon, g_cx, g_cy, g_cy);
+        if (a[3] & 2) broadcast(0x1A, 0x2F, 0, 0);                              /* WM_SETTINGCHANGE */
+        return 1;
+    case 0x2B:                                   /* SPI_GETMINIMIZEDMETRICS: width 160, no gaps, ARW_BOTTOMLEFT */
+        if (p) MEM32(p + 4) = 160, MEM32(p + 8) = 0, MEM32(p + 12) = 0, MEM32(p + 16) = 0;
+        return 1;
+    case 0x62: case 0x64: if (p) MEM32(p) = 4; return 1;                        /* mouse hover width, height */
+    case 0x66: if (p) MEM32(p) = 400; return 1;                                 /* SPI_GETMOUSEHOVERTIME */
     case 0x29:                                                                  /* SPI_GETNONCLIENTMETRICS */
         if (!p) return 0;
         memset((void*)(uintptr_t)(p + 4), 0, 0x1F0);
@@ -3213,7 +3290,7 @@ static void user_connect(uint32_t index, uint32_t ci, uint32_t len) {
         MEM16(g_psi + SI_LOGPIXELS) = 96;
         MEM32(g_psi + SI_PREFMASK) = 0;
         MEM32(g_psi + SI_GCLBORDER) = 1;               /* the sizing border setting (AdjustWindowRect: 4-pixel thick frames) */
-        w2k_monitor(g_disp, g_mon, g_cx, g_cy, g_cy - 28);
+        w2k_monitor(g_disp, g_mon, g_cx, g_cy, g_cy);   /* (the work area: the screen, until the taskbar sets it) */
         /* the desktop window */
         uobj_t* d = unew(W2K_TYPE_WINDOW, WND_SIZE);
         d->style = WS_VISIBLE | 0x02000000u, d->cls = -1;
@@ -3245,7 +3322,7 @@ void w2kx_start(void) {
 /* ======================================================================
  * The script, shots
  * ====================================================================== */
-enum { EV_SHOT, EV_CLICK, EV_COMMAND, EV_POST, EV_DLGCMD, EV_TYPE };
+enum { EV_SHOT, EV_CLICK, EV_COMMAND, EV_POST, EV_DLGCMD, EV_TYPE, EV_SCLICK };
 typedef struct { uint32_t ms; int kind; char arg[256]; } ev_t;
 #define MAXEV 64
 static ev_t g_ev[MAXEV];
@@ -3260,12 +3337,12 @@ static int ev_cmp(const void* a, const void* b) {
     return x < y ? -1 : 1;
 }
 int w2kx_script_arg(int argc, char** argv, int i) {
-    static const char* k[] = { "--shot", "--click", "--command", "--post", "--dlgcommand", "--type" };
+    static const char* k[] = { "--shot", "--click", "--command", "--post", "--dlgcommand", "--type", "--sclick" };
     if (!strcmp(argv[i], "--live")) { g_live = 1; return 1; }
     if (i + 1 >= argc) return 0;
     if (!strcmp(argv[i], "--out")) { snprintf(g_out, sizeof g_out, "%s", argv[i + 1]); return 2; }
     if (!strcmp(argv[i], "--secs")) { g_secs_ms = (uint32_t)(atof(argv[i + 1]) * 1000); return 2; }
-    for (int n = 0; n < 6; n++)
+    for (int n = 0; n < 7; n++)
         if (!strcmp(argv[i], k[n]) && g_nev < MAXEV) {
             ev_t* e = &g_ev[g_nev++];
             const char* at = n == EV_SHOT ? argv[i + 1] : strrchr(argv[i + 1], '@');
@@ -3323,6 +3400,16 @@ static void run_event(ev_t* e) {
         sscanf(e->arg, "%d,%d", &x, &y);
         uint32_t lp = (uint32_t)(y << 16 | (x & 0xFFFF));
         post(main, 0x201, 1, lp), post(main, 0x202, 0, lp);
+        break;
+    }
+    case EV_SCLICK: {                                   /* --sclick X,Y: a screen point, to the window under it (the taskbar's Start) */
+        int x = 0, y = 0;
+        sscanf(e->arg, "%d,%d", &x, &y);
+        uint32_t pt[2] = { (uint32_t)x, (uint32_t)y };
+        uobj_t* u = W(s_frompoint(pt));
+        if (!u || u->h == g_desktop) break;
+        uint32_t cl = (uint32_t)((y - u->cr.t) << 16 | ((x - u->cr.l) & 0xFFFF));
+        post(u->h, 0x201, 1, cl), post(u->h, 0x202, 0, cl);
         break;
     }
     case EV_COMMAND: post(main, 0x111, (uint32_t)strtoul(e->arg, NULL, 0), 0); break;
@@ -3599,13 +3686,13 @@ void w2kx_install(int cx, int cy, const char* fontdir) {
         { "NtUserPostMessage", s_post }, { "NtUserMessageCall", s_message_call }, { "NtUserGetMessage", s_getmessage },
         { "NtUserPeekMessage", s_peekmessage }, { "NtUserWaitMessage", s_waitmessage }, { "NtUserDispatchMessage", s_dispatch },
         { "NtUserTranslateMessage", s_translate }, { "NtUserSetTimer", s_settimer }, { "NtUserKillTimer", s_killtimer },
-        { "NtUserValidateTimerCallback", s_one_u }, { "NtUserThunkedMenuItemInfo", s_menu_item }, { "NtUserCheckMenuItem", s_check_menu },
+        { "NtUserValidateTimerCallback", s_one_u }, { "NtUserThunkedMenuItemInfo", s_menu_item }, { "NtUserRemoveMenu", s_remove_menu }, { "NtUserDeleteMenu", s_remove_menu }, { "NtUserCheckMenuItem", s_check_menu },
         { "NtUserEnableMenuItem", s_enable_menu }, { "NtUserDestroyMenu", s_destroy_menu }, { "NtUserGetMenuItemRect", s_menu_rect },
         { "NtUserGetSystemMenu", s_sysmenu }, { "NtUserFindExistingCursorIcon", s_find_cursor }, { "NtUserSetCursorIconData", s_set_cursor_data },
         { "NtUserDrawIconEx", s_drawicon }, { "NtUserDestroyCursor", s_one_u }, { "NtUserSetCursor", s_zero_u },
         { "NtUserCallNoParam", s_call_noparam }, { "NtUserCallOneParam", s_call_oneparam }, { "NtUserCallTwoParam", s_call_twoparam },
         { "NtUserCallHwndLock", s_hwnd_lock }, { "NtUserCallHwnd", s_call_hwnd }, { "NtUserGetCursorFrameInfo", s_cursorframe }, { "NtUserCallHwndParam", s_hwnd_param }, { "NtUserCallHwndParamLock", s_hwnd_param_lock },
-        { "NtUserSetWindowFNID", s_set_fnid }, { "NtUserDefSetText", s_deftext }, { "NtUserSetScrollInfo", s_setscroll }, { "NtUserQueryWindow", s_query_window }, { "NtUserSetWindowLong", s_setlong },
+        { "NtUserSetWindowFNID", s_set_fnid }, { "NtUserSendNotifyMessage", s_send_notify }, { "NtUserGetUpdateRect", s_update_rect }, { "NtUserDefSetText", s_deftext }, { "NtUserSetScrollInfo", s_setscroll }, { "NtUserQueryWindow", s_query_window }, { "NtUserSetWindowLong", s_setlong },
         { "NtUserSetFocus", s_setfocus }, { "NtUserSetCapture", s_setcapture }, { "NtUserSetActiveWindow", s_setactive },
         { "NtUserGetForegroundWindow", s_foreground }, { "NtUserGetThreadState", s_threadstate }, { "NtUserGetIconSize", s_iconsize }, { "NtUserGetThreadDesktop", s_threaddesk },
         { "NtUserModifyUserStartupInfoFlags", s_one_u }, { "NtUserGetDoubleClickTime", s_dblclick },

@@ -1171,6 +1171,9 @@ static uint32_t s_create_thread(uint32_t* a) {
     t->teb = ntp_alloc(0x2000);
     memcpy((void*)(uintptr_t)t->teb, (void*)(uintptr_t)g_teb, 0x2000);   /* (the first thread's, USER's thread info with it) */
     memset((void*)(uintptr_t)(t->teb + 0xE10), 0, 64 * 4);              /* but its own TlsSlots, empty (MFC keeps each thread's state there) */
+    /* and none of the first thread's per-thread pointers: ReservedForOle (ole32's SOleTlsData:
+     * shared, CoSetState on one thread released another's oleaut32 state) and TlsExpansionSlots */
+    MEM32(t->teb + 0xF80) = 0, MEM32(t->teb + 0xF94) = 0;
     MEM32(t->teb + 0xF94) = 0;                                           /* TlsExpansionSlots */
     t->tid = g_tid + 4 * ++next;
     MEM32(t->teb + 0x00) = 0xFFFFFFFFu;
@@ -2201,7 +2204,12 @@ static uint32_t s_request_wait_reply(uint32_t* a) {
     uint32_t m = a[1], api = MEM32(m + 0x1C), r = 0;
     csr_fn fn = api == 0 ? csr_client_connect : api == 0x1001A ? csr_nls_user_info : NULL;
     if (fn) r = fn(m + 0x28);
-    else {
+    else if (api == 0x10001 || api == 0x1000C || api == 0x30405) {
+        /* basesrv CreateThread (csrss notes a thread), SetProcessShutdownParam, usersrv
+         * GetThreadConsoleDesktop (none): success, nothing to keep */
+        uint16_t total = MEM16(m + 2);
+        if (api == 0x30405 && total > 0x28 && total < 0x1000) memset((void*)(uintptr_t)(m + 0x28), 0, total - 0x28);
+    } else {
         uint16_t total = MEM16(m + 2);
         if (total > 0x28 && total < 0x1000) memset((void*)(uintptr_t)(m + 0x28), 0, total - 0x28);
         if (g_trace) fprintf(stderr, "[csr] api %u:%u not answered, from sub_%08X\n", api >> 16, api & 0xFFFF, g_cur_func);
