@@ -652,6 +652,21 @@ static void run_termination(uint32_t blk) {
     native32_call_guest(MEM32(blk + 8), 1, arg);
 }
 
+/* KRNL386's CurTDB (DGROUP:122C), set by identity at its first task switch.
+ * Whichever thread takes the machine runs as its own task: KRNL386 reads
+ * the current queue as [thread+30] only while thread+14 (its TDB) is
+ * CurTDB, else as CurTDB's thread's (seg1 5C21). Left stale, MPREXE's
+ * worker registered its queue (RegisterSystemThread, USER seg67 3098)
+ * into MSGSRV32's thread, whose SendMessage then waited on the worker's
+ * queue. ponytail: Win98's ring 0 does this when the Win16Mutex changes
+ * hands (as I remember it, not read); here every hand-over of the machine
+ * does it, which is the same thing for 16-bit code. */
+uint16_t* g_w9x_curtdb;
+static void cur_task(void) {
+    uint16_t tdb;
+    if (g_w9x_curtdb && g_cur[0] && (tdb = *(uint16_t*)(uintptr_t)(g_cur[0] + 0x14)) != 0) *g_w9x_curtdb = tdb;
+}
+
 static DWORD w9x_wait(HANDLE h, DWORD ms) {
     uint16_t sds = g_seg_ds, ses = g_seg_es, sfs = g_seg_fs, sgs = g_seg_gs;
     uint32_t bds = g_ds_base, bes = g_es_base, bgs = g_gs_base;
@@ -661,6 +676,7 @@ static DWORD w9x_wait(HANDLE h, DWORD ms) {
     g_seg_ds = sds; g_seg_es = ses; g_seg_fs = sfs; g_seg_gs = sgs;
     g_ds_base = bds; g_es_base = bes; g_gs_base = bgs;
     g_cur[0] = cur[0]; g_cur[1] = cur[1]; g_cur[2] = cur[2];   /* this thread is VWIN32's current one again */
+    cur_task();
     if (t_r0 && MEM32(t_r0 + R0T_KILL)) {    /* VWIN32 B from another thread: run the teardown here (it ends in 2B) */
         uint32_t blk = MEM32(t_r0 + R0T_KILL);
         MEM32(t_r0 + R0T_KILL) = 0;
@@ -679,12 +695,14 @@ static void w9x_on_enter(void) {
     uint32_t r0 = t_r0 ? t_r0 : g_boot_r0;
     if (!r0 || !MEM32(r0 + R0T_THREAD)) return;
     g_cur[0] = MEM32(r0 + R0T_THREAD); g_cur[1] = MEM32(r0 + R0T_PROCESS); g_cur[2] = MEM32(r0 + R0T_TDBX);
+    cur_task();
 }
 static DWORD WINAPI guest_thread(LPVOID p) {
     t_r0 = (uint32_t)(uintptr_t)p;
     note_tid(t_r0);
     mach_enter();
     g_cur[0] = MEM32(t_r0 + R0T_THREAD); g_cur[1] = MEM32(t_r0 + R0T_PROCESS); g_cur[2] = MEM32(t_r0 + R0T_TDBX);
+    cur_task();
     g_esp = MEM32(t_r0 + R0T_ESP);
     recomp_set_seg(2, MEM32(t_r0 + R0T_SS));   /* a host thread starts with ss 0: 16-bit code would take esp as a 16-bit sp */
     recomp_func_t f = recomp_lookup(MEM32(t_r0 + R0T_ENTRY));
@@ -1336,6 +1354,11 @@ static uint32_t vwin32_int21(const uint32_t* a) {
         if (al == 0) { SET16(g_ebx, 0); return g_eax; }        /* tested before a 'NETQ' check (0xBFF7FC9B): no network */
         break;
     case 0x0D: return g_eax;                                   /* disk reset (KRNL386 at boot): nothing cached */
+    case 0x4B:   /* AX=4B00 DOS exec, edx = the name: KRNL386's LoadModule hands down what is not
+                  * a Windows module (MSGSRV32's "runonce.exe", absent from the guest). There is no
+                  * DOS VM: a missing file is 2, anything else 5. ponytail: DOS programs never run */
+        if (al == 0) { dos_fail(host_path(g_edx, path) && GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES ? 5 : 2); return g_eax; }
+        break;
     case 0x0E: SET8L(g_eax, 26); return g_eax;                 /* select drive: 26 letters */
     case 0x19: SET8L(g_eax, 2); return g_eax;                  /* current drive: C: */
     case 0x1C: {   /* DL drive's allocation: AL sectors/cluster, CX bytes/sector, DX clusters, DS:BX media byte

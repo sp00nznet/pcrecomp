@@ -288,6 +288,8 @@ static void host_far(CPU *c, uint16_t off) {
         c->es = flat; ok(c); return;
     }
     case 0x1B: case 0x1C: ok(c); return;   /* an event handled (89:0019, 89:0065): nothing to tell */
+    case 0x13: ok(c); return;   /* USER seg55 5459, from seg53 144B right after it reads the shift/ctrl/alt
+                                 * key states; nothing reads a result. ponytail: a notification, no-op */
     }
     if (off == H_VXD + 0x2A) switch (c->ah) {   /* VWIN32's PM API, KRNL386's calls through DGROUP:1A80 */
     case 0x00:   /* version: KRNL386 wants >= 100h (4.10, Win98); edx nonzero (seg001_6A63: the
@@ -329,7 +331,9 @@ static void host_far(CPU *c, uint16_t off) {
          * calls with es = DGROUP, di = the next TDB (also put in 13E4).
          * ponytail: di, not the r0 thread's own TDB; the same thing for every
          * switch KRNL386 makes itself */
-        *(uint16_t *)(uintptr_t)(recomp_sel_base(c->es) + 0x122C) = c->di;
+        extern uint16_t *g_w9x_curtdb;
+        g_w9x_curtdb = (uint16_t *)(uintptr_t)(recomp_sel_base(c->es) + 0x122C);
+        *g_w9x_curtdb = c->di;
         if (getenv("W16_TRACE")) fprintf(stderr, "[w16] VWIN32 01: CurTDB := %04X (ss:sp %04X:%04X) from ip %04X\n", c->di,
             c->di ? *(uint16_t *)(uintptr_t)(recomp_sel_base(c->di) + 4) : 0, c->di ? *(uint16_t *)(uintptr_t)(recomp_sel_base(c->di) + 2) : 0, c->ret_ip);
         if (getenv("W16_TRACE") && c->di) {
@@ -340,6 +344,11 @@ static void host_far(CPU *c, uint16_t off) {
         native32_w9x_switch_to(c->ebx);
         *c = sv; ok(c); return;
     }
+    case 0x0F:   /* KRNL386 seg1 750A (thread id, delta): ebx = its r0 thread, ecx = delta;
+                  * USER's SendMessage loop (seg54 1640/1693) calls it with -2 and then 2 on
+                  * the receiving queue's thread (+3C) around its wait: a priority boost.
+                  * ponytail: no-op, the host schedules; read as a boost from the -2/+2 pair */
+        ok(c); return;
     case 0x08: c->al = 0; ok(c); return;        /* -> DGROUP:1417, a flag read as "nonzero?" (ponytail: 0 until a caller needs 1) */
     case 0x03: {   /* VMM page services: args on the 16-bit stack, ecx bytes of them, which
                     * the entry removes (KRNL386 seg001_1FF7 pops what it pushed before them);
