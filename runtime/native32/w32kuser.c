@@ -1568,6 +1568,17 @@ static uint32_t s_setlong(uint32_t* a) {
      * (WND+0x16 bit 0) reads DWL_USER from there too (+0xA0): the Run
      * dialog's RunDlgProc kept its data in it and faulted on 0. Its
      * DWL_DLGPROC (4) is not a plain slot and stays unanswered. */
+    /* GWL_USERDATA is the WND's dwUserData (+0x94), read there by the guest's
+     * GetWindowLong: MB_DlgProc keeps its MSGBOXDATA in it and faulted on 0
+     * at OK (Display's "will now apply your new desktop settings") */
+    if ((int)a[1] == GWLP_USERDATA) {
+        uint8_t* w = native32_user_wnd(h);
+        uint32_t old;
+        if (!w) return 0;
+        old = *(uint32_t*)(w + 0x94);
+        *(uint32_t*)(w + 0x94) = a[2];
+        return old;
+    }
     if ((int)a[1] >= 0) {
         uint8_t* w = native32_user_wnd(h);
         uint32_t old;
