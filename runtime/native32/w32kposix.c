@@ -454,6 +454,7 @@ typedef struct gobj {
     uint32_t attr;
     struct { uint8_t a[DCA_SIZE]; rc_t clip; uint32_t hbm; } *saved;
     int nsaved;
+    struct dibsec* ds;                        /* a DIB section: its bits in guest memory */
 } gobj_t;
 static gobj_t* g_g[GDI_ENTRIES];
 static uint8_t g_guniq[GDI_ENTRIES];
@@ -497,12 +498,14 @@ static void gfree(gobj_t* o) {
     uint32_t i = o->h & 0xFFFF;
     w2k_gdi_clear(g_gdit, o->h);
     if (o->type == GDI_BMP) free(o->bm.px);
+    if (o->ds) free(o->ds);
     if (o->pat) free(o->pat->px), free(o->pat);
     free(o->saved);
     g_g[i] = NULL;
     free(o);                       /* ponytail: a DC's DC_ATTR page is not given back */
 }
-static bmp_t* bm_of(uint32_t h) { gobj_t* o = G(h, GDI_BMP); return o ? &o->bm : NULL; }
+static void ds_sync(gobj_t* o);
+static bmp_t* bm_of(uint32_t h) { gobj_t* o = G(h, GDI_BMP); if (o && o->ds) ds_sync(o); return o ? &o->bm : NULL; }
 static void bm_init(bmp_t* b, int w, int h, int mono) {
     b->w = w > 0 ? w : 1, b->h = h > 0 ? h : 1, b->mono = mono;
     b->px = calloc((size_t)b->w * b->h, 4);
@@ -667,6 +670,7 @@ static void line(gobj_t* d, int x0, int y0, int x1, int y1) {
  * BITMAPINFOHEADER (or BITMAPCOREHEADER), colours, bits: one pixel as a
  * COLORREF; DIB_PAL_COLORS indexes are taken as the index's grey. */
 typedef struct { int w, h, bpp, topdown, stride, ncol; uint32_t comp, mask[3]; uint32_t pal[256]; } dib_t;
+struct dibsec { dib_t D; uint32_t bits; int touched; uint8_t shadow[]; };
 static int dib_parse(uint32_t bmi, uint32_t usage, dib_t* o) {
     if (!bmi) return 0;
     uint32_t hs = MEM32(bmi);
@@ -1147,15 +1151,94 @@ static uint32_t s_getdibits(uint32_t* a) {
     return b && a[5] ? (uint32_t)dib_get(b, (int)a[2], (int)a[3], a[4], a[5]) : 0;
 }
 /* NtGdiCreateDIBSection(hdc, hSection, offset, BITMAPINFO*, usage, cjHeader,
- * fl, colorspace, void** bits). ponytail: a device bitmap with bits beside
- * it the program can write but GDI does not read back */
+ * fl, colorspace, void** bits): a device bitmap with its bits beside it */
 static uint32_t s_dibsection(uint32_t* a) {
     dib_t D;
     if (!dib_parse(a[3], a[4], &D)) return 0;
     gobj_t* o = bitmap_new(D.w, D.h, D.bpp == 1);
-    if (o && a[8]) MEM32(a[8]) = ntp_alloc((uint32_t)(D.stride * D.h));
-    fprintf(stderr, "[gdi] CreateDIBSection %dx%d %d bpp: its bits are not read back\n", D.w, D.h, D.bpp);
-    return o ? o->h : 0;
+    if (!o) return 0;
+    uint32_t bits = ntp_alloc((uint32_t)(D.stride * D.h));
+    if (a[8]) MEM32(a[8]) = bits;
+    if (bits && D.comp != 1 && D.comp != 2 && (o->ds = malloc(sizeof *o->ds + (size_t)D.stride * D.h))) {
+        o->ds->D = D, o->ds->bits = bits;
+        memset(o->ds->shadow, 0xFF, (size_t)D.stride * D.h);   /* (differs: the first use loads them) */
+    }
+    return o->h;
+}
+/* the program writes a DIB section's bits itself: before GDI uses the bitmap, bits that changed
+ * since the last look are loaded into its pixels. ponytail: one way only; GDI's own drawing is
+ * not written back to the bits (a program reading its bits after drawing on them sees the old
+ * ones), and the compare is a whole-buffer memcmp per use */
+static void ds_sync(gobj_t* o) {
+    struct dibsec* s = o->ds;
+    size_t n = (size_t)s->D.stride * s->D.h;
+    const uint8_t* bits = (const uint8_t*)(uintptr_t)s->bits;
+    s->touched = 1;                                         /* (GDI may draw on it now) */
+    if (!memcmp(s->shadow, bits, n)) return;
+    bmp_t* b = &o->bm;
+    int bpp = s->D.bpp;
+    for (int r = 0; r < s->D.h && r < b->h; r++) {         /* only the pixels whose bytes changed */
+        size_t ro = (size_t)r * s->D.stride;
+        if (!memcmp(s->shadow + ro, bits + ro, (size_t)s->D.stride)) continue;
+        int top = s->D.topdown ? r : s->D.h - 1 - r;
+        for (int x = 0; x < s->D.w && x < b->w; x++) {
+            size_t b0 = ro + (size_t)x * bpp / 8, b1 = ro + ((size_t)x * bpp + bpp - 1) / 8;
+            if (!memcmp(s->shadow + b0, bits + b0, b1 - b0 + 1)) continue;
+            uint32_t c = dib_px(&s->D, bits, x, r);
+            b->px[(size_t)top * b->w + x] = b->mono ? lum_mono(c) : c;
+        }
+    }
+    memcpy(s->shadow, bits, n);
+}
+/* a COLORREF into a DIB's mask field (field()'s inverse) */
+static uint32_t unfield(uint32_t c8, uint32_t m) {
+    if (!m) return 0;
+    int s = 0, n = 0;
+    while (!(m >> s & 1)) s++;
+    while (m >> (s + n) & 1) n++;
+    return ((n >= 8 ? c8 << (n - 8) : c8 >> (8 - n)) << s) & m;
+}
+/* GdiFlush (NtGdiFlush): what GDI drew on a DIB section is in its bits afterwards (the program
+ * reads them then: comctl32's image lists). Only the sections GDI touched since the last flush */
+static uint32_t s_gdiflush(uint32_t* a) {
+    (void)a;
+    for (int i = 0; i < GDI_ENTRIES; i++) {
+        gobj_t* o = g_g[i];
+        if (!o || !o->ds || !o->ds->touched) continue;
+        ds_sync(o);                                         /* (the program's own writes first) */
+        struct dibsec* s = o->ds;
+        const dib_t* D = &s->D;
+        uint8_t* bits = (uint8_t*)(uintptr_t)s->bits;
+        for (int r = 0; r < D->h && r < o->bm.h; r++) {
+            int top = D->topdown ? r : D->h - 1 - r;
+            uint8_t* row = bits + (size_t)r * D->stride;
+            for (int x = 0; x < D->w && x < o->bm.w; x++) {
+                uint32_t c = o->bm.px[(size_t)top * o->bm.w + x] & 0xFFFFFF;
+                if (dib_px(D, bits, x, r) == c) continue;
+                uint32_t R = c & 0xFF, G = c >> 8 & 0xFF, B = c >> 16 & 0xFF;
+                if (D->bpp <= 8) {                          /* the nearest palette entry */
+                    int best = 0, bd = 1 << 30;
+                    for (int k = 0; k < D->ncol; k++) {
+                        uint32_t q = D->pal[k];
+                        int d = abs((int)(q & 0xFF) - (int)R) + abs((int)(q >> 8 & 0xFF) - (int)G) + abs((int)(q >> 16 & 0xFF) - (int)B);
+                        if (d < bd) bd = d, best = k;
+                    }
+                    int sh = D->bpp == 1 ? 7 - (x & 7) : D->bpp == 4 ? (x & 1 ? 0 : 4) : 0;
+                    uint8_t mk = (uint8_t)(((1 << D->bpp) - 1) << sh);
+                    uint8_t* q = &row[(size_t)x * D->bpp / 8];
+                    *q = (uint8_t)((*q & ~mk) | ((best << sh) & mk));
+                } else if (D->bpp == 24) row[3 * x] = (uint8_t)B, row[3 * x + 1] = (uint8_t)G, row[3 * x + 2] = (uint8_t)R;
+                else {
+                    uint32_t v = unfield(R, D->mask[0]) | unfield(G, D->mask[1]) | unfield(B, D->mask[2]);
+                    if (D->bpp == 16) row[2 * x] = (uint8_t)v, row[2 * x + 1] = (uint8_t)(v >> 8);
+                    else memcpy(row + 4 * x, &v, 4);
+                }
+            }
+        }
+        memcpy(s->shadow, bits, (size_t)D->stride * D->h);
+        s->touched = 0;
+    }
+    return 1;
 }
 /* NtGdiExtGetObjectW(h, count, buffer) */
 static uint32_t s_getobject(uint32_t* a) {
@@ -1839,7 +1922,7 @@ static void menubar_layout(uobj_t* u) {
         x += m->items[i].w;
     }
 }
-static void draw_icon(gobj_t* d, uobj_t* ic, int x, int y, int cx, int cy);
+static void draw_icon(gobj_t* d, uobj_t* ic, int x, int y, int cx, int cy, uint32_t fl);
 /* a scroll bar, Windows 2000's way: two arrow buttons, the track in the
  * 3D-highlight/face dither, the thumb when the range is more than a page
  * (arrows greyed when it is not) */
@@ -1909,7 +1992,7 @@ static void ncpaint(uobj_t* u) {
         if (u->style & WS_SYSMENU) {
             cls_t* c = u->cls >= 0 ? &g_cls[u->cls] : NULL;
             uobj_t* ic = c ? U(c->iconsm ? c->iconsm : c->icon, W2K_TYPE_CURSOR) : NULL;
-            if (ic) draw_icon(d, ic, cr.l + 2, cr.t + 1, 16, 16);
+            if (ic) draw_icon(d, ic, cr.l + 2, cr.t + 1, 16, 16, 3);
             tx += 18;
         }
         draw_text(d, tx, cr.t + 2, u->text, act ? C[9] : C[19], 1, 0);
@@ -2294,10 +2377,13 @@ static item_t* menu_item(uobj_t* m, uint32_t item, int bypos, uobj_t** owner) {
 }
 
 /* ---- icons ------------------------------------------------------------------ */
-static void draw_icon(gobj_t* d, uobj_t* ic, int x, int y, int cx, int cy) {
+/* DrawIconEx's DI_MASK (1): the AND mask copied; DI_IMAGE (2): the image copied; DI_NORMAL (3):
+ * the two combined (comctl32's image lists take an icon's mask and image apart so) */
+static void draw_icon(gobj_t* d, uobj_t* ic, int x, int y, int cx, int cy, uint32_t fl) {
     bmp_t* m = bm_of(ic->mask), *c = bm_of(ic->color), *b = dc_bm(d);
     if (!m) return;
-    int iw = m->w, ih = c ? m->h : m->h / 2;
+    /* NT keeps the mask twice the icon's height for a colour icon too (the AND mask on top) */
+    int iw = c ? c->w : m->w, ih = c ? (m->h >= 2 * c->h ? c->h : m->h) : m->h / 2;
     if (!cx) cx = iw;
     if (!cy) cy = ih;
     for (int j = 0; j < cy; j++)
@@ -2309,7 +2395,8 @@ static void draw_icon(gobj_t* d, uobj_t* ic, int x, int y, int cx, int cy) {
             if (X < 0 || Y < 0 || X >= b->w || Y >= b->h || sx >= m->w || (c ? sy >= m->h || sx >= c->w || sy >= c->h : sy + ih >= m->h)) continue;
             uint32_t* p = &b->px[(size_t)Y * b->w + X];
             uint32_t a = m->px[(size_t)sy * m->w + sx], xo = c ? c->px[(size_t)sy * c->w + sx] : m->px[(size_t)(sy + ih) * m->w + sx];
-            *p = ((*p & a) ^ xo) & 0xFFFFFF;
+            uint32_t v = fl == 1 ? a : fl == 2 ? xo : (*p & a) ^ xo;
+            *p = (b->mono ? lum_mono(v) : v) & 0xFFFFFF;
         }
 }
 
@@ -2792,7 +2879,7 @@ static uint32_t s_drawicon(uint32_t* a) {
     if (!d || !c) return 0;
     int x = (int)a[1], y = (int)a[2];
     lp2dp(d, &x, &y);
-    draw_icon(d, c, x, y, (int)a[4] ? (int)a[4] : c->icx, (int)a[5] ? (int)a[5] : c->icy);
+    draw_icon(d, c, x, y, (int)a[4] ? (int)a[4] : c->icx, (int)a[5] ? (int)a[5] : c->icy, a[8] & 3 ? a[8] & 3 : 3);
     return 1;
 }
 
@@ -3073,7 +3160,7 @@ static uint32_t s_drawcaptiontemp(uint32_t* a) {
     int x = r.l + 2;
     uobj_t* ic = a[4] ? U(a[4], W2K_TYPE_CURSOR) : NULL;
     if (!ic && a[0] && W(a[0]) && W(a[0])->cls >= 0) { cls_t* k = &g_cls[W(a[0])->cls]; ic = U(k->iconsm ? k->iconsm : k->icon, W2K_TYPE_CURSOR); }
-    if ((fl & 4) && ic) { draw_icon(d, ic, x, r.t + (r.b - r.t - 16) / 2, 16, 16); x += 18; }
+    if ((fl & 4) && ic) { draw_icon(d, ic, x, r.t + (r.b - r.t - 16) / 2, 16, 16, 3); x += 18; }
     if (fl & 8) {
         uint16_t t[128] = { 0 };
         if (a[5] && MEM32(a[5] + 4)) { int n = MEM16(a[5]) / 2; for (int i = 0; i < n && i < 127; i++) t[i] = MEM16(MEM32(a[5] + 4) + 2 * i); }
@@ -3688,7 +3775,7 @@ void w2kx_install(int cx, int cy, const char* fontdir) {
         { "NtGdiRestoreDC", s_restoredc }, { "NtGdiGetCharSet", s_getcharset }, { "NtGdiGetDCPoint", s_dcpoint },
         { "NtGdiGetDCDword", s_getdword }, { "NtGdiGetAndSetDCDword", s_getsetdword }, { "NtGdiOpenDCW", s_opendc },
         { "NtGdiGetRgnBox", s_getrgnbox }, { "NtGdiGetAppClipBox", s_cliprect }, { "NtGdiFlushUserBatch", s_flushbatch },
-        { "NtGdiFlush", s_one }, { "NtGdiComputeXformCoefficients", s_one }, { "NtGdiSetLayout", s_zero }, { "NtGdiGetLayout", s_zero },
+        { "NtGdiFlush", s_gdiflush }, { "NtGdiComputeXformCoefficients", s_one }, { "NtGdiSetLayout", s_zero }, { "NtGdiGetLayout", s_zero },
         { "NtGdiEnumFontClose", s_one }, { "NtGdiGetTextCharsetInfo", s_charsetinfo }, { "NtGdiGetRandomRgn", s_randomrgn }, { "NtGdiRectVisible", s_one }, { "NtGdiGetNearestColor", s_nearest },
         { "NtGdiGetTextFaceW", s_textface }, { "NtGdiEnumFontOpen", s_enumfont_open }, { "NtGdiEnumFontChunk", s_enumfont_chunk },
         /* USER */
