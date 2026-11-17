@@ -336,6 +336,7 @@ static void krnl386_thunk(void) {
         *(uint16_t*)(tdb + 0x60) = MEM16(sp + 6);
         tdb[0x66] = 0x80 | 2;
         tdb[0xFA] = 'T'; tdb[0xFB] = 'D';
+        *(uint32_t*)(tdb + 0x54) = MEM32(sp + 2);   /* its thread: KRNL386's task cleanup (seg1 9002) and CreateTask's 32-bit side (seg1 630D) keep it here */
         _snprintf((char*)tdb + 0x100, 0x100, "\\%s", g_cwd);
         g_eax = native32_w9x_alloc_sel((uint32_t)(uintptr_t)tdb, 0x1FF); g_edx = 0;
         if (g_trace > 0) fprintf(stderr, "[krnl386] thunk 32 new task %04X (psp %04X, thread %08X)\n", g_eax, MEM16(sp + 6), MEM32(sp + 2));
