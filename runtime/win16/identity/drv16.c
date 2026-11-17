@@ -268,8 +268,16 @@ static void disp_realize(CPU *c) {
  * seg010_0DB3, clones it; the caller's own block is gone by then).
  * ponytail: 256 PDEVICE addresses, one selector each, never freed */
 static struct { uint32_t dev; int npal; uint16_t sel; uint16_t pal[256]; uint8_t bi[40 + 1024]; } g_dibpal[256];
-static uint16_t *dib_pal(uint32_t dev) {
-    for (int i = 0; i < 256 && g_dibpal[i].dev; i++) if (g_dibpal[i].dev == dev) return g_dibpal[i].npal ? g_dibpal[i].pal : NULL;
+/* Found by the PDEVICE's deBitmapInfo selector (each slot's own), not its address: GDI moves
+ * the block (shell32's image list DIB section, once the list grows), and an address lookup then
+ * found nothing, so every blit into that list was dropped (My Computer's icon black). */
+static uint16_t *dib_pal(const uint8_t *b) {
+    uint16_t sel = (uint16_t)(*(const uint32_t *)(b + 0x20) >> 16);
+    for (int i = 0; i < 256 && g_dibpal[i].dev; i++)
+        if (sel && g_dibpal[i].sel == sel) {
+            g_dibpal[i].dev = (uint32_t)(uintptr_t)b;   /* where it is now: a new PDEVICE at the old address gets its own slot */
+            return g_dibpal[i].npal ? g_dibpal[i].pal : NULL;
+        }
     return NULL;
 }
 #define DE_TYPE 0x5250
@@ -285,7 +293,7 @@ static int surf_of(uint32_t lp, surf_t *s) {
             s->bits = (uint8_t *)(uintptr_t)(off > 0xFFFF ? off : recomp_sel_base(*(const uint16_t *)(b + 0x1A)) + off);
         }
         if (s->pitch < 0) s->bits -= s->pitch * (s->h - 1);
-        s->pal = dib_pal((uint32_t)(uintptr_t)b);
+        s->pal = dib_pal(b);
         if (getenv("W16_DIBDBG")) fprintf(stderr, "[dib] surf %08X: %dx%d bpp %d bits %04X:%08X delta %d own %08X base %08X lim %08X\n", lp, s->w, s->h, s->bpp, *(const uint16_t *)(b + 0x1A), *(const uint32_t *)(b + 0x16), s->pitch, *(const uint32_t *)(b + 0x2C), recomp_sel_base(*(const uint16_t *)(b + 0x1A)), *(const uint32_t *)native32_w9x_desc(*(const uint16_t *)(b + 0x1A)), *(const uint32_t *)(b + 0x0A), *(const uint32_t *)(b + 0x48), *(const uint32_t *)(b + 0x50), *(const uint32_t *)(b + 0x54), *(const uint32_t *)(b + 0x58));
         return s->bits && (s->bpp == 15 || s->bpp == 24 || s->bpp == 32 || (s->pal && (s->bpp == 1 || s->bpp == 4 || s->bpp == 8)));
     }
