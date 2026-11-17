@@ -167,7 +167,9 @@ static uint32_t vmm_reg_open(const uint32_t* a) {   /* W98_REGTRACE=1: every ope
     return r;
 }
 static uint32_t vmm_reg_create(const uint32_t* a) {
-    return (uint32_t)REG("RegCreateKeyA", LONG(WINAPI*)(HKEY, LPCSTR, PHKEY))((HKEY)P(0), P(1), P(2));
+    uint32_t r = (uint32_t)REG("RegCreateKeyA", LONG(WINAPI*)(HKEY, LPCSTR, PHKEY))((HKEY)P(0), P(1), P(2));
+    if (getenv("W98_REGTRACE")) fprintf(stderr, "[reg] create %08X \"%s\" -> %u\n", a[0], a[1] ? (const char*)P(1) : "", r);
+    return r;
 }
 static uint32_t vmm_reg_close(const uint32_t* a) { return (uint32_t)RegCloseKey((HKEY)P(0)); }
 static uint32_t vmm_reg_delete_key(const uint32_t* a) {
