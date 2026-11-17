@@ -502,8 +502,8 @@ static void ms_inquire(CPU *c) {
  * the way MOUSE.DRV's interrupt handler calls it: ax = status (8000h absolute,
  * 1 moved, 2 left down, 4 left up), bx/cx = x/y scaled to 0..FFFFh, dx = buttons.
  * A host thread takes the machine for each call, as an interrupt would.
- * ponytail: clicks only, on a private 8 KB 16-bit stack; keys (keyboard_event
- * needs KEYBOARD's ToAscii) when a script wants them. */
+ * "key C@T": C pressed and released through KEYBOARD.Enable's proc (al vk, ah 80h up, bl scan).
+ * ponytail: left clicks and unshifted keys, on a private 8 KB 16-bit stack. */
 static uint32_t g_ms_proc;
 int w16_call(CPU *r);
 void mach_enter(void);
@@ -516,7 +516,7 @@ static DWORD WINAPI input_thread(LPVOID unused) {
     for (const char *s = getenv("W16_INPUT"); s && *s; s = strchr(s, ';') ? strchr(s, ';') + 1 : "") {
         int x, y; double t; char k;
         extern int g_fncount;
-        if (getenv("W16_FN_INPUT")) g_fncount = 1;   /* W16_FN's function trace from the first event on */
+        if (getenv("W16_FN_INPUT") || getenv("W16_ARGS")) g_fncount = 1;   /* W16_FN's function trace from the first event on */
         if (sscanf(s, " key %c@%lf", &k, &t) == 2) {   /* a press and release through KEYBOARD.Enable's proc */
             while (GetTickCount() - t0 < (DWORD)(t * 1000)) Sleep(20);
             UINT vk = k == '+' ? VK_ADD : k == '*' ? VK_MULTIPLY : k == '-' ? VK_SUBTRACT : k == '/' ? VK_DIVIDE : LOBYTE(VkKeyScanA(k));   /* ponytail: unshifted keys only */
@@ -534,10 +534,13 @@ static DWORD WINAPI input_thread(LPVOID unused) {
         }
         if (sscanf(s, " click %d,%d@%lf", &x, &y, &t) != 3) { fprintf(stderr, "[drv] W16_INPUT: cannot read \"%s\"\n", s); break; }
         while (GetTickCount() - t0 < (DWORD)(t * 1000)) Sleep(20);
-        for (int up = 0; up < 2; up++) {
+        /* move, then press, then release: USER's proc queues the button messages before it
+         * takes a move in the same call, so a press with the move bit lands where the cursor was */
+        static const uint16_t st[3] = { 0x8001, 0x8002, 0x8004 };
+        for (int up = 0; up < 3; up++) {
             mach_enter();
             CPU r; cpu_init(&r);
-            r.ax = (uint16_t)(0x8001 | (up ? 4 : 2)); r.bx = (uint16_t)(x * 0xFFFF / (FB_W - 1)); r.cx = (uint16_t)(y * 0xFFFF / (FB_H - 1)); r.dx = 2;
+            r.ax = st[up]; r.bx = (uint16_t)(x * 0xFFFF / (FB_W - 1)); r.cx = (uint16_t)(y * 0xFFFF / (FB_H - 1)); r.dx = 2;
             r.cs = (uint16_t)(g_ms_proc >> 16); r.ip = (uint16_t)g_ms_proc; r.ss = r.ds = r.es = ss; r.sp = 0x1FF0;
             fprintf(stderr, "[drv] mouse event %04X at %d,%d to %04X:%04X\n", r.ax, x, y, r.cs, r.ip);
             if (!w16_call(&r)) fprintf(stderr, "[drv] mouse proc %04X:%04X is no lifted function\n", r.cs, r.ip);
