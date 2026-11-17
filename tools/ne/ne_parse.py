@@ -79,6 +79,11 @@ class Segment:
         return bool(self.flags & 0x0100)
 
     @property
+    def use32(self) -> bool:
+        """A 32-bit code segment (NS32BIT): Win9x GDI's DIB-engine segments."""
+        return bool(self.flags & 0x2000) and self.is_code
+
+    @property
     def is_discardable(self) -> bool:
         return bool(self.flags & 0x1000)
 

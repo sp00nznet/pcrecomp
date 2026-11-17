@@ -96,7 +96,7 @@ class _Seg:
     def __init__(self, seg):
         self.seg = seg
         self.data = seg.data
-        self.dec = Decoder(seg.data, base_offset=0)
+        self.dec = Decoder(seg.data, base_offset=0, use32=getattr(seg, 'use32', False))
         self.owner = bytearray(len(seg.data))   # 0 free, 1 code, 2 data
         self.heads = {}                          # off -> length
         self.funcs = set()

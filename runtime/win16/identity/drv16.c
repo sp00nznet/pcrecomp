@@ -710,6 +710,7 @@ static void ms_inquire(CPU *c) {
  * "key C@T": C pressed and released through KEYBOARD.Enable's proc (al vk, ah 80h up, bl scan).
  * "text STR@T": each character, shifted ones between a Shift press and release.
  * "drag X,Y,X2,Y2@T": press at X,Y, eight moves to X2,Y2, release there.
+ * "mem N:OFF@T": print 16 words of global segment N at OFF (debug).
  * ponytail: left clicks and Shift-only keys, on a private 8 KB 16-bit stack. */
 static uint32_t g_ms_proc;
 int w16_call(CPU *r);
@@ -750,6 +751,16 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                     Sleep(60);
                 }
             }
+            continue;
+        }
+        unsigned ms, mo;
+        if (sscanf(s, " mem %u:%x@%lf", &ms, &mo, &t) == 3) {   /* "mem N:OFF@T": 16 words of global segment N at OFF */
+            while (GetTickCount() - t0 < (DWORD)(t * 1000)) Sleep(20);
+            extern uint16_t g_w16_segsel[];
+            const uint8_t *u = (const uint8_t *)(uintptr_t)recomp_sel_base(g_w16_segsel[ms]);
+            fprintf(stderr, "[drv] mem %u:%04X:", ms, mo);
+            for (int i = 0; u && i < 16; i++) fprintf(stderr, " %04X", *(const uint16_t *)(u + mo + 2 * i));
+            fprintf(stderr, "\n");
             continue;
         }
         int x2, y2, drag = sscanf(s, " drag %d,%d,%d,%d@%lf", &x, &y, &x2, &y2, &t) == 5;

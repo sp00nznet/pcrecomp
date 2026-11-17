@@ -84,7 +84,7 @@ def retf_purge(ne, ordinal):
     seg = ne.seg(e.segment) if e and 1 <= e.segment < 0xFE else None
     if seg is None or not seg.is_code or not seg.data:
         return None
-    d = Decoder(seg.data, base_offset=0)
+    d = Decoder(seg.data, base_offset=0, use32=seg.use32)
     d.pos = e.offset
     for _ in range(4000):
         inst = d.decode_one()

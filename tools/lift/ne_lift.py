@@ -235,7 +235,7 @@ class NELifter(Lifter):
         n = 0
         for i in reversed(run[:-1]):
             if i.mnemonic == 'push':
-                n += 2 if i.raw[:1] == b'\x66' else 1
+                n += 2 if i.op32 else 1
             elif i.mnemonic in _NO_SP and not (i.op1 and 'sp' in repr(i.op1).lower()):
                 continue
             else:
@@ -256,7 +256,7 @@ class NELifter(Lifter):
         off = r.target_off if r.src_type == 3 else int.from_bytes(b[1:3], 'little')
         if tgt is None or not tgt.data:
             return None
-        dec = Decoder(tgt.data, base_offset=0)
+        dec = Decoder(tgt.data, base_offset=0, use32=tgt.use32)
         dec.pos = off
         for _ in range(400):   # ponytail: the first retf on the straight decode names n
             try:
@@ -353,12 +353,18 @@ class NELifter(Lifter):
         # A near ret, and a far one, record the offset they pop (cpu->ret_ip)
         # for the near call sites below.
         if _IDENTITY and m == 'ret':
-            n = (op1.disp if op1 else 0) + 2
+            n = (op1.disp if op1 else 0) + (4 if inst.op32 else 2)   # o32 (a use32 segment): eip
             self._emit(f'cpu->ret_ip = mem_read16(cpu, cpu->ss, cpu->sp); cpu->sp += 0x{n:X}; return;', orig)
             return
-        if _IDENTITY and m == 'retf' and not (op1 is None and inst.raw[:1] == b'\x66'):
+        if _IDENTITY and m == 'retf' and inst.op32 and self.seg.use32:
+            # a use32 segment's own far return pops eip and a 32-bit cs (its far
+            # call sites below push both); 66h retf there is the 16-bit one
+            n = (op1.disp if op1 else 0) + 8
+            self._emit(f'cpu->ret_ip = mem_read16(cpu, cpu->ss, cpu->sp); cpu->sp += 0x{n:X}; return;', orig)
+            return
+        if _IDENTITY and m == 'retf' and not (op1 is None and inst.op32):
             self._emit('cpu->ret_ip = mem_read16(cpu, cpu->ss, cpu->sp);', 'the offset this far return pops')
-        if _IDENTITY and m == 'retf' and op1 is None and inst.raw[:1] == b'\x66':
+        if _IDENTITY and m == 'retf' and op1 is None and inst.op32:
             self._emit('w16_retf32(cpu); return;',
                        orig + ' (o32: into flat code)')
             return
@@ -373,10 +379,10 @@ class NELifter(Lifter):
         # call far GetProcAddress; push dx; push ax; retf` (KRNL386 seg1 CD6A:
         # SYSTEM.7, back at CD7D). A pushed `cs` then an immediate offset is a
         # return address the code built; as a far jump it unwound KRNL386.
-        if _IDENTITY and m == 'retf' and op1 is None and inst.raw[:1] != b'\x66' and self._pushes_cs_cont(self._run):
+        if _IDENTITY and m == 'retf' and op1 is None and not inst.op32 and self._pushes_cs_cont(self._run):
             self._emit('w16_retf_call(cpu); return;', orig + ' (a far call to what was pushed, back to the pushed cs:continuation)')
             return
-        if _IDENTITY and m == 'retf' and op1 is None and inst.raw[:1] != b'\x66' and \
+        if _IDENTITY and m == 'retf' and op1 is None and not inst.op32 and \
                 prev is not None and prev.mnemonic != 'push' and self._pushed_words(self._run) >= 4:
             self._emit('w16_retf_call(cpu); return;', orig + ' (a far call to what was pushed, back to the pushed continuation)')
             return
@@ -423,7 +429,8 @@ class NELifter(Lifter):
                 # identity: the caller's own selector (cpu->cs is not kept up as
                 # KRNL386 moves segments; a 16->32 thunk returns through it)
                 cs = f'SEG_{self.seg.index}' if _IDENTITY else 'cpu->cs'
-                self._emit(f'push16(cpu, {cs}); push16(cpu, 0x{local_off + inst.length:04X});',
+                _p = 'push32' if inst.op32 else 'push16'   # o32: 16:32 return address
+                self._emit(f'{_p}(cpu, {cs}); {_p}(cpu, 0x{local_off + inst.length:04X});',
                            'far call return addr')
                 # Identity mode: the fixup KRNL386's loader patched names the
                 # target segment's block; bind SEG_n to it before its code runs.
@@ -446,9 +453,14 @@ class NELifter(Lifter):
                     f'uint16_t _s = mem_read16(cpu, {seg_e}, (uint16_t)({off_e} + 2));')
             if m == 'call far':
                 cs = f'SEG_{self.seg.index}' if _IDENTITY else 'cpu->cs'
-                self._emit(f'{{ {read} push16(cpu, {cs}); push16(cpu, 0x{local_off + inst.length:04X}); '
+                if inst.op32:   # m16:32 pointer, 16:32 return address
+                    read = read.replace(f'({off_e} + 2)', f'({off_e} + 4)')
+                _p = 'push32' if inst.op32 else 'push16'
+                self._emit(f'{{ {read} {_p}(cpu, {cs}); {_p}(cpu, 0x{local_off + inst.length:04X}); '
                            f'dispatch_far(cpu, _s, _o); }}', orig)
             else:  # jmp far -> tail dispatch
+                if inst.op32:
+                    read = read.replace(f'({off_e} + 2)', f'({off_e} + 4)')
                 self._emit(f'{{ {read} dispatch_far(cpu, _s, _o); return; }}', orig)
             return
 
@@ -458,7 +470,7 @@ class NELifter(Lifter):
             idx = self.seg.index
             if m == 'call':
                 self._emit(f'{{ uint16_t _o = mem_read16(cpu, {seg_e}, {off_e}); '
-                           f'push16(cpu, 0x{local_off + inst.length:04X}); dispatch_near(cpu, {idx}, _o); }}', orig)
+                           f'{"push32" if inst.op32 else "push16"}(cpu, 0x{local_off + inst.length:04X}); dispatch_near(cpu, {idx}, _o); }}', orig)
             else:  # jmp near indirect -> tail dispatch
                 self._emit(f'{{ uint16_t _o = mem_read16(cpu, {seg_e}, {off_e}); '
                            f'dispatch_near(cpu, {idx}, _o); return; }}', orig)
@@ -525,7 +537,7 @@ class NELifter(Lifter):
                 return
             func_name = f'seg{self.seg.index:03d}_{target:04X}'
             self.func_calls.add(func_name)
-            self._emit(f'push16(cpu, 0x{local_off + inst.length:04X});', 'near call return addr')
+            self._emit(f'{"push32" if inst.op32 else "push16"}(cpu, 0x{local_off + inst.length:04X});', 'near call return addr')
             # A callee that pops its own return address and `jmp`s to it (KRNL386
             # seg1 AAE5: `pop dx; ...; jmp dx`) runs the continuation itself,
             # through dispatch_near. Returning here afterwards would run it a
@@ -662,13 +674,13 @@ class NELifter(Lifter):
         # frame still allocated — which corrupted bp, then DS, then every far
         # pointer built as `push ds`. Route it through the dispatcher like any
         # other computed near target.
-        if m in ('jmp', 'call') and op1 and op1.type == OpType.REG16:
-            reg = REG16_NAMES[op1.reg]
+        if m in ('jmp', 'call') and op1 and op1.type in (OpType.REG16, OpType.REG32):
+            reg = REG16_NAMES[op1.reg]   # a use32 target is still under 64K
             idx = self.seg.index
             if m == 'jmp':
                 self._emit(f'dispatch_near(cpu, {idx}, cpu->{reg}); return;', orig)
             else:
-                self._emit(f'{{ push16(cpu, 0x{local_off + inst.length:04X}); dispatch_near(cpu, {idx}, cpu->{reg}); }}', orig)
+                self._emit(f'{{ {"push32" if inst.op32 else "push16"}(cpu, 0x{local_off + inst.length:04X}); dispatch_near(cpu, {idx}, cpu->{reg}); }}', orig)
             return
 
         # --- String ops with a SEGMENT OVERRIDE on the source ---
@@ -1238,7 +1250,7 @@ def lift_segment(ne: NEHeader, seg_num: int, func_offset: int = -1, xmod=None):
         fall_off = func.end
         last = func_insts[-1]
         e = last.offset - seg.file_offset + last.length
-        dec = Decoder(seg.data, base_offset=seg.file_offset)
+        dec = Decoder(seg.data, base_offset=seg.file_offset, use32=seg.use32)
         if last.mnemonic not in TERMINATORS and e < func.end and e not in off_to_label:
             dec.pos = e
             i = dec.decode_one()
@@ -1321,7 +1333,7 @@ def lift_segment(ne: NEHeader, seg_num: int, func_offset: int = -1, xmod=None):
                     if i.mnemonic not in _NO_SP or 'sp' in ops or 'ss' in ops:
                         break
                 if (tail is not None and nx and nx[0].mnemonic == 'retf' and nx[0].op1 is None
-                        and nx[0].raw[:1] != b'\x66'):
+                        and not nx[0].op32):
                     close = code.rfind('}')
                     code = (code[:close] + f'    {_PUSHED_RETF} /* falls into {nxt}: a retf after a push */\n'
                             + code[close:])

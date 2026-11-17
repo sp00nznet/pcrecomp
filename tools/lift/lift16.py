@@ -1306,11 +1306,15 @@ class Lifter:
 
         elif m == 'enter':
             size_val = op1.disp
-            self._emit(f'push16(cpu, cpu->bp); cpu->bp = cpu->sp; '
-                       f'cpu->sp -= 0x{size_val:X};', orig)
+            if getattr(inst, 'op32', False):   # o32: ebp; the frame pointer still from sp (a 16-bit stack)
+                self._emit(f'push32(cpu, cpu->ebp); cpu->bp = cpu->sp; cpu->sp -= 0x{size_val:X};', orig)
+            else:
+                self._emit(f'push16(cpu, cpu->bp); cpu->bp = cpu->sp; '
+                           f'cpu->sp -= 0x{size_val:X};', orig)
 
         elif m == 'leave':
-            self._emit('cpu->sp = cpu->bp; cpu->bp = pop16(cpu);', orig)
+            self._emit('cpu->sp = cpu->bp; cpu->ebp = pop32(cpu);' if getattr(inst, 'op32', False)
+                       else 'cpu->sp = cpu->bp; cpu->bp = pop16(cpu);', orig)
 
         elif m == 'in':
             if op2 and op2.type == OpType.IMM8:

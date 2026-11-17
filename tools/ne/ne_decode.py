@@ -390,7 +390,7 @@ def disassemble_segment(seg: Segment, ne: NEHeader, show_relocs: bool = True) ->
         return [], [], {}
 
     reloc_map = build_reloc_map(seg, ne)
-    decoder = Decoder(seg.data, base_offset=seg.file_offset)
+    decoder = Decoder(seg.data, base_offset=seg.file_offset, use32=seg.use32)
 
     # If IDA exported accurate instruction heads for this segment, decode at
     # exactly those offsets. This eliminates linear-sweep desync on data-in-code

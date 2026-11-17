@@ -52,12 +52,12 @@ void recomp_fn_hit(const char *n) {   /* g_fncount: W16_FN=1 (with fs when it ch
         if (ww < 0) { const char *e = getenv("W16_WW"); char *t; wss = e ? (uint16_t)strtoul(e, &t, 16) : 0; ww = e && *t == ':' ? (int)strtoul(t + 1, 0, 16) : 0x10000; }
         if (ww < 0x10000 && g_w16.ss == wss) { uint16_t v = mem_read16(&g_w16, g_w16.ss, (uint16_t)ww); if (v != last) { last = v; fprintf(stderr, "WW ss:%04X = %04X at %s\n", ww, v, n); } }
     }
-    {   /* W16_ARGS=fn,fn: those functions' first 8 stack words on entry (above the far return) */
+    {   /* W16_ARGS=fn,fn: those functions' first 16 stack words on entry (above the far return) */
         static const char *wa = (const char *)-1;
         if (wa == (const char *)-1) wa = getenv("W16_ARGS");
         if (wa && strstr(wa, n)) {
-            fprintf(stderr, "ARGS %s thread %lu:", n, GetCurrentThreadId());
-            for (int i = 0; i < 8; i++) fprintf(stderr, " %04X", mem_read16(&g_w16, g_w16.ss, (uint16_t)(g_w16.sp + 4 + 2 * i)));
+            fprintf(stderr, "ARGS %s thread %lu (ax %04X bx %04X cx %04X dx %04X si %04X di %04X):", n, GetCurrentThreadId(), g_w16.ax, g_w16.bx, g_w16.cx, g_w16.dx, g_w16.si, g_w16.di);
+            for (int i = 0; i < 16; i++) fprintf(stderr, " %04X", mem_read16(&g_w16, g_w16.ss, (uint16_t)(g_w16.sp + 4 + 2 * i)));
             fprintf(stderr, "\n");
         }
         static const char *wb = (const char *)-1;   /* W16_BP=fn@-70: 16 words at ss:bp-70h there (a frame's buffer) */
