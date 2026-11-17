@@ -728,6 +728,7 @@ static void cur_task(void) {
     if (g_w9x_curtdb && g_cur[0] && (tdb = *(uint16_t*)(uintptr_t)(g_cur[0] + 0x14)) != 0) *g_w9x_curtdb = tdb;
 }
 
+static uint32_t vwin32_thread_done(const uint32_t* a);
 static DWORD w9x_wait(HANDLE h, DWORD ms) {
     uint16_t sds = g_seg_ds, ses = g_seg_es, sfs = g_seg_fs, sgs = g_seg_gs;
     uint32_t bds = g_ds_base, bes = g_es_base, bgs = g_gs_base;
@@ -743,6 +744,12 @@ static DWORD w9x_wait(HANDLE h, DWORD ms) {
         MEM32(t_r0 + R0T_KILL) = 0;
         if (g_trace > 0) fprintf(stderr, "[vxd] thread %08X (r0 %08X): its termination runs\n", g_cur[0], t_r0);
         run_termination(blk);
+        /* A thread terminated from outside never comes back to the code it was
+         * in: the teardown (0xBFF71D26) put its selectors back in kernel32's
+         * cache, its 16-bit stack alias among them ({next, 1}: read as a
+         * descriptor, base 000161xx). Explorer's killed thread ran on in its
+         * window-proc relay on that ss. If it did not end in 2B, it ends here. */
+        vwin32_thread_done(NULL);
     }
     return rc;
 }
