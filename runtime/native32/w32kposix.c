@@ -1737,12 +1737,34 @@ typedef struct { uint32_t h, id, elapse, due, proc; int on; } timer_t_;
 static timer_t_ g_tm[MAXT];
 
 /* ---- DCs for windows ------------------------------------------------------ */
+/* z-order, the one case there is: a topmost window (SetWindowPos HWND_TOPMOST: the taskbar) stays
+ * above the rest, so the others' DCs leave out the band it covers along an edge.
+ * ponytail: one rectangle per DC, so only a topmost window spanning a whole edge is cut out;
+ * real visible regions when overlapping windows have to clip each other */
+static rc_t zclip(uobj_t* u, rc_t r) {
+    uobj_t* t = u;
+    while (t && t->parent != g_desktop && W(t->parent)) t = W(t->parent);
+    if (!t || (t->ex & 8)) return r;
+    for (int i = 2; i < MAXU; i++) {
+        uobj_t* w = &g_u[i];
+        if (w->type != W2K_TYPE_WINDOW || w == t || w->parent != g_desktop || !(w->ex & 8) || !visible(w)) continue;
+        rc_t z = w->wr;
+        if (z.l <= r.l && z.r >= r.r) {
+            if (z.t <= r.t && z.b > r.t) r.t = z.b;
+            else if (z.b >= r.b && z.t < r.b) r.b = z.t;
+        } else if (z.t <= r.t && z.b >= r.b) {
+            if (z.l <= r.l && z.r > r.l) r.l = z.r;
+            else if (z.r >= r.r && z.l < r.r) r.r = z.l;
+        }
+    }
+    return r;
+}
 static gobj_t* window_dc(uobj_t* u, int whole) {
     gobj_t* d = dc_new(1);
     if (!d) return NULL;
     rc_t r = u ? (whole ? u->wr : u->cr) : (rc_t){ 0, 0, g_cx, g_cy };
     d->ox = r.l, d->oy = r.t;
-    d->vis = d->clip = rc_and(r, (rc_t){ 0, 0, g_cx, g_cy });
+    d->vis = d->clip = rc_and(u ? zclip(u, r) : r, (rc_t){ 0, 0, g_cx, g_cy });
     d->hwnd = u ? u->h : 0;
     return d;
 }
@@ -2396,6 +2418,8 @@ static uint32_t s_move(uint32_t* a) {            /* NtUserMoveWindow(hwnd, x, y,
 static uint32_t s_setpos(uint32_t* a) {          /* NtUserSetWindowPos(hwnd, after, x, y, cx, cy, flags) */
     uobj_t* u = W(a[0]);
     if (!u) return 0;
+    if (a[1] == 0xFFFFFFFFu && !(u->style & WS_CHILD)) u->ex |= 8;         /* HWND_TOPMOST: WS_EX_TOPMOST */
+    if (a[1] == 0xFFFFFFFEu && !(u->style & WS_CHILD)) u->ex &= ~8u;       /* HWND_NOTOPMOST */
     setpos(u, (int)a[2], (int)a[3], (int)a[4], (int)a[5], a[6]);
     if ((a[6] & SWP_SHOWWINDOW) && !(a[6] & 0x10) && !(u->style & WS_CHILD)) activate(u);
     return 1;
@@ -3201,6 +3225,10 @@ static void user_connect(uint32_t index, uint32_t ci, uint32_t len) {
         MEM32(d->obj + WND_PCLS) = desk_alloc(0x80);
         wnd_sync(d);
         MEM32(g_deskinfo + 8) = d->obj;
+        /* the monitor's handle (TYPE_MONITOR, 12): user32's GetMonitorInfo/MonitorFromRect validate
+         * it in the handle table; with none, the taskbar placed itself on a 0x0 monitor */
+        uobj_t* mo = unew(12, 4);
+        if (mo) MEM32(g_mon) = mo->h, w2k_ahe_set(g_ahe, mo->h, g_mon, 12, g_threadinfo);
     }
     w2k_user_connect(ci, g_psi, g_ahe, g_disp, g_defmsgs);
 }
