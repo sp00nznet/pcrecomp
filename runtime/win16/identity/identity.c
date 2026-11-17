@@ -252,7 +252,9 @@ static void host_far(CPU *c, uint16_t off) {
         if (c->ax == 0x100) { c->ax = native32_w9x_ldt_alias(); ok(c); return; }   /* LDT alias */
         break;
     }
-    if (off == H_VXD + 0x442 && c->ax == 9) { c->ax = 0; ok(c); return; }   /* ponytail: 0 until a reader needs more */
+    /* VTDAPI 9: the selector of the system-time dword (ms at offset 0); USER keeps 0:ax at
+     * DGROUP:0 for its GetTickCount and event times, KRNL386 at DGROUP:1A88 (drv16's tick thread) */
+    if (off == H_VXD + 0x442 && c->ax == 9) { uint16_t drv16_tick_sel(void); c->ax = drv16_tick_sel(); ok(c); return; }
     /* VMM 26Dh: KRNL386 seg1 B85A wants ah = 2 to read 26Eh too (DGROUP:1450);
      * ponytail: ax 0, the path it takes when VMM is absent */
     if (off == H_VXD + 0x001 && c->ax == 0x26D) { c->ax = 0; ok(c); return; }
@@ -912,6 +914,11 @@ int w16_retf(CPU *c) {
     w16_fn32 f = recomp_lookup(eip);
     if (getenv("W16_TRACE")) fprintf(stderr, "[w16] stub %04X:%04X -> %08X (entry %08X, cx %04X) depth %d back %04X:%04X thread %lu\n", at >> 16, at & 0xFFFF, eip, c->edx, c->cx,
         g_nthk, mem_read16(c, c->ss, (uint16_t)(c->sp + 6)), mem_read16(c, c->ss, (uint16_t)(c->sp + 4)), GetCurrentThreadId());
+    if (getenv("W16_TRACE")) {   /* the Pascal arguments above the far return, last pushed first */
+        fprintf(stderr, "[w16]   stub args");
+        for (int i = 0; i < 8; i++) fprintf(stderr, " %04X", mem_read16(c, c->ss, (uint16_t)(c->sp + 8 + 2 * i)));
+        fprintf(stderr, "\n");
+    }
     if (!f) w16_stop("generated stub jumps to no lifted function", eip >> 16, eip & 0xFFFF);
     if (g_nthk == 16) w16_stop("16->32 stubs nested too deep", 0, 0);
     uint32_t se[8] = { g_eax, g_ecx, g_edx, g_ebx, g_esp, g_ebp, g_esi, g_edi };
@@ -989,6 +996,8 @@ int w16_enter(uint32_t target) {
         cont = *(uint32_t *)(uintptr_t)(recomp_sel_base(c->ss) + c->esp);
         if (getenv("W16_TRACE")) fprintf(stderr, "[w16] enter %04X:%04X ss:esp %04X:%08X ds %04X fs %04X@%08X (+C %04X +E %04X +18 %08X +1C %04X) flat ret %08X\n", sel, off, c->ss, c->esp, c->ds, c->fs, recomp_sel_base(c->fs),
             mem_read16(c, c->fs, 0xC), mem_read16(c, c->fs, 0xE), mem_read32(c, c->fs, 0x18), mem_read16(c, c->fs, 0x1C), cont);
+        if (getenv("W16_TRACE")) { const uint16_t *a = (const uint16_t *)(uintptr_t)(recomp_sel_base(c->ss) + c->esp + 8);
+            fprintf(stderr, "[w16]   args %04X %04X %04X %04X %04X %04X %04X %04X\n", a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]); }
         g_w16_ret = cont;
     } else {
         uint32_t ret = mem_read32(c, c->ss, c->sp);

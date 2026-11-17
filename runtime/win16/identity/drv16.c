@@ -471,13 +471,24 @@ static void sys_fpu_save(CPU *c) { ret_far(c, 4); }
  * MOUSE.1 Inquire(lpMOUSEINFO): present, absolute, 2 buttons, 100 Hz; 2 Enable(lpEventProc), 3 Disable.
  * SYSTEM.1 InquireSystem(wReq, wDrive) dx:ax; 2 CreateSystemTimer(rate, lpProc) -> 1;
  * 3 KillSystemTimer(h); 4/5 Enable/DisableSystemTimers; 6 GetSystemMSecCount -> dx:ax.
- * ponytail: no timer callbacks yet; the mouse proc drives W16_INPUT (below), the keyboard one is kept nowhere. */
+ * Timers run from the tick thread (below); W16_INPUT drives the mouse and keyboard procs. */
 static void kb_inquire(CPU *c) {
     uint8_t *k = (uint8_t *)farptr(argfar(c, 0));
     k[0] = 0xFF; k[1] = 0xFE; k[2] = 0xFF; k[3] = 0xFE; put16((char *)k, 4, 0); put16((char *)k, 6, 12);
     c->ax = 8; ret_far(c, 4);
 }
-static void kb_enable(CPU *c) { c->ax = 1; ret_far(c, 8); }
+static uint32_t g_kb_proc;
+static void kb_enable(CPU *c) { g_kb_proc = argfar(c, 2); c->ax = 1; ret_far(c, 8); }   /* (lpEventProc, lpKeyState): the proc is the first pushed */
+/* KEYBOARD.4 ToAscii(vk, scan, lpKeyState, lpChar, flags) -> chars written; 131 MapVirtualKey(code, type).
+ * Through the host's own (pure) translation with the guest's key state.
+ * ponytail: the host's layout stands in for KEYBOARD.DRV's tables (US here). */
+static void kb_toascii(CPU *c) {
+    WORD ch = 0;
+    int n = ToAscii(arg16(c, 6), arg16(c, 5), (const BYTE *)farptr(argfar(c, 3)), &ch, arg16(c, 0));
+    if (n > 0) put16(farptr(argfar(c, 1)), 0, ch);
+    c->ax = (uint16_t)n; ret_far(c, 14);
+}
+static void kb_mapvk(CPU *c) { c->ax = (uint16_t)MapVirtualKeyA(arg16(c, 1), arg16(c, 0)); ret_far(c, 4); }
 static void drv_disable(CPU *c) { c->ax = 1; ret_far(c, 0); }
 static void kb_setspeed(CPU *c) { c->ax = 0xFFFF; ret_far(c, 2); }
 static void ms_inquire(CPU *c) {
@@ -503,7 +514,24 @@ static DWORD WINAPI input_thread(LPVOID unused) {
     DWORD t0 = GetTickCount();
     uint16_t ss = native32_w9x_alloc_sel((uint32_t)(uintptr_t)VirtualAlloc(NULL, 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE), 0x1FFF);
     for (const char *s = getenv("W16_INPUT"); s && *s; s = strchr(s, ';') ? strchr(s, ';') + 1 : "") {
-        int x, y; double t;
+        int x, y; double t; char k;
+        extern int g_fncount;
+        if (getenv("W16_FN_INPUT")) g_fncount = 1;   /* W16_FN's function trace from the first event on */
+        if (sscanf(s, " key %c@%lf", &k, &t) == 2) {   /* a press and release through KEYBOARD.Enable's proc */
+            while (GetTickCount() - t0 < (DWORD)(t * 1000)) Sleep(20);
+            UINT vk = k == '+' ? VK_ADD : k == '*' ? VK_MULTIPLY : k == '-' ? VK_SUBTRACT : k == '/' ? VK_DIVIDE : LOBYTE(VkKeyScanA(k));   /* ponytail: unshifted keys only */
+            for (int up = 0; up < 2 && g_kb_proc; up++) {
+                mach_enter();
+                CPU r; cpu_init(&r);
+                r.ax = (uint16_t)(vk | (up ? 0x8000 : 0)); r.bx = (uint16_t)MapVirtualKeyA(vk, 0);   /* al vk, ah 80h on release; bl scan */
+                r.cs = (uint16_t)(g_kb_proc >> 16); r.ip = (uint16_t)g_kb_proc; r.ss = r.ds = r.es = ss; r.sp = 0x1FF0;
+                fprintf(stderr, "[drv] key event %04X (%c) to %04X:%04X\n", r.ax, k, r.cs, r.ip);
+                if (!w16_call(&r)) fprintf(stderr, "[drv] keyboard proc %04X:%04X is no lifted function\n", r.cs, r.ip);
+                mach_leave();
+                Sleep(60);
+            }
+            continue;
+        }
         if (sscanf(s, " click %d,%d@%lf", &x, &y, &t) != 3) { fprintf(stderr, "[drv] W16_INPUT: cannot read \"%s\"\n", s); break; }
         while (GetTickCount() - t0 < (DWORD)(t * 1000)) Sleep(20);
         for (int up = 0; up < 2; up++) {
@@ -539,14 +567,81 @@ static void sys_inquire(CPU *c) {
     else if (req == 1) c->dx = 3;                 /* drive type: fixed */
     ret_far(c, 4);
 }
-static void sys_createtimer(CPU *c) { c->ax = 1; ret_far(c, 6); }
-static void sys_killtimer(CPU *c) { c->ax = 0; ret_far(c, 2); }
+/* The tick source. VTDAPI (VxD 442h) ax=9 hands back a selector whose dword
+ * at 0 is the system time in ms: USER keeps 0:sel at DGROUP:0 (seg72 1EEB, its
+ * GetTickCount 1:110C and every hardware event's time read it), KRNL386 at
+ * DGROUP:1A88. A host thread keeps that dword at GetTickCount and runs the
+ * SYSTEM.DRV timers (CreateSystemTimer's procs), taking the machine for each
+ * call as the timer interrupt would. No hardware: the host's clock only.
+ * ponytail: one thread, Sleep-paced (host ~15 ms granularity); 8 timers. */
+static volatile DWORD *g_tick;
+static uint16_t g_tick_sel;
+static struct { uint32_t proc; DWORD rate, next; } g_tmr[8];
+static DWORD WINAPI tick_thread(LPVOID unused) {
+    (void)unused;
+    uint16_t ss = native32_w9x_alloc_sel((uint32_t)(uintptr_t)VirtualAlloc(NULL, 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE), 0x1FFF);
+    for (;;) {
+        DWORD now = GetTickCount();
+        *g_tick = now;
+        for (int i = 0; i < 8; i++) {
+            if (!g_tmr[i].proc || (int)(now - g_tmr[i].next) < 0) continue;
+            g_tmr[i].next = now + g_tmr[i].rate;
+            mach_enter();
+            if (g_tmr[i].proc) {
+                CPU r; cpu_init(&r);
+                r.cs = (uint16_t)(g_tmr[i].proc >> 16); r.ip = (uint16_t)g_tmr[i].proc; r.ss = r.ds = r.es = ss; r.sp = 0x1FF0;
+                if (!w16_call(&r)) { fprintf(stderr, "[drv] system timer %04X:%04X is no lifted function\n", r.cs, r.ip); g_tmr[i].proc = 0; }
+            }
+            mach_leave();
+        }
+        Sleep(5);
+    }
+}
+uint16_t drv16_tick_sel(void) {
+    if (!g_tick_sel) {
+        g_tick = (volatile DWORD *)VirtualAlloc(NULL, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        *g_tick = GetTickCount();
+        g_tick_sel = native32_w9x_alloc_sel((uint32_t)(uintptr_t)g_tick, 0xFFF);
+        CloseHandle(CreateThread(NULL, 0, tick_thread, NULL, 0, NULL));
+    }
+    return g_tick_sel;
+}
+/* SYSTEM.2 CreateSystemTimer(wRate ms, lpProc) -> a handle (index + 1), 0 if full; 3 KillSystemTimer(h) -> 0 */
+static void sys_createtimer(CPU *c) {
+    uint32_t proc = argfar(c, 0); DWORD rate = arg16(c, 2);
+    drv16_tick_sel();
+    c->ax = 0;
+    for (int i = 0; i < 8; i++)
+        if (!g_tmr[i].proc) { g_tmr[i].rate = rate ? rate : 1; g_tmr[i].next = GetTickCount() + g_tmr[i].rate; g_tmr[i].proc = proc; c->ax = (uint16_t)(i + 1); break; }
+    if (getenv("W16_TRACE")) fprintf(stderr, "[drv] SYSTEM.CreateSystemTimer(%u ms, %08X) -> %u\n", (unsigned)rate, proc, c->ax);
+    ret_far(c, 6);
+}
+static void sys_killtimer(CPU *c) { unsigned h = arg16(c, 0); if (h >= 1 && h <= 8) g_tmr[h - 1].proc = 0; c->ax = 0; ret_far(c, 2); }
 static void sys_timers(CPU *c) { ret_far(c, 0); }
 static void sys_msec(CPU *c) { DWORD t = GetTickCount(); c->ax = (uint16_t)t; c->dx = (uint16_t)(t >> 16); ret_far(c, 0); }
+/* USER's static SYSTEM and KEYBOARD imports, as MOUSE_Ord* above (pop counts from USER's call sites:
+ * KEYBOARD.1 pushes 4, .4 14, .131 4; the generated stubs had 8, 18, 8). 128/129/133 stay generated. */
+void SYSTEM_Ord1(CPU *c) { sys_inquire(c); }
+void SYSTEM_Ord2(CPU *c) { sys_createtimer(c); }
+void SYSTEM_Ord3(CPU *c) { sys_killtimer(c); }
+void SYSTEM_Ord4(CPU *c) { sys_timers(c); }
+void SYSTEM_Ord5(CPU *c) { sys_timers(c); }
+void SYSTEM_Ord6(CPU *c) { sys_msec(c); }
+void KEYBOARD_Ord1(CPU *c) { kb_inquire(c); }
+void KEYBOARD_Ord2(CPU *c) { kb_enable(c); }
+void KEYBOARD_Ord3(CPU *c) { drv_disable(c); }
+void KEYBOARD_Ord4(CPU *c) { kb_toascii(c); }
+void KEYBOARD_Ord5(CPU *c) { kb_ansi_to_oem(c); }
+void KEYBOARD_Ord6(CPU *c) { kb_oem_to_ansi(c); }
+void KEYBOARD_Ord7(CPU *c) { kb_setspeed(c); }
+void KEYBOARD_Ord131(CPU *c) { kb_mapvk(c); }
+void KEYBOARD_Ord132(CPU *c) { kb_codepage(c); }
+void KEYBOARD_Ord134(CPU *c) { kb_ansi_to_oem_buf(c); }
+void KEYBOARD_Ord135(CPU *c) { kb_oem_to_ansi_buf(c); }
 
 static drv_t g_drv[] = {
     { "SYSTEM",   { [1] = sys_inquire, [2] = sys_createtimer, [3] = sys_killtimer, [4] = sys_timers, [5] = sys_timers, [6] = sys_msec, [7] = sys_fpu_size, [8] = sys_fpu_save, [9] = sys_fpu_save } },
-    { "KEYBOARD", { [5] = kb_ansi_to_oem, [6] = kb_oem_to_ansi, [1] = kb_inquire, [2] = kb_enable, [3] = drv_disable, [7] = kb_setspeed, [132] = kb_codepage, [134] = kb_ansi_to_oem_buf, [135] = kb_oem_to_ansi_buf, [136] = kb_sysreq } },
+    { "KEYBOARD", { [5] = kb_ansi_to_oem, [6] = kb_oem_to_ansi, [1] = kb_inquire, [2] = kb_enable, [3] = drv_disable, [7] = kb_setspeed, [4] = kb_toascii, [131] = kb_mapvk, [132] = kb_codepage, [134] = kb_ansi_to_oem_buf, [135] = kb_oem_to_ansi_buf, [136] = kb_sysreq } },
     { "MOUSE",    { [1] = ms_inquire, [2] = ms_enable, [3] = drv_disable } },
     { "DISPLAY",  { [1] = disp_bitblt, [8] = disp_output, [9] = disp_pixel, [2] = disp_colorinfo, [3] = disp_control, [4] = disp_disable, [4] = disp_disable, [5] = disp_enable, [10] = disp_realize, [14] = disp_exttextout, [15] = disp_charwidth, [19] = disp_dibbits,
                     [101] = disp_inquire, [102] = disp_setcursor, [103] = disp_movecursor, [104] = disp_checkcursor } },
