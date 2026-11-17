@@ -393,7 +393,7 @@ static uint32_t s_query_vm(uint32_t* a) {
 
 /* ------------------------------------------------------------- modules */
 #define MAX_MODS 32
-static struct { char name[64]; uint32_t base, size; } g_mod[MAX_MODS];
+static struct { char name[64]; uint32_t base, size; uint8_t* snap; int gone; } g_mod[MAX_MODS];
 static int g_nmod;
 
 static uint32_t image_size(uint32_t base) { return MEM32(base + MEM32(base + 0x3C) + 0x50); }
@@ -1366,6 +1366,37 @@ static uint32_t s_open_section(uint32_t* a) {
 }
 
 /* NtCreateSection(Handle*, Access, OA, MaximumSize*, Protect, Attributes, File) */
+/* A lifted image is never really unmapped (its code is in the host), so a DLL the loader unloads
+ * and loads again would keep the data its DllMain left at PROCESS_DETACH (oleaut32's CRT heap,
+ * after clbcatq's failed load). NT maps a fresh copy: the writable sections are saved at the
+ * first map and put back on a map after an unmap (syscall32.c's img_writable). */
+static void img_writable(int m, int restore) {
+    uint32_t b = g_mod[m].base, nt = b + MEM32(b + 0x3C), sh = nt + 0x18 + MEM16(nt + 0x14), n = 0, o = 0;
+    for (int pass = 0; pass < 2; pass++)
+        for (uint32_t k = 0; k < MEM16(nt + 6); k++) {
+            uint32_t h = sh + 40 * k, v = MEM32(h + 8);
+            if (!(MEM32(h + 36) & 0x80000000u)) continue;          /* IMAGE_SCN_MEM_WRITE */
+            if (!pass) { n += v; continue; }
+            void* at = (void*)(uintptr_t)(b + MEM32(h + 12));
+            if (restore) memcpy(at, g_mod[m].snap + o, v); else memcpy(g_mod[m].snap + o, at, v);
+            o += v;
+        }
+    (void)n;
+}
+static void img_mapped(int m) {
+    if (m < 0) return;
+    if (!g_mod[m].snap) {
+        uint32_t b = g_mod[m].base, nt = b + MEM32(b + 0x3C), sh = nt + 0x18 + MEM16(nt + 0x14), n = 0;
+        for (uint32_t k = 0; k < MEM16(nt + 6); k++) if (MEM32(sh + 40 * k + 36) & 0x80000000u) n += MEM32(sh + 40 * k + 8);
+        g_mod[m].snap = malloc(n ? n : 1);
+        img_writable(m, 0);
+    } else if (g_mod[m].gone) {
+        img_writable(m, 1);
+        fprintf(stderr, "[nt] %s mapped again: its writable sections as at its first map\n", g_mod[m].name);
+    }
+    g_mod[m].gone = 0;
+}
+
 static uint32_t s_create_section(uint32_t* a) {
     obj_t* f = a[6] ? h_get(a[6]) : NULL;
     if (a[5] & 0x01000000u) {                                          /* SEC_IMAGE */
@@ -1375,7 +1406,7 @@ static uint32_t s_create_section(uint32_t* a) {
         int m = module_by_name(name), p = proxy_by_name(name);
         uint32_t base = 0;
         int exe = n > 4 && (!strcasecmp(name + n - 4, ".exe") || !strcasecmp(name + n - 4, ".com") || !strcasecmp(name + n - 4, ".scr"));
-        if (m >= 0) base = g_mod[m].base;
+        if (m >= 0) base = g_mod[m].base, img_mapped(m);
         else if (exe) {
             fprintf(stderr, "[guard] %s: a program that is not lifted: not run\n", f->guest);
             return ST_ACCESS_DENIED;
@@ -1435,7 +1466,8 @@ static uint32_t s_unmap_view(uint32_t* a) {
             g_view[i].base = 0;
             return 0;
         }
-    return 0;      /* an image: stays */
+    for (int i = 0; i < g_nmod; i++) if (g_mod[i].base == a[1]) g_mod[i].gone = 1;
+    return 0;      /* an image: stays (its data is put back if it is mapped again) */
 }
 
 /* NtQuerySection(Section, Class, Buffer, Length, ReturnLength*) */
@@ -2445,6 +2477,12 @@ void recomp_syscall(int vector) {
 /* A host fault (a lifted function's stray access): where, the guest
  * function, its last indirect calls and the host frames (addr2line them) */
 static void crash(int sig, siginfo_t* si, void* uc) {
+    /* a stack growing down: a reserved page right below a committed one (the guard page, which NT
+     * moves down on the first touch) is committed and the access goes on */
+    uint32_t fa = (uint32_t)(uintptr_t)si->si_addr, fp = fa >> 12;
+    if (sig == SIGSEGV && fa >= GUEST_LO && fa < GUEST_HI && pg_state[fp] == PG_RESERVED &&
+        pg_state[fp + 1] == PG_COMMITTED && pg_base[fp] == pg_base[fp + 1] && vm_commit(fp << 12, 0x1000, 0x04))
+        return;
     void* bt[32];
     int n = backtrace(bt, 32);
     fprintf(stderr, "\n[ntposix] signal %d at %p (host eip %08X) in sub_%08X, esp %08X\n", sig, si->si_addr,
