@@ -47,6 +47,18 @@ def main():
     if "edx == RECOMP_RETADDR" not in on or "RECOMP_RETADDR" in off:
         print("FAIL jmp edx: the popped-return check is wrong:", on, off, sep=chr(10))
         bad += 1
+    # push [eax+8]; mov eax, 8; ret (ole32's delay-load failure): a jump, in any mode;
+    # the same ret at a label (others branch to it) stays a return.
+    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+    md.detail = True
+    for labels in (set(), {0x1008}):
+        lf = Lifter()
+        lf._labels = labels
+        out = "\n".join(t for i in md.disasm(b"\xff\x70\x08\xb8\x08\x00\x00\x00\xc3", 0x1000)
+                        for t in lf.lift_instruction(LinearInstruction(i)))
+        if ("RECOMP_RET_JUMP(_rt)" in out) != (not labels):
+            print("FAIL push; mov; ret with labels %s:\n%s" % (labels, out))
+            bad += 1
     print("computed_ret: %s" % ("FAIL" if bad else "ok"))
     return 1 if bad else 0
 

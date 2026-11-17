@@ -164,6 +164,10 @@ static uint32_t vmm_reg_close(const uint32_t* a) { return (uint32_t)RegCloseKey(
 static uint32_t vmm_reg_delete_key(const uint32_t* a) {
     return (uint32_t)REG("RegDeleteKeyA", LONG(WINAPI*)(HKEY, LPCSTR))((HKEY)P(0), P(1));
 }
+static uint32_t vmm_reg_delete_value(const uint32_t* a) {
+    return (uint32_t)REG("RegDeleteValueA", LONG(WINAPI*)(HKEY, LPCSTR))((HKEY)P(0), P(1));
+}
+static uint32_t vmm_reg_flush(const uint32_t* a) { (void)a; return 0; }   /* nothing buffered */
 static uint32_t vmm_reg_query_value_sub(const uint32_t* a) {   /* RegQueryValue(hkey, subkey, value, &cb): ole32 TreatAs */
     return (uint32_t)REG("RegQueryValueA", LONG(WINAPI*)(HKEY, LPCSTR, LPSTR, PLONG))((HKEY)P(0), P(1), P(2), P(3));
 }
@@ -1593,6 +1597,9 @@ static uint32_t vwin32_int21(const uint32_t* a) {
         case 0x47:                                             /* LFN cwd: DL drive (0 = current), DS:ESI */
             if ((uint8_t)g_edx != 0 && (uint8_t)g_edx != 3) { dos_fail(15); return g_eax; }
             guest_put(g_esi, g_cwd, 260); SET16(g_eax, 0x0100); return g_eax;
+        case 0xA3:   /* Explorer's shell32 (7FCBA80D) watching a folder (FindFirstChangeNotification path).
+                      * ponytail: no change notification, 32h not supported; callers poll or refresh by hand */
+            dos_fail(0x32); return g_eax;
         case 0x3B: {                                           /* LFN chdir */
             DWORD at;
             if (!host_path(g_edx, path) || (at = GetFileAttributesA(path)) == INVALID_FILE_ATTRIBUTES || !(at & FILE_ATTRIBUTE_DIRECTORY)) { dos_fail(3); return g_eax; }
@@ -1786,7 +1793,11 @@ static const vxd_service_t g_services[] = {
     { 0x00010011, 3, vmm_reg_open, "VMM_RegOpenKey" },
     { 0x00010012, 3, vmm_reg_create, "VMM_RegCreateKey" },
     { 0x00010013, 1, vmm_reg_close, "VMM_RegCloseKey" },
-    { 0x00010016, 2, vmm_reg_delete_key, "VMM_RegDeleteKey" },
+    /* numbers from advapi32's own Reg* exports (each pushes its service): 14 is
+     * RegDeleteKeyA, 16 RegDeleteValueA (16 was taken for RegDeleteKey before) */
+    { 0x00010014, 2, vmm_reg_delete_key, "VMM_RegDeleteKey" },
+    { 0x00010016, 2, vmm_reg_delete_value, "VMM_RegDeleteValue" },
+    { 0x0001001C, 1, vmm_reg_flush, "VMM_RegFlushKey" },
     { 0x00010017, 4, vmm_reg_query_value_sub, "VMM_RegQueryValue" },
     { 0x00010018, 4, vmm_reg_enum_key, "VMM_RegEnumKey" },
     { 0x00010019, 8, vmm_reg_enum_value, "VMM_RegEnumValue" },

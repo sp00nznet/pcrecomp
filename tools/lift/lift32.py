@@ -317,6 +317,8 @@ class Lifter:
         # push BFF53981; push proc; jmp BFF58150, an import jump). The jump
         # comes back as a C return, so the pushed function runs next.
         self._push_ret = None
+        self._push_jmp = False     # the last stack op was a push (see lift_instruction)
+        self._branch_targets = None   # generate.py: this body's branch targets
         # Call targets whose first instruction is `pop r32` (see the call case).
         self.call_pop = call_pop or set()
         self._patched_imm = None
@@ -797,10 +799,19 @@ class Lifter:
     def lift_instruction(self, insn) -> list:
         """Lift one instruction, recording the runtime flag kind if it wrote flags."""
         seq0 = self._flag_seq
+        stops = self._branch_targets if self._branch_targets is not None else self._labels
+        if stops is None or insn.address in stops:
+            self._push_jmp = False   # a ret others branch to returns for them
         self._insn_flag_width = 32    # only this instruction's _flag_capture narrows it
         lines = self._lift_instruction(insn)
+        m, ops = insn.mnemonic, insn.operands
+        # `push x; [mov r, y]; ret` is a jump to x (ole32's delay-load failure
+        # path 7F44C4E7: `push [eax+8]; mov eax, 8; ret` into a `ret 18h` stub
+        # that pops the caller's arguments). Lifted as a return, the stub never
+        # ran and the caller's stack came back 1Ch short.
+        self._push_jmp = m == 'push' or (self._push_jmp and m in ('mov', 'movzx') and not (
+            ops and ops[0].type == X86_OP_REG and ops[0].reg in (X86_REG_ESP, X86_REG_SP, X86_REG_EBP)))
         if W9X:
-            m, ops = insn.mnemonic, insn.operands
             if m == 'push' and ops and ops[0].type == X86_OP_IMM and self.lifted and ops[0].imm in self.lifted:
                 self._push_ret = ops[0].imm
             elif not (m in ('push', 'mov', 'movzx', 'xchg') and not (ops and ops[0].type == X86_OP_REG
@@ -1624,7 +1635,7 @@ class Lifter:
             # any stdcall callee-cleanup bytes (ret N -> esp += 4 + N). Without the
             # +4 the simulated ESP drifts down 4 bytes per call and eventually the
             # 0xDEAD0000 dummy return address gets read as a function argument.
-            if self.dos or self.computed_ret:
+            if (self.dos or self.computed_ret) and not self._push_jmp:
                 # `push target; ret` is a computed jump, and Watcom's int386x
                 # makes one into its table of `int N; ret` stubs. A return
                 # address the caller did not push is not ours to pop: it is
@@ -1633,7 +1644,11 @@ class Lifter:
                 at = "SS_BASE + esp" if self._ss_fn else "esp"
                 lines.append(f"if (MEM32({at}) != RECOMP_RETADDR) {{ uint32_t _rt = MEM32({at}); esp += {4 + n};"
                              f" RECOMP_FLAGS_OUT(); RECOMP_RET_JUMP(_rt); return; }}")
-            if ops and ops[0].type == X86_OP_IMM:
+            if self._push_jmp and not ops:
+                at = "SS_BASE + esp" if self._ss_fn else "esp"
+                lines.append(f"{{ uint32_t _rt = MEM32({at}); esp += 4; RECOMP_FLAGS_OUT();"
+                             f" RECOMP_RET_JUMP(_rt); return; }} /* push; ret: a jump */ {comment}")
+            elif ops and ops[0].type == X86_OP_IMM:
                 n = ops[0].imm
                 lines.append(f"RECOMP_FLAGS_OUT(); esp += {4 + n}; return; {comment}")
             else:

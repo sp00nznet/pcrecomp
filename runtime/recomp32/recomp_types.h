@@ -1374,10 +1374,14 @@ static inline recomp_func_t recomp_resolve(uint32_t va) {
 #define RECOMP_RESOLVE_SITE(va) recomp_resolve(va)
 #endif
 
-/* Direct call to a known recompiled function */
-#define RECOMP_CALL(func) do { \
+/* Direct call to a known recompiled function. The _SS forms are for a
+ * function LIFT32_W9X sees load ss (generate.py): the dummy return goes on the
+ * stack ss names, not at flat esp (a 16-bit esp there is a low linear address). */
+#define RECOMP_CALL(func) RECOMP_CALL_P(func, PUSH32)
+#define RECOMP_CALL_SS(func) RECOMP_CALL_P(func, PUSH32_SS)
+#define RECOMP_CALL_P(func, PUSHM) do { \
     uint32_t _caller = g_cur_func; \
-    PUSH32(esp, RECOMP_RETADDR); /* dummy return address */ \
+    PUSHM(esp, RECOMP_RETADDR); /* dummy return address */ \
     RECOMP_FLAGS_OUT(); \
     RECOMP_REGS_OUT(); \
     func(); \
@@ -1405,13 +1409,15 @@ RECOMP_WEAK void (*recomp_trap_hook)(uint32_t code, uint32_t va);
     RECOMP_FLAGS_OUT(); RECOMP_REGS_OUT(); recomp_trap_hook(code_, va_); RECOMP_REGS_IN(); } } while (0)
 
 /* Indirect call through dispatch */
-#define RECOMP_ICALL(target_va) do { \
+#define RECOMP_ICALL(target_va) RECOMP_ICALL_P(target_va, PUSH32)
+#define RECOMP_ICALL_SS(target_va) RECOMP_ICALL_P(target_va, PUSH32_SS)
+#define RECOMP_ICALL_P(target_va, PUSHM) do { \
     uint32_t _va = (uint32_t)(target_va); \
     RECOMP_ICALL_TRACE(_va); \
     recomp_func_t _fn = RECOMP_RESOLVE_SITE(_va); \
     if (_fn) { \
         uint32_t _caller = g_cur_func; \
-        PUSH32(esp, RECOMP_RETADDR); \
+        PUSHM(esp, RECOMP_RETADDR); \
         RECOMP_FLAGS_OUT(); \
         RECOMP_REGS_OUT(); \
         _fn(); \
