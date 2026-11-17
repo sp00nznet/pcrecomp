@@ -30,7 +30,7 @@ import lift32
 from pe_analyze import analyze_pe, build_iat_map
 from lift32 import Lifter
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32
-from capstone.x86 import X86_OP_IMM, X86_OP_MEM
+from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_REG_CS
 from disasm32 import decode
 
 
@@ -550,7 +550,9 @@ def _jump_table(ins, code, code_start, lo, hi, limit=1024, read=None):
     if not ins.operands or ins.operands[0].type != X86_OP_MEM:
         return []
     mem = ins.operands[0].mem
-    if mem.base or not mem.index or mem.scale != 4:
+    # or a byte-offset index into a cs: table (user32 0xBFF55BDA: `jmp cs:[edx + table]`)
+    cs_bytes = mem.segment == X86_REG_CS and mem.base and not mem.index
+    if not cs_bytes and (mem.base or not mem.index or mem.scale != 4):
         return []
     disp = mem.disp & 0xFFFFFFFF
     if read is not None and not 0 <= disp - code_start < len(code):

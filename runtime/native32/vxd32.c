@@ -454,12 +454,31 @@ static void qt_stub(void) {
     recomp_lookup(0xBFF727D9u)();
 }
 
+/* The FT_Prolog form of the same stub (user32 0xBFF5D4AA, into USER.EXE):
+ * `jmp +20h` to `call $+5; pop edx; sub edx, 25h; push edx; push imm;
+ * push patcher; ret`. Its patcher (kernel32 ordinal 89, 0xBFF725F0) rewrites
+ * it into `movzx edx, cl; mov edx, [edx*4+table]; push 0xBFF7268D; ret`,
+ * table = the dword at stub+imm. ponytail: 0xBFF7268D (Win98 SE's) hardcoded. */
+static __declspec(thread) uint32_t t_ft_stub;
+static int is_ft_stub(uint32_t va) {
+    static const uint8_t tail[] = { 0xE8, 0, 0, 0, 0, 0x5A, 0x81, 0xEA, 0x25, 0, 0, 0, 0x52, 0x68 };
+    return va >= 0x10000 && !IsBadReadPtr((void *)(uintptr_t)va, 0x34) && MEM8(va) == 0xEB && MEM8(va + 1) == 0x1E &&
+           !memcmp((const void *)(uintptr_t)(va + 0x20), tail, sizeof tail);
+}
+static void ft_stub(void) {
+    uint32_t va = t_ft_stub;
+    g_edx = MEM32(MEM32(va + MEM32(va + 0x2E)) + (g_ecx & 0xFF) * 4);
+    if (g_trace > 0 || getenv("W16_TRACE")) fprintf(stderr, "[ft] thunk %02X -> %04X:%04X (stub %08X)\n", g_ecx & 0xFF, g_edx >> 16, g_edx & 0xFFFF, va);
+    recomp_lookup(0xBFF7268Du)();
+}
+
 /* The host's recomp_lookup_manual forwards here: VWIN32's entries above. */
 recomp_func_t native32_w9x_lookup(uint32_t va) {
     if (va == K386_TAG) return krnl386_thunk;
     if (va == USIG_TAG) return user_signal_proc;
     if (va == MBOX_TAG) return guest_message_box;
     if (is_qt_stub(va)) { t_qt_stub = va; return qt_stub; }
+    if (is_ft_stub(va)) { t_ft_stub = va; return ft_stub; }
     if ((va & 0xFFFF0000u) == R0F_TAG && (va & 0xFFFF) < 4 * 11 && !(va & 3)) return g_r0f[(va & 0xFFFF) / 4];
     return NULL;
 }
@@ -1092,6 +1111,19 @@ static uint32_t vwin32_thread_done(const uint32_t* a) {
     uint32_t r0 = t_r0 ? t_r0 : g_boot_r0;
     (void)a;
     if (g_trace > 0) fprintf(stderr, "[vxd] thread %08X ended (VWIN32 2B)\n", g_cur[0]);
+    {   /* Ring 0 takes the Win16Mutex back from a thread that dies holding it
+         * (calc's, ending in its process init, kept it for good). A crst is
+         * {+04 recursion, +08 owner TDBX, +10 lock count}: give up every
+         * level, then hand it on as LeaveCriticalSection's 1E would.
+         * ponytail: 0xBFFC9470 is Win98 SE kernel32's Win16Mutex pointer. */
+        uint32_t m = MEM32(0xBFFC9470u);
+        if (m && MEM32(m + 8) == MEM32(r0 + R0T_TDBX)) {
+            uint32_t n = MEM32(m + 4);
+            MEM32(m + 4) = 0; MEM32(m + 8) = 0; MEM32(m + 0x10) -= n;
+            if (g_trace > 0) fprintf(stderr, "[vxd] thread %08X ended holding the Win16Mutex (%u): released\n", g_cur[0], n);
+            if ((int32_t)MEM32(m + 0x10) >= 0) vwin32_crst_wake(&m);
+        }
+    }
     if (MEM32(r0 + R0T_PARKED)) SetEvent((HANDLE)(uintptr_t)MEM32(r0 + R0T_PARKED));
     HANDLE never = CreateEventA(NULL, TRUE, FALSE, NULL);
     for (;;) native32_wait(never, INFINITE);

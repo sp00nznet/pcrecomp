@@ -349,6 +349,11 @@ static void host_far(CPU *c, uint16_t off) {
                   * the receiving queue's thread (+3C) around its wait: a priority boost.
                   * ponytail: no-op, the host schedules; read as a boost from the -2/+2 pair */
         ok(c); return;
+    case 0x0E:   /* KRNL386 seg1 7584 (thread id, value): ebx = its r0 thread, ecx = value.
+                  * USER seg54 96B6 calls it with 0 for the queue that loses the foreground
+                  * (ds:[14Eh]) and 1 for the new one: the foreground thread's boost.
+                  * ponytail: no-op, the host schedules (read off the 0/1 callers) */
+        ok(c); return;
     case 0x08: c->al = 0; ok(c); return;        /* -> DGROUP:1417, a flag read as "nonzero?" (ponytail: 0 until a caller needs 1) */
     case 0x03: {   /* VMM page services: args on the 16-bit stack, ecx bytes of them, which
                     * the entry removes (KRNL386 seg001_1FF7 pops what it pushed before them);
@@ -714,7 +719,26 @@ void dispatch_far(CPU *cpu, uint16_t sel, uint16_t off) {
     if (w16_drv_far(cpu, sel, off)) return;   /* a host driver's segment (drv16.c) */
     uint32_t pushed = mem_read32(cpu, cpu->ss, cpu->sp);   /* the far return the caller pushed */
     uint16_t ss0 = cpu->ss, sp0 = cpu->sp;
-    if (!(sel & 4) || !recomp_dispatch_lookup(cpu, seg_of(sel), off)) w16_stop("far call miss", sel, off);
+    if (!(sel & 4) || !recomp_dispatch_lookup(cpu, seg_of(sel), off)) {
+        uint32_t b = (sel & 4) ? recomp_sel_base(sel) : 0;   /* what is there: a thunk built at run time? */
+        const uint8_t *t = (const uint8_t *)(uintptr_t)(b + off);
+        /* the 16-bit face of a 32-bit window procedure (calc's, through
+         * USER's dispatch seg 54 9E87): `push dword proc32; push dword x;
+         * jmp far sel:off`, written into a KERNEL-owned block at run time.
+         * Its bytes are recognized, not run (as vxd32's flat-thunk stubs). */
+        if (b && !IsBadReadPtr(t, 17) && t[0] == 0x66 && t[1] == 0x68 && t[6] == 0x66 && t[7] == 0x68 && t[12] == 0xEA) {
+            push32(cpu, *(const uint32_t *)(t + 2));
+            push32(cpu, *(const uint32_t *)(t + 8));
+            dispatch_far(cpu, *(const uint16_t *)(t + 15), *(const uint16_t *)(t + 13));
+            return;
+        }
+        if (b && !IsBadReadPtr((void *)(uintptr_t)(b + off), 24)) {
+            fprintf(stderr, "[w16] %04X:%04X (base %08X):", sel, off, b);
+            for (int i = 0; i < 24; i++) fprintf(stderr, " %02X", ((uint8_t *)(uintptr_t)(b + off))[i]);
+            fputc('\n', stderr);
+        }
+        w16_stop("far call miss", sel, off);
+    }
     /* The callee's last retf popped some other frame: a task switch-in
      * (KRNL386 seg1 5F7F loads the next task's ss:sp from its TDB, 5F8A
      * retfs into it -- a new task's entry, MSGSRV32 89:22EE). That code is

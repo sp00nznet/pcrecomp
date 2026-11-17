@@ -132,6 +132,22 @@ class CodeMap:
             return None
         return inst
 
+    def _pops_ret(self, s, off):
+        """A callee that opens `pop r16` and, on its straight line, `jmp r16`
+        through the same register: it returns by jumping to the popped address."""
+        i0 = self._decode(s, off)
+        if not (i0 and i0.mnemonic == 'pop' and i0.op1 is not None and i0.op1.type == OpType.REG16):
+            return False
+        p = off + i0.length
+        for _ in range(16):
+            i = self._decode(s, p)
+            if i is None or i.mnemonic in _STOP or i.mnemonic == 'call':
+                return False
+            if i.mnemonic == 'jmp':
+                return i.op1 is not None and i.op1.type == OpType.REG16 and i.op1.reg == i0.op1.reg
+            p += i.length
+        return False
+
     def _far_target(self, s, off, inst):
         """(seg, off) a direct far call/jmp at `off` resolves to, or None."""
         r = s.relocs.get(off + 1)
@@ -224,6 +240,13 @@ class CodeMap:
                 continue
             if is_func:
                 log.append(('w' if is_func == 2 else 'f', s, off, 0))
+                # A call says code starts here; a jump table's extent was a
+                # guess (GDI seg 1: a table guessed over 75A0..7607 hid the
+                # function at 7600 that 7860 calls). The call wins.
+                e = off
+                while is_func is True and e < len(s.data) and s.owner[e] == 2:
+                    e += 1
+                s.owner[off:e] = bytes(e - off)
             recent = list(ctx[0]) if ctx else []   # the path here: jump-table guards
             if len(ctx) > 1 and off not in s.heads:
                 # A jump-table entry is a guess at the table's extent: one that
@@ -258,6 +281,11 @@ class CodeMap:
                         raise _Bad('branch out of segment', sidx, off)
                     if m == 'call':
                         work.append((sidx, t, True))
+                        if self._pops_ret(s, t):
+                            # the callee jmps back through dispatch_near (USER
+                            # seg 54 9BE0: `pop bx; ...; jmp bx`): the return
+                            # address is a function of its own
+                            work.append((sidx, nxt, True))
                     else:
                         work.append((sidx, t, False, recent[-12:]))
                         log.append(('j', s, t, 0))

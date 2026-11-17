@@ -273,7 +273,18 @@ def table_entries(read, table, is_code, limit=256):
 
 
 # `jmp dword ptr [idx*4 + table]`; with a base register the disp is not the table
-_TABLE_JMP = re.compile(r"dword ptr \[\w+\*4 \+ (0x[0-9a-f]+)\]$")
+# `jmp [reg*4 + table]`, or a byte-offset index into a cs: table (user32
+# 0xBFF55BDA, hand-written: `jmp cs:[edx + 0xBFF55BE1]`, capstone prints
+# the displacement negative).
+_TABLE_JMP = re.compile(r"dword ptr (?:\[\w+\*4 \+ (0x[0-9a-f]+)\]|cs:\[\w+ ([+-]) (0x[0-9a-f]+)\])$")
+
+
+def table_va(m):
+    """The table address a _TABLE_JMP match names."""
+    if m.group(1):
+        return int(m.group(1), 16)
+    v = int(m.group(3), 16)
+    return (-v if m.group(2) == '-' else v) & 0xFFFFFFFF
 
 
 # Bytes decoded per linear scan inside a function. Straight-line code longer
@@ -1438,7 +1449,7 @@ def drop_mid_instruction_entries(read_va, functions, code_start, code_end,
                         t = int(op, 16) if op.startswith("0x") else None
                         sw = _TABLE_JMP.search(op) if m == "jmp" and t is None else None
                         if sw:
-                            for arm in table_entries(read_va, int(sw.group(1), 16),
+                            for arm in table_entries(read_va, table_va(sw),
                                                      lambda v: code_start <= v < code_end):
                                 if addr <= arm < code_end and arm - addr < REACH \
                                    and arm not in seen:
@@ -1585,7 +1596,7 @@ def close_dispatch_targets(read_va, functions, code_start, code_end,
                 if sw:
                     # A switch arm past a clamp is a dispatch too (MFC's
                     # 0x004A4B70, cut by chunks it calls, lost 0x004A5025).
-                    for t in table_entries(read_va, int(sw.group(1), 16),
+                    for t in table_entries(read_va, table_va(sw),
                                            lambda v: code_start <= v < code_end):
                         if not (addr <= t < end or t in functions or (inside and inside(t))):
                             wanted.add(t)

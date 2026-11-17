@@ -46,7 +46,7 @@ from eh32 import resume_points
 from pe_analyze import analyze_pe, build_iat_map
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'disasm'))
-from disasm32 import _TABLE_JMP, table_entries   # noqa: E402  the arms recursive descent follows
+from disasm32 import _TABLE_JMP, table_entries, table_va   # noqa: E402  the arms recursive descent follows
 
 
 def lift_image(img, catalog, out, seeds=(), split=400, log=print, precise_carry=True):
@@ -105,7 +105,7 @@ def lift_image(img, catalog, out, seeds=(), split=400, log=print, precise_carry=
                 m = _TABLE_JMP.search(i.op_str)
                 if not m:
                     return None
-                arms = table_entries(read, int(m.group(1), 16), lambda v: cs <= v < ce)
+                arms = table_entries(read, table_va(m), lambda v: cs <= v < ce)
                 if not arms:
                     return None
                 out |= set(arms)
