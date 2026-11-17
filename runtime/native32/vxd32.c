@@ -759,8 +759,10 @@ uint32_t native32_w9x_wait(void* h, uint32_t ms) { return w9x_wait((HANDLE)h, ms
 
 /* Whichever guest thread takes the machine (a back-edge hand-over as much as
  * a wait coming back) is VWIN32's current one. */
+static DWORD g_boot_tid;
 static void w9x_on_enter(void) {
     uint32_t r0 = t_r0 ? t_r0 : g_boot_r0;
+    if (!t_r0) g_boot_tid = GetCurrentThreadId();
     if (!r0 || !MEM32(r0 + R0T_THREAD)) return;
     g_cur[0] = MEM32(r0 + R0T_THREAD); g_cur[1] = MEM32(r0 + R0T_PROCESS); g_cur[2] = MEM32(r0 + R0T_TDBX);
     cur_task();
@@ -786,7 +788,50 @@ static DWORD WINAPI guest_thread(LPVOID p) {
     return 0;
 }
 
+/* W98_STACKS=secs: at that time, every guest thread's host stack named
+ * through the PDBs (sub_XXXXXXXX are lifted guest functions): who waits where. */
+#include <dbghelp.h>
+#define MAXTHREADS 64
+static uint32_t g_threads[MAXTHREADS];
+static DWORD g_tids[MAXTHREADS];
+static int g_nthreads;
+static void stack_of(DWORD tid, const char* who) {
+    HANDLE th = OpenThread(THREAD_ALL_ACCESS, FALSE, tid), ph = GetCurrentProcess();
+    if (!th) return;
+    CONTEXT c; memset(&c, 0, sizeof c); c.ContextFlags = CONTEXT_FULL;
+    SuspendThread(th);
+    GetThreadContext(th, &c);
+    STACKFRAME64 f; memset(&f, 0, sizeof f);
+    f.AddrPC.Offset = c.Eip; f.AddrStack.Offset = c.Esp; f.AddrFrame.Offset = c.Ebp;
+    f.AddrPC.Mode = f.AddrStack.Mode = f.AddrFrame.Mode = AddrModeFlat;
+    DWORD64 pcs[64]; int n = 0;
+    while (n < 64 && StackWalk64(IMAGE_FILE_MACHINE_I386, ph, th, &f, &c, NULL, SymFunctionTableAccess64, SymGetModuleBase64, NULL) && f.AddrPC.Offset)
+        pcs[n++] = f.AddrPC.Offset;
+    ResumeThread(th);
+    CloseHandle(th);
+    fprintf(stderr, "[stacks] %s host %lu:", who, tid);
+    for (int i = 0; i < n; i++) {
+        char b[sizeof(SYMBOL_INFO) + 128]; SYMBOL_INFO* si = (SYMBOL_INFO*)b; DWORD64 d = 0;
+        memset(b, 0, sizeof b); si->SizeOfStruct = sizeof(SYMBOL_INFO); si->MaxNameLen = 127;
+        if (SymFromAddr(ph, pcs[i], &d, si)) fprintf(stderr, " %s", si->Name); else fprintf(stderr, " %p", (void*)(uintptr_t)pcs[i]);
+    }
+    fprintf(stderr, "\n");
+}
+static DWORD WINAPI stacks_thread(LPVOID p) {
+    Sleep((DWORD)(uintptr_t)p * 1000);
+    SymInitialize(GetCurrentProcess(), NULL, TRUE);
+    for (;;) {
+        char who[64];
+        if (g_boot_tid) stack_of(g_boot_tid, "boot");
+        for (int t = 0; t < g_nthreads; t++)
+            if (g_tids[t]) { sprintf(who, "thread %08X", MEM32(g_threads[t] + R0T_THREAD)); stack_of(g_tids[t], who); }
+        fflush(stderr);
+        Sleep(5000);
+    }
+}
 static void start_thread(uint32_t r0) {
+    static int stacks;
+    if (!stacks++ && getenv("W98_STACKS")) CloseHandle(CreateThread(NULL, 0, stacks_thread, (LPVOID)(uintptr_t)atoi(getenv("W98_STACKS")), 0, NULL));
     if (MEM32(r0 + R0T_PARKED)) return;
     native32_on_enter = w9x_on_enter;
     MEM32(r0 + R0T_PARKED) = (uint32_t)(uintptr_t)CreateEventA(NULL, FALSE, FALSE, NULL);
@@ -835,12 +880,8 @@ static uint32_t vwin32_run_thread(const uint32_t* a) {
 #define R0T_WAITN  0x40
 #define R0T_WAITS  0x44
 #define R0T_WOKEN  0x48
-#define MAXTHREADS 64
-static uint32_t g_threads[MAXTHREADS];     /* every r0 twin, for vxd_wake */
-static int g_nthreads;
 static HANDLE thread_wake(void);
 static void track_thread(uint32_t r0) { if (g_nthreads < MAXTHREADS) g_threads[g_nthreads++] = r0; }
-static DWORD g_tids[MAXTHREADS];           /* the host thread each runs on, for the dump */
 static void note_tid(uint32_t r0) { for (int t = 0; t < g_nthreads; t++) if (g_threads[t] == r0) g_tids[t] = GetCurrentThreadId(); }
 static uint32_t g_console_obj;   /* VCOND 2's object: its input is the host's stdin */
 /* Mutexes (kernel32 type 3, 0xBFF8CAA2: 18h bytes, +4 0, +8 1): Win98's
@@ -932,6 +973,7 @@ static uint32_t vwin32_wait_multiple(const uint32_t* a) {
     if (g_trace > 0) fprintf(stderr, "[vxd] thread %08X waits on %u blocks (%d ms), first %08X\n", g_cur[0], a[0], (int)a[2], MEM32(a[1]));
     DWORD rc = w9x_wait(thread_wake(), a[2]);
     MEM32(r0 + R0T_WAITN) = 0;
+    if (g_trace > 0) fprintf(stderr, "[vxd] thread %08X woke (%lu, block %d)\n", g_cur[0], rc, (int)MEM32(r0 + R0T_WOKEN));
     if (rc == WAIT_TIMEOUT) return 0x102;
     return MEM32(r0 + R0T_WOKEN) == 0xFFFFFFFFu ? 0xC0 : MEM32(r0 + R0T_WOKEN);
 }
