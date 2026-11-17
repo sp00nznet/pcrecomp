@@ -621,7 +621,7 @@ static __declspec(thread) uint32_t g_retf_at;   /* where the last plain retf wen
 /* 16->32 calls in flight whose 32-bit side comes back by a far jump into
  * 16-bit code (w16_retf's generated stubs, w16_retf32's 16:16 returns):
  * w16_enter longjmps here when its target is the pending return. */
-static __declspec(thread) struct { jmp_buf jb; uint32_t back; } g_thk[16];
+static __declspec(thread) struct { jmp_buf jb; uint32_t back; uint16_t ss, sp; } g_thk[16];   /* ss:sp: where back sits */
 static __declspec(thread) int g_nthk;
 void w16_retf32(CPU *c) {
     /* eip and a 32-bit cs from ss:esp when ss is a big (B) segment, else ss:sp */
@@ -670,7 +670,7 @@ void w16_retf32(CPU *c) {
         CPU keep = *c;
         w16_ff *ff = g_ff;
         int k = g_nthk++;
-        g_thk[k].back = ret;
+        g_thk[k].back = ret; g_thk[k].ss = c->ss; g_thk[k].sp = c->sp;
         if (!setjmp(g_thk[k].jb)) {
             recomp_set_seg(3, c->ds); recomp_set_seg(0, c->es);
             f();
@@ -925,6 +925,7 @@ int w16_retf(CPU *c) {
     w16_ff *ff = g_ff;   /* the stub's return longjmps past nested far calls */
     int k = g_nthk++;
     g_thk[k].back = mem_read32(c, c->ss, c->sp);   /* the 16-bit caller's far return */
+    g_thk[k].ss = c->ss; g_thk[k].sp = c->sp;
     if (!setjmp(g_thk[k].jb)) {
         f();
         w16_stop("16->32 stub's function returned without its retf", eip >> 16, eip & 0xFFFF);
@@ -944,9 +945,19 @@ int w16_enter(uint32_t target) {
         /* the outermost of a run with the same return: a flat thunk not yet
          * connected re-enters itself through KRNL386 (kernel32 0xBFF718AE ->
          * 16-bit connect -> jmp far32 0xBFF718C7), and both come back to the
-         * one 16-bit caller, whose C frame is the outer one's */
+         * one 16-bit caller, whose C frame is the outer one's. Only when the
+         * return sits in the same 16-bit frame: a window procedure that sends
+         * a message to itself (USER 30:3D12 -> calc -> SendMessage -> 3D12)
+         * nests stubs with the same return on other frames, and each must
+         * come back to its own C frame */
         int k = g_nthk - 1;
-        while (k > 0 && g_thk[k - 1].back == target) k--;
+        while (k > 0 && g_thk[k - 1].back == target) {
+            if (g_thk[k - 1].ss != g_thk[k].ss || g_thk[k - 1].sp != g_thk[k].sp) {
+                if (getenv("W16_TRACE")) fprintf(stderr, "[w16] stub %d and %d share return %04X:%04X but not its frame (%04X:%04X, %04X:%04X)\n", k - 1, k, target >> 16, target & 0xFFFF, g_thk[k - 1].ss, g_thk[k - 1].sp, g_thk[k].ss, g_thk[k].sp);
+                break;
+            }
+            k--;
+        }
         if (getenv("W16_TRACE")) fprintf(stderr, "[w16] stub %d returns to %04X:%04X (thread %lu)\n", k, target >> 16, target & 0xFFFF, GetCurrentThreadId());
         longjmp(g_thk[k].jb, 1);
     }
