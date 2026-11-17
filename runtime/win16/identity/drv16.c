@@ -530,6 +530,32 @@ static void disp_dibbits(CPU *c) {
     c->ax = (uint16_t)done; ret_far(c, 26);
 }
 
+/* DISPLAY.21 DIBtoDevice(lpPDevice, X, Y, iStart, cScans, lpClipRect, lpDrawMode, lpDIBits,
+ * lpBitmapInfo, lpTranslate) -> scans drawn: SetDIBitsToDevice straight onto the device (winmine's
+ * tiles). X,Y is the DIB's top-left; the buffer holds scans iStart.. (bottom-up DIBs count from the
+ * bottom); only what lies in the clip rect is drawn.
+ * ponytail: no lpTranslate (no palette device), X,Y read as the whole DIB's top-left */
+static void disp_dibtodev(CPU *c) {
+    int x0 = (int16_t)arg16(c, 13), y0 = (int16_t)arg16(c, 12), start = arg16(c, 11), scans = arg16(c, 10);
+    const rect16 *cr = argfar(c, 8) ? (const rect16 *)farptr(argfar(c, 8)) : NULL;
+    const uint8_t *bi = (const uint8_t *)farptr(argfar(c, 2));
+    uint8_t *bits = (uint8_t *)farptr(argfar(c, 4));
+    int w = *(const int32_t *)(bi + 4), h = *(const int32_t *)(bi + 8), bpp = *(const uint16_t *)(bi + 14);
+    const uint8_t *pal = bi + *(const uint32_t *)bi;
+    int stride = ((w * bpp + 31) / 32) * 4, hh = h < 0 ? -h : h, done = 0;
+    surf_t s;
+    if (surf_of(argfar(c, 14), &s))
+        for (int i = 0; i < scans && start + i < hh; i++, done++) {
+            int y = y0 + (h < 0 ? start + i : hh - 1 - (start + i));
+            if (cr && (y < cr->t || y >= cr->b)) continue;
+            uint8_t *row = bits + (size_t)i * stride;
+            for (int x = 0; x < w; x++)
+                if (!cr || (x0 + x >= cr->l && x0 + x < cr->r)) surf_put(&s, x0 + x, y, dib_px(row, x, bpp, pal));
+        }
+    if (getenv("W16_TRACE")) fprintf(stderr, "[drv] DISPLAY.DIBtoDevice %d,%d %dx%d %dbpp scans %d+%d -> %d\n", x0, y0, w, h, bpp, start, scans, done);
+    c->ax = (uint16_t)done; ret_far(c, 32);
+}
+
 /* SYSTEM.7 Get80x87SaveSize() -> the FNSAVE size; 8 Save80x87(lpBuf) / 9 Restore80x87(lpBuf).
  * ponytail: lifted code keeps no x87 state in guest memory, so save/restore do nothing. */
 static void sys_fpu_size(CPU *c) { c->ax = 94; ret_far(c, 0); }
@@ -731,14 +757,22 @@ void KEYBOARD_Ord132(CPU *c) { kb_codepage(c); }
 void KEYBOARD_Ord134(CPU *c) { kb_ansi_to_oem_buf(c); }
 void KEYBOARD_Ord135(CPU *c) { kb_oem_to_ansi_buf(c); }
 
+/* SOUND.DRV (winmine imports 1 OpenSound, 2 CloseSound, 4 SetVoiceNote(4 words), 5 SetVoiceAccent(5 words),
+ * 9 StartSound, 10 StopSound): no audio device, so OpenSound answers S_SERDVNA (-1, in use/not there)
+ * and the rest do nothing. */
+static void snd_open(CPU *c) { c->ax = 0xFFFF; ret_far(c, 0); }
+static void snd_zero(CPU *c) { c->ax = 0; ret_far(c, 0); }
+static void snd_note(CPU *c) { c->ax = 0; ret_far(c, 8); }
+static void snd_accent(CPU *c) { c->ax = 0; ret_far(c, 10); }
+
 static drv_t g_drv[] = {
     { "SYSTEM",   { [1] = sys_inquire, [2] = sys_createtimer, [3] = sys_killtimer, [4] = sys_timers, [5] = sys_timers, [6] = sys_msec, [7] = sys_fpu_size, [8] = sys_fpu_save, [9] = sys_fpu_save } },
     { "KEYBOARD", { [5] = kb_ansi_to_oem, [6] = kb_oem_to_ansi, [1] = kb_inquire, [2] = kb_enable, [3] = drv_disable, [7] = kb_setspeed, [4] = kb_toascii, [131] = kb_mapvk, [132] = kb_codepage, [134] = kb_ansi_to_oem_buf, [135] = kb_oem_to_ansi_buf, [136] = kb_sysreq } },
     { "MOUSE",    { [1] = ms_inquire, [2] = ms_enable, [3] = drv_disable } },
-    { "DISPLAY",  { [1] = disp_bitblt, [8] = disp_output, [9] = disp_pixel, [2] = disp_colorinfo, [3] = disp_control, [4] = disp_disable, [4] = disp_disable, [5] = disp_enable, [10] = disp_realize, [14] = disp_exttextout, [15] = disp_charwidth, [19] = disp_dibbits,
+    { "DISPLAY",  { [1] = disp_bitblt, [8] = disp_output, [9] = disp_pixel, [2] = disp_colorinfo, [3] = disp_control, [4] = disp_disable, [4] = disp_disable, [5] = disp_enable, [10] = disp_realize, [14] = disp_exttextout, [15] = disp_charwidth, [19] = disp_dibbits, [21] = disp_dibtodev,
                     [101] = disp_inquire, [102] = disp_setcursor, [103] = disp_movecursor, [104] = disp_checkcursor } },
-    { "MMSOUND",  { 0 } },   /* SlowBoot: sound.drv= default; makes no sound */
     { "COMM",     { 0 } },   /* comm.drv=: no ports */
+    { "SOUND",    { [1] = snd_open, [2] = snd_zero, [4] = snd_note, [5] = snd_accent, [9] = snd_zero, [10] = snd_zero } },
 };
 #define NDRV (int)(sizeof g_drv / sizeof *g_drv)
 
