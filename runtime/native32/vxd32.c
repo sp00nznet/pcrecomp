@@ -1742,6 +1742,8 @@ uint32_t native32_vwin32_r0_table(void) {
  * selectors (the host's own flat ones) are base 0. */
 static uint8_t g_ldt[0x10000];
 static uint16_t g_ldt_alias;
+#define HOST_POOL 0xF800u                 /* LDT offsets F800..FFF8: the host's (native32_w9x_ldt) */
+static uint16_t g_pool_next = HOST_POOL;
 extern uint32_t g_es_base, g_cs_base, g_ds_base, g_ss_base;   /* native32.c (per-thread state) */
 
 /* The alias's own descriptor is in the LDT too, as on Win9x: KRNL386 reads
@@ -1752,6 +1754,9 @@ void native32_w9x_ldt(uint16_t alias_sel, uint32_t* ldt_base) {
     uint8_t* d = g_ldt + g_ldt_alias; uint32_t b = *ldt_base;
     d[0] = d[1] = 0xFF; d[2] = (uint8_t)b; d[3] = (uint8_t)(b >> 8); d[4] = (uint8_t)(b >> 16); d[7] = (uint8_t)(b >> 24);
     d[5] = 0xF2; d[6] = 0x40;
+    /* the host's pool (native32_w9x_alloc_sel): present, base 0, so KRNL386 leaves
+     * them out of its free chain. ponytail: 256 at the top, never given back */
+    for (unsigned i = HOST_POOL; i < 0x10000; i += 8) { g_ldt[i + 5] = 0xF2; g_ldt[i + 6] = 0x40; }
 }
 
 /* A selector whose descriptor is allocated but not present (P=0): Win16 identity
@@ -1779,9 +1784,22 @@ uint32_t recomp_sel_access_base(uint32_t sel) {
  * KRNL386 would have allocated. */
 uint16_t native32_w9x_alloc_sel(uint32_t base, uint32_t limit) {
     /* KRNL386 writes the LDT itself (its alias from int 2Fh 168Ah): skip
-     * descriptors it holds, including its free chain (nonzero bytes) */
-    while (g_next_sel > 7 && (*(uint32_t*)(g_ldt + (g_next_sel & ~7u)) || *(uint32_t*)(g_ldt + (g_next_sel & ~7u) + 4)))
+     * descriptors it holds, including its free chain (nonzero bytes). Once
+     * it has chained every free one, the counter ran off the top and wrapped
+     * onto entry 0 (USER's tick pointer was 0007:0000, the real-mode vector
+     * table, and sol's clock never ran): after that, the host's own pool. */
+    while (g_next_sel > 7 && g_next_sel < HOST_POOL && (*(uint32_t*)(g_ldt + (g_next_sel & ~7u)) || *(uint32_t*)(g_ldt + (g_next_sel & ~7u) + 4)))
         g_next_sel += 8;
+    if (g_next_sel <= 7 || g_next_sel >= HOST_POOL) {
+        if (!g_pool_next) { fprintf(stderr, "\n[vxd] host selector pool empty\n"); fflush(stderr); TerminateProcess(GetCurrentProcess(), 5); }
+        uint16_t ps = (uint16_t)(g_pool_next | 7);
+        g_pool_next = (uint16_t)(g_pool_next + 8);
+        uint8_t* pd = g_ldt + (ps & ~7u);
+        pd[0] = (uint8_t)limit; pd[1] = (uint8_t)(limit >> 8);
+        pd[2] = (uint8_t)base; pd[3] = (uint8_t)(base >> 8); pd[4] = (uint8_t)(base >> 16); pd[7] = (uint8_t)(base >> 24);
+        pd[5] = 0xF2; pd[6] = (uint8_t)((limit >> 16) & 0x0F) | 0x40;
+        return ps;
+    }
     uint16_t sel = g_next_sel;
     uint8_t* d = g_ldt + (sel & ~7u);
     g_next_sel += 8;

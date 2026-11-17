@@ -784,6 +784,13 @@ void dispatch_far(CPU *cpu, uint16_t sel, uint16_t off) {
             dispatch_far(cpu, *(const uint16_t *)(t + 15), *(const uint16_t *)(t + 13));
             return;
         }
+        /* MakeProcInstance's thunk, in KRNL386's thunk blocks: `mov ax, ds; jmp far
+         * sel:off` (sol's TimerProc through USER's timer dispatch). Recognized, not run. */
+        if (b && !IsBadReadPtr(t, 8) && t[0] == 0xB8 && t[3] == 0xEA) {
+            cpu->ax = *(const uint16_t *)(t + 1);
+            dispatch_far(cpu, *(const uint16_t *)(t + 6), *(const uint16_t *)(t + 4));
+            return;
+        }
         if (b && !IsBadReadPtr((void *)(uintptr_t)(b + off), 24)) {
             fprintf(stderr, "[w16] %04X:%04X (base %08X):", sel, off, b);
             for (int i = 0; i < 24; i++) fprintf(stderr, " %02X", ((uint8_t *)(uintptr_t)(b + off))[i]);
