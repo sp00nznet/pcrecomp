@@ -1089,7 +1089,31 @@ uint32_t ntp_event(int signaled, int manual) {
     return h_put(o);
 }
 /* NtCreateEvent(Handle*, Access, OA, Type, InitialState): type 0 manual reset */
-static uint32_t s_create_event(uint32_t* a) { return new_handle(a[0], O_EVENT, a[4] != 0, a[3] == 0); }
+/* named events, in this process: CreateEvent of a name that exists opens it (STATUS_OBJECT_NAME_EXISTS),
+ * NtOpenEvent finds it. The tray's "MSShellRunDlgReady", set by shell32's Run dialog, was never found and
+ * the tray waited its 10 s. ponytail: one process's names (no cross-process objects), kept for its life */
+static struct { char n[128]; obj_t* o; } g_named[64];
+static obj_t* named_event(uint32_t oa, obj_t* add) {
+    char n[128];
+    us_to_u8(oa ? MEM32(oa + 8) : 0, n, sizeof n);
+    if (!n[0]) return NULL;
+    for (int i = 0; i < 64; i++) if (g_named[i].o && !strcasecmp(g_named[i].n, n)) return g_named[i].o;
+    for (int i = 0; add && i < 64; i++) if (!g_named[i].o) { snprintf(g_named[i].n, sizeof g_named[i].n, "%s", n); g_named[i].o = add, add->refs++; break; }
+    return NULL;
+}
+static uint32_t s_create_event(uint32_t* a) {
+    obj_t* o = named_event(a[2], NULL);
+    if (o && o->type == O_EVENT) { o->refs++, MEM32(a[0]) = h_put(o); return 0x40000000u; }   /* STATUS_OBJECT_NAME_EXISTS */
+    uint32_t r = new_handle(a[0], O_EVENT, a[4] != 0, a[3] == 0);
+    named_event(a[2], h_get(MEM32(a[0])));
+    return r;
+}
+static uint32_t s_open_event(uint32_t* a) {     /* NtOpenEvent(Handle*, Access, OA) */
+    obj_t* o = named_event(a[2], NULL);
+    if (!o || o->type != O_EVENT) return ST_NAME_NOT_FOUND;
+    o->refs++, MEM32(a[0]) = h_put(o);
+    return 0;
+}
 static uint32_t s_set_event(uint32_t* a) {
     obj_t* o = h_get(a[0]);
     if (!o || o->type != O_EVENT) return ST_INVALID_HANDLE;
@@ -2386,7 +2410,7 @@ static const struct { const char* name; uint32_t (*fn)(uint32_t*); } g_impl[] = 
     { "NtLockFile", s_ok }, { "NtUnlockFile", s_ok },
     { "NtClose", s_close }, { "NtDuplicateObject", s_duplicate },
     { "NtQueryObject", s_query_object }, { "NtSetInformationObject", s_ok },
-    { "NtCreateEvent", s_create_event }, { "NtOpenEvent", s_not_found },
+    { "NtCreateEvent", s_create_event }, { "NtOpenEvent", s_open_event },
     { "NtSetEvent", s_set_event }, { "NtResetEvent", s_reset_event }, { "NtClearEvent", s_reset_event },
     { "NtPulseEvent", s_reset_event },
     { "NtCreateMutant", s_create_mutant }, { "NtOpenMutant", s_open_mutant }, { "NtReleaseMutant", s_release },
@@ -2551,8 +2575,12 @@ static void crash(int sig, siginfo_t* si, void* uc) {
     _exit(128 + sig);
 }
 
+/* SIGUSR1 turns the syscall trace on and off in a running process (a live run traced only around one click) */
+volatile int ntp_tracing;
+static void on_usr1(int sig) { (void)sig; ntp_tracing = g_trace = !g_trace; }
 void ntp_init(void) {
-    g_trace = getenv("NATIVE32_SYSCALLS") != NULL;
+    ntp_tracing = g_trace = getenv("NATIVE32_SYSCALLS") != NULL;
+    signal(SIGUSR1, on_usr1);
     {
         struct sigaction sa;
         static uint8_t alt[64 << 10];
