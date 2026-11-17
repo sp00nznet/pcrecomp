@@ -1487,6 +1487,12 @@ static uint32_t rgn_set(gobj_t* o, rc_t r, uint32_t cplx);
 static uint32_t s_randomrgn(uint32_t* a) {       /* NtGdiGetRandomRgn(hdc, hrgn, SYSRGN 4): the visible region, screen coordinates */
     gobj_t* d = DCH(a[0]), *r = G(a[1], GDI_RGN);
     if (!d || !r) return (uint32_t)-1;
+    if (a[2] == 1) {                             /* CLIPRGN (GetClipRgn): 0 when no clip was selected, so
+                                                  * DrawText's restore selects none instead of keeping its own */
+        if (!memcmp(&d->clip, &d->vis, sizeof d->clip)) return 0;
+        rgn_set(r, (rc_t){ d->clip.l - d->ox, d->clip.t - d->oy, d->clip.r - d->ox, d->clip.b - d->oy }, 2);
+        return 1;
+    }
     rgn_set(r, d->vis, 2);
     return 1;
 }
@@ -1567,7 +1573,8 @@ static void batch_cmd(uint32_t hdc, uint32_t cmd, uint32_t e, uint32_t len) {
     case W2K_B_CLIPRGN:
         if (d) {
             uint32_t m = MEM32(e + 4);
-            if (m & 0x80000000u) d->clip = d->vis;
+            TRACE("[gdi] batch clip %08X mode %08X %d,%d,%d,%d\n", hdc, m, (int)MEM32(e + 8), (int)MEM32(e + 0xC), (int)MEM32(e + 0x10), (int)MEM32(e + 0x14));
+            if (m & 0x88000000u) d->clip = d->vis;    /* a NULL region (Windows 2000 gdi32 sets 0x08000000) */
             else {
                 rc_t r = { (int)MEM32(e + 8) + d->ox, (int)MEM32(e + 0xC) + d->oy, (int)MEM32(e + 0x10) + d->ox, (int)MEM32(e + 0x14) + d->oy };
                 d->clip = (m & 0xFF) == 1 ? rc_and(d->clip, r) : rc_and(d->vis, r);
@@ -3034,8 +3041,18 @@ static uint32_t s_setlong(uint32_t* a) {
     if (!u) return 0;
     switch (i) {
     case -4: old = MEM32(u->obj + WND_PROC); MEM32(u->obj + WND_PROC) = a[2]; u->ansi = a[3] != 0; return old;   /* GWL_WNDPROC */
-    case -16: old = u->style; u->style = (a[2] & ~WS_VISIBLE) | (u->style & WS_VISIBLE) | (a[2] & WS_VISIBLE); wnd_sync(u); return old;
-    case -20: old = u->ex; u->ex = a[2]; wnd_sync(u); return old;
+    case -16: case -20: {
+        /* WM_STYLECHANGING/WM_STYLECHANGED (STYLESTRUCT old, new), as win32k sends them: comctl32
+         * keeps its own copy of the style from them (the Start menu toolbar's CCS_NORESIZE) */
+        uint32_t* f = i == -16 ? &u->style : &u->ex, ss[2] = { *f, a[2] };
+        old = *f;
+        if (old == a[2]) return old;
+        send(u->h, 0x7C, (uint32_t)i, (uint32_t)(uintptr_t)ss);
+        *f = ss[1];
+        wnd_sync(u);
+        send(u->h, 0x7D, (uint32_t)i, (uint32_t)(uintptr_t)ss);
+        return old;
+    }
     case -12: old = u->id; u->id = a[2]; wnd_sync(u); return old;            /* GWL_ID */
     case -6: old = u->inst; u->inst = a[2]; wnd_sync(u); return old;         /* GWL_HINSTANCE */
     case -21: old = MEM32(u->obj + WND_USERDATA); MEM32(u->obj + WND_USERDATA) = a[2]; return old;
