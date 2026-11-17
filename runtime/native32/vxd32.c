@@ -1089,6 +1089,10 @@ static uint32_t vwin32_crst_wake(const uint32_t* a) {
     return 0;
 }
 
+/* The same pair from 16-bit code: KRNL386's EnterCrst/LeaveCrst (seg1 7D85/7F14 and
+ * 7DCD) call VWIN32's PM API 0A/0B with ebx = the crst's linear address. */
+void native32_w9x_crst(int wake, uint32_t crst) { if (wake) vwin32_crst_wake(&crst); else vwin32_crst_wait(&crst); }
+
 /* Wake every thread waiting on wait block obj; returns how many. A wait
  * lists wait blocks or kernel32 objects (a process, a thread), whose +4 is
  * their wait block (the process at 0xBFF8CDxx signals PDB+4). */

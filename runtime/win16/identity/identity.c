@@ -390,6 +390,13 @@ static void host_far(CPU *c, uint16_t off) {
                   * (ds:[14Eh]) and 1 for the new one: the foreground thread's boost.
                   * ponytail: no-op, the host schedules (read off the 0/1 callers) */
         ok(c); return;
+    case 0x0A: case 0x0B: {   /* a 16-bit crst's contention (KRNL386 seg1 7F43/7DB5 wait, 7E08 wake):
+                    * ebx = its linear address; kernel32's VWIN32 1D/1E */
+        void native32_w9x_crst(int wake, uint32_t crst);
+        CPU sv = *c;
+        native32_w9x_crst(c->ah == 0x0B, c->ebx);
+        *c = sv; ok(c); return;
+    }
     case 0x08: c->al = 0; ok(c); return;        /* -> DGROUP:1417, a flag read as "nonzero?" (ponytail: 0 until a caller needs 1) */
     case 0x03: {   /* VMM page services: args on the 16-bit stack, ecx bytes of them, which
                     * the entry removes (KRNL386 seg001_1FF7 pops what it pushed before them);

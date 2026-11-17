@@ -53,6 +53,11 @@ def rebase(path, base):
                     raise ValueError('%s: relocation type %d' % (path, e.type))
         off = pe.OPTIONAL_HEADER.get_file_offset() + 28   # ImageBase
         data[off:off + 4] = base.to_bytes(4, 'little')
+        # A new timestamp, as rebase.exe gives: modules left in place that are
+        # bound to this one (Win98's shdoc401 to ole32) then see a stale binding
+        # and the loader snaps their IAT instead of calling the linked address.
+        off = pe.FILE_HEADER.get_file_offset() + 4   # TimeDateStamp
+        data[off:off + 4] = ((pe.FILE_HEADER.TimeDateStamp + 1) & 0xFFFFFFFF).to_bytes(4, 'little')
     # Bound imports: the IAT in the file holds the imports' addresses at
     # their LINKED bases, and a real NT loader keeps them when the import's
     # timestamp matches. Every module of a rebased set has moved or may
