@@ -1746,21 +1746,30 @@ static timer_t_ g_tm[MAXT];
  * above the rest, so the others' DCs leave out the band it covers along an edge.
  * ponytail: one rectangle per DC, so only a topmost window spanning a whole edge is cut out;
  * real visible regions when overlapping windows have to clip each other */
+static rc_t band_cut(rc_t r, rc_t z) {
+    if (z.l <= r.l && z.r >= r.r) {
+        if (z.t <= r.t && z.b > r.t) r.t = z.b;
+        else if (z.b >= r.b && z.t < r.b) r.b = z.t;
+    } else if (z.t <= r.t && z.b >= r.b) {
+        if (z.l <= r.l && z.r > r.l) r.l = z.r;
+        else if (z.r >= r.r && z.l < r.r) r.r = z.l;
+    }
+    return r;
+}
 static rc_t zclip(uobj_t* u, rc_t r) {
+    /* WS_CLIPCHILDREN: a visible child spanning a whole edge of it (a status bar, a toolbar) is
+     * left out, so the parent painting after the child (UpdateWindow painted the child first)
+     * does not cover it. ponytail: the same one-rectangle band rule as the topmost case */
+    if (u->style & 0x02000000u)
+        for (int i = 2; i < MAXU; i++)
+            if (g_u[i].type == W2K_TYPE_WINDOW && g_u[i].parent == u->h && visible(&g_u[i])) r = band_cut(r, g_u[i].wr);
     uobj_t* t = u;
     while (t && t->parent != g_desktop && W(t->parent)) t = W(t->parent);
     if (!t || (t->ex & 8)) return r;
     for (int i = 2; i < MAXU; i++) {
         uobj_t* w = &g_u[i];
         if (w->type != W2K_TYPE_WINDOW || w == t || w->parent != g_desktop || !(w->ex & 8) || !visible(w)) continue;
-        rc_t z = w->wr;
-        if (z.l <= r.l && z.r >= r.r) {
-            if (z.t <= r.t && z.b > r.t) r.t = z.b;
-            else if (z.b >= r.b && z.t < r.b) r.b = z.t;
-        } else if (z.t <= r.t && z.b >= r.b) {
-            if (z.l <= r.l && z.r > r.l) r.l = z.r;
-            else if (z.r >= r.r && z.l < r.r) r.r = z.l;
-        }
+        r = band_cut(r, w->wr);
     }
     return r;
 }
@@ -1870,8 +1879,11 @@ static void ncpaint(uobj_t* u) {
     int b = borders(u->style, u->ex), cap = caption_h(u->style, u->ex);
     if (u->ex & WS_EX_WINDOWEDGE) {
         edge(d, r, C[22], C[21], C[20], C[16]);
-        for (int k = 2; k < b - (u->ex & WS_EX_CLIENTEDGE ? 2 : 0); k++)
-            edge(d, (rc_t){ r.l + k, r.t + k, r.r - k, r.b - k }, C[15], C[15], C[15], C[15]);
+        for (int k = 2; k < b - (u->ex & WS_EX_CLIENTEDGE ? 2 : 0); k++) {   /* one ring per k (edge() draws two: */
+            rc_t q = { r.l + k, r.t + k, r.r - k, r.b - k };                   /*  the last one fell in the client) */
+            fill(d, (rc_t){ q.l, q.t, q.r, q.t + 1 }, C[15]), fill(d, (rc_t){ q.l, q.b - 1, q.r, q.b }, C[15]);
+            fill(d, (rc_t){ q.l, q.t, q.l + 1, q.b }, C[15]), fill(d, (rc_t){ q.r - 1, q.t, q.r, q.b }, C[15]);
+        }
     } else if (u->style & WS_BORDER) edge(d, r, C[6], C[6], C[6], C[6]);   /* (one pixel: only the outer ring is seen) */
     rc_t sc = u->cr;                              /* the client with its scroll bars */
     if (u->style & WS_VSCROLL) sc.r += SM(2);
@@ -2292,6 +2304,9 @@ static void draw_icon(gobj_t* d, uobj_t* ic, int x, int y, int cx, int cy) {
         for (int i = 0; i < cx; i++) {
             int X = x + i, Y = y + j, sx = i * iw / cx, sy = j * ih / cy;
             if (X < d->clip.l || X >= d->clip.r || Y < d->clip.t || Y >= d->clip.b) continue;
+            /* each read inside its own bitmap (a colour bitmap smaller than the mask, a DC clip
+             * larger than the DC's bitmap: the live-mode fault read past a pixel buffer) */
+            if (X < 0 || Y < 0 || X >= b->w || Y >= b->h || sx >= m->w || (c ? sy >= m->h || sx >= c->w || sy >= c->h : sy + ih >= m->h)) continue;
             uint32_t* p = &b->px[(size_t)Y * b->w + X];
             uint32_t a = m->px[(size_t)sy * m->w + sx], xo = c ? c->px[(size_t)sy * c->w + sx] : m->px[(size_t)(sy + ih) * m->w + sx];
             *p = ((*p & a) ^ xo) & 0xFFFFFF;
