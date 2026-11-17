@@ -111,6 +111,7 @@ class ExportEntry:
     name: Optional[str]
     ordinal: int
     rva: int
+    forwarder: Optional[str] = None   # "NTDLL.RtlAllocateHeap": rva is that string, not code
 
 
 @dataclass
@@ -278,6 +279,7 @@ def _analyze_with_pefile(filepath: str, info: PEInfo, pefile) -> None:
                 name=exp.name.decode('ascii', errors='replace') if exp.name else None,
                 ordinal=exp.ordinal,
                 rva=exp.address,
+                forwarder=exp.forwarder.decode('ascii', errors='replace') if exp.forwarder else None,
             ))
 
     # ── Computed ranges ───────────────────────────────────────────

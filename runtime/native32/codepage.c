@@ -395,12 +395,13 @@ static FARPROC WINAPI cp_GetProcAddress(HMODULE h, LPCSTR name);
 /* native32_redirect: a host's own native replacements, by name, for imports
  * and for GetProcAddress (a DLL the guest loads itself: a host that wants to
  * see what reaches DrawDibDraw). */
-#define MAX_REDIRECTS 32
+#define MAX_REDIRECTS 160
 static struct { const char* name; void* fn; } g_redir[MAX_REDIRECTS];
 static int g_nredir;
 
 void native32_redirect(const char* name, void* fn) {
     if (g_nredir < MAX_REDIRECTS) g_redir[g_nredir].name = name, g_redir[g_nredir++].fn = fn;
+    else fprintf(stderr, "[redirect] table full: %s not redirected\n", name);
 }
 
 /* The replacement for an import by this name, or 0: a host redirect, then

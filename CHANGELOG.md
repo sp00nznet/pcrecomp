@@ -11,6 +11,21 @@ versions follow [SemVer](https://semver.org/).
   or timer ticks, not wall time (`--record`, `--replay`, `--keys f<frame>:...`),
   with screenshot/hash checkpoints; Win16 hosts take the flags in `main.c`.
   After Exhume's runtime/replay (MIT). Pilots: Jazz Jackrabbit, KISS.
+- native32: a Windows 2000 userland on a modern host, with only the kernel
+  boundary shimmed. `syscall32.c` (the NT system call gate, booting a lifted
+  ntdll through its own LdrInitializeThunk, guest threads and waits that give
+  up the machine), `csr32.c`, `w32kgdi.c` and `w32kuser.c` (win32k's GDI and
+  USER halves for a lifted gdi32/user32: windows, dialogs, menus, icons,
+  cursors, regions, fonts, DC_ATTR, the `W2K_SCREEN` virtual screen with
+  explorer's taskbar and Start menu), `regbox32.c` (a guest registry sandbox;
+  writes never reach the real registry), the `PCRECOMP_FILEBOX` drive sandbox
+  (`PCRECOMP_GUEST_PATH/ENV/CWD`), host settings refused at the system call,
+  `PCRECOMP_MUTE` covering a lifted winmm, and cmdline32's CRT globals.
+  winmine, sol, freecell, calc, notepad, wordpad and mspaint run on it, the
+  first and the last two pixel-identical. Lifter: the NT system call gate,
+  forwarder exports, SEH filter and `__finally` seeds, `__except` resume
+  points, delay-load seeds, `RECOMP_FLAGS_IN`; disasm32 vtable, IAT and MFC
+  message-map fixes; `tools/pe/rebase.py` drops bound import directories.
 - lift32: a test that `jcxz` (67 E3) leaves the function as `jecxz` does
   (`tools/lift/test_loop_exits.py`; #191, by [@pete-jorgensen](https://github.com/pete-jorgensen)).
 - `tools/pe/vb6.py`: a Visual Basic 5/6 exe's VB header (`VB5!`): native code

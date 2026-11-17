@@ -414,6 +414,27 @@ class Disassembler:
         data = self.read_bytes(va, size)
         if not data:
             return False
+        # Three aligned code addresses in a row are a table, not code: a
+        # vtable in a code section (Windows 2000's binaries merge .rdata into
+        # .text) whose address `mov [esi], offset vtbl` stores. Decoded as a
+        # body it covered the slots, and the data scan then skipped the
+        # functions they name (mspaint's 0x0101E404, reached from MFC).
+        if va % 4 == 0 and len(data) >= 12 and all(
+                bounds[0] <= int.from_bytes(data[k:k + 4], 'little') < sec_end for k in (0, 4, 8)):
+            return False
+        # A NUL-terminated ASCII name is not code either: `push offset
+        # "GetLayout"` ahead of GetProcAddress (mspaint), whose bytes decode
+        # and ran on into the vtable after it.
+        n = 0
+        while n < len(data) and 0x20 <= data[n] < 0x7F:
+            n += 1
+        if n >= 4 and n < len(data) and data[n] == 0:
+            return False
+        n = 0      # and UTF-16 (L"gdi32.dll" right after it)
+        while 2 * n + 1 < len(data) and 0x20 <= data[2 * n] < 0x7F and data[2 * n + 1] == 0:
+            n += 1
+        if n >= 4 and data[2 * n:2 * n + 2] == b'\0\0':
+            return False
 
         end = va
         zeros = 0
@@ -746,6 +767,20 @@ class Disassembler:
         found = set()
         probed = rejected = mid = padded = in_run = 0
         in_code = 0
+        # Addresses code reads as a pointer: `call [abs]`, `jmp [abs]`,
+        # `mov reg, [abs]`. In a merged .text a lone slot is a function only
+        # with this evidence: Windows 2000's shell32/browseui/shdocvw lazy
+        # imports (a variable `mov esi, [slot]; call esi` whose first value
+        # is a stub that loads the DLL, patches the slot and jumps on).
+        import re
+        loads = set()
+        for s in self.sections:
+            if s.is_code:
+                cd = self.read_bytes(self.image_base + s.virtual_address, s.raw_size) or b''
+                for m in re.finditer(rb'(?:\xff[\x15\x25]|\x8b[\x05\x0d\x15\x1d\x2d\x35\x3d]|\xa1)', cd):
+                    o = m.end()
+                    if o + 4 <= len(cd):
+                        loads.add(int.from_bytes(cd[o:o + 4], 'little'))
         for s in self.sections:
             base = self.image_base + s.virtual_address
             data = self.read_bytes(base, s.raw_size)
@@ -759,15 +794,51 @@ class Disassembler:
                 # no decoded instruction covers: a hand-written renderer's
                 # table of span routines between its functions (Sim Theme
                 # Park's assembler `cseg`, reached by `jmp [table + eax*4]`).
+                # Or one 24 bytes on: MFC's AFX_MSGMAP_ENTRY { msg, code, id,
+                # lastId, sig, pfn } array, the only reference to a handler
+                # (mspaint, in Windows 2000's merged .text).
                 if s.is_code:
                     at = base + off
+                    def ptr(o):
+                        return 0 <= o <= len(data) - 4 and code_start <= int.from_bytes(data[o:o + 4], 'little') < code_end
+                    # The pfn of an AFX_MSGMAP_ENTRY { nMessage, nCode, nID,
+                    # nLastID, nSig, pfn }: a message, a notification code
+                    # (small or negative), IDs and an AfxSig all small. Two
+                    # pointers 24 bytes apart alone took any table: 22 -> 584
+                    # unimplemented instructions in mspaint, all dead code.
+                    # A neighbour entry, or the all-zero terminator after a
+                    # map of one (wordpad's WM_CREATE handler 0x0100C3C6).
+                    def msgmap(o):
+                        if o < 20 or not ptr(o):
+                            return False
+                        m, c, i, l, s = (int.from_bytes(data[o - 20 + 4 * k:o - 16 + 4 * k], 'little') for k in range(5))
+                        return m < 0x10000 and (c < 0x10000 or c >= 0xFFFF0000) and i < 0x10000 and l < 0x10000 \
+                            and (s < 0x100 or m == 0xC000)   # ON_REGISTERED_MESSAGE: &the message
+                    # Three in a row are a table even where a body decoded
+                    # from bad evidence claims the bytes (a vtable in
+                    # Windows 2000's merged .text, run over by data decoded
+                    # as code).
+                    # Any three: the slot can end the run (an IUnknown-only
+                    # vtable { QI, AddRef, Release } before a string: browseui
+                    # 0x20D1CE68 -> 0x20D0B840) or start it.
+                    run3 = (ptr(off - 4) and ptr(off + 4)) or (ptr(off - 8) and ptr(off - 4)) or (ptr(off + 4) and ptr(off + 8))
                     if off % 4 or interior is None or not (code_start <= at and at + 4 <= code_end) \
-                            or any(interior[at - code_start + k] for k in range(4)) \
-                            or not any(0 <= o <= len(data) - 4 and code_start <= int.from_bytes(data[o:o + 4], 'little') < code_end
-                                       for o in (off - 4, off + 4)):
+                            or (not run3 and any(interior[at - code_start + k] for k in range(4))) \
+                            or not (ptr(off - 4) or ptr(off + 4) or at in loads
+                                    or (msgmap(off) and (msgmap(off - 24) or msgmap(off + 24)
+                                                         or data[off + 4:off + 28] == bytes(24)))):
                         continue
                     in_code += 1
-                if va in queued or va in found:
+                table = s.is_code and run3
+                if va in queued or va in found or va in getattr(self, 'seh_resume', ()):
+                    continue
+                # A vtable slot is a start even where a body decoded from a
+                # GUID before it runs over it (shdocvw 0x20E0AC30, covered by
+                # 0x20E0AC20, the IID's bytes): kept like the uncovered ones.
+                if table and va in covered:
+                    self.table_targets.add(va)
+                    in_run += 1
+                    found.add(va)
                     continue
                 if va in covered:
                     # An instruction some body already decoded. Normally a
@@ -793,7 +864,13 @@ class Disassembler:
                         in_run += 1
                         found.add(va)
                     continue
-                if interior is not None and interior[va - code_start]:
+                # A vtable (three code pointers in a row) inside code outranks
+                # a body decoded from data: riched20's slot 0x20711CA4 names
+                # 0x2070B6E0, the second byte of a `mov esi, imm32` that the
+                # GUID before it decoded as. Still probed below.
+                if table:
+                    self.table_targets.add(va)
+                if interior is not None and interior[va - code_start] and not table:
                     mid += 1
                     continue
                 probed += 1
@@ -835,6 +912,7 @@ class Disassembler:
         Returns dict of addr -> Function.
         """
         self.light_operands = release_operands
+        self.table_targets = set()   # vtable slots in code (find_data_code_pointers)
         print(f"[*] Scanning for call targets in 0x{code_start:08X}-0x{code_end:08X}...")
         call_targets = self.find_branch_targets(code_start, code_end)
         print(f"[*] Found {len(call_targets)} potential call targets")
@@ -876,7 +954,14 @@ class Disassembler:
         queue = list(all_targets)
         queued = set(all_targets)
 
+        # The import table is data even inside .text (Windows 2000 merges
+        # .idata into it): wordpad.exe's bound IAT decoded from a stray
+        # pointer to a slot as a 2,294-instruction body, 6,000 unimplemented.
+        iat_lo, iat_hi = (min(iat_map), max(iat_map) + 4) if iat_map else (0, 0)
+
         def _add_func(addr, entry_kind="start"):
+            if iat_lo <= addr < iat_hi:
+                return None
             real = self.past_padding(addr)
             if real != addr:
                 # Not a function: the one after the padding is. Queued rather
@@ -1003,7 +1088,15 @@ class Disassembler:
                               if not self.is_code_address(tgt):
                                   continue
                               loaded = (ins.mnemonic == 'mov' and ins.operands[0].type == X86_OP_REG)
-                              if own_lo < tgt < own_hi and tgt not in own and loaded:
+                              # Unless an instruction of another body ends right
+                              # at it: then it is past that body, not a hole in
+                              # this one (riched20's `mov eax, 0x207108C0`
+                              # stores a method that follows another's `ret`).
+                              after_other = any(
+                                  tgt - n in covered and tgt - n not in own
+                                  and all(interior[k - code_start] for k in range(tgt - n + 1, tgt))
+                                  for n in range(1, 16) if code_start <= tgt - n)
+                              if own_lo < tgt < own_hi and tgt not in own and loaded and not after_other:
                                   continue
                               # Data kept in code is loaded the same way: Theme
                               # Park's startup does `mov edx, offset "con"` for
@@ -1075,7 +1168,7 @@ class Disassembler:
         # Killing Floor's case).
         gone = drop_mid_instruction_entries(
             lambda va, n: self.read_bytes(va, n), sizes, code_start, code_end,
-            keep=set(seeds) & set(sizes), callers=callers, weak=weak & set(sizes))
+            keep=(set(seeds) | self.table_targets) & set(sizes), callers=callers, weak=weak & set(sizes))
         for a in list(functions):
             if a not in sizes:
                 del functions[a]
@@ -1148,6 +1241,39 @@ def eh_entries(read, code_start, code_end):
             n_catch, catches = dword(tries + 20 * t + 12), dword(tries + 20 * t + 16)
             acts += [dword(catches + 16 * c + 12) for c in range(min(n_catch, 64))]
         out.update(a for a in acts if code_start <= a < code_end)
+    return out
+
+
+def seh_entries(read, code_start, code_end, resume=None):
+    """__try/__except/__finally code (_except_handler3) that only a scope
+    table names: entries to seed.
+
+    The frame prologue `push -1; push scopetable; push handler; mov eax,
+    fs:[0]` names a table of (enclosing level, filter, handler). Filters and
+    __finally blocks (filter 0) are called -- by the handler, by
+    _local_unwind2 -- and return, so each is an entry that runs on its
+    parent's ebp. An __except block is a resume point of its function (eh32),
+    not an entry. Windows 2000's RtlSetCurrentDirectory_U has a __finally
+    nothing else names; unseeded, `cd` in cmd.exe failed with an unresolved
+    indirect call.
+    """
+    text = read(code_start, code_end - code_start) or b""
+    def dword(va):
+        raw = read(va, 4)
+        return int.from_bytes(raw, "little") if raw and len(raw) == 4 else 0
+    out = set()
+    for m in re.finditer(rb"\x6A\xFF\x68(.{4})\x68(.{4})\x64\xA1\x00\x00\x00\x00", text, re.S):
+        table = int.from_bytes(m.group(1), "little")
+        for k in range(64):
+            enclosing, flt, handler = dword(table + 12 * k), dword(table + 12 * k + 4), dword(table + 12 * k + 8)
+            if not (enclosing == 0xFFFFFFFF or enclosing < k) or not code_start <= handler < code_end:
+                break
+            if flt and code_start <= flt < code_end:
+                out.add(flt)
+                if resume is not None:
+                    resume.add(handler)
+            elif not flt:
+                out.add(handler)
     return out
 
 
@@ -1473,6 +1599,8 @@ def close_dispatch_targets(read_va, functions, code_start, code_end,
             try:
                 code = read_va(addr, size)
             except Exception:
+                continue
+            if not code:        # outside every section (ole32: an extent past its end)
                 continue
             end = addr + size
             for ins in md.disasm(code, addr):
@@ -2049,11 +2177,37 @@ def main(argv=None):
     # were missing, and the engine's first call into the module was an
     # unresolved ICALL. An export into a code section only: a forwarder or an
     # exported variable is not a function.
+    # Windows 2000's kernel32 keeps its export directory, forwarder strings
+    # and all, inside .text: "NTDLL.RtlAllocateHeap" was seeded and lifted.
     exported = {info.image_base + e.rva for e in info.exports
-                if info.code_start <= info.image_base + e.rva < info.code_end}
+                if info.code_start <= info.image_base + e.rva < info.code_end
+                and not getattr(e, 'forwarder', None)}
     if exported:
         print(f"[*] {len(exported)} exports seeded")
     seeds |= exported
+
+    # A delay-load IAT slot holds, until its first call, the address of that
+    # import's load stub (push slot; jmp __delayLoadHelper): only the slot
+    # points at it, so no scan finds it (Windows 2000's shell32 calls
+    # CoUninitialize through one and the first call was an unresolved ICALL).
+    try:
+        import pefile
+        dpe = pefile.PE(data=pe_data, fast_load=True)
+        dpe.parse_data_directories([pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT']])
+        stubs = set()
+        for d in getattr(dpe, 'DIRECTORY_ENTRY_DELAY_IMPORT', []):
+            for imp in d.imports:
+                v = dpe.get_dword_at_rva(imp.address - info.image_base) if imp.address >= info.image_base \
+                    else dpe.get_dword_at_rva(imp.address)
+                if v and v < info.image_base:            # an RVA-based (VC7+) descriptor
+                    v += info.image_base
+                if v and info.code_start <= v < info.code_end:
+                    stubs.add(v)
+        if stubs:
+            print(f"[*] {len(stubs)} delay-load stubs seeded")
+        seeds |= stubs
+    except Exception as e:                               # (no pefile: no delay-load seeds)
+        print(f"[*] delay-load stubs not seeded: {e}")
 
     if args.seed_functions:
         with open(args.seed_functions) as f:
@@ -2065,6 +2219,14 @@ def main(argv=None):
         print(f"[*] {len(doc)} seeds from {args.seed_functions}")
 
     dis = Disassembler(pe_data, info.image_base, info.sections)
+    # The __except blocks (resume points, never entries): the data scan reads
+    # a scope table's (filter, block) pair as two code pointers and made
+    # rpcrt4's blocks functions, so _except_handler3's jump ran one as a call.
+    dis.seh_resume = set()
+    seh = seh_entries(dis.read_bytes, info.code_start, info.code_end, dis.seh_resume) - seeds
+    if seh:
+        print(f"[*] {len(seh)} SEH filters and __finally blocks seeded")
+    seeds |= seh
     # This CLI exports a catalog and never lifts, so it is the caller that can
     # afford to let the operand lists go -- which is where the memory went on a
     # multi-megabyte image.

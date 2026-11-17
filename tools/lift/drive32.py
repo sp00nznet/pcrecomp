@@ -42,7 +42,7 @@ import pefile
 from generate import (EXTENT_REACH, alias_stub, find_splits, true_extent,
                       linear_disassemble_function, lift_function_linear, write_chunk)
 from lift32 import Lifter
-from eh32 import resume_points
+from eh32 import frame as eh_frame
 from pe_analyze import analyze_pe, build_iat_map
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'disasm'))
@@ -78,11 +78,15 @@ def lift_image(img, catalog, out, seeds=(), split=400, log=print, precise_carry=
     os.makedirs(out)
     starts = {a for a in byaddr if byaddr[a].get('entry_kind') != 'alias'}
     starts -= find_splits(md, code, cs, ce, starts)
-    eh_at = {}
+    eh_at, eh_off = {}, {}
     for a in byaddr:
-        r = resume_points(md, read, list(md.disasm(read(a, 64) or b'', a))[:12])
-        if r:
+        # (resume points, frame offset): the offset makes it RECOMP_EH_FRAME,
+        # which a guest handler's jump into an __except block can find
+        r = eh_frame(md, read, list(md.disasm(read(a, 64) or b'', a))[:12])
+        if r and r[0]:
             eh_at[a] = r
+            eh_off[a] = r[1]
+            eh_at[a] = r[0]
     starts -= set().union(*eh_at.values()) if eh_at else set()
 
     def walk(addr):
@@ -137,7 +141,7 @@ def lift_image(img, catalog, out, seeds=(), split=400, log=print, precise_carry=
                 arms_out.update(ind - {i.address for i in insns})
             eh = eh_at.get(addr)
             st['catch'] += bool(eh)
-            body = (lift_function_linear(lifter, name, insns, leaders, addr, eh_resume=eh,
+            body = (lift_function_linear(lifter, name, insns, leaders, addr, eh_resume=eh, eh_off=eh_off.get(addr),
                                          alias_entries=aliases, indirect_targets=ind) if insns
                     else 'void %s(void) { }\n' % name)
         except Exception as e:                      # noqa: BLE001 -- counted, not hidden

@@ -51,6 +51,11 @@ void native32_set_codepage(unsigned cp);
  * name never sees. Call before native32_bind; up to 32. */
 void native32_redirect(const char* name, void* fn);
 
+/* The guest's command line ("winmine.exe -x"), not the host's flags:
+ * GetCommandLineA/W and the host msvcrt's __getmainargs/__wgetmainargs
+ * answer it (cmdline32.c). Call before native32_bind; uses 4 redirects. */
+void native32_set_command_line(const char* line);
+
 /* Serve the registry subtrees a .reg file names (regedit 4: [HKEY_...\path]
  * sections, "name"="text", dword:, hex:) from that file instead of the real
  * registry: the guest's RegOpenKey/RegCreateKey/RegQueryValueEx/RegSetValueEx
@@ -67,11 +72,23 @@ int native32_registry(const char* file);
  * server. Call before native32_bind. */
 void native32_net_loopback_only(void);
 
-/* Give the guest its own HKLM and HKCU (regbox32.c), under
- * HKCU\Software\pcrecomp\sandbox\<name>: its Reg*A imports write there and
- * read there first, then the real registry read-only. Two instances with two
- * names keep apart. Call before native32_bind; 0 if the key can't be made. */
+/* Give the guest its own registry (regbox32.c), under
+ * HKCU\Software\pcrecomp\sandbox\<name> (or \pcrecomp\<name> when name has a
+ * backslash): its Reg* imports (A and W) and profile calls write there and
+ * read there first, then the real registry read-only; it can never write the
+ * real one. Two instances with two names keep apart. Call before
+ * native32_bind; 0 if the key can't be made. */
 int native32_registry_sandbox(const char* name);
+/* The same for a lifted ntdll's NtXxxKey services and a proxied host
+ * advapi32: pass native32_nt_override, native32_nt_forward and
+ * native32_nt_proxy_hook (before native32_nt_boot). */
+void native32_registry_sandbox_nt(void (*ovr)(const char*, uint32_t (*)(uint32_t*)),
+                                  uint32_t (*fwd)(const char*, uint32_t*), void (*hook)(const char*, void*));
+/* A REG_SZ the guest's own box holds under HKCU\sub (never the real
+ * registry's): 1 and the text in out, 0 if there is no box or no value. */
+int native32_registry_box_sz(const wchar_t* sub, const wchar_t* value, wchar_t* out, unsigned long cch);
+/* A sandbox replacement by its export name (WriteProfileStringW...), or NULL. */
+void* native32_registry_sandbox_fn(const char* name);
 
 /* Call once, before anything else. */
 void native32_init(void);
@@ -109,7 +126,9 @@ int native32_require_color_depth(int bpp);
 uint32_t native32_map(const char* path, uint32_t base);
 
 /* Fill a mapped module's IAT the way the Windows loader would: shims first
- * (by name, or "<dll>#<ordinal>"), then LoadLibrary + GetProcAddress. Returns unresolved count. */
+ * (by name, or "<dll>#<ordinal>"), then LoadLibrary + GetProcAddress. A shim named
+ * "<dll>!<name>" ("NTDLL.DLL!CsrClientCallServer", DLL any case) also replaces
+ * that export of a GUEST module; a plain name never does. Returns unresolved count. */
 int native32_bind(uint32_t base, native32_shim_t* shims, int nshims);
 
 /* A mapped guest module by file name ("Golf.exe", or a path ending in one;
@@ -128,6 +147,18 @@ void native32_call_guest(uint32_t va, int nargs, const uint32_t* args);
  * register globals from its own threads must too. Nests. */
 void mach_enter(void);
 void mach_leave(void);
+/* Give up every level of the machine around a host call that may wait on
+ * another guest thread; put the same count back after. */
+int mach_release(void);
+void mach_reacquire(int n);
+
+/* A lifted function answered by the host instead, wherever its address is
+ * resolved (indirect calls, snapped imports); and a built-in shim by name.
+ * A lifted ntdll's RtlUnwind ends in NtContinue, a resume the lift cannot
+ * make; native32_nt_boot puts the seh32 one in its place. */
+void native32_replace(uint32_t va, recomp_func_t fn);
+void native32_mute_winmm(void);   /* PCRECOMP_MUTE: a lifted winmm opens no device */
+recomp_func_t native32_shim(const char* name);
 
 /* Name for a native address ("kernel32.dll!CreateFileA"), or NULL. */
 const char* native32_name(uint32_t va);
@@ -190,6 +221,9 @@ int native32_headless(void);
  * function that registered the frame RtlUnwind last stopped at. That function
  * needs a landing pad (generate.py eh_resume). */
 void native32_seh_continue(uint32_t va);
+void native32_rpc_guard(uint32_t ndr_client_call2, uint32_t ndr_client_call);   /* guest RPC failures end the call (native32.c) */
+void native32_rpc_fail(uint32_t exception_record, uint32_t context);
+int native32_local_unwind2(void);   /* MSVC __local_unwind2 copies in the guest modules: a finally that exits its function (native32.c) */
 extern int native32_guest_seh;   /* 1: RaiseException goes to the guest chain */
 /* A Visual Basic 5/6 guest on the real MSVBVM60/50 (vb6rt.c): the runtime is
  * entered with the guest's registers and stack, and its runtime errors go to
@@ -213,6 +247,12 @@ void native32_input_synthetic(int on);
 void native32_input_mouse(int dx, int dy, int dz);
 void native32_input_button(int b, int down);
 void native32_input_key(int dik, int down);
+
+/* A look at every Windows -> guest call (a window procedure, a hook, ...):
+ * in, at the guest stack's copy of its arguments before it runs; out, at
+ * them and its result after. A filter may change both. */
+extern void (*native32_cb_in)(uint32_t* args);
+extern void (*native32_cb_out)(uint32_t* args, uint32_t* eax);
 
 /* Diagnostics: set before running. */
 extern int native32_trace_native;     /* one line per native call */
@@ -239,5 +279,76 @@ int native32_attach(uint32_t base);
 int native32_attach_imports(uint32_t base);
 native32_module_t* native32_module_by_name(const char* path);
 native32_module_t* native32_module_by_base(uint32_t base);
+
+/* ---- syscall32.c: a lifted Windows NT userland on the host's kernel ------
+ * The guest's own ntdll (and kernel32 ... on it) is lifted like any module;
+ * its system call gate (int 2Eh, lifted to recomp_syscall) is the only
+ * boundary. The service numbers are the guest ntdll's own, read from its
+ * NtXxx export stubs (mov eax, N; ...; int 2Eh; ret 4*argc), so the table
+ * needs no symbols; a backend maps each service by NAME to the host (on
+ * Windows: the host ntdll's export of that name, with per-service fixups).
+ *
+ *   native32_modules_map(...)        every guest module, NOT bound: the
+ *                                    guest's own loader snaps the imports
+ *   native32_nt_syscalls(ntdll)
+ *   native32_nt_boot(...)            the kernel's part of process creation,
+ *                                    then the guest ntdll's LdrInitializeThunk
+ *                                    (heap, NLS, loader lists, imports, DllMains)
+ *   native32_call_guest(entry)
+ *
+ * The kernel's part: a PEB and process parameters, the NLS tables, image
+ * sections (a lifted module's view is its mapping; a host DLL is a proxy
+ * image of its exports; anything else is refused, and so is process
+ * creation: no original binary runs natively), \KnownDlls hidden, and csrss
+ * over its LPC port (csr32.c). NATIVE32_SYSCALLS=1 traces every call. */
+extern uint32_t native32_guest_peb;
+extern int native32_guest_loaded;
+int native32_nt_syscalls(uint32_t ntdll_base);
+typedef uint32_t (*native32_syscall_fn)(uint32_t* args);
+void native32_nt_override(const char* name, native32_syscall_fn fn);
+uint32_t native32_nt_forward(const char* name, uint32_t* args);
+/* dll_path: the loader's search path (the guest modules' directory first,
+ * then the host's system directory for proxies). csd: the service pack, as
+ * PEB's OSCSDVersion (0x0400 for SP4). Returns 0 on failure. */
+int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, const wchar_t* cmdline,
+                     const wchar_t* dll_path, const char* nls_dir, uint16_t csd);
+/* win32k (services 0x1000..): numbers and argument counts from the guest's
+ * own user32/gdi32 stubs, names from a "0xNNNN Name" file. Unanswered
+ * services are logged and return 0; a host answers by name. */
+int native32_nt_win32k(const uint32_t* bases, int nbases, const char* names_file);
+void native32_nt_win32k_override(const char* name, native32_syscall_fn fn);
+/* Called before every win32k service, as win32k flushes GDI's TEB batch on entry. */
+extern void (*native32_win32k_pre)(void);
+/* A user-mode callback, as win32k makes one (KeUserModeCallback): the guest
+ * ntdll's KiUserCallbackDispatcher runs KernelCallbackTable[api](in, len);
+ * returns its status, and the NtCallbackReturn output. */
+uint32_t native32_nt_callback(uint32_t api, uint32_t in, uint32_t len, uint32_t* out, uint32_t* outlen);
+/* A host function in place of a host DLL's export in its proxy image (same
+ * signature): a host notes what the guest gets from the host's DLLs. */
+void native32_nt_proxy_hook(const char* name, void* fn);
+/* w32kgdi.c: GDI's shared state for a lifted gdi32 on host GDI (see there). */
+void native32_gdi_install(void);
+int native32_gdi_start(uint32_t gdi32_base);   /* GdiDllInitialize, when user32 is the host's */
+/* w32kuser.c: USER's half, for a lifted user32 (with w32kgdi). */
+void native32_user_install(void);
+uint8_t* native32_user_wnd(void* hwnd);   /* the Windows 2000 WND user32 sees for a host window */
+extern uint8_t* native32_user_psi;   /* csr32.c: SERVERINFO, Windows 2000 layout */
+extern uint8_t* native32_user_ahe;   /* csr32.c: the USER handle table */
+extern uint8_t* native32_user_disp;  /* csr32.c: DISPLAYINFO */
+uint32_t native32_gdi_handle(uint32_t host_handle);   /* -> the guest's handle */
+uint32_t native32_gdi_rgn(uint32_t guest_handle);      /* a region's host handle, its RGNATTR applied */
+uint32_t native32_gdi_host(uint32_t guest_handle);     /* -> the host's, 0 if none */
+uint8_t* native32_gdi_attr(uint32_t hdc);
+/* a guest DC as the host's, its attributes applied and the TEB batch flushed (void*: an HDC) */
+void* native32_gdi_dc(uint32_t hdc);
+/* A named section the guest opens that a server process of its own OS would
+ * have created (csrss's \NLS\NlsSection* for kernel32): NtOpenSection on
+ * that name returns a read-only section of the file. */
+void native32_nt_section_file(const wchar_t* name, const wchar_t* file);
+/* csr32.c: csrss for the guest, at its LPC port. A handler for an api
+ * ((server << 16) | api) gets the message's data (msg + 0x28) and capture
+ * buffer and returns the status; unanswered apis are logged and succeed. */
+typedef uint32_t (*native32_csr_api_fn)(uint32_t data, uint32_t capture);
+void native32_csr_api(uint32_t number, native32_csr_api_fn fn);
 
 #endif
