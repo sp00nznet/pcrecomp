@@ -55,8 +55,11 @@ static uint32_t vwin32_crst_create(const uint32_t* a) {
 /* VMM's Win32 memory services (DDK _PageReserve/_PageCommit/_PageDecommit),
  * in pages. page: a page number, or PR_PRIVATE 0x80000400 / PR_SHARED
  * 0x80060000 / PR_SYSTEM 0x80080000 for "anywhere in that arena".
- * ponytail: every arena is "anywhere" in the host; place PR_SHARED above 2 GB
- * if kernel32 turns out to test addresses for sharedness. */
+ * PR_SHARED goes in Win9x's shared arena (80000000-BFFFFFFF): kernel32 tests
+ * sharedness by address (HeapDestroy, 0xBFF88D3C: a heap below 7FFFFFFF is
+ * unlinked from the process's heap list, and comctl32's HEAP_SHARED heap is in
+ * none: the walk ran off the end into [0+48h] and spun at calc's exit).
+ * ponytail: PR_PRIVATE and PR_SYSTEM stay "anywhere". */
 #define PR_ANY(p) (((p) & 0xFFF00000u) == 0x80000000u)
 /* Win9x commits a reserved page on first touch (a thread's stack grows that
  * way: kernel32 commits its top 2 pages and the program probes below). A
@@ -132,13 +135,20 @@ static uint32_t vwin32_virtual_query(const uint32_t* a) {
 static uint32_t vwin32_in_context(const uint32_t* a) { return a[0]; }
 static uint32_t vmm_page_reserve(const uint32_t* a) {
     void* want = PR_ANY(a[0]) ? NULL : (void*)(uintptr_t)(a[0] << 12);
-    void* p = VirtualAlloc(want, a[1] << 12, MEM_RESERVE, PAGE_READWRITE);
+    void* p = NULL;
+    MEMORY_BASIC_INFORMATION mb;
+    if (a[0] == 0x80060000u)   /* PR_SHARED: the first free 64 KB-aligned hole in 80000000-BFFFFFFF */
+        for (uintptr_t at = 0x80000000u; !p && at < 0xC0000000u && VirtualQuery((void*)at, &mb, sizeof mb); at = (uintptr_t)mb.BaseAddress + mb.RegionSize) {
+            uintptr_t lo = ((uintptr_t)mb.BaseAddress + 0xFFFF) & ~(uintptr_t)0xFFFF;
+            if (mb.State == MEM_FREE && lo + ((uintptr_t)a[1] << 12) <= (uintptr_t)mb.BaseAddress + mb.RegionSize && lo + ((uintptr_t)a[1] << 12) <= 0xC0000000u)
+                p = VirtualAlloc((void*)lo, a[1] << 12, MEM_RESERVE, PAGE_READWRITE);
+        }
+    if (!p) p = VirtualAlloc(want, a[1] << 12, MEM_RESERVE, PAGE_READWRITE);
     if (p) {
         if (!g_nresv) AddVectoredExceptionHandler(1, resv_fault);
         LONG i = InterlockedIncrement(&g_nresv) - 1;
         if (i < 4096) { g_resv[i].base = (uintptr_t)p; g_resv[i].size = (uintptr_t)a[1] << 12; } else g_nresv = 4096;
     }
-    MEMORY_BASIC_INFORMATION mb;
     /* kernel32's loader reserving a module at its own base, where native32
      * already holds that image (the lifted code is for that address): the
      * region is the guest's already, and the pager fills it with the same
@@ -774,11 +784,11 @@ static void cur_task(void) {
 }
 
 static uint32_t vwin32_thread_done(const uint32_t* a);
-static DWORD w9x_wait(HANDLE h, DWORD ms) {
+static DWORD w9x_wait_(HANDLE h, DWORD ms, int park) {
     uint16_t sds = g_seg_ds, ses = g_seg_es, sfs = g_seg_fs, sgs = g_seg_gs;
     uint32_t bds = g_ds_base, bes = g_es_base, bgs = g_gs_base;
     uint32_t cur[3] = { g_cur[0], g_cur[1], g_cur[2] };
-    if (t_r0) SetEvent((HANDLE)(uintptr_t)MEM32(t_r0 + R0T_PARKED));
+    if (t_r0 && park) SetEvent((HANDLE)(uintptr_t)MEM32(t_r0 + R0T_PARKED));
     DWORD rc = native32_wait(h, ms);
     g_seg_ds = sds; g_seg_es = ses; g_seg_fs = sfs; g_seg_gs = sgs;
     g_ds_base = bds; g_es_base = bes; g_gs_base = bgs;
@@ -799,8 +809,20 @@ static DWORD w9x_wait(HANDLE h, DWORD ms) {
     return rc;
 }
 
+static DWORD w9x_wait(HANDLE h, DWORD ms) { return w9x_wait_(h, ms, 1); }
+
 /* A blocking wait from 16-bit code (VWIN32_EventWait): the machine is given up meanwhile. */
 uint32_t native32_w9x_wait(void* h, uint32_t ms) { return w9x_wait((HANDLE)h, ms); }
+
+/* KERNEL.447 (a Win32 thread's PeekMessage found nothing: Win98 lets the Win16
+ * lock go for a moment there). The machine is that lock, so it is handed over
+ * at any call depth for 1 ms; the thread is not parked (it has not blocked).
+ * USER's modal loops (caption buttons, move, size) poll this way. */
+void native32_w9x_yield(void) {
+    static HANDLE never;
+    if (!never) never = CreateEventA(NULL, TRUE, FALSE, NULL);
+    w9x_wait_(never, 1, 0);
+}
 
 /* Whichever guest thread takes the machine (a back-edge hand-over as much as
  * a wait coming back) is VWIN32's current one. */
@@ -1158,7 +1180,7 @@ static uint32_t vcond_read(const uint32_t* a) {
 static uint32_t vwin32_crst_wait(const uint32_t* a) {
     uint32_t r0 = t_r0 ? t_r0 : g_boot_r0;
     MEM32(r0 + R0T_CRST) = a[0];
-    if (g_trace > 0) fprintf(stderr, "[vxd] thread %08X waits for crst %08X (owner %08X)\n", g_cur[0], a[0], MEM32(a[0] + 8));
+    if (g_trace > 0) fprintf(stderr, "[vxd] thread %08X waits for crst %08X (owner %08X, count %d)\n", g_cur[0], a[0], MEM32(a[0] + 8), (int32_t)MEM32(a[0] + 0x10));
     while (MEM32(r0 + R0T_CRST)) w9x_wait(thread_wake(), INFINITE);
     return 0;
 }
@@ -1277,9 +1299,9 @@ static uint32_t vwin32_thread_done(const uint32_t* a) {
         uint32_t m = MEM32(0xBFFC9470u);
         if (m && MEM32(m + 8) == MEM32(r0 + R0T_TDBX)) {
             uint32_t n = MEM32(m + 4);
-            MEM32(m + 4) = 0; MEM32(m + 8) = 0; MEM32(m + 0x10) -= n;
-            if (g_trace > 0) fprintf(stderr, "[vxd] thread %08X ended holding the Win16Mutex (%u): released\n", g_cur[0], n);
-            if ((int32_t)MEM32(m + 0x10) >= 0) vwin32_crst_wake(&m);
+            MEM32(m + 4) = 0; MEM32(m + 8) = 0; MEM32(m + 0x10) += n;   /* an enter decrements (0xBFF741CA, KRNL386 1:7D85): 1 is free */
+            if (g_trace > 0) fprintf(stderr, "[vxd] thread %08X ended holding the Win16Mutex (%u): released (count %d)\n", g_cur[0], n, (int32_t)MEM32(m + 0x10));
+            if ((int32_t)MEM32(m + 0x10) <= 0) vwin32_crst_wake(&m);   /* still below 1: someone waits */
         }
     }
     if (MEM32(r0 + R0T_PARKED)) SetEvent((HANDLE)(uintptr_t)MEM32(r0 + R0T_PARKED));

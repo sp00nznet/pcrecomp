@@ -902,7 +902,18 @@ void w16_raise(CPU *c, int n, uint16_t cs, uint16_t ip) {
  * handler's offset goes in a saved-register slot, 8624 `ret`s into it): run
  * that continuation in the callee's segment, until the far return is popped. */
 __declspec(thread) uint16_t g_w16_callseg;
+/* KERNEL.447 (KRNL386 1:805D): USER's PeekMessage calls it for a Win32 queue that
+ * had nothing (seg 3 0D31); Win98 lets the Win16 lock go there. The machine is
+ * that lock, so it is handed over (native32_w9x_yield), at any depth: USER's
+ * modal loops (caption buttons, move, size, menus) poll from inside a window
+ * procedure, and the input thread must get in to post the button release.
+ * ponytail: KRNL386's lifted symbol; a build without it links the stub below. */
+void seg001_805D(CPU *);
+void w16_no_447(CPU *c) { (void)c; }
+#pragma comment(linker, "/alternatename:_seg001_805D=_w16_no_447")
+void native32_w9x_yield(void);
 void w16_farcall(CPU *c, void (*f)(CPU *)) {
+    if (f == seg001_805D && f != w16_no_447) native32_w9x_yield();
     w16_ff fr = { g_ff, c->ss, c->sp };
     uint16_t seg = g_w16_callseg; g_w16_callseg = 0;
     g_ff = &fr;
