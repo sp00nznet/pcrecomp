@@ -471,7 +471,7 @@ static void sys_fpu_save(CPU *c) { ret_far(c, 4); }
  * MOUSE.1 Inquire(lpMOUSEINFO): present, absolute, 2 buttons, 100 Hz; 2 Enable(lpEventProc), 3 Disable.
  * SYSTEM.1 InquireSystem(wReq, wDrive) dx:ax; 2 CreateSystemTimer(rate, lpProc) -> 1;
  * 3 KillSystemTimer(h); 4/5 Enable/DisableSystemTimers; 6 GetSystemMSecCount -> dx:ax.
- * ponytail: no input events and no timer callbacks yet (the procs are kept nowhere). */
+ * ponytail: no timer callbacks yet; the mouse proc drives W16_INPUT (below), the keyboard one is kept nowhere. */
 static void kb_inquire(CPU *c) {
     uint8_t *k = (uint8_t *)farptr(argfar(c, 0));
     k[0] = 0xFF; k[1] = 0xFE; k[2] = 0xFF; k[3] = 0xFE; put16((char *)k, 4, 0); put16((char *)k, 6, 12);
@@ -486,7 +486,52 @@ static void ms_inquire(CPU *c) {
     put16(m, 10, FB_W); put16(m, 12, FB_H);
     c->ax = 14; ret_far(c, 4);
 }
-static void ms_enable(CPU *c) { c->ax = 1; ret_far(c, 4); }
+/* Scripted input, W16_INPUT="click X,Y@T;click X,Y@T;...": at T seconds a left
+ * press and release at screen X,Y, through the event proc USER gave MOUSE.Enable,
+ * the way MOUSE.DRV's interrupt handler calls it: ax = status (8000h absolute,
+ * 1 moved, 2 left down, 4 left up), bx/cx = x/y scaled to 0..FFFFh, dx = buttons.
+ * A host thread takes the machine for each call, as an interrupt would.
+ * ponytail: clicks only, on a private 8 KB 16-bit stack; keys (keyboard_event
+ * needs KEYBOARD's ToAscii) when a script wants them. */
+static uint32_t g_ms_proc;
+int w16_call(CPU *r);
+void mach_enter(void);
+void mach_leave(void);
+uint16_t native32_w9x_alloc_sel(uint32_t base, uint32_t limit);
+static DWORD WINAPI input_thread(LPVOID unused) {
+    (void)unused;
+    DWORD t0 = GetTickCount();
+    uint16_t ss = native32_w9x_alloc_sel((uint32_t)(uintptr_t)VirtualAlloc(NULL, 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE), 0x1FFF);
+    for (const char *s = getenv("W16_INPUT"); s && *s; s = strchr(s, ';') ? strchr(s, ';') + 1 : "") {
+        int x, y; double t;
+        if (sscanf(s, " click %d,%d@%lf", &x, &y, &t) != 3) { fprintf(stderr, "[drv] W16_INPUT: cannot read \"%s\"\n", s); break; }
+        while (GetTickCount() - t0 < (DWORD)(t * 1000)) Sleep(20);
+        for (int up = 0; up < 2; up++) {
+            mach_enter();
+            CPU r; cpu_init(&r);
+            r.ax = (uint16_t)(0x8001 | (up ? 4 : 2)); r.bx = (uint16_t)(x * 0xFFFF / (FB_W - 1)); r.cx = (uint16_t)(y * 0xFFFF / (FB_H - 1)); r.dx = 2;
+            r.cs = (uint16_t)(g_ms_proc >> 16); r.ip = (uint16_t)g_ms_proc; r.ss = r.ds = r.es = ss; r.sp = 0x1FF0;
+            fprintf(stderr, "[drv] mouse event %04X at %d,%d to %04X:%04X\n", r.ax, x, y, r.cs, r.ip);
+            w16_call(&r);
+            mach_leave();
+            Sleep(60);
+        }
+    }
+    return 0;
+}
+static void ms_enable(CPU *c) {
+    g_ms_proc = argfar(c, 0);
+    if (getenv("W16_INPUT")) fprintf(stderr, "[drv] MOUSE.Enable %08X\n", g_ms_proc);
+    if (g_ms_proc && getenv("W16_INPUT")) CloseHandle(CreateThread(NULL, 0, input_thread, NULL, 0, NULL));
+    c->ax = 1; ret_far(c, 4);
+}
+/* USER imports MOUSE statically, so its lifted calls name these (not the
+ * stand-in module's segment, which KRNL386-loaded callers reach).
+ * ponytail: MOUSE only; USER's static KEYBOARD and SYSTEM imports still take
+ * the generated "unimplemented" stubs (keys and timers have no consumer yet). */
+void MOUSE_Ord1(CPU *c) { ms_inquire(c); }
+void MOUSE_Ord2(CPU *c) { ms_enable(c); }
+void MOUSE_Ord3(CPU *c) { drv_disable(c); }
 static void sys_inquire(CPU *c) {
     uint16_t req = arg16(c, 1);
     c->ax = 0; c->dx = 0;
