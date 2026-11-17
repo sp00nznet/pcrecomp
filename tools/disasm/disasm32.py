@@ -275,16 +275,16 @@ def table_entries(read, table, is_code, limit=256):
 # `jmp dword ptr [idx*4 + table]`; with a base register the disp is not the table
 # `jmp [reg*4 + table]`, or a byte-offset index into a cs: table (user32
 # 0xBFF55BDA, hand-written: `jmp cs:[edx + 0xBFF55BE1]`, capstone prints
-# the displacement negative).
-_TABLE_JMP = re.compile(r"dword ptr (?:\[\w+\*4 \+ (0x[0-9a-f]+)\]|cs:\[\w+ ([+-]) (0x[0-9a-f]+)\])$")
+# the displacement negative; so it does for a table above 2 GB, comctl32 0xBFE9B664
+# `jmp [eax*4 - 0x401644B9]`).
+_TABLE_JMP = re.compile(r"dword ptr (?:\[\w+\*4 ([+-]) (0x[0-9a-f]+)\]|cs:\[\w+ ([+-]) (0x[0-9a-f]+)\])$")
 
 
 def table_va(m):
     """The table address a _TABLE_JMP match names."""
-    if m.group(1):
-        return int(m.group(1), 16)
-    v = int(m.group(3), 16)
-    return (-v if m.group(2) == '-' else v) & 0xFFFFFFFF
+    sign, v = (m.group(1), m.group(2)) if m.group(2) else (m.group(3), m.group(4))
+    v = int(v, 16)
+    return (-v if sign == '-' else v) & 0xFFFFFFFF
 
 
 # Bytes decoded per linear scan inside a function. Straight-line code longer

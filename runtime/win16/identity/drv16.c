@@ -14,11 +14,12 @@
 #include "cpu.h"
 
 uint32_t recomp_sel_base(uint32_t selector);
+uint8_t *native32_w9x_desc(uint16_t sel);
 void w16_drv_stop(const char *what, unsigned a, unsigned b);
 
 #define E_LIBENTRY 0x08     /* the NE's cs:ip */
 #define E_FIRST    0x10     /* entry n (ordinal) at E_FIRST + 2 * (n - 1) */
-#define NORD       140      /* ordinals 1..NORD exported (KEYBOARD goes to 136) */
+#define NORD       410      /* ordinals 1..NORD exported (KEYBOARD goes to 136, DIBENG to 408) */
 
 typedef void (*drv_fn)(CPU *c);
 typedef struct { const char *name; drv_fn fn[NORD + 1]; } drv_t;
@@ -244,9 +245,35 @@ static void disp_realize(CPU *c) {
 /* A destination: the screen's PDEVICE (bmType nonzero) or a GDI memory bitmap (a PBITMAP:
  * type, width, height, widthbytes, planes, bitspixel, bits far ptr at 0Ah). 1 and 16 bpp.
  * ponytail: no huge (>64K, segmented) bitmaps. */
-typedef struct { uint8_t *bits; int w, h, pitch, bpp; } surf_t;
+typedef struct { uint8_t *bits; int w, h, pitch, bpp; const uint16_t *pal; } surf_t;   /* pal: a palettized DIB's colors (5-6-5) */
+/* A DIB section's PDEVICE (DIBENG.CreateDIBPDevice, below): the DIB engine's DIBENGINE
+ * header, deType 'RP', deDeltaScan (signed) at 0Eh, deBits 16:32 at 16h (offset) and 1Ah
+ * (selector): the buffer's start (GDI writes its own there after CreateDIBPDevice), so a
+ * negative deDeltaScan (bottom-up) starts at its last row. 1/4/8 bpp through the color
+ * table (a host copy, found by the PDEVICE's address), 16 (5-5-5), 24 and 32 bpp. */
+static struct { uint32_t dev; uint16_t *pal; } g_dibpal[256];   /* ponytail: 256 DIB sections, never freed */
+static uint16_t *dib_pal(uint32_t dev) {
+    for (int i = 0; i < 256 && g_dibpal[i].dev; i++) if (g_dibpal[i].dev == dev) return g_dibpal[i].pal;
+    return NULL;
+}
+#define DE_TYPE 0x5250
+uint32_t recomp_sel_base(uint32_t selector);
 static int surf_of(uint32_t lp, surf_t *s) {
     const uint8_t *b = (const uint8_t *)farptr(lp);
+    if (*(const uint16_t *)b == DE_TYPE) {
+        s->w = *(const int16_t *)(b + 2); s->h = *(const int16_t *)(b + 4); s->pitch = *(const int32_t *)(b + 0x0E);
+        s->bpp = b[9] == 16 ? 15 : b[9];   /* 15: a DIB's 5-5-5 */
+        {   /* GDI's own bits are flat (the 32-bit caller writes them): an offset past 64 KB is
+             * the address, whatever the selector word holds. ponytail: read from one case */
+            uint32_t off = *(const uint32_t *)(b + 0x16);
+            s->bits = (uint8_t *)(uintptr_t)(off > 0xFFFF ? off : recomp_sel_base(*(const uint16_t *)(b + 0x1A)) + off);
+        }
+        if (s->pitch < 0) s->bits -= s->pitch * (s->h - 1);
+        s->pal = dib_pal((uint32_t)(uintptr_t)b);
+        if (getenv("W16_DIBDBG")) fprintf(stderr, "[dib] surf %08X: %dx%d bpp %d bits %04X:%08X delta %d own %08X base %08X lim %08X\n", lp, s->w, s->h, s->bpp, *(const uint16_t *)(b + 0x1A), *(const uint32_t *)(b + 0x16), s->pitch, *(const uint32_t *)(b + 0x2C), recomp_sel_base(*(const uint16_t *)(b + 0x1A)), *(const uint32_t *)native32_w9x_desc(*(const uint16_t *)(b + 0x1A)));
+        return s->bits && (s->bpp == 15 || s->bpp == 24 || s->bpp == 32 || (s->pal && (s->bpp == 1 || s->bpp == 4 || s->bpp == 8)));
+    }
+    s->pal = NULL;
     if (*(const uint16_t *)b) { s->bits = (uint8_t *)g_fb; s->w = FB_W; s->h = FB_H; s->pitch = FB_W * 2; s->bpp = 16; return 1; }
     s->w = *(const int16_t *)(b + 2); s->h = *(const int16_t *)(b + 4); s->pitch = *(const uint16_t *)(b + 6);
     s->bpp = b[9] * b[8]; s->bits = (uint8_t *)farptr(*(const uint32_t *)(b + 10));
@@ -256,12 +283,41 @@ static int surf_of(uint32_t lp, surf_t *s) {
 static void surf_put(surf_t *s, int x, int y, uint16_t col) {
     if (x < 0 || y < 0 || x >= s->w || y >= s->h) return;
     if (s->bpp == 16) { *(uint16_t *)(s->bits + y * s->pitch + x * 2) = col; return; }
+    if (s->pal) {   /* a palettized DIB: the nearest entry. ponytail: a linear search per pixel */
+        uint32_t c = rgb_of(col), best = 0, bd = 0xFFFFFFFFu;
+        for (uint32_t i = 0; i < (1u << s->bpp); i++) {
+            uint32_t e = rgb_of(s->pal[i]);
+            int dr = (int)(c & 0xFF) - (int)(e & 0xFF), dg = (int)(c >> 8 & 0xFF) - (int)(e >> 8 & 0xFF), db = (int)(c >> 16 & 0xFF) - (int)(e >> 16 & 0xFF);
+            uint32_t d = (uint32_t)(dr * dr + dg * dg + db * db);
+            if (d < bd) { bd = d; best = i; if (!d) break; }
+        }
+        uint8_t *q = s->bits + y * s->pitch + (x * s->bpp >> 3);
+        int sh = 8 - s->bpp - (x * s->bpp & 7);
+        *q = (uint8_t)((*q & ~(((1 << s->bpp) - 1) << sh)) | best << sh);
+        return;
+    }
+    if (s->bpp > 16) {   /* a DIB section: 5-6-5 to 5-5-5 or B,G,R */
+        uint32_t c = rgb_of(col);
+        uint8_t *q = s->bits + y * s->pitch + x * (s->bpp == 15 ? 2 : s->bpp / 8);
+        if (s->bpp == 15) *(uint16_t *)q = (uint16_t)((c & 0xF8) << 7 | (c >> 6 & 0x3E0) | (c >> 19 & 0x1F));
+        else { q[0] = (uint8_t)(c >> 16); q[1] = (uint8_t)(c >> 8); q[2] = (uint8_t)c; if (s->bpp == 32) q[3] = 0; }
+        return;
+    }
     uint8_t *p = s->bits + y * s->pitch + (x >> 3), m = (uint8_t)(0x80 >> (x & 7));
     if (col == 0xFFFF) *p |= m; else *p &= (uint8_t)~m;
 }
 static uint16_t surf_get(surf_t *s, int x, int y) {
     if (x < 0 || y < 0 || x >= s->w || y >= s->h) return 0;
     if (s->bpp == 16) return *(uint16_t *)(s->bits + y * s->pitch + x * 2);
+    if (s->pal) {
+        const uint8_t *q = s->bits + y * s->pitch + (x * s->bpp >> 3);
+        return s->pal[*q >> (8 - s->bpp - (x * s->bpp & 7)) & ((1 << s->bpp) - 1)];
+    }
+    if (s->bpp > 16) {
+        const uint8_t *q = s->bits + y * s->pitch + x * (s->bpp == 15 ? 2 : s->bpp / 8);
+        if (s->bpp == 15) { uint16_t v = *(const uint16_t *)q; return rgb565((uint32_t)(v >> 7 & 0xF8) | (uint32_t)(v >> 2 & 0xF8) << 8 | (uint32_t)(v << 3 & 0xF8) << 16); }
+        return rgb565((uint32_t)q[2] | (uint32_t)q[1] << 8 | (uint32_t)q[0] << 16);
+    }
     return (s->bits[y * s->pitch + (x >> 3)] & (0x80 >> (x & 7))) ? 0xFFFF : 0;
 }
 typedef struct { int16_t l, t, r, b; } rect16;
@@ -765,19 +821,86 @@ static void snd_zero(CPU *c) { c->ax = 0; ret_far(c, 0); }
 static void snd_note(CPU *c) { c->ax = 0; ret_far(c, 8); }
 static void snd_accent(CPU *c) { c->ax = 0; ret_far(c, 10); }
 
+/* DIBENG.300 CreateDIBPDevice(lpbi, lpDevice, lpBits, wFlags) (GDI.EXE's CreateDIBSection,
+ * comctl32's image lists, 4 bpp by default): the DIBENGINE header. No lpBits: the bits are
+ * ours, flat memory under a flat selector (GDI hands deBits to the 32-bit caller).
+ * ponytail: the answer is the header's size; the bits and the color table copy are never
+ * freed, and a later SetDIBColorTable is not seen. */
+uint16_t native32_w9x_alloc_sel(uint32_t base, uint32_t limit);
+uint8_t *native32_w9x_desc(uint16_t sel);
+static void dib_createpdevice(CPU *c) {
+    uint16_t flags = arg16(c, 0);
+    uint32_t bits = argfar(c, 1), dev = argfar(c, 3), lpbi = argfar(c, 5);
+    const uint8_t *bi = (const uint8_t *)farptr(lpbi);
+    int32_t w = *(const int32_t *)(bi + 4), h = *(const int32_t *)(bi + 8);
+    uint16_t bpp = *(const uint16_t *)(bi + 14);
+    if (getenv("W16_TRACE")) fprintf(stderr, "[drv] DIBENG.CreateDIBPDevice(bi %08X %dx%d %u bpp, dev %08X, bits %08X, flags %04X)\n", lpbi, w, h, bpp, dev, bits, flags);
+    int32_t stride = ((w * bpp + 31) / 32) * 4, ah = h < 0 ? -h : h;
+    if (dev) {
+        static uint16_t flat;
+        uint32_t own = 0;
+        if (!bits) {
+            if (!flat) { flat = native32_w9x_alloc_sel(0, 0xFFFFF); native32_w9x_desc(flat)[6] |= 0x80; }   /* 4 GB, page granular */
+            own = (uint32_t)(uintptr_t)VirtualAlloc(NULL, (SIZE_T)stride * ah + 16, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            bits = (uint32_t)flat << 16;   /* the offset is 32-bit: own, below */
+        }
+        uint8_t *d = (uint8_t *)farptr(dev);
+        memset(d, 0, 0x40);
+        *(uint16_t *)d = DE_TYPE; *(int16_t *)(d + 2) = (int16_t)w; *(int16_t *)(d + 4) = (int16_t)ah;
+        *(uint16_t *)(d + 6) = (uint16_t)stride; d[8] = 1; d[9] = (uint8_t)bpp;
+        *(int32_t *)(d + 0x0E) = h < 0 ? stride : -stride;   /* bottom-up unless the height is negative */
+        *(uint32_t *)(d + 0x12) = dev;                     /* delpPDevice: itself */
+        *(uint32_t *)(d + 0x16) = own ? own : (bits & 0xFFFF);
+        *(uint16_t *)(d + 0x1A) = (uint16_t)(bits >> 16);
+        if (bpp <= 8) {   /* the color table, as 5-6-5 */
+            uint32_t n = *(const uint32_t *)(bi + 32), hs = *(const uint32_t *)bi;
+            if (!n || n > (1u << bpp)) n = 1u << bpp;
+            uint16_t *pal = (uint16_t *)calloc(256, sizeof *pal);
+            const uint8_t *q = bi + hs;
+            for (uint32_t i = 0; i < n; i++) pal[i] = rgb565((uint32_t)q[4 * i + 2] | (uint32_t)q[4 * i + 1] << 8 | (uint32_t)q[4 * i] << 16);
+            int i = 0;
+            while (i < 255 && g_dibpal[i].dev && g_dibpal[i].dev != (uint32_t)(uintptr_t)d) i++;
+            g_dibpal[i].dev = (uint32_t)(uintptr_t)d; g_dibpal[i].pal = pal;
+        }
+    }
+    c->ax = 0x40; c->dx = 0;
+    ret_far(c, 14);
+}
+
+/* DIBENG.30 BitmapBits(lpDevice, fFlags, dwCount, lpBits): 2 (DBB_GET) copies the bitmap's
+ * bytes out, 1 (DBB_SET) in, as they lie (a DIB's own row order). ponytail: no conversion,
+ * the count clipped to the bits. */
+static void dib_bitmapbits(CPU *c) {
+    uint32_t lpbits = argfar(c, 0), count = argfar(c, 2), flags = argfar(c, 4), dev = argfar(c, 6);
+    surf_t s;
+    uint32_t done = 0;
+    if (surf_of(dev, &s) && lpbits) {
+        int stride = s.pitch < 0 ? -s.pitch : s.pitch;
+        uint8_t *start = s.pitch < 0 ? s.bits + s.pitch * (s.h - 1) : s.bits;
+        done = count < (uint32_t)(stride * s.h) ? count : (uint32_t)(stride * s.h);
+        if (flags & 2) memcpy(farptr(lpbits), start, done); else if (flags & 1) memcpy(start, farptr(lpbits), done); else done = 0;
+    }
+    if (getenv("W16_TRACE")) fprintf(stderr, "[drv] DIBENG.BitmapBits(%08X, flags %X, %u) -> %u\n", dev, flags, count, done);
+    c->ax = (uint16_t)done; c->dx = (uint16_t)(done >> 16);
+    ret_far(c, 16);
+}
+#define DISPLAY_FNS [1] = disp_bitblt, [8] = disp_output, [9] = disp_pixel, [2] = disp_colorinfo, [3] = disp_control, [4] = disp_disable, [5] = disp_enable, [10] = disp_realize, [14] = disp_exttextout, [15] = disp_charwidth, [19] = disp_dibbits, [21] = disp_dibtodev
 static drv_t g_drv[] = {
     { "SYSTEM",   { [1] = sys_inquire, [2] = sys_createtimer, [3] = sys_killtimer, [4] = sys_timers, [5] = sys_timers, [6] = sys_msec, [7] = sys_fpu_size, [8] = sys_fpu_save, [9] = sys_fpu_save } },
     { "KEYBOARD", { [5] = kb_ansi_to_oem, [6] = kb_oem_to_ansi, [1] = kb_inquire, [2] = kb_enable, [3] = drv_disable, [7] = kb_setspeed, [4] = kb_toascii, [131] = kb_mapvk, [132] = kb_codepage, [134] = kb_ansi_to_oem_buf, [135] = kb_oem_to_ansi_buf, [136] = kb_sysreq } },
     { "MOUSE",    { [1] = ms_inquire, [2] = ms_enable, [3] = drv_disable } },
-    { "DISPLAY",  { [1] = disp_bitblt, [8] = disp_output, [9] = disp_pixel, [2] = disp_colorinfo, [3] = disp_control, [4] = disp_disable, [4] = disp_disable, [5] = disp_enable, [10] = disp_realize, [14] = disp_exttextout, [15] = disp_charwidth, [19] = disp_dibbits, [21] = disp_dibtodev,
+    { "DISPLAY",  { DISPLAY_FNS,
                     [101] = disp_inquire, [102] = disp_setcursor, [103] = disp_movecursor, [104] = disp_checkcursor } },
     { "COMM",     { 0 } },   /* comm.drv=: no ports */
+    /* GDI.EXE's DIB sections: the DIB engine's entries are the display driver's ordinals,
+     * drawing into a DIBENGINE surface (surf_of) */
+    { "DIBENG",   { DISPLAY_FNS, [30] = dib_bitmapbits, [300] = dib_createpdevice } },
     { "SOUND",    { [1] = snd_open, [2] = snd_zero, [4] = snd_note, [5] = snd_accent, [9] = snd_zero, [10] = snd_zero } },
 };
 #define NDRV (int)(sizeof g_drv / sizeof *g_drv)
 
 /* ---- the NE file ---- */
-static uint8_t g_ne[0x800];
+static uint8_t g_ne[0x1000];
 static size_t ne_build(int idx) {
     const char *name = g_drv[idx].name;
     uint8_t *f = g_ne;
@@ -807,8 +930,11 @@ static size_t ne_build(int idx) {
     /* entry table: one bundle of NORD fixed entries in segment 1, exported */
     *(uint16_t *)(ne + 0x04) = (uint16_t)(p - ne);
     uint8_t *et = p;
-    *p++ = NORD; *p++ = 1;
-    for (int i = 0; i < NORD; i++) { *p++ = 1; *(uint16_t *)p = (uint16_t)(E_FIRST + 2 * i); p += 2; }
+    for (int i = 0; i < NORD; ) {   /* bundles of at most 255 */
+        int k = NORD - i < 255 ? NORD - i : 255;
+        *p++ = (uint8_t)k; *p++ = 1;
+        for (int e = 0; e < k; e++, i++) { *p++ = 1; *(uint16_t *)p = (uint16_t)(E_FIRST + 2 * i); p += 2; }
+    }
     *p++ = 0;
     *(uint16_t *)(ne + 0x06) = (uint16_t)(p - et);
     /* nonresident names: the description */
@@ -837,7 +963,7 @@ void w16_drv_write(const char *sysdir) {
     snprintf(g_fontdir, sizeof g_fontdir, "%s", sysdir);
     for (int i = 0; i < NDRV; i++) {
         char path[512];
-        snprintf(path, sizeof path, "%s\\%s.DRV", sysdir, g_drv[i].name);
+        snprintf(path, sizeof path, "%s\\%s.%s", sysdir, g_drv[i].name, strcmp(g_drv[i].name, "DIBENG") ? "DRV" : "DLL");
         size_t n = ne_build(i);
         FILE *f = fopen(path, "wb");
         if (!f) { fprintf(stderr, "[drv] cannot write %s\n", path); continue; }

@@ -164,6 +164,9 @@ static uint32_t vmm_reg_close(const uint32_t* a) { return (uint32_t)RegCloseKey(
 static uint32_t vmm_reg_delete_key(const uint32_t* a) {
     return (uint32_t)REG("RegDeleteKeyA", LONG(WINAPI*)(HKEY, LPCSTR))((HKEY)P(0), P(1));
 }
+static uint32_t vmm_reg_query_value_sub(const uint32_t* a) {   /* RegQueryValue(hkey, subkey, value, &cb): ole32 TreatAs */
+    return (uint32_t)REG("RegQueryValueA", LONG(WINAPI*)(HKEY, LPCSTR, LPSTR, PLONG))((HKEY)P(0), P(1), P(2), P(3));
+}
 static uint32_t vmm_reg_enum_key(const uint32_t* a) {
     return (uint32_t)REG("RegEnumKeyA", LONG(WINAPI*)(HKEY, DWORD, LPSTR, DWORD))((HKEY)P(0), a[1], P(2), a[3]);
 }
@@ -1784,6 +1787,7 @@ static const vxd_service_t g_services[] = {
     { 0x00010012, 3, vmm_reg_create, "VMM_RegCreateKey" },
     { 0x00010013, 1, vmm_reg_close, "VMM_RegCloseKey" },
     { 0x00010016, 2, vmm_reg_delete_key, "VMM_RegDeleteKey" },
+    { 0x00010017, 4, vmm_reg_query_value_sub, "VMM_RegQueryValue" },
     { 0x00010018, 4, vmm_reg_enum_key, "VMM_RegEnumKey" },
     { 0x00010019, 8, vmm_reg_enum_value, "VMM_RegEnumValue" },
     { 0x0001001A, 6, vmm_reg_query_value, "VMM_RegQueryValueEx" },
