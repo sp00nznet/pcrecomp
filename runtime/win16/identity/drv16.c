@@ -76,7 +76,7 @@ static void put16(char *p, int off, int v) { *(uint16_t *)(p + off) = (uint16_t)
 /* DISPLAY.5 Enable(lpDevice, style, lpDestDevType, lpOutputFile, lpData): GDI seg005_26A4 asks
  * with style 1 for GDIINFO into a 7Eh-byte block (it keeps its own words from 78h), then
  * seg005_289F with style 0 for the PDEVICE (dpDEVICEsize bytes it GlobalAllocs). */
-#define PDEV_SIZE 0x20
+#define PDEV_SIZE 0x40   /* also every DIB section's PDEVICE (GDI CreateDIBSection, seg007_0052): a DIBENGINE is 30h */
 static void disp_enable(CPU *c) {
     char *dev = farptr(argfar(c, 7));
     uint16_t style = arg16(c, 6);
@@ -263,9 +263,13 @@ static void disp_realize(CPU *c) {
  * (selector): the buffer's start (GDI writes its own there after CreateDIBPDevice), so a
  * negative deDeltaScan (bottom-up) starts at its last row. 1/4/8 bpp through the color
  * table (a host copy, found by the PDEVICE's address), 16 (5-5-5), 24 and 32 bpp. */
-static struct { uint32_t dev; uint16_t *pal; } g_dibpal[256];   /* ponytail: 256 DIB sections, never freed */
+/* Each PDEVICE address has a slot (GDI reuses the addresses): the color table as 5-6-5 and
+ * the BITMAPINFO copy deBitmapInfo points at (GDI's CreateCompatibleBitmap on a DIB-section DC,
+ * seg010_0DB3, clones it; the caller's own block is gone by then).
+ * ponytail: 256 PDEVICE addresses, one selector each, never freed */
+static struct { uint32_t dev; int npal; uint16_t sel; uint16_t pal[256]; uint8_t bi[40 + 1024]; } g_dibpal[256];
 static uint16_t *dib_pal(uint32_t dev) {
-    for (int i = 0; i < 256 && g_dibpal[i].dev; i++) if (g_dibpal[i].dev == dev) return g_dibpal[i].pal;
+    for (int i = 0; i < 256 && g_dibpal[i].dev; i++) if (g_dibpal[i].dev == dev) return g_dibpal[i].npal ? g_dibpal[i].pal : NULL;
     return NULL;
 }
 #define DE_TYPE 0x5250
@@ -282,7 +286,7 @@ static int surf_of(uint32_t lp, surf_t *s) {
         }
         if (s->pitch < 0) s->bits -= s->pitch * (s->h - 1);
         s->pal = dib_pal((uint32_t)(uintptr_t)b);
-        if (getenv("W16_DIBDBG")) fprintf(stderr, "[dib] surf %08X: %dx%d bpp %d bits %04X:%08X delta %d own %08X base %08X lim %08X\n", lp, s->w, s->h, s->bpp, *(const uint16_t *)(b + 0x1A), *(const uint32_t *)(b + 0x16), s->pitch, *(const uint32_t *)(b + 0x2C), recomp_sel_base(*(const uint16_t *)(b + 0x1A)), *(const uint32_t *)native32_w9x_desc(*(const uint16_t *)(b + 0x1A)));
+        if (getenv("W16_DIBDBG")) fprintf(stderr, "[dib] surf %08X: %dx%d bpp %d bits %04X:%08X delta %d own %08X base %08X lim %08X\n", lp, s->w, s->h, s->bpp, *(const uint16_t *)(b + 0x1A), *(const uint32_t *)(b + 0x16), s->pitch, *(const uint32_t *)(b + 0x2C), recomp_sel_base(*(const uint16_t *)(b + 0x1A)), *(const uint32_t *)native32_w9x_desc(*(const uint16_t *)(b + 0x1A)), *(const uint32_t *)(b + 0x0A), *(const uint32_t *)(b + 0x48), *(const uint32_t *)(b + 0x50), *(const uint32_t *)(b + 0x54), *(const uint32_t *)(b + 0x58));
         return s->bits && (s->bpp == 15 || s->bpp == 24 || s->bpp == 32 || (s->pal && (s->bpp == 1 || s->bpp == 4 || s->bpp == 8)));
     }
     s->pal = NULL;
@@ -437,6 +441,15 @@ static void disp_bitblt(CPU *c) {
     if (!surf_of(lpdst, &d)) { c->ax = 0; ret_far(c, 32); return; }
     if (lpsrc && ((code >> 2) ^ code) & 0x33) hs = surf_of(lpsrc, &s);   /* the rop reads S */
     uint16_t *tmp = NULL;
+    if (hs && getenv("W16_DUMPSRC")) {   /* debug: W16_DUMPSRC=WxH writes each such source surface as dumpNNN.ppm */
+        static int n; char want[32], fn[64]; snprintf(want, sizeof want, "%dx%d", s.w, s.h);
+        if (!strcmp(want, getenv("W16_DUMPSRC")) && n < 50 && (!getenv("W16_DUMPSCR") || code == 0xE2 || d.bits == (uint8_t *)g_fb)) {
+            snprintf(fn, sizeof fn, "work/s34dump/d%03d.ppm", n++);
+            FILE *f = fopen(fn, "wb");
+            if (f) { fprintf(f, "P6 %d %d 255\n", s.w, s.h); for (int y = 0; y < s.h; y++) for (int x = 0; x < s.w; x++) { uint32_t v = rgb_of(surf_get(&s, x, y)); fputc((int)(v & 255), f); fputc((int)(v >> 8 & 255), f); fputc((int)(v >> 16 & 255), f); } fclose(f); }
+            fprintf(stderr, "[drv] dumped %s (bpp %d pitch %d) for blit %d,%d<-%d,%d %dx%d rop %02X\n", fn, s.bpp, s.pitch, dx, dy, sx, sy, w, h, code);
+        }
+    }
     if (hs) {   /* the source block, as destination-format pixels */
         tmp = (uint16_t *)malloc((size_t)(w > 0 ? w : 1) * (h > 0 ? h : 1) * 2);
         for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
@@ -560,7 +573,9 @@ static void disp_checkcursor(CPU *c) { ret_far(c, 0); }
 /* DISPLAY.19 DeviceBitmapBits(lpBitmap, fGet, iStart, cScans, lpDIBits, lpBitmapInfo,
  * lpDrawMode, lpConversionInfo) (GDI seg005_5F05: Set/GetDIBits on a device bitmap):
  * scans copied. A DIB is bottom-up, BITMAPINFOHEADER then its color table; 1/4/8/16/24/32 bpp
- * (16 as 5-5-5). ponytail: BI_RGB only; Get writes 1 bpp or 24 bpp as asked, others skipped. */
+ * (16 as 5-5-5). A 4/8 bpp get from a DIB of that depth copies its indices and color table
+ * (comctl32 ImageList_Draw goes through one), else the nearest entry of the given table.
+ * ponytail: BI_RGB only. */
 static uint16_t dib_px(const uint8_t *row, int x, int bpp, const uint8_t *pal) {
     const uint8_t *q;
     switch (bpp) {
@@ -583,20 +598,45 @@ static void disp_dibbits(CPU *c) {
     int stride = ((w * bpp + 31) / 32) * 4, hh = h < 0 ? -h : h;
     uint8_t *bits = (uint8_t *)farptr(lpbits);
     surf_t s; int done = 0;
+    int same = 0;   /* a get from a palettized DIB of this depth: its indices and color table as they are */
+    if (surf_of(lpbm, &s) && get && bpp <= 8 && bpp > 1) {
+        same = s.pal && s.bpp == bpp;
+        uint8_t *q = (uint8_t *)pal;
+        if (same) for (int k = 0; k < (1 << bpp); k++) { uint32_t v = rgb_of(s.pal[k]); q[4 * k] = (uint8_t)(v >> 16); q[4 * k + 1] = (uint8_t)(v >> 8); q[4 * k + 2] = (uint8_t)v; q[4 * k + 3] = 0; }
+        if (same) *(uint32_t *)(bi + 32) = 0;
+    }
     if (surf_of(lpbm, &s))
         for (int i = 0; i < scans && start + i < hh; i++) {
             int y = h < 0 ? start + i : hh - 1 - (start + i);   /* the bitmap row this scan is */
             uint8_t *row = bits + (size_t)i * stride;
             for (int x = 0; x < w && x < s.w; x++) {
                 if (!get) { surf_put(&s, x, y, dib_px(row, x, bpp, pal)); continue; }
+                if (bpp == 4 || bpp == 8) {   /* an index: the surface's own, or the nearest in the given table */
+                    unsigned k = 0;
+                    if (same) { const uint8_t *sq = s.bits + y * s.pitch + (x * bpp >> 3); k = *sq >> (8 - bpp - (x * bpp & 7)) & ((1u << bpp) - 1); }
+                    else {
+                        uint32_t v = rgb_of(surf_get(&s, x, y)), bd = 0xFFFFFFFFu;
+                        for (int e = 0; e < ncol; e++) {
+                            int dr = (int)(v & 255) - pal[4 * e + 2], dg = (int)(v >> 8 & 255) - pal[4 * e + 1], db = (int)(v >> 16 & 255) - pal[4 * e];
+                            uint32_t dd = (uint32_t)(dr * dr + dg * dg + db * db);
+                            if (dd < bd) { bd = dd; k = (unsigned)e; }
+                        }
+                    }
+                    if (bpp == 8) row[x] = (uint8_t)k;
+                    else row[x >> 1] = (uint8_t)((x & 1) ? (row[x >> 1] & 0xF0) | k : (row[x >> 1] & 0x0F) | k << 4);
+                    continue;
+                }
                 uint32_t rgb = rgb_of(surf_get(&s, x, y));
+                if (bpp == 32) { row[4 * x] = (uint8_t)(rgb >> 16); row[4 * x + 1] = (uint8_t)(rgb >> 8); row[4 * x + 2] = (uint8_t)rgb; row[4 * x + 3] = 0; continue; }
+                if (bpp == 16) { ((uint16_t *)row)[x] = (uint16_t)((rgb & 0xF8) << 7 | (rgb >> 6 & 0x3E0) | (rgb >> 19 & 0x1F)); continue; }
                 if (bpp == 24) { row[3 * x] = (uint8_t)(rgb >> 16); row[3 * x + 1] = (uint8_t)(rgb >> 8); row[3 * x + 2] = (uint8_t)rgb; }
                 else if (bpp == 1) { uint8_t m = (uint8_t)(0x80 >> (x & 7)); if ((rgb & 0xFFFFFF) == 0xFFFFFF) row[x >> 3] |= m; else row[x >> 3] &= (uint8_t)~m; }
             }
             done++;
         }
     (void)ncol;
-    if (getenv("W16_TRACE")) fprintf(stderr, "[drv] DISPLAY.DeviceBitmapBits %s %dx%d %dbpp scans %d+%d -> %d\n", get ? "get" : "set", w, h, bpp, start, scans, done);
+    if (getenv("W16_TRACE")) fprintf(stderr, "[drv] DISPLAY.DeviceBitmapBits %s %dx%d %dbpp scans %d+%d -> %d (bi %08X bits %08X: %08X %08X, table %08X %08X same %d)\n", get ? "get" : "set", w, h, bpp, start, scans, done,
+                                         lpbi, lpbits, *(const uint32_t *)(bits + 8 * stride), *(const uint32_t *)(bits + 8 * stride + 4), *(const uint32_t *)(pal + 4), *(const uint32_t *)(pal + 36), same);
     c->ax = (uint16_t)done; ret_far(c, 26);
 }
 
@@ -848,36 +888,39 @@ static void dib_createpdevice(CPU *c) {
     const uint8_t *bi = (const uint8_t *)farptr(lpbi);
     int32_t w = *(const int32_t *)(bi + 4), h = *(const int32_t *)(bi + 8);
     uint16_t bpp = *(const uint16_t *)(bi + 14);
-    if (getenv("W16_TRACE")) fprintf(stderr, "[drv] DIBENG.CreateDIBPDevice(bi %08X %dx%d %u bpp, dev %08X, bits %08X, flags %04X)\n", lpbi, w, h, bpp, dev, bits, flags);
+    if (getenv("W16_TRACE")) fprintf(stderr, "[drv] DIBENG.CreateDIBPDevice(bi %08X %dx%d %u bpp, dev %08X, bits %08X, flags %04X) hdr %u comp %u clr %u: %08X %08X %08X %08X\n", lpbi, w, h, bpp, dev, bits, flags,
+                                         *(const uint32_t *)bi, *(const uint32_t *)(bi + 16), *(const uint32_t *)(bi + 32), *(const uint32_t *)(bi + 40), *(const uint32_t *)(bi + 44), *(const uint32_t *)(bi + 48), *(const uint32_t *)(bi + 52));
     int32_t stride = ((w * bpp + 31) / 32) * 4, ah = h < 0 ? -h : h;
     if (dev) {
-        static uint16_t flat;
-        uint32_t own = 0;
-        if (!bits) {
-            if (!flat) { flat = native32_w9x_alloc_sel(0, 0xFFFFF); native32_w9x_desc(flat)[6] |= 0x80; }   /* 4 GB, page granular */
-            own = (uint32_t)(uintptr_t)VirtualAlloc(NULL, (SIZE_T)stride * ah + 16, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-            bits = (uint32_t)flat << 16;   /* the offset is 32-bit: own, below */
-        }
         uint8_t *d = (uint8_t *)farptr(dev);
         memset(d, 0, 0x40);
         *(uint16_t *)d = DE_TYPE; *(int16_t *)(d + 2) = (int16_t)w; *(int16_t *)(d + 4) = (int16_t)ah;
         *(uint16_t *)(d + 6) = (uint16_t)stride; d[8] = 1; d[9] = (uint8_t)bpp;
         *(int32_t *)(d + 0x0E) = h < 0 ? stride : -stride;   /* bottom-up unless the height is negative */
         *(uint32_t *)(d + 0x12) = dev;                     /* delpPDevice: itself */
-        *(uint32_t *)(d + 0x16) = own ? own : (bits & 0xFFFF);
+        *(uint32_t *)(d + 0x16) = bits & 0xFFFF;          /* no lpBits: GDI allocates the bits (shared ones from a section) and writes deBits after */
         *(uint16_t *)(d + 0x1A) = (uint16_t)(bits >> 16);
-        if (bpp <= 8) {   /* the color table, as 5-6-5 */
-            uint32_t n = *(const uint32_t *)(bi + 32), hs = *(const uint32_t *)bi;
-            if (!n || n > (1u << bpp)) n = 1u << bpp;
-            uint16_t *pal = (uint16_t *)calloc(256, sizeof *pal);
-            const uint8_t *q = bi + hs;
-            for (uint32_t i = 0; i < n; i++) pal[i] = rgb565((uint32_t)q[4 * i + 2] | (uint32_t)q[4 * i + 1] << 8 | (uint32_t)q[4 * i] << 16);
+        {   /* the slot: color table as 5-6-5, the BITMAPINFO copy (header and table or masks) */
             int i = 0;
             while (i < 255 && g_dibpal[i].dev && g_dibpal[i].dev != (uint32_t)(uintptr_t)d) i++;
-            g_dibpal[i].dev = (uint32_t)(uintptr_t)d; g_dibpal[i].pal = pal;
+            g_dibpal[i].dev = (uint32_t)(uintptr_t)d; g_dibpal[i].npal = 0;
+            uint32_t n = *(const uint32_t *)(bi + 32), hs = *(const uint32_t *)bi, comp = *(const uint32_t *)(bi + 16);
+            if (bpp <= 8 && (!n || n > (1u << bpp))) n = 1u << bpp;
+            const uint8_t *q = bi + hs;
+            if (bpp <= 8) {
+                for (uint32_t k = 0; k < n; k++) g_dibpal[i].pal[k] = rgb565((uint32_t)q[4 * k + 2] | (uint32_t)q[4 * k + 1] << 8 | (uint32_t)q[4 * k] << 16);
+                g_dibpal[i].npal = (int)n;
+            }
+            uint32_t tab = bpp <= 8 ? 4 * n : comp == 3 ? 12 : 0;
+            if (hs > 40) hs = 40;
+            memcpy(g_dibpal[i].bi, bi, hs); memcpy(g_dibpal[i].bi + hs, q, tab);
+            *(uint32_t *)g_dibpal[i].bi = hs;
+            uint32_t base = (uint32_t)(uintptr_t)g_dibpal[i].bi;
+            if (!g_dibpal[i].sel) g_dibpal[i].sel = native32_w9x_alloc_sel(base, sizeof g_dibpal[i].bi - 1);
+            *(uint32_t *)(d + 0x20) = (uint32_t)g_dibpal[i].sel << 16;   /* deBitmapInfo */
         }
     }
-    c->ax = 0x40; c->dx = 0;
+    { uint32_t sz = (uint32_t)stride * (uint32_t)ah; c->eax = sz; c->dx = (uint16_t)(sz >> 16); }   /* the image size: GDI stores it as biSizeImage */
     ret_far(c, 14);
 }
 
