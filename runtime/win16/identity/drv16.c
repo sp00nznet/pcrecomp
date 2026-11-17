@@ -763,6 +763,16 @@ static DWORD WINAPI input_thread(LPVOID unused) {
             fprintf(stderr, "\n");
             continue;
         }
+        if (sscanf(s, " wnd %u:%x@%lf", &ms, &mo, &t) == 3) {   /* "wnd N:HWND@T": USER's WND (N its DGROUP), via the table at 10000h */
+            while (GetTickCount() - t0 < (DWORD)(t * 1000)) Sleep(20);
+            extern uint16_t g_w16_segsel[];
+            const uint8_t *u = (const uint8_t *)(uintptr_t)recomp_sel_base(g_w16_segsel[ms]);
+            uint32_t pw = u ? *(const uint32_t *)(u + 0x10000 + mo) : 0;
+            fprintf(stderr, "[drv] wnd %04X @%08X:", mo, pw);
+            for (int i = 0; pw >= 0x10000 && i < 40; i++) fprintf(stderr, " %04X", *(const uint16_t *)(u + pw + 2 * i));
+            fprintf(stderr, "\n");
+            continue;
+        }
         int x2, y2, drag = sscanf(s, " drag %d,%d,%d,%d@%lf", &x, &y, &x2, &y2, &t) == 5;
         if (!drag && sscanf(s, " click %d,%d@%lf", &x, &y, &t) != 3) { fprintf(stderr, "[drv] W16_INPUT: cannot read \"%s\"\n", s); break; }
         if (!drag) x2 = x, y2 = y;

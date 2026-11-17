@@ -999,19 +999,32 @@ int w16_ss_big(uint16_t ss);
  * kernel32 dispatcher that runs entry edx and comes back to the 16-bit
  * caller with an o16 retf (w16_enter sees its return address and unwinds
  * here). Static code cannot hold it, so the runtime runs it. */
+/* A plain retf with one far pointer pushed above the far call's own return
+ * (ne_lift saw no push in the retf's block): a far jump to that pointer.
+ * USER's 16-bit thunk entries (seg31 00C8: `push dword cs:[bx]`, a version
+ * check, `retf` at 00E9) reach GetWindowPlacement and friends this way.
+ * ponytail: only exactly one pointer above a direct far call's frame; an
+ * indirect far call as a framed function's first instruction would look the same. */
+static int w16_retf_jmp(CPU *c) {
+    if (!g_ff || c->ss != g_ff->ss || (uint16_t)(c->sp + 4) != g_ff->sp) return 0;
+    uint16_t off = pop16(c), sel = pop16(c);
+    if (getenv("W16_TRACE")) fprintf(stderr, "[w16] retf above the far return: a jump to %04X:%04X\n", sel, off);
+    w16_jmpf(c, sel, off);
+    return 1;
+}
 int w16_retf(CPU *c) {
     uint32_t at = mem_read32(c, c->ss, c->sp);
     g_retf_at = at;
     int recomp_lar32(uint16_t sel, uint32_t *rights);
     uint32_t r;   /* only a present code selector of the guest's (a C return names a placeholder) */
-    if (!(at >> 16 & 4) || !recomp_lar32((uint16_t)(at >> 16), &r) || (r & 0x8800) != 0x8800 || !recomp_sel_base(at >> 16)) return 0;
+    if (!(at >> 16 & 4) || !recomp_lar32((uint16_t)(at >> 16), &r) || (r & 0x8800) != 0x8800 || !recomp_sel_base(at >> 16)) return w16_retf_jmp(c);
     const uint8_t *p = (const uint8_t *)(uintptr_t)w16_lin(recomp_sel_base(at >> 16) + (at & 0xFFFF));
     static const uint8_t t1[] = { 0x8E, 0xC0, 0x66, 0x0F, 0xB7, 0xC9, 0x67, 0x66, 0x26, 0x8B, 0x91 };
     /* or seg001_7618's (a flat thunk's first call, e.g. USER's WNet ones):
      *   B8 sel / 8E C0 / 66 BA imm32 / 66 EA off32 sel16 = es = sel; edx = imm32 */
     static const uint8_t t2[] = { 0x8E, 0xC0, 0x66, 0xBA };
     int ft = p[0] == 0xB8 && !memcmp(p + 3, t2, sizeof t2) && p[0xB] == 0x66 && p[0xC] == 0xEA;
-    if (!ft && (p[0] != 0xB8 || memcmp(p + 3, t1, sizeof t1) || p[0x12] != 0x66 || p[0x13] != 0xEA)) return 0;
+    if (!ft && (p[0] != 0xB8 || memcmp(p + 3, t1, sizeof t1) || p[0x12] != 0x66 || p[0x13] != 0xEA)) return w16_retf_jmp(c);
     c->sp += 4;
     c->es = *(const uint16_t *)(p + 1);
     if (ft) c->edx = *(const uint32_t *)(p + 7);

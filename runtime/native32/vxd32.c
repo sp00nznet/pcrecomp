@@ -488,6 +488,15 @@ static void qt_stub(void) {
     g_ecx = MEM8(g_ebp - 4);
     g_edx = MEM32(MEM32(va + MEM32(va + 0x2C)) + g_ecx * 4);
     if (g_trace > 0 || getenv("W16_TRACE")) fprintf(stderr, "[qt] thunk %02X -> %04X:%04X (stub %08X ss %04X@%08X esp %08X fs %04X)\n", g_ecx, g_edx >> 16, g_edx & 0xFFFF, va, g_seg_ss, g_ss_base, g_esp, g_seg_fs);
+    static const char *qa = (const char *)-1;   /* W16_QTARGS=OFF: the 32-bit caller and args of thunks into xxxx:OFF */
+    if (qa == (const char *)-1) qa = getenv("W16_QTARGS");
+    if (qa && (g_edx & 0xFFFF) == strtoul(qa, NULL, 16))
+        fprintf(stderr, "[qt] %04X:%04X from %08X: %08X %08X %08X %08X %08X %08X %08X\n", g_edx >> 16, g_edx & 0xFFFF, MEM32(g_ebp + 4),
+                MEM32(g_ebp + 8), MEM32(g_ebp + 12), MEM32(g_ebp + 16), MEM32(g_ebp + 20), MEM32(g_ebp + 24), MEM32(g_ebp + 28), MEM32(g_ebp + 32));
+    if (qa && (g_edx & 0xFFFF) == strtoul(qa, NULL, 16)) {   /* and the 32-bit stack above, for the caller's return */
+        for (int i = 0; i < 48; i++) fprintf(stderr, " %08X", MEM32(g_ebp + 36 + 4 * i));
+        fprintf(stderr, "\n");
+    }
     g_eax = 0xBFF727D9u;
     recomp_lookup(0xBFF727D9u)();
 }
@@ -507,6 +516,10 @@ static void ft_stub(void) {
     uint32_t va = t_ft_stub;
     g_edx = MEM32(MEM32(va + MEM32(va + 0x2E)) + (g_ecx & 0xFF) * 4);
     if (g_trace > 0 || getenv("W16_TRACE")) fprintf(stderr, "[ft] thunk %02X -> %04X:%04X (stub %08X)\n", g_ecx & 0xFF, g_edx >> 16, g_edx & 0xFFFF, va);
+    const char *qa = getenv("W16_QTARGS");
+    if (qa && (g_edx & 0xFFFF) == strtoul(qa, NULL, 16))
+        fprintf(stderr, "[ft] %04X:%04X from %08X: %08X %08X %08X %08X %08X %08X %08X\n", g_edx >> 16, g_edx & 0xFFFF, MEM32(g_ebp + 4),
+                MEM32(g_ebp + 8), MEM32(g_ebp + 12), MEM32(g_ebp + 16), MEM32(g_ebp + 20), MEM32(g_ebp + 24), MEM32(g_ebp + 28), MEM32(g_ebp + 32));
     recomp_lookup(0xBFF7268Du)();
 }
 
@@ -1552,6 +1565,16 @@ static uint32_t vwin32_int21(const uint32_t* a) {
         SET8L(g_eax, 64); SET16(g_ecx, 512); SET16(g_edx, 0xFFFF); g_ebx = (uint32_t)(uintptr_t)&media;
         return g_eax;
     }
+    case 0x73:   /* AX=7303 FAT32 free space: DS:DX root, ES:DI the 2Ch-byte struct (shell32 opening C:).
+                  * ponytail: the same fixed drive as 1Ch (64 x 512 x 65535), half free; nothing of the host's. */
+        if ((uint8_t)g_eax == 3) {
+            char d = (char)(MEM8(g_edx) | 0x20);
+            if (d != 'c' && d != '\\') { dos_fail(15); return g_eax; }
+            uint32_t s[11] = { 0x2C, 64, 512, 32767, 65535, 32767 * 64, 65535 * 64, 32767, 65535, 0, 0 };
+            memcpy((void *)(uintptr_t)g_edi, s, sizeof s);
+            return g_eax;
+        }
+        break;
     case 0x2A: { SYSTEMTIME t; GetLocalTime(&t);
         SET16(g_ecx, t.wYear); SET16(g_edx, t.wMonth << 8 | t.wDay); SET8L(g_eax, t.wDayOfWeek); return g_eax; }
     case 0x2C: { SYSTEMTIME t; GetLocalTime(&t);
