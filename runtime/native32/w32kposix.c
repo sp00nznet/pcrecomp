@@ -3424,7 +3424,7 @@ void w2kx_start(void) {
 /* ======================================================================
  * The script, shots
  * ====================================================================== */
-enum { EV_SHOT, EV_CLICK, EV_COMMAND, EV_POST, EV_DLGCMD, EV_TYPE, EV_SCLICK };
+enum { EV_SHOT, EV_CLICK, EV_COMMAND, EV_POST, EV_DLGCMD, EV_TYPE, EV_SCLICK };   /* (run_event names each one) */
 typedef struct { uint32_t ms; int kind; char arg[256]; } ev_t;
 #define MAXEV 64
 static ev_t g_ev[MAXEV];
@@ -3493,7 +3493,7 @@ static uint32_t find_child(uint32_t parent, uint32_t id) {
 }
 static void run_event(ev_t* e) {
     uint32_t main = g_main, top = top_window();
-    fprintf(stderr, "[script] %u ms: %s %s\n", e->ms, (const char*[]){ "shot", "click", "command", "post", "dlgcommand", "type" }[e->kind], e->arg);
+    fprintf(stderr, "[script] %u ms: %s %s\n", e->ms, (const char*[]){ "shot", "click", "command", "post", "dlgcommand", "type", "sclick" }[e->kind], e->arg);
     if (e->kind != EV_SHOT) popup_close();
     switch (e->kind) {
     case EV_SHOT: shot(e->ms); break;
