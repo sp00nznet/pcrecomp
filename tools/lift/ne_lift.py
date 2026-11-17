@@ -547,6 +547,17 @@ class NELifter(Lifter):
                 # 3B5C pops its return, builds a frame and pushes it back.
                 self._emit(f'{func_name}(cpu); if (cpu->ret_ip != 0x{local_off + inst.length:04X}) {{ W16_RETPAST(cpu, 0x{local_off + inst.length:04X}); return; }}', orig)
                 return
+            if (_IDENTITY and prev is not None and prev.mnemonic == 'push' and bytes(prev.raw[:1]) == b'\x0e'
+                    and prev.address + prev.length == inst.address):
+                # `push cs; call near`: a far call into this segment, whose callee
+                # may near-ret into an address it pushed (USER 1:101E calls 56E5;
+                # 56E8 pushes 5702, and 5720's `ret` goes there, whose retf
+                # comes back here). Run what it returned into, as above.
+                # ponytail: only this shape; _ret_jumps misses it because the
+                # path has calls in it.
+                r = local_off + inst.length
+                self._emit(f"{func_name}(cpu); if (cpu->ret_ip != 0x{r:04X}) w16_retjump(cpu, {self.seg.index}, 0x{r:04X});", orig + ' (far-call shape: may return into a pushed address)')
+                return
             self._emit(f'{func_name}(cpu);', orig)
             return
 

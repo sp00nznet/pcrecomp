@@ -729,6 +729,7 @@ void w16_retf32(CPU *c) {
         }
         g_nthk = k; g_ff = ff;
         *c = keep;
+        c->ret_ip = (uint16_t)ret;
         c->eax = g_eax; c->ecx = g_ecx; c->edx = g_edx; c->ebx = g_ebx;
         c->ebp = g_ebp; c->esi = g_esi; c->edi = g_edi;
         c->ss = g_seg_ss; c->sp = (uint16_t)g_esp; c->ds = g_seg_ds; c->es = g_seg_es; c->fs = g_seg_fs; c->gs = g_seg_gs;
@@ -988,6 +989,7 @@ int w16_retf(CPU *c) {
     }
     g_nthk = k; g_ff = ff;
     *c = keep;   /* g_w16 may have been reused by a nested 32->16 call */
+    c->ret_ip = (uint16_t)g_thk[k].back;   /* the offset the stub came back to (a `push cs; call near` checks it) */
     c->eax = g_eax; c->ecx = g_ecx; c->edx = g_edx; c->ebx = g_ebx;
     c->ebp = g_ebp; c->esi = g_esi; c->edi = g_edi;
     c->ss = g_seg_ss; c->sp = (uint16_t)g_esp; c->ds = g_seg_ds; c->es = g_seg_es; c->fs = g_seg_fs; c->gs = g_seg_gs;
@@ -1063,6 +1065,7 @@ int w16_enter(uint32_t target) {
         fprintf(stderr, "\n");
         w16_stop("no lifted function at", sel, off);
     }
+    if (getenv("W16_TRACE")) fprintf(stderr, "[w16] enter %04X:%04X back: g ss %04X@%08X ds %04X@%08X c ds %04X ss:sp %04X:%04X di %08X bp %08X (in: di %08X bp %08X)\n", sel, off, g_seg_ss, g_ss_base, g_seg_ds, g_ds_base, c->ds, c->ss, c->sp, c->edi, c->ebp, g_edi, g_ebp);
     g_w16_ret = prev;
     g_eax = c->eax; g_ecx = c->ecx; g_edx = c->edx; g_ebx = c->ebx;
     g_esi = c->esi; g_edi = c->edi; g_ebp = c->ebp;
