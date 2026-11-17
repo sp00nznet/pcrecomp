@@ -312,6 +312,11 @@ class Lifter:
         # needs RECOMP_RETADDR to be a value no such push makes. DOS mode
         # always has it.
         self.computed_ret = computed_ret
+        # LIFT32_W9X: `push <function>; ...; jmp <function>` is a call whose
+        # return is the pushed function (user32's window-proc relay BFF53955:
+        # push BFF53981; push proc; jmp BFF58150, an import jump). The jump
+        # comes back as a C return, so the pushed function runs next.
+        self._push_ret = None
         # Call targets whose first instruction is `pop r32` (see the call case).
         self.call_pop = call_pop or set()
         self._patched_imm = None
@@ -794,6 +799,13 @@ class Lifter:
         seq0 = self._flag_seq
         self._insn_flag_width = 32    # only this instruction's _flag_capture narrows it
         lines = self._lift_instruction(insn)
+        if W9X:
+            m, ops = insn.mnemonic, insn.operands
+            if m == 'push' and ops and ops[0].type == X86_OP_IMM and self.lifted and ops[0].imm in self.lifted:
+                self._push_ret = ops[0].imm
+            elif not (m in ('push', 'mov', 'movzx', 'xchg') and not (ops and ops[0].type == X86_OP_REG
+                                                                   and ops[0].reg in (X86_REG_ESP, X86_REG_SP))):
+                self._push_ret = None
         if self._seg_fn and next((b for b in insn.bytes if b not in (0x66, 0x67, 0xF2, 0xF3)), 0) in range(0xA4, 0xB0):
             # a string op where ds/es are real selectors: es:[edi], ds:[esi]
             fix = lambda t: (re.sub(r'\b(MEM8|MEM16|MEM32)\(edi\)', r'\1(ES_BASE + edi)', t)
@@ -1617,7 +1629,9 @@ class Lifter:
                 # makes one into its table of `int N; ret` stubs. A return
                 # address the caller did not push is not ours to pop: it is
                 # where control goes, with the stack as it was before the push.
-                lines.append(f"if (MEM32(esp) != RECOMP_RETADDR) {{ uint32_t _rt = MEM32(esp); esp += 4;"
+                n = ops[0].imm if ops and ops[0].type == X86_OP_IMM else 0
+                at = "SS_BASE + esp" if self._ss_fn else "esp"
+                lines.append(f"if (MEM32({at}) != RECOMP_RETADDR) {{ uint32_t _rt = MEM32({at}); esp += {4 + n};"
                              f" RECOMP_FLAGS_OUT(); RECOMP_RET_JUMP(_rt); return; }}")
             if ops and ops[0].type == X86_OP_IMM:
                 n = ops[0].imm
@@ -1641,6 +1655,8 @@ class Lifter:
                 # `66 CB` (o16 retf) pops a 16:16 target packed in one dword,
                 # into 16-bit code; the 16-bit side comes back by a 32-bit retf.
                 pop = 4 if bytes(insn.bytes)[0] == 0x66 else 8
+                if ops and ops[0].type == X86_OP_IMM:
+                    pop += ops[0].imm   # retf N: user32's relay return (BFF53912 `retf 6`) pops its 16-bit args
                 sp = "SS_BASE + esp" if self._ss_fn else "esp"
                 lines.append(f"{{ uint32_t _ft = MEM32({sp}); esp += {pop}; RECOMP_REGS_OUT(); {comment}")
                 lines.append(f"  if (recomp_retf32(_ft)) {{ RECOMP_REGS_IN(); _ft = MEM32({sp}); esp += 8; }} else RECOMP_REGS_IN();")
@@ -1652,7 +1668,9 @@ class Lifter:
 
         elif m == 'jmp':
             target = insn.get_branch_target()
-            if target and self._labels is not None and target not in self._labels:
+            if W9X and target and self._push_ret is not None and self.lifted and target in self.lifted:
+                lines.append(f"RECOMP_ITAIL(0x{target:08X}u); RECOMP_ITAIL(0x{self._push_ret:08X}u); return; /* a call returning to the pushed function */ {comment}")
+            elif target and self._labels is not None and target not in self._labels:
                 # Branch leaves the function: a tail call, or a run of bytes that
                 # was never really code. Either way there is no label to jump to,
                 # so dispatch and return instead of emitting an undefined goto.

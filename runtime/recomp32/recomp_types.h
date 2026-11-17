@@ -10,6 +10,14 @@
 #ifndef RECOMP_TYPES_H
 #define RECOMP_TYPES_H
 
+#if defined(_MSC_VER) && defined(RECOMP_PART)
+#define RECOMP_HOSTDATA __declspec(dllimport)   /* a part DLL: the data is the host exe's */
+#elif defined(_MSC_VER) && defined(RECOMP_PARTS)
+#define RECOMP_HOSTDATA __declspec(dllexport)   /* the host of part DLLs (uninitialised globals escape export-all) */
+#else
+#define RECOMP_HOSTDATA
+#endif
+
 #include <stdint.h>
 #include <stddef.h>   /* ptrdiff_t (g_mem_base); MSVC pulls it in transitively, gcc/clang do not */
 #include <stdlib.h>
@@ -40,7 +48,7 @@ static inline uint64_t __rdtsc(void) {
  * ============================================================ */
 
 /* Volatile (caller-saved) registers */
-extern uint32_t g_eax, g_ecx, g_edx, g_esp;
+extern RECOMP_HOSTDATA uint32_t g_eax, g_ecx, g_edx, g_esp;
 
 /* Callee-saved registers (also global for implicit parameter passing).
  * ebp is global too, not a per-function local: MSVC's __EH_prolog sets its
@@ -48,15 +56,15 @@ extern uint32_t g_eax, g_ecx, g_edx, g_esp;
  * would discard it and every C++ EH function would then address off zero.
  * Real x86 has one ebp; FPO functions that never touch it simply pass the
  * caller's through, which is exactly the behaviour we want. */
-extern uint32_t g_ebx, g_esi, g_edi, g_ebp;
+extern RECOMP_HOSTDATA uint32_t g_ebx, g_esi, g_edi, g_ebp;
 
 /* The x87 FPU stack is GLOBAL (8 shared registers), not per-function: helpers
  * like __ftol receive their argument on the FPU stack from the caller, and the
  * control word persists across calls. A per-function local stack would make every
  * cross-call FPU value read as 0. */
-extern double   g_st[8];
-extern int      g_fp_top;
-extern uint16_t g_fpu_cw;
+extern RECOMP_HOSTDATA double   g_st[8];
+extern RECOMP_HOSTDATA int      g_fp_top;
+extern RECOMP_HOSTDATA uint16_t g_fpu_cw;
 
 /* The arithmetic flags a function RETURNS with. The lazy flag state is local
  * to each lifted function, but assembly and the CRT return results in flags:
@@ -66,17 +74,27 @@ extern uint16_t g_fpu_cw;
  * black). So every `ret` publishes the state and every call picks it back up;
  * where the caller overwrites the flags first, the compiler drops the loads.
  * Defined here, weakly, so no project's runtime has to. */
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && defined(RECOMP_PART)
+/* A part DLL (pcrecomp_gen_parts): the host exe owns every global; the part
+ * imports them (the exe exports all its symbols). */
+#define RECOMP_WEAK extern __declspec(dllimport)
+#define RECOMP_WEAK_INIT(v)
+#elif defined(_MSC_VER) && defined(RECOMP_PARTS)
+#define RECOMP_WEAK __declspec(selectany) __declspec(dllexport)
+#elif defined(_MSC_VER)
 #define RECOMP_WEAK __declspec(selectany)
 #else
 #define RECOMP_WEAK __attribute__((weak))
+#endif
+#ifndef RECOMP_WEAK_INIT
+#define RECOMP_WEAK_INIT(v) = v
 #endif
 RECOMP_WEAK uint32_t g_flag_k, g_flag_a, g_flag_b, g_flag_cf;
 #define RECOMP_FLAGS_OUT() (g_flag_k = _flag_k, g_flag_a = _flag_a, g_flag_b = _flag_b, g_flag_cf = _cf)
 #define RECOMP_FLAGS_IN()  (_flag_k = g_flag_k, _flag_a = g_flag_a, _flag_b = g_flag_b, _cf = g_flag_cf)
 
 /* Segment registers (flat mode Win32 - effectively unused) */
-extern uint16_t g_seg_cs, g_seg_ds, g_seg_es, g_seg_fs, g_seg_gs, g_seg_ss;
+extern RECOMP_HOSTDATA uint16_t g_seg_cs, g_seg_ds, g_seg_es, g_seg_fs, g_seg_gs, g_seg_ss;
 
 /* Function pointer type for recompiled functions */
 typedef void (*recomp_func_t)(void);
@@ -199,7 +217,7 @@ extern const uint32_t recomp_dispatch_count;
  * For fixed-base mapping, this is 0.
  * ============================================================ */
 
-extern ptrdiff_t g_mem_base;
+extern RECOMP_HOSTDATA ptrdiff_t g_mem_base;
 
 #ifdef RECOMP_FLAT_MEMORY
 /* Guest VAs ARE host addresses (a 32-bit host mapping each module at its own
@@ -218,8 +236,8 @@ extern ptrdiff_t g_mem_base;
 /* Thread-relative segment bases. In Win32, fs: points at the TIB/TEB; gs is
  * unused on x86. The lifter emits fs:/gs: accesses as FS_BASE/GS_BASE + addr,
  * so the runtime points g_fs_base at a simulated TIB (VA). cs/ds/es/ss are flat. */
-extern uint32_t g_fs_base;
-extern uint32_t g_gs_base;
+extern RECOMP_HOSTDATA uint32_t g_fs_base;
+extern RECOMP_HOSTDATA uint32_t g_gs_base;
 #define FS_BASE  g_fs_base
 #define GS_BASE  g_gs_base
 
@@ -227,13 +245,13 @@ extern uint32_t g_gs_base;
  * hlt and segment loads (tools/lift/lift32.py _lift_dos). A DOS host such as
  * runtime/dos32 defines them; nothing else references them. Under DOS/4GW es
  * is a real selector (the PSP, the environment), so es: overrides get a base. */
-extern uint32_t g_es_base, g_cs_base;
+extern RECOMP_HOSTDATA uint32_t g_es_base, g_cs_base;
 #define ES_BASE  g_es_base
 /* ds as a real selector, in the functions LIFT32_W9X lifts segmented */
-extern uint32_t g_ds_base;
+extern RECOMP_HOSTDATA uint32_t g_ds_base;
 #define DS_BASE  g_ds_base
 /* ss as a real selector, in the functions LIFT32_W9X sees load ss (QT_Thunk) */
-extern uint32_t g_ss_base;
+extern RECOMP_HOSTDATA uint32_t g_ss_base;
 #define SS_BASE  g_ss_base
 /* cs: overrides: 0 for the program, the module's base while a far call runs
  * code a program loaded at run time (a driver addressing its own tables). */
@@ -780,7 +798,7 @@ static inline uint32_t recomp_eflags_setcf(uint32_t kind, uint32_t a, uint32_t b
  * wants them thread-local instead.
  * ============================================================ */
 
-extern uint64_t g_mm[8];
+extern RECOMP_HOSTDATA uint64_t g_mm[8];
 
 #define MM_W(v, i)  ((int16_t)((uint64_t)(v) >> ((i) * 16)))
 #define MM_D(v, i)  ((int32_t)((uint64_t)(v) >> ((i) * 32)))
@@ -986,8 +1004,8 @@ typedef union {
     uint8_t  u8[16];
 } xmm_t;
 
-extern xmm_t    g_xmm[8];
-extern uint32_t g_mxcsr;
+extern RECOMP_HOSTDATA xmm_t    g_xmm[8];
+extern RECOMP_HOSTDATA uint32_t g_mxcsr;
 
 static inline xmm_t xmm_ld(uint32_t a) { xmm_t v; memcpy(&v, (const void*)ADDR(a), 16); return v; }
 static inline void  xmm_st(uint32_t a, xmm_t v) { memcpy((void*)ADDR(a), &v, 16); }
@@ -1067,8 +1085,8 @@ static inline uint32_t sse_cmp_pred(double a, double b, int p) {
  * it) when it nears an end. Host: g_stbuf/g_sti64buf/g_stp/g_sti64p and
  * recomp_x87_recentre (win32hle host_lite.c). */
 #define X87_RING 4096
-extern double  g_stbuf[X87_RING], *g_stp;
-extern int64_t g_sti64buf[X87_RING], *g_sti64p;
+extern RECOMP_HOSTDATA double  g_stbuf[X87_RING], *g_stp;
+extern RECOMP_HOSTDATA int64_t g_sti64buf[X87_RING], *g_sti64p;
 void recomp_x87_recentre(void);
 #define g_st_i64 g_sti64p
 static inline void fp_push_ring(double val, int64_t shadow) {
@@ -1202,11 +1220,11 @@ static inline void fp_bcd_st(uint8_t* p, int64_t v) {
  * global-register lifter does not implement most of those instructions; a
  * host that clears the bits gets the x87 paths instead (The Movies: 16,977
  * unimplemented SIMD sites against a handful of x87 ones). */
-RECOMP_WEAK uint32_t g_cpuid_edx1 = 0xFFFFFFFFu, g_cpuid_ecx1 = 0xFFFFFFFFu;
-RECOMP_WEAK uint32_t g_cpuid_edx_ext = 0xFFFFFFFFu;
+RECOMP_WEAK uint32_t g_cpuid_edx1 RECOMP_WEAK_INIT(0xFFFFFFFFu), g_cpuid_ecx1 RECOMP_WEAK_INIT(0xFFFFFFFFu);
+RECOMP_WEAK uint32_t g_cpuid_edx_ext RECOMP_WEAK_INIT(0xFFFFFFFFu);
 /* Nonzero replaces leaf 1's family/model/stepping (eax). Some libraries pick
  * SIMD paths by family alone (Crypto++ on family 0xF), past the feature bits. */
-RECOMP_WEAK uint32_t g_cpuid_signature = 0;
+RECOMP_WEAK uint32_t g_cpuid_signature RECOMP_WEAK_INIT(0);
 
 static inline void CPUID_impl(uint32_t eax_val, uint32_t ebx_val, uint32_t ecx_val, uint32_t edx_val) {
 #ifdef _MSC_VER
@@ -1231,7 +1249,7 @@ static inline void CPUID_impl(uint32_t eax_val, uint32_t ebx_val, uint32_t ecx_v
 
 /* The VA of the function currently executing (see RECOMP_ENTER below); an
  * unresolved dispatch is far more useful with its caller named. */
-extern uint32_t g_cur_func;
+extern RECOMP_HOSTDATA uint32_t g_cur_func;
 
 /* Enter a lifted body at an address inside it, not at its start. An alias
  * entry (a catalog entry inside another function's code) lifts as a stub that
@@ -1255,10 +1273,10 @@ RECOMP_WEAK uint32_t g_alias_entry;
  * report showed it as a caller and never as a target, and the function that
  * handed it a null argument was already gone. 128 costs a kilobyte. */
 #define ICALL_TRACE_SIZE 128
-extern uint32_t g_icall_trace[ICALL_TRACE_SIZE];
-extern uint32_t g_icall_from[ICALL_TRACE_SIZE];
-extern uint32_t g_icall_trace_idx;
-extern uint32_t g_icall_count;
+extern RECOMP_HOSTDATA uint32_t g_icall_trace[ICALL_TRACE_SIZE];
+extern RECOMP_HOSTDATA uint32_t g_icall_from[ICALL_TRACE_SIZE];
+extern RECOMP_HOSTDATA uint32_t g_icall_trace_idx;
+extern RECOMP_HOSTDATA uint32_t g_icall_count;
 
 /* Lookup functions */
 recomp_func_t recomp_lookup(uint32_t va);          /* binary search in dispatch table */
@@ -1270,7 +1288,7 @@ recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
  * asked), so it is never cached, and it is looked up first, before the
  * search of the lifted functions that cannot hold it. A host that sets it
  * keeps its manual overrides off the import VAs. */
-RECOMP_WEAK int (*recomp_is_import)(uint32_t va) = 0;
+RECOMP_WEAK int (*recomp_is_import)(uint32_t va) RECOMP_WEAK_INIT(0);
 
 /* An indirect call's target: manual overrides, the dispatch table (a binary
  * search), then the imports. A host where one thread at a time runs lifted
@@ -1280,7 +1298,7 @@ RECOMP_WEAK int (*recomp_is_import)(uint32_t va) = 0;
  * looked up every time (the lookup names the shim about to run). */
 #ifdef RECOMP_RESOLVE_CACHE
 typedef struct { uint32_t va; recomp_func_t fn; } recomp_resolve_slot_t;
-RECOMP_WEAK recomp_resolve_slot_t g_resolve_cache[RECOMP_RESOLVE_CACHE] = { { 0, 0 } };
+RECOMP_WEAK recomp_resolve_slot_t g_resolve_cache[RECOMP_RESOLVE_CACHE] RECOMP_WEAK_INIT({ { 0 } });
 #endif
 static inline recomp_func_t recomp_resolve(uint32_t va) {
     if (recomp_is_import && recomp_is_import(va)) return recomp_lookup_import(va);
@@ -1458,12 +1476,12 @@ static __attribute__((noinline, cold, unused)) void recomp_itail_miss(uint32_t v
 /* Always-on: the VA of the function currently executing. A plain global store
  * (no call), so unlike the ring tracer below it doesn't force register reloads --
  * useful for pinning a crash to a function without perturbing codegen. */
-extern uint32_t g_cur_func;
+extern RECOMP_HOSTDATA uint32_t g_cur_func;
 
 #ifdef RECOMP_TRACE
 #define RECOMP_ENTER_SIZE 1024
-extern uint32_t g_enter_trace[RECOMP_ENTER_SIZE];
-extern uint32_t g_enter_idx;
+extern RECOMP_HOSTDATA uint32_t g_enter_trace[RECOMP_ENTER_SIZE];
+extern RECOMP_HOSTDATA uint32_t g_enter_idx;
 void recomp_trace_enter(uint32_t va);
 #define RECOMP_ENTER(va) do { g_cur_func = (va); RECOMP_FLAGS_IN(); recomp_trace_enter(va); } while (0)
 #else

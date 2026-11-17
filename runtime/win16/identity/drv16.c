@@ -229,7 +229,7 @@ static void disp_realize(CPU *c) {
             b->style = *(const uint16_t *)li; b->color = rgb565(*(const uint32_t *)(li + 2));
             b->hatch = *(const uint16_t *)(li + 6); b->bk = 0xFFFF;
             for (int i = 0; i < 64; i++) b->pat[i] = b->color;
-            if (b->style > 1 && getenv("W16_TRACE")) fprintf(stderr, "[drv] DISPLAY brush style %u: solid\n", b->style);
+            if (b->style > 1 && getenv("W16_TRACE")) fprintf(stderr, "[drv] DISPLAY brush style %u: solid (color %08X hatch %04X)\n", b->style, *(const uint32_t *)(li + 2), b->hatch);
         }
     }
     if (style == 3 && !_stricmp((const char *)farptr(in) + 18, "Marlett")) {   /* a device font (above) */

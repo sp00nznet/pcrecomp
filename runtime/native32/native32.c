@@ -653,14 +653,51 @@ static void native_bridge(void) {
     SetLastError(last_error);
 }
 
-static recomp_func_t dispatch_find(uint32_t va) {
-    uint32_t lo = 0, hi = recomp_dispatch_count;
+static recomp_func_t table_find(const recomp_dispatch_entry_t *t, uint32_t n, uint32_t va) {
+    uint32_t lo = 0, hi = n;
     while (lo < hi) {
-        uint32_t mid = lo + (hi - lo) / 2, m = recomp_dispatch_table[mid].address;
-        if (m == va) return recomp_dispatch_table[mid].func;
+        uint32_t mid = lo + (hi - lo) / 2, m = t[mid].address;
+        if (m == va) return t[mid].func;
         if (m < va) lo = mid + 1; else hi = mid;
     }
     return NULL;
+}
+#ifdef RECOMP_PARTS
+/* A host built with pcrecomp_gen_parts: each lifted module is its own DLL
+ * next to the exe (RECOMP_PARTS="a.dll,b.dll"), with its own dispatch table
+ * (recomp_part_dispatch). They load on the first lookup, after the guest's
+ * address ranges are taken. The exe stays small: one image of every lift
+ * outgrew what CreateProcess maps (error 308). */
+static struct { const recomp_dispatch_entry_t *t; uint32_t n, lo, hi; } g_parts[64];
+static int g_nparts;
+static INIT_ONCE g_parts_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK parts_load(PINIT_ONCE o, PVOID a, PVOID *c) {
+    (void)o; (void)a; (void)c;
+    char dir[MAX_PATH], path[MAX_PATH], list[] = RECOMP_PARTS, *ctx;
+    GetModuleFileNameA(NULL, dir, MAX_PATH);
+    char *e = strrchr(dir, '\\'); if (e) e[1] = 0;
+    for (char *p = strtok_s(list, ",", &ctx); p && g_nparts < 64; p = strtok_s(NULL, ",", &ctx)) {
+        snprintf(path, sizeof path, "%s%s", dir, p);
+        HMODULE h = LoadLibraryExA(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+        typedef const recomp_dispatch_entry_t *(*getf)(uint32_t *);
+        getf g = h ? (getf)(void *)GetProcAddress(h, "recomp_part_dispatch") : NULL;
+        if (!g) { fprintf(stderr, "[native32] part %s did not load (error %lu)\n", path, GetLastError()); fflush(stderr); TerminateProcess(GetCurrentProcess(), 3); }
+        int k = g_nparts++;
+        g_parts[k].t = g(&g_parts[k].n);
+        g_parts[k].lo = g_parts[k].n ? g_parts[k].t[0].address : 1;
+        g_parts[k].hi = g_parts[k].n ? g_parts[k].t[g_parts[k].n - 1].address : 0;
+    }
+    return TRUE;
+}
+#endif
+static recomp_func_t dispatch_find(uint32_t va) {
+    recomp_func_t f = table_find(recomp_dispatch_table, recomp_dispatch_count, va);
+#ifdef RECOMP_PARTS
+    InitOnceExecuteOnce(&g_parts_once, parts_load, NULL, NULL);
+    for (int i = 0; !f && i < g_nparts; i++)
+        if (va >= g_parts[i].lo && va <= g_parts[i].hi) f = table_find(g_parts[i].t, g_parts[i].n, va);
+#endif
+    return f;
 }
 
 /* native32_replace: a lifted function answered by the host instead, for every

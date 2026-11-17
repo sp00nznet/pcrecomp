@@ -311,6 +311,8 @@ static void host_far(CPU *c, uint16_t off) {
         c->es = flat; ok(c); return;
     }
     case 0x1B: case 0x1C: ok(c); return;   /* an event handled (89:0019, 89:0065): nothing to tell */
+    case 0x14: ok(c); return;   /* USER seg64 3E16 (from 694C, Explorer's tray setup): ax/cx/bx from USER's
+                                 * ds:200..204; nothing reads a result. ponytail: a notification, no-op */
     case 0x13: ok(c); return;   /* USER seg55 5459, from seg53 144B right after it reads the shift/ctrl/alt
                                  * key states; nothing reads a result. ponytail: a notification, no-op */
     }
@@ -706,7 +708,8 @@ static __declspec(thread) uint32_t g_retf_at;   /* where the last plain retf wen
 /* 16->32 calls in flight whose 32-bit side comes back by a far jump into
  * 16-bit code (w16_retf's generated stubs, w16_retf32's 16:16 returns):
  * w16_enter longjmps here when its target is the pending return. */
-static __declspec(thread) struct { jmp_buf jb; uint32_t back; uint16_t ss, sp; } g_thk[16];   /* ss:sp: where back sits */
+static __declspec(thread) struct { jmp_buf jb; uint32_t back, lin; uint16_t ss, sp; } g_thk[16];   /* ss:sp: where back sits */
+#define W16_BACK_ANY 0xFFFFFFFFu   /* back: any 16-bit retf that pops the stack above lin */
 static __declspec(thread) int g_nthk;
 void w16_retf32(CPU *c) {
     /* eip and a 32-bit cs from ss:esp when ss is a big (B) segment, else ss:sp */
@@ -737,8 +740,15 @@ void w16_retf32(CPU *c) {
     int back16 = (ret >> 16 & 4) && recomp_lar32((uint16_t)(ret >> 16), &rr) && (rr & 0x8800) == 0x8800 && recomp_sel_base(ret >> 16);
     static const uint8_t stub[] = { 0x66, 0x8E, 0xD7, 0x2B, 0xE6, 0x66, 0x16, 0x66, 0x68, 0xFF, 0xFF, 0x53, 0x66, 0x68 };
     const uint8_t *r = (const uint8_t *)(uintptr_t)ret;
-    if (!back16 && (memcmp(r, stub, sizeof stub) || r[16] != 0x66 || r[17] != 0x68 || r[20] != 0x66 || r[21] != 0xCB))
-        w16_stop("flat return is not KRNL386's 32->16 stub", ret >> 16, ret & 0xFFFF);
+    if (!back16 && (IsBadReadPtr(r, 22) || memcmp(r, stub, sizeof stub) || r[16] != 0x66 || r[17] != 0x68 || r[20] != 0x66 || r[21] != 0xCB)) {
+        /* No return at [esp]: KRNL386's window-proc relay (seg 2 763F/76BC, from
+         * a `push dword; push dword; jmp far 2:7616` thunk) puts no return there.
+         * The flat side (user32 BFF53955) finds its frame through ebx and comes
+         * back by `lss sp, [ebx]; ...; retf 6` into 2:7678. That return is any
+         * o16 retf that pops the stack above where this call found it. */
+        if (getenv("W16_TRACE")) fprintf(stderr, "[w16] far32 with no return at [esp] (%08X): back is the first retf above %08X\n", ret, sb + c->esp);
+        back16 = 2; ret = W16_BACK_ANY;
+    }
     uint32_t se[8] = { g_eax, g_ecx, g_edx, g_ebx, g_esp, g_ebp, g_esi, g_edi };
     uint16_t sss = g_seg_ss, sds = g_seg_ds, ses = g_seg_es; uint32_t ssb = g_ss_base, sdb = g_ds_base, seb = g_es_base;
     g_eax = c->eax; g_ecx = c->ecx; g_edx = c->edx; g_ebx = c->ebx;
@@ -755,13 +765,14 @@ void w16_retf32(CPU *c) {
         CPU keep = *c;
         w16_ff *ff = g_ff;
         int k = g_nthk++;
-        g_thk[k].back = ret; g_thk[k].ss = c->ss; g_thk[k].sp = c->sp;
+        g_thk[k].back = ret; g_thk[k].ss = c->ss; g_thk[k].sp = c->sp; g_thk[k].lin = sb + c->esp;
         if (!setjmp(g_thk[k].jb)) {
             recomp_set_seg(3, c->ds); recomp_set_seg(0, c->es);
             f();
             w16_stop("flat function returned without its retf to", ret >> 16, ret & 0xFFFF);
         }
         g_nthk = k; g_ff = ff;
+        if (back16 == 2) ret = g_thk[k].back;   /* the retf w16_enter caught */
         *c = keep;
         c->ret_ip = (uint16_t)ret;
         c->eax = g_eax; c->ecx = g_ecx; c->edx = g_edx; c->ebx = g_ebx;
@@ -1040,6 +1051,12 @@ int w16_retf(CPU *c) {
 }
 
 int w16_enter(uint32_t target) {
+    if (g_nthk && g_thk[g_nthk - 1].back == W16_BACK_ANY
+        && g_ss_base + (w16_ss_big(g_seg_ss) ? g_esp : (uint16_t)g_esp) > g_thk[g_nthk - 1].lin) {
+        if (getenv("W16_TRACE")) fprintf(stderr, "[w16] relay returns to %04X:%04X (ss:sp %04X:%04X)\n", target >> 16, target & 0xFFFF, g_seg_ss, (uint16_t)g_esp);
+        g_thk[g_nthk - 1].back = target;
+        longjmp(g_thk[g_nthk - 1].jb, 1);
+    }
     if (g_nthk && target == g_thk[g_nthk - 1].back) {   /* a 16->32 stub's return */
         /* the outermost of a run with the same return: a flat thunk not yet
          * connected re-enters itself through KRNL386 (kernel32 0xBFF718AE ->
