@@ -517,7 +517,7 @@ static uint32_t proxy_image(int k) {
 }
 
 /* ------------------------------------------------------------- objects */
-enum { O_FILE = 1, O_EVENT, O_SECTION, O_IMAGE, O_PORT, O_DIROBJ, O_MUTANT, O_SEM, O_TOKEN, O_KEY, O_THREAD };
+enum { O_FILE = 1, O_EVENT, O_SECTION, O_IMAGE, O_PORT, O_DIROBJ, O_MUTANT, O_SEM, O_TOKEN, O_KEY, O_THREAD, O_IOCOMP };
 typedef struct obj {
     int type, refs;
     int fd, keepfd;              /* keepfd: stdin/out/err, never closed */
@@ -532,6 +532,8 @@ typedef struct obj {
     int image;
     uint32_t ctx[9], teb, tid;   /* a thread: edi esi ebx edx ecx eax ebp eip esp; its TEB, its id */
     int suspended;
+    uint32_t* q;                 /* an I/O completion port: packets of 4 (key, apc, status, information) */
+    int qn, qcap;
 } obj_t;
 
 #define MAXH 4096
@@ -557,6 +559,7 @@ static void obj_release(obj_t* o) {
     free(o->names);
     if (o->fd >= 0 && !o->keepfd) close(o->fd);
     if (o->del && o->host) { if (remove(o->host)) rmdir(o->host); }
+    free(o->q);
     free(o->guest);
     free(o->host);
     free(o);
@@ -604,7 +607,10 @@ static int to_host(const char* guest, char* out, int cap) {
         size_t L = strlen(out);
         snprintf(out + L, cap - L, "/%s", comp);
         struct stat st;
-        if (!lstat(out, &st)) continue;
+        if (!lstat(out, &st)) {
+            if (S_ISLNK(st.st_mode)) return 0;      /* the drive sandbox: a link never leads out of a mount */
+            continue;
+        }
         out[L] = 0;
         DIR* d = opendir(L ? out : "/");
         struct dirent* de;
@@ -613,6 +619,7 @@ static int to_host(const char* guest, char* out, int cap) {
             if (!strcasecmp(de->d_name, comp)) { snprintf(out + L, cap - L, "/%s", de->d_name); found = 1; break; }
         if (d) closedir(d);
         if (!found) snprintf(out + L, cap - L, "/%s", comp);
+        else if (!lstat(out, &st) && S_ISLNK(st.st_mode)) return 0;
     }
     return 1;
 }
@@ -1236,6 +1243,63 @@ static uint32_t s_waitn(uint32_t* a) {
     }
 }
 
+/* I/O completion ports (the thread pool's): a queue of packets nobody but the guest fills */
+static uint32_t s_create_iocomp(uint32_t* a) {
+    obj_t* o = obj_new(O_IOCOMP);
+    MEM32(a[0]) = h_put(o);
+    return 0;
+}
+/* NtSetIoCompletion(Port, KeyContext, ApcContext, Status, Information) */
+static uint32_t s_set_iocomp(uint32_t* a) {
+    obj_t* o = h_get(a[0]);
+    if (!o || o->type != O_IOCOMP) return ST_INVALID_HANDLE;
+    if (o->qn == o->qcap) o->q = realloc(o->q, (o->qcap = o->qcap * 2 + 16) * 16);
+    memcpy(o->q + 4 * o->qn++, a + 1, 16);
+    return 0;
+}
+/* NtRemoveIoCompletion(Port, KeyContext*, ApcContext*, IoStatusBlock*, Timeout*) */
+static uint32_t s_remove_iocomp(uint32_t* a) {
+    for (uint64_t end = 0;;) {
+        obj_t* o = h_get(a[0]);
+        if (!o || o->type != O_IOCOMP) return ST_INVALID_HANDLE;
+        if (o->qn) {
+            uint32_t* p = o->q;
+            MEM32(a[1]) = p[0], MEM32(a[2]) = p[1], MEM32(a[3]) = p[2], MEM32(a[3] + 4) = p[3];
+            memmove(p, p + 4, (size_t)--o->qn * 16);
+            return 0;
+        }
+        if (!wait_more(a[4], &end)) return end ? ST_TIMEOUT : wait_timeout(a[4], "NtRemoveIoCompletion");
+    }
+}
+
+/* the global atom table (GlobalAddAtom): NtAddAtom/NtFindAtom(Name, Length in bytes, Atom*), NtDeleteAtom(Atom) */
+static char* g_atom[0x1000];
+static uint32_t atom_op(uint32_t* a, int add) {
+    char n[512];
+    uint32_t len = a[1] / 2 > 255 ? 255 : a[1] / 2;
+    u16_to_u8((const uint16_t*)(uintptr_t)a[0], len, n, sizeof n);
+    if (n[0] == '#') { if (a[2]) MEM16(a[2]) = (uint16_t)atoi(n + 1); return 0; }
+    int i, fr = -1;
+    for (i = 0; i < 0x1000; i++) {
+        if (g_atom[i] && !strcasecmp(g_atom[i], n)) break;
+        if (!g_atom[i] && fr < 0) fr = i;
+    }
+    if (i == 0x1000) {
+        if (!add) return ST_NAME_NOT_FOUND;
+        if (fr < 0) return ST_NO_MEMORY;
+        g_atom[i = fr] = strdup(n);
+    }
+    if (a[2]) MEM16(a[2]) = (uint16_t)(0xC000 + i);
+    return 0;
+}
+static uint32_t s_add_atom(uint32_t* a) { return atom_op(a, 1); }
+static uint32_t s_find_atom(uint32_t* a) { return atom_op(a, 0); }
+static uint32_t s_delete_atom(uint32_t* a) {
+    uint32_t i = (a[0] & 0xFFFF) - 0xC000;
+    if (i < 0x1000) { free(g_atom[i]); g_atom[i] = NULL; }
+    return 0;
+}
+
 /* NtDelayExecution(Alertable, Interval*) */
 static uint32_t s_delay(uint32_t* a) {
     uint64_t end = 0;
@@ -1582,11 +1646,15 @@ static uint32_t s_query_token(uint32_t* a) {
     }
 }
 static uint32_t s_open_thread_token(uint32_t* a) { (void)a; return ST_NO_TOKEN; }
-/* The registry: read only, and only what the guest's NLS code checks
- * (IsValidLocale: the locale's key and its language group). Everything else
- * is not found, and cmd, kernel32 and msvcrt keep their defaults.
- * ponytail: a table, not a hive; a writable private hive (regbox32's on
- * Windows) when a program needs to keep settings. */
+/* The registry box: one tree of keys and values in memory, seeded with what
+ * the guest's NLS code checks (IsValidLocale: the locale's key and its
+ * language group; the user's International values), then loaded from the
+ * box file (ntp_regbox) and saved to it after every write. There is no host
+ * registry here: the guest sees the seed and the file, nothing else. The file
+ * is text, one "[\Registry\...]" line per key and one "name"=hex(T):xx,xx
+ * line per value (@ for the default value).
+ * ponytail: a flat array scanned linearly, the whole file rewritten per
+ * write; a hash and a flush at idle if a guest writes a lot. */
 #define USER_KEY "\\REGISTRY\\USER\\S-1-5-21-1-2-3-1000"
 static const struct { const char* key; const char* name; const char* sz; } g_reg[] = {
     { "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Nls\\Locale", "00000409", "1" },
@@ -1610,58 +1678,346 @@ static const struct { const char* key; const char* name; const char* sz; } g_reg
 };
 #define NREG ((int)(sizeof g_reg / sizeof g_reg[0]))
 
+typedef struct rval { char* name; uint32_t type, len; uint8_t* data; struct rval* next; } rval_t;
+typedef struct { char* path; int parent, dead; rval_t* vals, *last; } rkey_t;
+static rkey_t* g_rk;
+static int g_nrk, g_rkinit;
+static char g_regfile[1024];
+static pthread_mutex_t g_regmu = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
+
+static int rk_find(const char* p) {
+    for (int i = 0; i < g_nrk; i++) if (!g_rk[i].dead && !strcasecmp(g_rk[i].path, p)) return i;
+    return -1;
+}
+static int rk_make(const char* p) {
+    int k = rk_find(p);
+    if (k >= 0) return k;
+    char par[1024];
+    snprintf(par, sizeof par, "%s", p);
+    char* sl = strrchr(par, '\\');
+    int pi = -1;
+    if (sl && sl != par) { *sl = 0; pi = rk_make(par); }
+    if (!(g_nrk & 255)) g_rk = realloc(g_rk, (g_nrk + 256) * sizeof *g_rk);
+    g_rk[g_nrk] = (rkey_t){ strdup(p), pi, 0, NULL, NULL };
+    return g_nrk++;
+}
+static rval_t* rv_find(int k, const char* n) {
+    for (rval_t* v = g_rk[k].vals; v; v = v->next) if (!strcasecmp(v->name, n)) return v;
+    return NULL;
+}
+static void rv_set(int k, const char* n, uint32_t type, const void* d, uint32_t len) {
+    rval_t* v = rv_find(k, n);
+    if (!v) {                                    /* appended: values enumerate in the order they were set */
+        v = calloc(1, sizeof *v);
+        v->name = strdup(n);
+        if (g_rk[k].last) g_rk[k].last->next = v; else g_rk[k].vals = v;
+        g_rk[k].last = v;
+    }
+    free(v->data);
+    v->type = type, v->len = len, v->data = malloc(len ? len : 1);
+    memcpy(v->data, d, len);
+}
+static void reg_save(void) {
+    if (!g_regfile[0]) return;
+    char tmp[1100];
+    snprintf(tmp, sizeof tmp, "%s.new", g_regfile);
+    FILE* f = fopen(tmp, "w");
+    if (!f) return;
+    for (int i = 0; i < g_nrk; i++) {
+        if (g_rk[i].dead) continue;
+        fprintf(f, "[%s]\n", g_rk[i].path);
+        for (rval_t* v = g_rk[i].vals; v; v = v->next) {
+            if (!v->name[0]) fputc('@', f);
+            else {
+                fputc('"', f);
+                for (const char* c = v->name; *c; c++) { if (*c == '"' || *c == '\\') fputc('\\', f); fputc(*c, f); }
+                fputc('"', f);
+            }
+            fprintf(f, "=hex(%x):", v->type);
+            for (uint32_t j = 0; j < v->len; j++) fprintf(f, j ? ",%02x" : "%02x", v->data[j]);
+            fputc('\n', f);
+        }
+    }
+    fclose(f);
+    rename(tmp, g_regfile);
+}
+static void reg_load(const char* file) {
+    FILE* f = fopen(file, "r");
+    if (!f) return;
+    static char l[1 << 20];
+    static uint8_t d[1 << 18];
+    int k = -1;
+    while (fgets(l, sizeof l, f)) {
+        l[strcspn(l, "\r\n")] = 0;
+        if (l[0] == '[') { char* e = strrchr(l, ']'); if (e) { *e = 0; k = rk_make(l + 1); } continue; }
+        if (k < 0 || (l[0] != '"' && l[0] != '@')) continue;
+        char n[1024];
+        size_t o = 0;
+        const char* c = l + 1;
+        if (l[0] == '"') {
+            while (*c && *c != '"' && o < sizeof n - 1) { if (*c == '\\' && c[1]) c++; n[o++] = *c++; }
+            if (*c) c++;
+        }
+        n[o] = 0;
+        unsigned type;
+        if (sscanf(c, "=hex(%x):", &type) != 1 || !(c = strchr(c, ':'))) continue;
+        uint32_t len = 0;
+        for (c++; *c && len < sizeof d; ) {
+            d[len++] = (uint8_t)strtoul(c, (char**)&c, 16);
+            if (*c != ',') break;
+            c++;
+        }
+        rv_set(k, n, type, d, len);
+    }
+    fclose(f);
+}
+static void reg_init(void) {
+    if (g_rkinit) return;
+    g_rkinit = 1;
+    rk_make("\\Registry\\Machine\\Software\\Classes");
+    for (int i = 0; i < NREG; i++) {
+        int k = rk_make(g_reg[i].key);
+        if (!g_reg[i].name) continue;
+        uint16_t w[256];
+        rv_set(k, g_reg[i].name, 1, w, 2u * (u8_to_u16(g_reg[i].sz, w, 256) + 1));
+    }
+    if (g_regfile[0]) reg_load(g_regfile);
+}
+void ntp_regbox(const char* file) { snprintf(g_regfile, sizeof g_regfile, "%s", file); }
+
+/* OBJECT_ATTRIBUTES -> the key's full path */
+static int key_path(uint32_t oa, char* full, int cap) {
+    char n[512];
+    obj_t* root = oa && MEM32(oa + 4) ? h_get(MEM32(oa + 4)) : NULL;
+    us_to_u8(oa ? MEM32(oa + 8) : 0, n, sizeof n);
+    size_t L = strlen(n);
+    while (L && n[L - 1] == '\\') n[--L] = 0;
+    if (root && root->type == O_KEY && root->guest) snprintf(full, cap, L ? "%s\\%s" : "%s", root->guest, n);
+    else if (root) return 0;
+    else snprintf(full, cap, "%s", n);
+    return 1;
+}
+static int key_of(uint32_t h) {
+    obj_t* o = h_get(h);
+    return o && o->type == O_KEY && o->guest ? rk_find(o->guest) : -1;
+}
+static uint32_t key_handle(uint32_t at, int k) {
+    obj_t* o = obj_new(O_KEY);
+    o->guest = strdup(g_rk[k].path);
+    MEM32(at) = h_put(o);
+    return 0;
+}
+/* an information block: a fixed part, then a tail at off; NT's rules for a short buffer */
+static uint32_t reg_out(uint32_t buf, uint32_t cap, uint32_t res, const void* hdr, uint32_t nh, const void* tail, uint32_t nt, uint32_t off) {
+    uint32_t need = off + nt;
+    if (res) MEM32(res) = need;
+    if (cap < nh) return ST_BUFFER_TOO_SMALL;
+    memcpy((void*)(uintptr_t)buf, hdr, nh);
+    if (cap < need) return ST_BUFFER_OVERFLOW;
+    if (nt) memcpy((void*)(uintptr_t)(buf + off), tail, nt);
+    return 0;
+}
+static const char* leaf(const char* p) { const char* s = strrchr(p, '\\'); return s ? s + 1 : p; }
+
 /* NtOpenKey(Handle*, Access, OA) */
 static uint32_t s_registry(uint32_t* a) {
-    char n[512], full[1024];
-    obj_t* root = a[2] && MEM32(a[2] + 4) ? h_get(MEM32(a[2] + 4)) : NULL;
-    us_to_u8(a[2] ? MEM32(a[2] + 8) : 0, n, sizeof n);
-    if (root && root->type == O_KEY && root->guest) snprintf(full, sizeof full, "%s\\%s", root->guest, n);
-    else if (root) return ST_NAME_NOT_FOUND;
-    else snprintf(full, sizeof full, "%s", n);
-    for (int i = 0; i < NREG; i++)
-        if (!strcasecmp(g_reg[i].key, full)) {
-            obj_t* o = obj_new(O_KEY);
-            o->guest = strdup(g_reg[i].key);
-            MEM32(a[0]) = h_put(o);
-            return 0;
-        }
-    return ST_NAME_NOT_FOUND;
+    char full[1024];
+    pthread_mutex_lock(&g_regmu);
+    reg_init();
+    int k = key_path(a[2], full, sizeof full) ? rk_find(full) : -1;
+    uint32_t r = k < 0 ? ST_NAME_NOT_FOUND : key_handle(a[0], k);
+    pthread_mutex_unlock(&g_regmu);
+    return r;
+}
+/* NtCreateKey(Handle*, Access, OA, TitleIndex, Class, Options, Disposition*) */
+static uint32_t s_create_key(uint32_t* a) {
+    char full[1024];
+    pthread_mutex_lock(&g_regmu);
+    reg_init();
+    uint32_t r = ST_NAME_NOT_FOUND;
+    if (key_path(a[2], full, sizeof full) && !strncasecmp(full, "\\Registry\\", 10)) {
+        int had = rk_find(full) >= 0, k = rk_make(full);
+        if (a[6]) MEM32(a[6]) = had ? 2 : 1;      /* REG_OPENED_EXISTING_KEY : REG_CREATED_NEW_KEY */
+        if (!had) reg_save();
+        r = key_handle(a[0], k);
+    }
+    pthread_mutex_unlock(&g_regmu);
+    return r;
 }
 
+/* KEY_VALUE_{BASIC,FULL,PARTIAL}_INFORMATION */
+static uint32_t value_info(rval_t* v, uint32_t cls, uint32_t buf, uint32_t cap, uint32_t res) {
+    uint16_t wn[512];
+    uint32_t nl = 2u * u8_to_u16(v->name, wn, 512), h[5];
+    if (cls == 0) { h[0] = 0, h[1] = v->type, h[2] = nl; return reg_out(buf, cap, res, h, 12, wn, nl, 12); }
+    if (cls == 2) { h[0] = 0, h[1] = v->type, h[2] = v->len; return reg_out(buf, cap, res, h, 12, v->data, v->len, 12); }
+    if (cls != 1) return ST_INVALID_INFO_CLASS;
+    uint32_t off = (20 + nl + 3) & ~3u, need = off + v->len;
+    h[0] = 0, h[1] = v->type, h[2] = off, h[3] = v->len, h[4] = nl;
+    if (res) MEM32(res) = need;
+    if (cap < 20) return ST_BUFFER_TOO_SMALL;
+    memcpy((void*)(uintptr_t)buf, h, 20);
+    if (cap < need) return ST_BUFFER_OVERFLOW;
+    memcpy((void*)(uintptr_t)(buf + 20), wn, nl);
+    memcpy((void*)(uintptr_t)(buf + off), v->data, v->len);
+    return 0;
+}
 /* NtQueryValueKey(Key, ValueName*, Class, Buffer, Length, ResultLength*) */
 static uint32_t s_query_value(uint32_t* a) {
-    obj_t* o = h_get(a[0]);
-    char n[256];
-    if (!o || o->type != O_KEY || !o->guest) return ST_INVALID_HANDLE;
+    char n[1024];
+    pthread_mutex_lock(&g_regmu);
+    int k = key_of(a[0]);
     us_to_u8(a[1], n, sizeof n);
-    for (int i = 0; i < NREG; i++) {
-        if (strcasecmp(g_reg[i].key, o->guest) || !g_reg[i].name || strcasecmp(g_reg[i].name, n)) continue;
-        uint16_t w[256];
-        uint32_t dl = 2u * (u8_to_u16(g_reg[i].sz, w, 256) + 1), b = a[3], need;
-        if (a[2] == 2) {                                        /* KeyValuePartialInformation */
-            need = 12 + dl;
-            if (a[5]) MEM32(a[5]) = need;
-            if (a[4] < need) return a[4] < 12 ? ST_BUFFER_TOO_SMALL : ST_BUFFER_OVERFLOW;
-            MEM32(b) = 0, MEM32(b + 4) = 1, MEM32(b + 8) = dl;  /* REG_SZ */
-            memcpy((void*)(uintptr_t)(b + 12), w, dl);
-            return 0;
-        }
-        if (a[2] == 1) {                                        /* KeyValueFullInformation */
-            uint16_t wn[256];
-            uint32_t nl = 2u * u8_to_u16(g_reg[i].name, wn, 256), off = (20 + nl + 3) & ~3u;
-            need = off + dl;
-            if (a[5]) MEM32(a[5]) = need;
-            if (a[4] < need) return a[4] < 20 ? ST_BUFFER_TOO_SMALL : ST_BUFFER_OVERFLOW;
-            MEM32(b) = 0, MEM32(b + 4) = 1, MEM32(b + 8) = off, MEM32(b + 12) = dl, MEM32(b + 16) = nl;
-            memcpy((void*)(uintptr_t)(b + 20), wn, nl);
-            memcpy((void*)(uintptr_t)(b + off), w, dl);
-            return 0;
-        }
-        return ST_INVALID_INFO_CLASS;
-    }
-    return ST_NAME_NOT_FOUND;
+    rval_t* v = k >= 0 ? rv_find(k, n) : NULL;
+    uint32_t r = k < 0 ? ST_INVALID_HANDLE : !v ? ST_NAME_NOT_FOUND : value_info(v, a[2], a[3], a[4], a[5]);
+    pthread_mutex_unlock(&g_regmu);
+    return r;
 }
-static uint32_t s_create_key(uint32_t* a) { (void)a; return ST_ACCESS_DENIED; }
+/* NtEnumerateValueKey(Key, Index, Class, Buffer, Length, ResultLength*) */
+static uint32_t s_enum_value(uint32_t* a) {
+    pthread_mutex_lock(&g_regmu);
+    int k = key_of(a[0]);
+    rval_t* v = k >= 0 ? g_rk[k].vals : NULL;
+    for (uint32_t i = 0; v && i < a[1]; i++) v = v->next;
+    uint32_t r = k < 0 ? ST_INVALID_HANDLE : !v ? ST_NO_MORE_ENTRIES : value_info(v, a[2], a[3], a[4], a[5]);
+    pthread_mutex_unlock(&g_regmu);
+    return r;
+}
+/* NtSetValueKey(Key, ValueName*, TitleIndex, Type, Data, DataSize) */
+static uint32_t s_set_value(uint32_t* a) {
+    char n[1024];
+    pthread_mutex_lock(&g_regmu);
+    int k = key_of(a[0]);
+    us_to_u8(a[1], n, sizeof n);
+    if (k >= 0) { rv_set(k, n, a[3], (const void*)(uintptr_t)a[4], a[5]); reg_save(); }
+    pthread_mutex_unlock(&g_regmu);
+    return k < 0 ? ST_INVALID_HANDLE : 0;
+}
+/* NtDeleteValueKey(Key, ValueName*) */
+static uint32_t s_delete_value(uint32_t* a) {
+    char n[1024];
+    pthread_mutex_lock(&g_regmu);
+    int k = key_of(a[0]);
+    uint32_t r = k < 0 ? ST_INVALID_HANDLE : ST_NAME_NOT_FOUND;
+    us_to_u8(a[1], n, sizeof n);
+    if (k >= 0) {
+        rval_t* prev = NULL;
+        for (rval_t* v = g_rk[k].vals; v; prev = v, v = v->next) {
+            if (strcasecmp(v->name, n)) continue;
+            if (prev) prev->next = v->next; else g_rk[k].vals = v->next;
+            if (g_rk[k].last == v) g_rk[k].last = prev;
+            free(v->name), free(v->data), free(v);
+            reg_save();
+            r = 0;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_regmu);
+    return r;
+}
+/* NtDeleteKey(Key): only a key with no subkeys, as NT */
+static uint32_t s_delete_key(uint32_t* a) {
+    pthread_mutex_lock(&g_regmu);
+    int k = key_of(a[0]);
+    uint32_t r = k < 0 ? ST_INVALID_HANDLE : 0;
+    for (int i = 0; k >= 0 && i < g_nrk; i++) if (!g_rk[i].dead && g_rk[i].parent == k) r = ST_ACCESS_DENIED;
+    if (!r) { g_rk[k].dead = 1; reg_save(); }
+    pthread_mutex_unlock(&g_regmu);
+    return r;
+}
+/* KEY_BASIC / KEY_NODE / KEY_FULL_INFORMATION of key k */
+static uint32_t key_info(int k, uint32_t cls, uint32_t buf, uint32_t cap, uint32_t res) {
+    uint16_t wn[512];
+    uint32_t nl = 2u * u8_to_u16(leaf(g_rk[k].path), wn, 512), h[11] = { 0 };
+    if (cls == 0) { h[3] = nl; return reg_out(buf, cap, res, h, 16, wn, nl, 16); }
+    if (cls == 1) { h[3] = 0xFFFFFFFFu, h[5] = nl; return reg_out(buf, cap, res, h, 24, wn, nl, 24); }
+    if (cls != 2) return ST_INVALID_INFO_CLASS;
+    h[3] = 44;                                           /* ClassOffset */
+    for (int i = 0; i < g_nrk; i++) {
+        if (g_rk[i].dead || g_rk[i].parent != k) continue;
+        uint32_t l = 2u * (uint32_t)strlen(leaf(g_rk[i].path));
+        h[5]++;
+        if (l > h[6]) h[6] = l;
+    }
+    for (rval_t* v = g_rk[k].vals; v; v = v->next) {
+        uint32_t l = 2u * (uint32_t)strlen(v->name);
+        h[8]++;
+        if (l > h[9]) h[9] = l;
+        if (v->len > h[10]) h[10] = v->len;
+    }
+    return reg_out(buf, cap, res, h, 44, NULL, 0, 44);
+}
+/* NtQueryKey(Key, Class, Buffer, Length, ResultLength*) */
+static uint32_t s_query_key(uint32_t* a) {
+    pthread_mutex_lock(&g_regmu);
+    int k = key_of(a[0]);
+    uint32_t r = k < 0 ? ST_INVALID_HANDLE : key_info(k, a[1], a[2], a[3], a[4]);
+    pthread_mutex_unlock(&g_regmu);
+    return r;
+}
+/* NtEnumerateKey(Key, Index, Class, Buffer, Length, ResultLength*) */
+static uint32_t s_enum_key(uint32_t* a) {
+    pthread_mutex_lock(&g_regmu);
+    int k = key_of(a[0]), c = -1;
+    for (int i = 0, n = 0; k >= 0 && i < g_nrk; i++)
+        if (!g_rk[i].dead && g_rk[i].parent == k && (uint32_t)n++ == a[1]) { c = i; break; }
+    uint32_t r = k < 0 ? ST_INVALID_HANDLE : c < 0 ? ST_NO_MORE_ENTRIES : key_info(c, a[2], a[3], a[4], a[5]);
+    pthread_mutex_unlock(&g_regmu);
+    return r;
+}
+/* NtNotifyChangeKey: nothing else writes the box, so no change ever comes */
+static uint32_t s_notify_key(uint32_t* a) { (void)a; return 0x103; }      /* STATUS_PENDING */
+
+/* ------------------------------------------------------------- the RPC client call guard
+ * (native32.c's): Windows 2000's ole32 calls rpcss with no __except around its stubs, since rpcss
+ * is always there. Here no RPC server is, so an RPC status (0x6A4..0x7FF, or its HRESULT) that no
+ * guest frame takes inside NdrClientCall2/NdrClientCall ends that call: the handlers it entered
+ * unwind, and the stub returns the status. */
+typedef struct rpcg {
+    struct rpcg* prev;
+    jmp_buf jb;
+    uint32_t chain, esp, ebx, esi, edi, ebp, func, status;
+    recomp_ehframe_t* frames;
+} rpcg_t;
+static __thread rpcg_t* t_rpcg;
+static recomp_func_t g_rpc_orig[2];
+static void rpc_guarded(int k) {
+    rpcg_t g;
+    g.prev = t_rpcg, g.chain = MEM32(g_fs_base), g.frames = t_frames;
+    g.esp = g_esp, g.ebx = g_ebx, g.esi = g_esi, g.edi = g_edi, g.ebp = g_ebp, g.func = g_cur_func;
+    t_rpcg = &g;
+    if (!setjmp(g.jb)) g_rpc_orig[k]();
+    else {
+        MEM32(g_fs_base) = g.chain;
+        t_frames = g.frames;
+        g_esp = g.esp + 4, g_ebx = g.ebx, g_esi = g.esi, g_edi = g.edi, g_ebp = g.ebp, g_cur_func = g.func;
+        g_eax = g.status, g_edx = 0;
+        fprintf(stderr, "[rpc] client call failed with %08X: returned to the stub, not raised\n", g.status);
+    }
+    t_rpcg = g.prev;
+}
+static void shim_rpc_call2(void) { rpc_guarded(0); }
+static void shim_rpc_call(void) { rpc_guarded(1); }
+static void rpc_guard_install(void) {
+    uint32_t rpc = ntp_module("rpcrt4.dll"), va;
+    if (!rpc) return;
+    if ((va = ntp_export(rpc, "NdrClientCall2")) && (g_rpc_orig[0] = recomp_lookup(va))) ntp_replace(va, shim_rpc_call2);
+    if ((va = ntp_export(rpc, "NdrClientCall")) && (g_rpc_orig[1] = recomp_lookup(va))) ntp_replace(va, shim_rpc_call);
+}
+static void rpc_fail(uint32_t er, uint32_t ctx) {
+    rpcg_t* g = t_rpcg;
+    uint32_t code = er ? MEM32(er) : 0, c = (code & 0xFFFF0000u) == 0x80070000u ? code & 0xFFFF : code;
+    if (!g || c < 0x6A4 || c > 0x7FF) return;
+    MEM32(er + 4) |= 2u;                                     /* EXCEPTION_UNWINDING */
+    for (uint32_t reg = MEM32(g_fs_base); reg && reg != 0xFFFFFFFFu && reg != g->chain; ) {
+        uint32_t args[4] = { er, reg, ctx, 0 };
+        if (recomp_lookup(MEM32(reg + 4))) ntp_guest(MEM32(reg + 4), 4, args);
+        reg = MEM32(reg);
+        MEM32(g_fs_base) = reg;
+    }
+    g->status = c;
+    longjmp(g->jb, 1);
+}
 
 /* ------------------------------------------------------------- exceptions */
 static uint32_t s_raise_exception(uint32_t* a) {
@@ -1680,6 +2036,7 @@ static uint32_t s_raise_exception(uint32_t* a) {
         depth--;
         g_esp = sp;
     }
+    rpc_fail(rec, ctx);                                  /* in a guarded RPC client call: that call fails instead */
     fprintf(stderr, "\n[nt] unhandled guest exception %08X at %08X (first chance %u), eip %08X esp %08X\n",
             rec ? MEM32(rec) : 0, rec ? MEM32(rec + 12) : 0, a[2], ctx ? MEM32(ctx + 0xB8) : 0, ctx ? MEM32(ctx + 0xC4) : 0);
     fflush(NULL);
@@ -1904,6 +2261,30 @@ uint32_t ntp_guest(uint32_t va, int nargs, const uint32_t* args) {
 }
 uint32_t ntp_peb(void) { return g_peb; }
 
+/* RtlUnwind(TargetFrame, TargetIp, ExceptionRecord, ReturnValue), stdcall: the guest's own ends in
+ * NtContinue to its caller, which a lift cannot do. This one (seh32.c's, on the guest's fs:[0]
+ * chain) calls each handler above the target with the unwinding flag, unlinks it, and returns:
+ * TargetIp is where the caller goes on anyway (its __except block, through the landing pads).
+ * ponytail: no ExecuteHandler2 frame around the handler (C++Builder's stub reads one). */
+static void shim_rtl_unwind(void) {
+    uint32_t target = MEM32(g_esp + 4), er = MEM32(g_esp + 12), ret = MEM32(g_esp + 16), esp = g_esp;
+    g_esp = (g_esp - 0x400) & ~15u;                          /* a record and a context below the caller */
+    uint32_t mine = g_esp, ctx = g_esp + 0x80;
+    memset((void*)(uintptr_t)mine, 0, 0x80 + 0x2CC);
+    MEM32(mine) = 0xC0000027u;                               /* STATUS_UNWIND */
+    if (!er) er = mine;
+    MEM32(er + 4) |= 2u | (target ? 0 : 4u);                 /* EXCEPTION_UNWINDING, EXIT_UNWIND */
+    for (uint32_t reg = MEM32(g_fs_base); reg && reg != 0xFFFFFFFFu && reg != target; ) {
+        uint32_t args[4] = { er, reg, ctx, 0 };
+        if (recomp_lookup(MEM32(reg + 4))) ntp_guest(MEM32(reg + 4), 4, args);
+        else fprintf(stderr, "[seh] handler %08X of frame %08X is not lifted\n", MEM32(reg + 4), reg);
+        reg = MEM32(reg);
+        MEM32(g_fs_base) = reg;
+    }
+    g_esp = esp + 4 + 16;
+    g_eax = ret;
+}
+
 /* ------------------------------------------------------------- the table */
 static const struct { const char* name; uint32_t (*fn)(uint32_t*); } g_impl[] = {
     { "NtAllocateVirtualMemory", s_alloc_vm }, { "NtFreeVirtualMemory", s_free_vm },
@@ -1944,6 +2325,12 @@ static const struct { const char* name; uint32_t (*fn)(uint32_t*); } g_impl[] = 
     { "NtQueryDirectoryObject", s_query_dirobj }, { "NtOpenSymbolicLinkObject", s_not_found },
     { "NtOpenProcessToken", s_open_token }, { "NtQueryInformationToken", s_query_token }, { "NtOpenThreadToken", s_open_thread_token },
     { "NtOpenKey", s_registry }, { "NtQueryValueKey", s_query_value }, { "NtCreateKey", s_create_key },
+    { "NtEnumerateValueKey", s_enum_value }, { "NtSetValueKey", s_set_value }, { "NtDeleteValueKey", s_delete_value },
+    { "NtDeleteKey", s_delete_key }, { "NtQueryKey", s_query_key }, { "NtEnumerateKey", s_enum_key },
+    { "NtFlushKey", s_ok }, { "NtNotifyChangeKey", s_notify_key },
+    { "NtCreateIoCompletion", s_create_iocomp }, { "NtSetIoCompletion", s_set_iocomp },
+    { "NtRemoveIoCompletion", s_remove_iocomp },
+    { "NtAddAtom", s_add_atom }, { "NtFindAtom", s_find_atom }, { "NtDeleteAtom", s_delete_atom },
     { "NtRaiseException", s_raise_exception }, { "NtContinue", s_continue },
     { "NtSecureConnectPort", s_secure_connect }, { "NtConnectPort", s_connect },
     { "NtRequestWaitReplyPort", s_request_wait_reply }, { "NtRequestPort", s_ok },
@@ -2129,6 +2516,10 @@ static uint32_t environment(void) {
         "PATHEXT=.COM;.EXE;.BAT;.CMD", "PROCESSOR_ARCHITECTURE=x86", "PROMPT=$P$G", "SystemDrive=C:",
         "SystemRoot=C:\\WINNT", "TEMP=C:\\TEMP", "TMP=C:\\TEMP", "USERNAME=user", "COMPUTERNAME=W2K",
         "windir=C:\\WINNT", "NUMBER_OF_PROCESSORS=1",
+        /* the profile: a shell finds its folders through these (all under the C: mount) */
+        "ALLUSERSPROFILE=C:\\Documents and Settings\\all", "APPDATA=C:\\Documents and Settings\\user\\Application Data",
+        "CommonProgramFiles=C:\\Program Files\\Common Files", "HOMEDRIVE=C:", "HOMEPATH=\\Documents and Settings\\user",
+        "ProgramFiles=C:\\Program Files", "USERPROFILE=C:\\Documents and Settings\\user",
     };
     uint32_t e = ntp_alloc(0x4000), o = e;
     for (size_t i = 0; i < sizeof env / sizeof env[0]; i++)
@@ -2229,6 +2620,8 @@ int ntp_boot(uint32_t ntdll, uint32_t exe, const char* image, const char* cmdlin
     MEM32(peb + 0x60) = casetab;
 
     /* LdrInitializeThunk(Context, ntdll base, 0) with the initial CONTEXT after it */
+    if (ntp_export(ntdll, "RtlUnwind")) ntp_replace(ntp_export(ntdll, "RtlUnwind"), shim_rtl_unwind);
+    rpc_guard_install();
     uint32_t thunk = ntp_export(ntdll, "LdrInitializeThunk");
     if (!thunk) { fprintf(stderr, "[nt] ntdll has no LdrInitializeThunk\n"); return 0; }
     uint32_t args[3 + 0x2CC / 4] = { 0, ntdll, 0 };

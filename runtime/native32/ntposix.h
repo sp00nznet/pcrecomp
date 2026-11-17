@@ -18,6 +18,7 @@
 void ntp_init(void);
 /* guest path prefix ("C:", "C:\\WINNT\\system32") -> host directory; longest wins */
 void ntp_mount(const char* guest, const char* host);
+void ntp_regbox(const char* file);   /* the registry box: loaded from and saved to this file only */
 /* map a (rebased) PE at its base as a lifted module; name is what the loader asks for */
 uint32_t ntp_map(const char* path, uint32_t base, const char* name);
 uint32_t ntp_export(uint32_t base, const char* name);
