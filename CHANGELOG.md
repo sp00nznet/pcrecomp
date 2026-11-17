@@ -738,6 +738,14 @@ From #9. Found bringing Nocturne (Terminal Reality, Watcom C/C++32) in game.
 
 ### Fixed
 
+- native32 regbox32: the guest OS's own keys are never read from the host,
+  whether or not the box has them: HKCU `...\CurrentVersion\Explorer` and
+  `Policies`, `Environment`, `Volatile Environment`; HKLM `Explorer\Shell
+  Folders`, `User Shell Folders`, `Policies`, `ProfileList` and Session
+  Manager\Environment (`os_owned_key`). A host shell32 in a stage 1 process
+  had read the host's User Shell Folders and written C:\Users\<user>\OneDrive
+  paths into the box. `RegGetValueA/W` are boxed too (kernelbase opened the
+  host key itself).
 - win32hle: `WM_KEYDOWN`/`WM_KEYUP` set lParam's extended-key bit (24) for
   the keys Windows marks extended: the arrows, Insert, Delete, Home, End,
   Page Up and Down, and the right-hand Ctrl and Alt. A game reading the scan
