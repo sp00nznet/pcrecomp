@@ -360,7 +360,7 @@ static void disp_exttextout(CPU *c) {
     const uint8_t *base = fi - 66;
     int n = count < 0 ? -count : count, width = 0;
     const uint8_t *str = (const uint8_t *)farptr(lpstr);
-    surf_t s; int draw = count > 0 && surf_of(lpdev, &s);
+    surf_t s; int draw = count >= 0 && surf_of(lpdev, &s);   /* count 0: ETO_OPAQUE alone, a fill (comctl32 PatB) */
     rect16 clip = { 0, 0, 0x7FFF, 0x7FFF };
     if (lpclip) clip = *(const rect16 *)farptr(lpclip);
     const uint8_t *dm = lpdm ? (const uint8_t *)farptr(lpdm) : NULL;
@@ -454,8 +454,8 @@ static void disp_bitblt(CPU *c) {
         tmp = (uint16_t *)malloc((size_t)(w > 0 ? w : 1) * (h > 0 ? h : 1) * 2);
         for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
             uint16_t v = surf_get(&s, sx + x, sy + y);
-            if (s.bpp == 1 && d.bpp == 16) v = v ? bk : fg;
-            else if (s.bpp == 16 && d.bpp == 1) v = v == bk ? 0xFFFF : 0;
+            if (s.bpp == 1 && d.bpp != 1) v = v ? bk : fg;   /* any color surface: screen, bitmap or DIB */
+            else if (s.bpp != 1 && d.bpp == 1) v = v == bk ? 0xFFFF : 0;
             tmp[y * w + x] = v;
         }
     }
@@ -467,7 +467,7 @@ static void disp_bitblt(CPU *c) {
         surf_put(&d, px, py, rop3(code, for_surf(&d, pv), sv, surf_get(&d, px, py)));
     }
     free(tmp);
-    if (getenv("W16_TRACE")) fprintf(stderr, "[drv] DISPLAY.BitBlt %d,%d %dx%d rop %02X src %s %s\n", dx, dy, w, h, code, hs ? "yes" : "no",
+    if (getenv("W16_TRACE")) fprintf(stderr, "[drv] DISPLAY.BitBlt %d,%d %dx%d rop %02X pat %04X src %s %s\n", dx, dy, w, h, code, brush_at(br, dx, dy), hs ? "yes" : "no",
                                          d.bits == (uint8_t *)g_fb ? "screen" : d.bpp == 1 ? "mono" : "bitmap");
     c->ax = 1; ret_far(c, 32);
 }
