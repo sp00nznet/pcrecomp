@@ -212,6 +212,9 @@ static int marlett_build(int lfh, uint8_t *fi) {
     return size;
 }
 
+typedef struct { uint8_t *bits; int w, h, pitch, bpp; const uint16_t *pal; } surf_t;
+static int surf_of(uint32_t lp, surf_t *s);
+static uint16_t surf_get(surf_t *s, int x, int y);
 typedef struct { uint16_t style, width, color, pad; } ppen_t;
 typedef struct { uint16_t style, hatch, color, bk; uint16_t pat[64]; } pbrush_t;
 static void disp_realize(CPU *c) {
@@ -230,6 +233,15 @@ static void disp_realize(CPU *c) {
             b->style = *(const uint16_t *)li; b->color = rgb565(*(const uint32_t *)(li + 2));
             b->hatch = *(const uint16_t *)(li + 6); b->bk = 0xFFFF;
             for (int i = 0; i < 64; i++) b->pat[i] = b->color;
+            if (b->style == 3) {   /* BS_PATTERN: GDI passes a far pointer to the bitmap's PBITMAP where the
+                                    * colour would be (notepad's scroll bars); its top-left 8x8 is the pattern.
+                                    * A mono one (bk 0) takes the DRAWMODE's colours in BitBlt, 1 -> background. */
+                surf_t ps;
+                if (surf_of(*(const uint32_t *)(li + 2), &ps)) {
+                    for (int i = 0; i < 64; i++) b->pat[i] = surf_get(&ps, i & 7, i >> 3);
+                    if (ps.bpp == 1) b->bk = 0;
+                }
+            }
             if (b->style > 1 && getenv("W16_TRACE")) fprintf(stderr, "[drv] DISPLAY brush style %u: solid (color %08X hatch %04X)\n", b->style, *(const uint32_t *)(li + 2), b->hatch);
         }
     }
@@ -245,7 +257,7 @@ static void disp_realize(CPU *c) {
 /* A destination: the screen's PDEVICE (bmType nonzero) or a GDI memory bitmap (a PBITMAP:
  * type, width, height, widthbytes, planes, bitspixel, bits far ptr at 0Ah). 1 and 16 bpp.
  * ponytail: no huge (>64K, segmented) bitmaps. */
-typedef struct { uint8_t *bits; int w, h, pitch, bpp; const uint16_t *pal; } surf_t;   /* pal: a palettized DIB's colors (5-6-5) */
+/* surf_t (above), pal: a palettized DIB's colors (5-6-5) */
 /* A DIB section's PDEVICE (DIBENG.CreateDIBPDevice, below): the DIB engine's DIBENGINE
  * header, deType 'RP', deDeltaScan (signed) at 0Eh, deBits 16:32 at 16h (offset) and 1Ah
  * (selector): the buffer's start (GDI writes its own there after CreateDIBPDevice), so a
@@ -437,7 +449,9 @@ static void disp_bitblt(CPU *c) {
     for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
         int px = dx + x, py = dy + y;
         uint16_t sv = tmp ? tmp[y * w + x] : 0;
-        surf_put(&d, px, py, rop3(code, for_surf(&d, brush_at(br, px, py)), sv, surf_get(&d, px, py)));
+        uint16_t pv = brush_at(br, px, py);
+        if (br && br->style == 3 && !br->bk && d.bpp != 1) pv = pv ? bk : fg;   /* a mono pattern */
+        surf_put(&d, px, py, rop3(code, for_surf(&d, pv), sv, surf_get(&d, px, py)));
     }
     free(tmp);
     if (getenv("W16_TRACE")) fprintf(stderr, "[drv] DISPLAY.BitBlt %d,%d %dx%d rop %02X src %s %s\n", dx, dy, w, h, code, hs ? "yes" : "no",
