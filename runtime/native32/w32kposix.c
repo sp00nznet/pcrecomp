@@ -2503,6 +2503,11 @@ static int next_msg(uint32_t msg, uint32_t hw, uint32_t lo, uint32_t hi, int rem
         for (int i = 2; i < MAXU; i++) {
             uobj_t* u = &g_u[i];
             if (u->type != W2K_TYPE_WINDOW || !(u->dirty || u->ncdirty) || !visible(u)) continue;
+            /* an empty window has an empty update region: no WM_PAINT (comctl32's toolbar paints
+             * nothing at zero width and never calls BeginPaint, so its WM_PAINT came forever) */
+            if (rc_empty(&u->cr)) u->dirty = 0;
+            if (rc_empty(&u->wr)) u->ncdirty = 0;
+            if (!(u->dirty || u->ncdirty)) continue;
             if (hw && u->h != hw && !child_of(u->h, hw)) continue;
             MEM32(msg) = u->h, MEM32(msg + 4) = 0x0F, MEM32(msg + 8) = 0, MEM32(msg + 12) = 0, MEM32(msg + 16) = ntp_clock_ms();
             return 1;
@@ -2717,6 +2722,12 @@ static uint32_t s_call_oneparam(uint32_t* a) {
     case 0x1E: return 0x04090409;                /* GetKeyboardLayout */
     case 0x33: if (a[0]) MEM32(a[0]) = 0; return 1;   /* GetProcessDefaultLayout */
     case 0x16: return 1;                         /* BeginDeferWindowPos */
+    case 0x18: return 1;                         /* AllowSetForegroundWindow: the guest's own */
+    /* 0x1D GetInputEvent(wake mask): MsgWaitForMultipleObjects waits on it with its handles.
+     * ponytail: always signalled (the caller then peeks; every peek lets time pass), so a
+     * message wait never sleeps; a real per-queue event when idle CPU matters */
+    case 0x1D: { static uint32_t ev; if (!ev) ev = ntp_event(1, 1); return ev; }
+    case 0x21: return 1;                         /* LockSetForegroundWindow */
     }
     fprintf(stderr, "[user] NtUserCallOneParam(%08X, 0x%X) not answered\n", a[0], a[1]);
     return 0;
@@ -2728,6 +2739,7 @@ static uint32_t s_call_twoparam(uint32_t* a) {
 }
 static uint32_t s_call_hwnd(uint32_t* a) {       /* NtUserCallHwnd(hwnd, index) */
     if (a[1] == 0x3D) return 1;                   /* SetMsgBox: the dialog is a message box (win32k only marks it) */
+    if (a[1] == 0x3C || a[1] == 0x39) return 1;   /* Register/DeregisterShellHookWindow. ponytail: no HSHELL_* sent yet */
     fprintf(stderr, "[user] NtUserCallHwnd index 0x%X not answered\n", a[1]);
     return 0;
 }
@@ -2742,7 +2754,7 @@ static uint32_t s_hwnd_lock(uint32_t* a) {       /* NtUserCallHwndLock(hwnd, ind
     if (!u) return 0;
     if (a[1] == 0x50) { update(u); return 1; }  /* UpdateWindow */
     if (a[1] == 0x48) { u->ncdirty = 1; return 1; }   /* DrawMenuBar */
-    if (a[1] == 0x4C) { activate(u); return 1; }      /* (SetForegroundWindow's) */
+    if (a[1] == 0x4C || a[1] == 0x4D) { activate(u); return 1; }   /* (SetForegroundWindow's) */
     fprintf(stderr, "[user] NtUserCallHwndLock index 0x%X not answered\n", a[1]);
     return 0;
 }
@@ -2869,6 +2881,31 @@ static uint32_t s_threaddesk(uint32_t* a) { (void)a; return 0x128; }
 static uint32_t s_one_u(uint32_t* a) { (void)a; return 1; }
 static uint32_t s_selpal(uint32_t* a) { (void)a; return g_stock[15]; }   /* NtUserSelectPalette: the default palette stays */
 static uint32_t s_zero_u(uint32_t* a) { (void)a; return 0; }
+/* NtGdiCreateHalftonePalette(hdc): a true-colour screen has no palette to build; the default
+ * one (DeleteObject on a stock object succeeds and does nothing) */
+static uint32_t s_halftone(uint32_t* a) { (void)a; return g_stock[15]; }
+/* NtGdiCreatePaletteInternal(LOGPALETTE*, count): an object to select; nothing here is palettised.
+ * NtGdiDoPalette(hpal, start, count, entries, func, inbound): no entries to give or take.
+ * ponytail: entries not kept; add when a guest reads back what it set */
+static uint32_t s_create_palette(uint32_t* a) { (void)a; gobj_t* o = gnew(GDI_PAL, 0); return o ? o->h : 0; }
+/* NtGdiGetBitmapBits(hbm, cb, bits): the DDB's rows, WORD aligned: 1 bpp for a mono bitmap, else 32 */
+static uint32_t s_getbitmapbits(uint32_t* a) {
+    bmp_t* b = bm_of(a[0]);
+    if (!b) return 0;
+    uint32_t stride = b->mono ? (uint32_t)((b->w + 15) / 16 * 2) : (uint32_t)b->w * 4, n = stride * (uint32_t)b->h;
+    if (!a[2]) return n;
+    if (n > a[1]) n = a[1];
+    uint8_t* p = (uint8_t*)(uintptr_t)a[2];
+    memset(p, 0, n);
+    for (uint32_t y = 0; y < (uint32_t)b->h; y++)
+        for (uint32_t x = 0; x < (uint32_t)b->w; x++) {
+            uint32_t c = b->px[(size_t)y * b->w + x], o = y * stride + (b->mono ? x >> 3 : 4 * x);
+            if (o >= n) continue;
+            if (b->mono) { if (c & 0xFFFFFF) p[o] |= (uint8_t)(0x80 >> (x & 7)); }
+            else if (o + 3 < n) p[o] = (uint8_t)(c >> 16), p[o + 1] = (uint8_t)(c >> 8), p[o + 2] = (uint8_t)c, p[o + 3] = 0;
+        }
+    return n;
+}
 static uint32_t s_deftext(uint32_t* a) {        /* NtUserDefSetText(hwnd, LARGE_STRING*): DefWindowProc's WM_SETTEXT */
     uobj_t* u = W(a[0]);
     if (!u) return 0;
@@ -2902,6 +2939,47 @@ static uint32_t s_iconsize(uint32_t* a) {
     if (!c) return 0;
     if (a[2]) MEM32(a[2]) = (uint32_t)(c->icx ? c->icx : 32);
     if (a[3]) MEM32(a[3]) = (uint32_t)(2 * (c->icy ? c->icy : 32));
+    return 1;
+}
+/* NtUserGetIconInfo(hicon, ICONINFO*, module*, resource*, DWORD* bpp, internal): copies of the
+ * mask and colour (the caller deletes them, as win32k's are copies). ponytail: no names */
+static uint32_t bm_copy(uint32_t h) {
+    bmp_t* s = bm_of(h);
+    gobj_t* o = s ? bitmap_new(s->w, s->h, s->mono) : NULL;
+    if (!o) return 0;
+    memcpy(o->bm.px, s->px, (size_t)s->w * s->h * 4);
+    return o->h;
+}
+static uint32_t s_iconinfo(uint32_t* a) {
+    uobj_t* c = U(a[0], W2K_TYPE_CURSOR);
+    if (!c || !a[1] || !bm_of(c->mask)) return 0;
+    MEM32(a[1]) = 1, MEM32(a[1] + 4) = (uint32_t)c->icx / 2, MEM32(a[1] + 8) = (uint32_t)c->icy / 2;
+    MEM32(a[1] + 12) = bm_copy(c->mask), MEM32(a[1] + 16) = c->color ? bm_copy(c->color) : 0;
+    if (a[4]) MEM32(a[4]) = c->color && !bm_of(c->color)->mono ? 32 : 1;
+    return 1;
+}
+/* NtUserDrawCaptionTemp(hwnd, hdc, RECT*, hfont, hicon, UNICODE_STRING* text, flags): a caption
+ * drawn into any DC. explorer's Start button bitmap is DC_INBUTTON|DC_ICON|DC_TEXT: the face
+ * colour, the small icon, the text in bold. A string with no buffer is the window's own title.
+ * ponytail: the system font, bold; no gradient for DC_GRADIENT */
+static uint32_t s_drawcaptiontemp(uint32_t* a) {
+    gobj_t* d = DCH(a[1]);
+    if (!d || !a[2]) return 0;
+    rc_t r = rc_get(a[2]);
+    r = dc_rect(d, r.l, r.t, r.r, r.b);
+    uint32_t fl = a[6], act = fl & 1;
+    uint32_t bg = fl & 0x10 ? C[15] : act ? C[2] : C[3], fg = fl & 0x10 ? C[18] : act ? C[9] : C[19];
+    fill(d, r, bg);
+    int x = r.l + 2;
+    uobj_t* ic = a[4] ? U(a[4], W2K_TYPE_CURSOR) : NULL;
+    if (!ic && a[0] && W(a[0]) && W(a[0])->cls >= 0) { cls_t* k = &g_cls[W(a[0])->cls]; ic = U(k->iconsm ? k->iconsm : k->icon, W2K_TYPE_CURSOR); }
+    if ((fl & 4) && ic) { draw_icon(d, ic, x, r.t + (r.b - r.t - 16) / 2, 16, 16); x += 18; }
+    if (fl & 8) {
+        uint16_t t[128] = { 0 };
+        if (a[5] && MEM32(a[5] + 4)) { int n = MEM16(a[5]) / 2; for (int i = 0; i < n && i < 127; i++) t[i] = MEM16(MEM32(a[5] + 4) + 2 * i); }
+        else if (a[0] && W(a[0])) u16cpy(t, W(a[0])->text, 128);
+        draw_text(d, x, r.t + (r.b - r.t - 13) / 2, t, fg, 1, 0);
+    }
     return 1;
 }
 static uint32_t s_keystate(uint32_t* a) { return a[0] < 256 && g_keys[a[0]] ? 0xFF80u : 0; }
@@ -2943,6 +3021,61 @@ static uint32_t s_sethook(uint32_t* a) {
     return 0x00010001u + 0x100;
 }
 static uint32_t s_unhook(uint32_t* a) { if (a[0] == 0x00010001u + 0x105) g_cbt = 0; return 1; }
+/* NtUserEnumDisplayMonitors(hdc, clip, MONITORENUMPROC, data): the one monitor, to the guest's
+ * proc (as w32kuser.c). ponytail: hdc and the clip ignored */
+static uint32_t s_enum_monitors(uint32_t* a) {
+    static uint32_t rc;
+    if (!a[2]) return 0;
+    if (!rc) rc = ntp_alloc(16);
+    memcpy((void*)(uintptr_t)rc, (void*)(uintptr_t)(g_mon + 0x10), 16);
+    uint32_t args[4] = { MEM32(g_mon), a[0], rc, a[3] };
+    ntp_guest(a[2], 4, args);
+    return 1;
+}
+/* NtUserEnumDisplaySettings(device, mode, DEVMODEW*, flags): the screen, 32 bpp, 60 Hz, for the
+ * current and registry modes; mode n >= 0: the same one only (nothing to switch to here) */
+static uint32_t s_enum_settings(uint32_t* a) {
+    uint32_t d = a[2];
+    if (!d || ((int)a[1] >= 1)) return 0xC0000001u;
+    MEM32(d + 0x48) = 0x40000 | 0x80000 | 0x100000 | 0x200000 | 0x400000;   /* BITSPERPEL PELSWIDTH PELSHEIGHT DISPLAYFLAGS DISPLAYFREQUENCY */
+    MEM32(d + 0x4C) = MEM32(d + 0x50) = 0;
+    MEM32(d + 0xA8) = 32, MEM32(d + 0xAC) = (uint32_t)g_cx, MEM32(d + 0xB0) = (uint32_t)g_cy;
+    MEM32(d + 0xB4) = 0, MEM32(d + 0xB8) = 60;
+    return 0;
+}
+/* NtUserBuildHwndList(hdesk, hwnd, fChildren, tid, cMax, HWND* list, ULONG* cNeeded): the top-level
+ * windows (or hwnd's children), Windows 2000's way: the list ends with HWND 1, counted.
+ * ponytail: tid and hdesk not filtered (one desktop, one process) */
+static uint32_t s_hwndlist(uint32_t* a) {
+    uint32_t parent = a[2] && a[1] ? a[1] : g_desktop, n = 0;
+    for (int i = 2; i < MAXU; i++)
+        if (g_u[i].type == W2K_TYPE_WINDOW && g_u[i].parent == parent && g_u[i].h != g_desktop) {
+            if (n < a[4] && a[5]) MEM32(a[5] + 4 * n) = g_u[i].h;
+            n++;
+        }
+    if (n < a[4] && a[5]) MEM32(a[5] + 4 * n) = 1;
+    n++;
+    if (a[6]) MEM32(a[6]) = n;
+    return n > a[4] ? 0xC0000023u : 0;
+}
+static uint32_t s_winsta(uint32_t* a) { (void)a; return 0x10; }   /* NtUserGetProcessWindowStation: the one there is */
+/* NtUserGetObjectInformation(h, index, buf, len, needed*): UOI_NAME (2) of the window station */
+static uint32_t s_objinfo(uint32_t* a) {
+    static const char n[] = "WinSta0";
+    if (a[1] != 2) return 0;
+    if (a[4]) MEM32(a[4]) = 2 * sizeof n;
+    if (a[3] < 2 * sizeof n) return 0;
+    for (unsigned i = 0; i < sizeof n; i++) MEM16(a[2] + 2 * i) = (uint8_t)n[i];
+    return 1;
+}
+/* NtUserPaintDesktop(hdc): the desktop's colour (COLOR_BACKGROUND) over the DC's clip.
+ * ponytail: no wallpaper (none is set in the box) */
+static uint32_t s_paintdesktop(uint32_t* a) {
+    gobj_t* d = DCH(a[0]);
+    if (!d) return 0;
+    fill(d, d->clip, C[1]);
+    return 1;
+}
 static uint32_t s_fill_window(uint32_t* a) {     /* NtUserFillWindow(hwndBrush, hwnd, hdc, hbr) */
     uobj_t* u = W(a[1]);
     gobj_t* d = DCH(a[2]);
@@ -2975,6 +3108,19 @@ static uint32_t s_getplacement(uint32_t* a) {    /* NtUserGetWindowPlacement(hwn
     if (!u || !a[1]) return 0;
     MEM32(a[1] + 8) = 1;
     rc_put(a[1] + 28, u->wrel);
+    return 1;
+}
+/* NtUserSetWindowPlacement(hwnd, WINDOWPLACEMENT*): the normal rectangle (+28) is where the window
+ * goes; the taskbar places itself this way. ponytail: showCmd (+8) and the min/max points ignored */
+static uint32_t s_setplacement(uint32_t* a) {
+    uobj_t* u = W(a[0]);
+    if (!u || !a[1]) return 0;
+    rc_t r = rc_get(a[1] + 28);
+    TRACE("[user] SetWindowPlacement %08X flags %u show %u normal %d,%d,%d,%d\n", a[0], MEM32(a[1] + 4), MEM32(a[1] + 8), r.l, r.t, r.r, r.b);
+    /* an empty rectangle keeps the window where it is: wordpad, with no saved placement, hands
+     * 0,0,0,0 (on Windows the frame's minimum tracking size would apply) */
+    if (rc_empty(&r) || r.l == (int)0x80000000 || r.t == (int)0x80000000) return 1;   /* (mspaint hands back a CW_USEDEFAULT rect) */
+    setpos(u, r.l, r.t, r.r - r.l, r.b - r.t, 0x0004 | 0x0010);   /* SWP_NOZORDER | SWP_NOACTIVATE */
     return 1;
 }
 /* NtUserSystemParametersInfo(action, uiParam, pvParam, fWinIni): queries
@@ -3050,6 +3196,9 @@ static void user_connect(uint32_t index, uint32_t ci, uint32_t len) {
         d->wrel = d->cin = (rc_t){ 0, 0, g_cx, g_cy };
         g_desktop = d->h;
         MEM16(d->obj + WND_FNID) = FNID_DESKTOP;
+        /* its class (#32769): GetClassLong(GetDesktopWindow()) reads through WND_PCLS (shell32 at
+         * startup). ponytail: an empty CLS, every field 0; fill when a caller wants one */
+        MEM32(d->obj + WND_PCLS) = desk_alloc(0x80);
         wnd_sync(d);
         MEM32(g_deskinfo + 8) = d->obj;
     }
@@ -3111,6 +3260,14 @@ static void shot(uint32_t ms) {
     for (int i = 2; i < MAXU; i++)
         if (g_u[i].type == W2K_TYPE_WINDOW && g_u[i].parent == g_desktop && (g_u[i].style & WS_VISIBLE)) box = rc_or(box, g_u[i].wr);
     box = rc_or(box, g_popup);
+    for (int i = 2; g_trace && i < MAXU; i++)   /* the windows, for a trace (where is what) */
+        if (g_u[i].type == W2K_TYPE_WINDOW) {
+            uobj_t* u = &g_u[i];
+            char cn[64] = "?";
+            if (u->cls >= 0) { int k = 0; for (; k < 63 && g_cls[u->cls].name[k]; k++) cn[k] = (char)g_cls[u->cls].name[k]; cn[k] = 0; }
+            fprintf(stderr, "[shot]   %08X parent %08X style %08X ex %08X %s (%d,%d)-(%d,%d) %s\n", u->h, u->parent, u->style, u->ex,
+                    visible(u) ? "shown " : "hidden", u->wr.l, u->wr.t, u->wr.r, u->wr.b, cn);
+        }
     snprintf(p, sizeof p, "%s_%u.png", g_out, ms / 1000);
     if (!rc_empty(&box) && png_write(p, &g_screen, box)) fprintf(stderr, "[shot] %u ms: %s (%dx%d)\n", ms, p, box.r - box.l, box.b - box.t);
     uobj_t* m = W(g_main);
@@ -3182,7 +3339,9 @@ static int script_idle(void) {
         fflush(NULL);
         exit(0);
     }
-    if (next > now) ntp_clock_advance(next - now);
+    /* in steps of at most 100 ms: another guest thread (explorer's tray, its desktop) is still
+     * starting while this one idles, and a jump straight to the next event left it no time */
+    if (next > now) ntp_clock_advance(next - now < 100 ? next - now : 100);
     return 1;
 }
 
@@ -3426,11 +3585,18 @@ void w2kx_install(int cx, int cy, const char* fontdir) {
         { "NtUserTranslateAccelerator", s_translate_accel }, { "NtUserSetWindowsHookEx", s_sethook }, { "NtUserUnhookWindowsHookEx", s_unhook },
         { "NtUserCallNextHookEx", s_zero_u }, { "NtUserSetProp", s_one_u }, { "NtUserRemoveProp", s_zero_u },
         { "NtUserFillWindow", s_fill_window }, { "NtUserWindowFromPoint", s_frompoint }, { "NtUserGetWindowPlacement", s_getplacement },
-        { "NtUserSetWindowPlacement", s_one_u }, { "NtUserSystemParametersInfo", s_spi }, { "NtUserGetKeyState", s_keystate },
+        { "NtUserSetWindowPlacement", s_setplacement }, { "NtUserSystemParametersInfo", s_spi }, { "NtUserGetKeyState", s_keystate },
         { "NtUserGetAsyncKeyState", s_keystate }, { "NtUserShowCaret", s_showcaret }, { "NtUserHideCaret", s_hidecaret },
         { "NtUserCreateCaret", s_createcaret }, { "NtUserGetKeyboardLayoutList", s_zero_u },
         { "NtUserGetControlBrush", s_ctlbrush }, { "NtUserGetClassName", s_classname }, { "NtUserFindWindowEx", s_findwindow }, { "NtUserScrollWindowEx", s_scrollwindow },
         { "NtUserUnregisterClass", s_unregister_class }, { "NtUserCountClipboardFormats", s_zero_u }, { "NtUserGetControlColor", s_ctlcolor },
+        { "NtUserGetIconInfo", s_iconinfo }, { "NtUserDrawCaptionTemp", s_drawcaptiontemp },
+        { "NtUserRegisterHotKey", s_one_u }, { "NtUserUnregisterHotKey", s_one_u },   /* no system-wide hotkeys here */
+        { "NtGdiCreateHalftonePalette", s_halftone }, { "NtUserPaintDesktop", s_paintdesktop },
+        { "NtUserSetShellWindowEx", s_one_u }, { "NtUserEnumDisplayMonitors", s_enum_monitors },
+        { "NtUserEnumDisplaySettings", s_enum_settings }, { "NtUserBuildHwndList", s_hwndlist },
+        { "NtUserGetProcessWindowStation", s_winsta }, { "NtUserGetObjectInformation", s_objinfo }, { "NtUserCallHwndOpt", s_one_u },   /* Set{Progman,Taskman}Window */
+        { "NtGdiCreatePaletteInternal", s_create_palette }, { "NtGdiDoPalette", s_zero_u }, { "NtGdiGetBitmapBits", s_getbitmapbits },
     };
     for (unsigned i = 0; i < sizeof svc / sizeof svc[0]; i++) ntp_win32k_override(svc[i].name, svc[i].fn);
 }

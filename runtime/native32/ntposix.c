@@ -1064,6 +1064,11 @@ static uint32_t new_handle(uint32_t ph, int type, int signaled, int manual) {
     MEM32(ph) = h_put(o);
     return 0;
 }
+uint32_t ntp_event(int signaled, int manual) {
+    obj_t* o = obj_new(O_EVENT);
+    o->signaled = signaled, o->manual = manual;
+    return h_put(o);
+}
 /* NtCreateEvent(Handle*, Access, OA, Type, InitialState): type 0 manual reset */
 static uint32_t s_create_event(uint32_t* a) { return new_handle(a[0], O_EVENT, a[4] != 0, a[3] == 0); }
 static uint32_t s_set_event(uint32_t* a) {
@@ -1578,11 +1583,30 @@ static uint32_t s_query_process(uint32_t* a) {
         break;
     case 0xC: MEM32(o) = g_harderror; n = 4; break;      /* DefaultHardErrorMode */
     case 0x1A: MEM32(o) = 0; n = 4; break;               /* Wow64Information: none */
+    case 0x18: MEM32(o) = 0; n = 4; break;               /* SessionInformation: session 0 */
     default:
         fprintf(stderr, "[ntposix] NtQueryInformationProcess class %u\n", a[1]);
         return ST_INVALID_INFO_CLASS;
     }
     if (a[4]) MEM32(a[4]) = n;
+    return 0;
+}
+/* NtOpenProcess(Handle*, Access, OA, CLIENT_ID*): only the guest's own process, as the current-process
+ * handle (explorer asks for its own session). Any other process does not exist here. */
+static uint32_t s_open_process(uint32_t* a) {
+    if (!a[3] || MEM32(a[3]) != g_pid) return 0xC000000Bu;   /* STATUS_INVALID_CID */
+    MEM32(a[0]) = 0xFFFFFFFFu;
+    return 0;
+}
+/* NtQuerySecurityObject(Handle, SecurityInformation, SD*, Length, LengthNeeded*): a self-relative
+ * descriptor with a NULL DACL (everyone may): the only user is the guest itself.
+ * ponytail: no owner/group SIDs; add when a caller reads them */
+static uint32_t s_query_security(uint32_t* a) {
+    if (a[4]) MEM32(a[4]) = 20;
+    if (a[3] < 20) return ST_BUFFER_TOO_SMALL;
+    memset((void*)(uintptr_t)a[2], 0, 20);
+    MEM8(a[2]) = 1;                                      /* SECURITY_DESCRIPTOR_REVISION */
+    MEM16(a[2] + 2) = 0x8004;                            /* SE_SELF_RELATIVE | SE_DACL_PRESENT, Dacl 0: NULL DACL */
     return 0;
 }
 static uint32_t s_set_process(uint32_t* a) { if (a[1] == 0xC) g_harderror = MEM32(a[2]); return 0; }
@@ -2355,6 +2379,7 @@ static const struct { const char* name; uint32_t (*fn)(uint32_t*); } g_impl[] = 
     { "NtCreateProcess", s_no_process }, { "NtCreateProcessEx", s_no_process },
     { "NtOpenDirectoryObject", s_open_dirobj }, { "NtCreateDirectoryObject", s_open_dirobj },
     { "NtQueryDirectoryObject", s_query_dirobj }, { "NtOpenSymbolicLinkObject", s_not_found },
+    { "NtOpenProcess", s_open_process }, { "NtQuerySecurityObject", s_query_security },
     { "NtOpenProcessToken", s_open_token }, { "NtQueryInformationToken", s_query_token }, { "NtOpenThreadToken", s_open_thread_token },
     { "NtOpenKey", s_registry }, { "NtQueryValueKey", s_query_value }, { "NtCreateKey", s_create_key },
     { "NtEnumerateValueKey", s_enum_value }, { "NtSetValueKey", s_set_value }, { "NtDeleteValueKey", s_delete_value },
