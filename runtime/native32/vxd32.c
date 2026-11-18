@@ -44,9 +44,9 @@ static int is_vxd_block(uint32_t p) { for (int i = 0; p && i < g_nblocks; i++) i
  * the KEXP header's boot entry (_FREQASM+0C, survey.md), never a fork.
  * Windows 95 OSR2 (4.00.1111)'s were matched to Win98 SE's by masked bytes
  * (win95-recomp tools/k32map.py). */
-typedef struct { uint32_t boot, qt_thunk, ft_target, win16mutex, console_new, krn32mutex, cur_thread, leave_krn32, pdb_console, tdbx_psp; } w9x_k32_t;
-static const w9x_k32_t k32_w98se = { 0xBFFC7AE4u, 0xBFF727D9u, 0xBFF7268Du, 0xBFFC9470u, 0xBFF8E9E1u, 0, 0, 0, 0xB0, 0x50 };
-static const w9x_k32_t k32_w95b  = { 0xBFFBB374u, 0xBFF728D0u, 0xBFF72791u, 0xBFFBF9E0u, 0xBFF8C35Eu, 0xBFFBFA60u, 0xBFFBC280u, 0xBFF743D3u, 0xAC, 0x40 };
+typedef struct { uint32_t boot, qt_thunk, ft_target, win16mutex, console_new, krn32mutex, cur_thread, leave_krn32, pdb_console, tdbx_psp, thread_tdb; } w9x_k32_t;
+static const w9x_k32_t k32_w98se = { 0xBFFC7AE4u, 0xBFF727D9u, 0xBFF7268Du, 0xBFFC9470u, 0xBFF8E9E1u, 0, 0, 0, 0xB0, 0x50, 0x14 };
+static const w9x_k32_t k32_w95b  = { 0xBFFBB374u, 0xBFF728D0u, 0xBFF72791u, 0xBFFBF9E0u, 0xBFF8C35Eu, 0xBFFBFA60u, 0xBFFBC280u, 0xBFF743D3u, 0xAC, 0x40, 0x1C };   /* thread_tdb: KRNL386 1:5C14 reads THDB+1C (Win98 SE's 5C21: +14) */
 static const w9x_k32_t* k32(void) {
     static const w9x_k32_t* v;
     if (!v) v = !IsBadReadPtr((void*)(uintptr_t)0xBFF71000u, 16) && MEM32(0xBFF7100Cu) == k32_w95b.boot ? &k32_w95b : &k32_w98se;
@@ -813,7 +813,7 @@ static void run_termination(uint32_t blk) {
 uint16_t* g_w9x_curtdb;
 static void cur_task(void) {
     uint16_t tdb;
-    if (g_w9x_curtdb && g_cur[0] && (tdb = *(uint16_t*)(uintptr_t)(g_cur[0] + 0x14)) != 0) *g_w9x_curtdb = tdb;
+    if (g_w9x_curtdb && g_cur[0] && (tdb = *(uint16_t*)(uintptr_t)(g_cur[0] + k32()->thread_tdb)) != 0) *g_w9x_curtdb = tdb;
 }
 
 static uint32_t vwin32_thread_done(const uint32_t* a);
@@ -1485,7 +1485,9 @@ static uint32_t vwin32_first_thread(const uint32_t* a) {
     blk[0x10 / 4] = (uint32_t)(uintptr_t)g_cur;
     ((uint16_t*)blk)[0x1C / 2] = g_w9x_psp_sel;
     ((uint16_t*)blk)[0x1E / 2] = 0;
-    blk[0x44 / 4] = nls_block();
+    /* the NLS tables: +44 on Win98 SE; +3C on Win95, whose +44 is an input
+     * (0xBFFBB5D4; read back by 0xBFFBA30E into [0xBFFBC2B8]) */
+    blk[(native32_w9x_is_win95() ? 0x3C : 0x44) / 4] = nls_block();
     return 0;
 }
 

@@ -315,6 +315,9 @@ static void host_far(CPU *c, uint16_t off) {
                                  * ds:200..204; nothing reads a result. ponytail: a notification, no-op */
     case 0x13: ok(c); return;   /* USER seg55 5459, from seg53 144B right after it reads the shift/ctrl/alt
                                  * key states; nothing reads a result. ponytail: a notification, no-op */
+    case 0x106: ok(c); return;  /* Win95 USER seg64 20F8 (ax 1, bx = a value USER's init read from two
+                                 * profile ints, seg70 4AF0); Win98 SE's USER has no such call. A setting
+                                 * handed down, no result read. ponytail: no-op */
     }
     if (off == H_VXD + 0x2A) switch (c->ah) {   /* VWIN32's PM API, KRNL386's calls through DGROUP:1A80 */
     case 0x00:   /* version: KRNL386 wants >= 100h (4.10, Win98); edx nonzero (seg001_6A63: the
@@ -590,9 +593,12 @@ static uint16_t g_alias[8192];
  * When sel is bound to a lifted segment, the read goes to that segment's bytes in the
  * linked image (what a load puts there; relocations are applied), its placeholder SEL(n).
  * ponytail: reads only make sense; KRNL386 still thinks the segment is not loaded. */
+static uint16_t seg_of(uint16_t sel);
+static int w16_load_np(uint16_t sel, uint16_t n);
 static uint32_t w16_np(uint16_t sel) {
-    uint16_t n = g_alias[sel >> 3];
+    uint16_t n = g_alias[sel >> 3] ? g_alias[sel >> 3] : seg_of(sel);
     if (getenv("W16_TRACE")) fprintf(stderr, "[w16] not-present selector %04X read: segment %u\n", sel, n);
+    if (n && w16_load_np(sel, n)) return recomp_sel_base(sel);
     return n ? recomp_sel_base((uint32_t)n << 3 | 7) : 0;
 }
 
@@ -849,6 +855,7 @@ void dispatch_far(CPU *cpu, uint16_t sel, uint16_t off) {
             for (int i = 0; i < 24; i++) fprintf(stderr, " %02X", ((uint8_t *)(uintptr_t)(b + off))[i]);
             fputc('\n', stderr);
         }
+        fprintf(stderr, "[w16] far call miss with ds %04X es %04X ss:sp %04X:%04X bp %04X\n", cpu->ds, cpu->es, cpu->ss, cpu->sp, cpu->bp);
         w16_stop("far call miss", sel, off);
     }
     /* The callee's last retf popped some other frame: a task switch-in
@@ -943,6 +950,67 @@ static int w16_entry(CPU *c, uint16_t seg, uint16_t off) {
     g_ff = up;
     return ok;
 }
+
+/* The CPU's #NP on a not-present code segment, which has KRNL386 load it. Windows 95
+ * needs it: its KERNEL 1:6808 (GetProcAddress16, for kernel32's ThunkConnect32)
+ * touches the segment it returns (`cmp es:[0], ax`), and GDI's thunk connection data
+ * is in a load-on-call code segment there (GDI seg 42; Win98's, seg 43, is preload),
+ * which kernel32 then MapSLs and whose relocations name other segments' selectors.
+ * KRNL386's own 0Bh handler only does __GP recovery, so the load is its
+ * GetCodeHandle (KERNEL.93) in the (hExe : segment number) form (1:056A), run on
+ * the touching thread's stack. Returns 1 once sel is present. ponytail: code only
+ * (a discarded data segment keeps w16_np's linked-image read). */
+static uint16_t kernel_export(uint16_t ord, uint16_t *off) {   /* KRNL386.EXE's entry table on disk */
+    char p[MAX_PATH]; static uint8_t b[0x40000];
+    if (!GetEnvironmentVariableA("NATIVE32_W9X_ROOT", p, MAX_PATH - 32)) return 0;
+    strcat(p, "\\WINDOWS\\SYSTEM\\"); strcat(p, RECOMP_MODULES[0].file);
+    FILE *f = fopen(p, "rb");
+    if (!f) return 0;
+    size_t n = fread(b, 1, sizeof b, f); fclose(f);
+    uint32_t ne = n > 0x40 ? *(uint32_t *)(b + 0x3C) : 0;
+    if (!ne || ne + 0x40 > n || b[ne] != 'N' || b[ne + 1] != 'E') return 0;
+    const uint8_t *e = b + ne + *(uint16_t *)(b + ne + 4), *end = b + n;
+    for (uint16_t o = 1; e + 2 <= end && e[0]; e += 2 + (e[1] ? e[0] * (e[1] == 0xFF ? 6 : 3) : 0)) {
+        if (ord >= o + e[0]) { o = (uint16_t)(o + e[0]); continue; }
+        if (!e[1]) return 0;
+        const uint8_t *x = e + 2 + (ord - o) * (e[1] == 0xFF ? 6 : 3);
+        uint8_t sg = e[1] == 0xFF ? x[3] : e[1];
+        *off = e[1] == 0xFF ? *(const uint16_t *)(x + 4) : *(const uint16_t *)(x + 1);
+        return (uint16_t)(RECOMP_MODULES[0].first_seg + sg - 1);
+    }
+    return 0;
+}
+static uint16_t module_hexe(const RecompModule *rm) {   /* the module's NE selector, via its DGROUP's arena */
+    uint16_t dg = g_w16_segsel[rm->dgroup], kd = RECOMP_MODULES[0].dgroup;
+    if (!rm->dgroup || dg == (uint16_t)(rm->dgroup << 3 | 7)) return 0;
+    uint32_t kdg = recomp_sel_base(g_w16_segsel[kd]);
+    uint32_t bm = kdg ? recomp_sel_base(*(uint16_t *)(uintptr_t)(kdg + 0x121E)) : 0;
+    uint32_t tab = kdg ? *(uint32_t *)(uintptr_t)(kdg + 0x1234) : 0;
+    uint32_t a = bm ? *(uint32_t *)(uintptr_t)(bm + tab + ((uint32_t)(dg & ~7) >> 1)) : 0;
+    uint16_t own = a ? (uint16_t)(*(uint16_t *)(uintptr_t)(bm + a + 0x12) | 7) : 0;
+    const uint8_t *ne = own ? (const uint8_t *)(uintptr_t)recomp_sel_base(own) : NULL;
+    return ne && ne[0] == 'N' && ne[1] == 'E' ? own : 0;
+}
+static int w16_load_np(uint16_t sel, uint16_t n) {
+    static uint16_t gch, gch_off;
+    static __declspec(thread) int busy;
+    uint8_t *d = native32_w9x_desc(sel);
+    if (busy || !g_w16.ss || (d[5] & 0x18) != 0x18) return 0;
+    if (!gch && !(gch = kernel_export(93, &gch_off))) return 0;
+    const RecompModule *rm = NULL;
+    for (int m = 0; m < RECOMP_NUM_MODULES; m++)
+        if (n >= RECOMP_MODULES[m].first_seg && n <= RECOMP_MODULES[m].last_seg) rm = &RECOMP_MODULES[m];
+    uint16_t hexe = rm ? module_hexe(rm) : 0;
+    if (!hexe) return 0;
+    CPU saved = g_w16;
+    g_w16.sp = (uint16_t)(g_w16.sp - 0x40);   /* below the live frame */
+    push16(&g_w16, hexe); push16(&g_w16, (uint16_t)(n - rm->first_seg + 1));   /* GetCodeHandle(hExe:segno), PASCAL */
+    push16(&g_w16, 0); push16(&g_w16, 0);
+    busy = 1; w16_entry(&g_w16, gch, gch_off); busy = 0;
+    if (getenv("W16_TRACE")) fprintf(stderr, "[w16] #NP %04X: %s seg %u, GetCodeHandle -> %04X, access %02X\n", sel, rm->name, n - rm->first_seg + 1, g_w16.ax, d[5]);
+    g_w16 = saved;
+    return (d[5] & 0x80) != 0;
+}
 void w16_unwind(CPU *c) {
     w16_ff *t = NULL;
     for (w16_ff *f = g_ff; f && f->ss == c->ss && (uint32_t)f->sp + 4 <= c->sp; f = f->up) t = f;
@@ -1024,6 +1092,7 @@ static int w16_retf_jmp(CPU *c) {
     w16_jmpf(c, sel, off);
     return 1;
 }
+int native32_w9x_is_win95(void);
 int w16_retf(CPU *c) {
     uint32_t at = mem_read32(c, c->ss, c->sp);
     g_retf_at = at;
@@ -1106,7 +1175,7 @@ int w16_enter(uint32_t target) {
             }
             k--;
         }
-        if (getenv("W16_TRACE")) fprintf(stderr, "[w16] stub %d returns to %04X:%04X (thread %lu)\n", k, target >> 16, target & 0xFFFF, GetCurrentThreadId());
+        if (getenv("W16_TRACE")) fprintf(stderr, "[w16] stub %d returns to %04X:%04X (thread %lu) eax %08X edx %08X\n", k, target >> 16, target & 0xFFFF, GetCurrentThreadId(), g_eax, g_edx);
         longjmp(g_thk[k].jb, 1);
     }
     uint16_t sel = (uint16_t)(target >> 16), off = (uint16_t)target;
@@ -1145,6 +1214,17 @@ int w16_enter(uint32_t target) {
         if (getenv("W16_TRACE")) fprintf(stderr, "[w16] enter %04X:%04X ss:sp %04X:%04X ds %04X ret %08X args %04X %04X\n", sel, off, c->ss, c->sp, c->ds, ret,
             mem_read16(c, c->ss, (uint16_t)(c->sp + 4)), mem_read16(c, c->ss, (uint16_t)(c->sp + 6)));
         const uint8_t *stub = (const uint8_t *)(uintptr_t)(recomp_sel_base(ret >> 16) + (ret & 0xFFFF));
+        if ((stub[0] != 0x66 || stub[1] != 0xEA) && getenv("W16_TRACE")) fprintf(stderr, "[w16] stub bytes %02X %02X %02X %02X %02X %02X %02X %02X (base %08X, seg %u)\n", stub[0], stub[1], stub[2], stub[3], stub[4], stub[5], stub[6], stub[7], recomp_sel_base(ret >> 16), seg_of((uint16_t)(ret >> 16)));
+        if ((stub[0] != 0x66 || stub[1] != 0xEA) && native32_w9x_is_win95() && *(const uint32_t *)(uintptr_t)0xBFFBC04Cu == ((uint32_t)sel << 16 | off)) {
+            /* Win95 kernel32's per-process thunk dispatcher (0xBFF71988) for a process
+             * its thunk data does not list yet: `push dword [0xBFFBC04C]; retf`, a far
+             * jump to KRNL386's handler (3:2372) on the 16-bit caller's frame as it was
+             * (ret is that frame's own return). Run it, then go on where its retf went,
+             * a far jump, which unwinds to the 16-bit far call it passes. */
+            if (!w16_entry(c, seg_of(sel), off)) w16_stop("no lifted function at", sel, off);
+            w16_jmpf(c, (uint16_t)(ret >> 16), (uint16_t)ret);
+            w16_stop("thunk handler's far jump came back", sel, off);
+        }
         if (stub[0] != 0x66 || stub[1] != 0xEA) w16_stop("thunk return is not a jmp far 32", ret >> 16, ret & 0xFFFF);
         memcpy(&cont, stub + 2, 4);
     }
