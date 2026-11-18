@@ -556,6 +556,185 @@ static BOOL WINAPI g_SystemParametersInfoA(UINT a, UINT u, void* pv, UINT w) {
     return SystemParametersInfoA(a, u, pv, 0);
 }
 
+/* ---- the guest's identity -------------------------------------------------
+ * The guest never learns the host's account or machine: it is user "User" on
+ * computer "PCRECOMP". The host's names are read here only to be recognized
+ * (never printed): a proxied advapi32 answer naming one is rewritten, a host
+ * registry value holding one reads as absent, and the guest's environment
+ * drops every entry holding one (syscall32.c). */
+#define GUEST_USER L"User"
+#define GUEST_MACHINE L"PCRECOMP"
+static wchar_t g_hid[6][260];      /* user, display name, profile folder | computer, DNS host, domain */
+static int g_nhid = -1;
+static void host_ids(void) {
+    DWORD n;
+    HANDLE t;
+    wchar_t* s;
+    BOOLEAN (WINAPI* ex)(int, wchar_t*, ULONG*) = (void*)GetProcAddress(LoadLibraryA("secur32.dll"), "GetUserNameExW");
+    BOOL (WINAPI* prof)(HANDLE, wchar_t*, DWORD*) = (void*)GetProcAddress(LoadLibraryA("userenv.dll"), "GetUserProfileDirectoryW");
+    if (g_nhid >= 0) return;
+    memset(g_hid, 0, sizeof g_hid);
+    n = 260, GetUserNameW(g_hid[0], &n);
+    n = 260; if (ex) ex(3 /* NameDisplay */, g_hid[1], &n);
+    n = 260;
+    if (prof && OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &t)) {
+        if (prof(t, g_hid[2], &n) && (s = wcsrchr(g_hid[2], L'\\'))) memmove(g_hid[2], s + 1, (wcslen(s + 1) + 1) * 2);
+        else g_hid[2][0] = 0;
+        CloseHandle(t);
+    }
+    n = 260, GetComputerNameW(g_hid[3], &n);
+    n = 260, GetComputerNameExW(ComputerNameDnsHostname, g_hid[4], &n);
+    GetEnvironmentVariableW(L"USERDOMAIN", g_hid[5], 260);
+    for (int i = 0; i < 6; i++) if (wcslen(g_hid[i]) < 3) g_hid[i][0] = 0;   /* too short to tell from other text */
+    g_nhid = 6;
+}
+/* s (n characters) is exactly a host name: the guest's name for it */
+static const wchar_t* id_map(const wchar_t* s, size_t n) {
+    host_ids();
+    for (int i = 0; s && i < 6; i++)
+        if (g_hid[i][0] && wcslen(g_hid[i]) == n && !_wcsnicmp(s, g_hid[i], n)) return i < 3 ? GUEST_USER : GUEST_MACHINE;
+    return NULL;
+}
+/* s (n characters) holds a host name anywhere, as a whole word (a 3-letter machine
+ * name is not found inside "AppliedDPI") */
+int native32_host_identity_in(const wchar_t* s, size_t n) {
+    host_ids();
+    for (int i = 0; i < 6; i++) {
+        size_t k = wcslen(g_hid[i]);
+        for (size_t j = 0; k && j + k <= n; j++)
+            if (!_wcsnicmp(s + j, g_hid[i], k) && (!j || !iswalnum(s[j - 1])) && (j + k == n || !iswalnum(s[j + k]))) return 1;
+    }
+    return 0;
+}
+static void us_fix(US* u) {
+    const wchar_t* m = u && u->Buffer ? id_map(u->Buffer, u->Length / 2) : NULL;
+    USHORT n;
+    if (!m) return;
+    n = (USHORT)(wcslen(m) * 2);
+    /* ponytail: a buffer too small for the guest's name points at a constant (LSA frees the block, not the string) */
+    if (n <= u->MaximumLength) memcpy(u->Buffer, m, n); else u->Buffer = (PWSTR)m, u->MaximumLength = n;
+    u->Length = n;
+}
+/* the A/W "name, count" out-parameter rule: the count without the NUL on success, with it when too small */
+static BOOL id_put(const wchar_t* v, void* buf, DWORD* cnt, int ansi) {
+    DWORD need = (DWORD)wcslen(v) + 1;
+    if (!cnt || !buf || *cnt < need) { if (cnt) *cnt = need; SetLastError(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+    if (ansi) WideCharToMultiByte(CP_ACP, 0, v, -1, (char*)buf, (int)*cnt, NULL, NULL); else wcscpy((wchar_t*)buf, v);
+    *cnt = need;
+    return TRUE;
+}
+static BOOL WINAPI g_GetUserNameW(wchar_t* b, DWORD* n) { return id_put(GUEST_USER, b, n, 0); }   /* (the count with the NUL) */
+static BOOL WINAPI g_GetUserNameA(char* b, DWORD* n) { return id_put(GUEST_USER, b, n, 1); }
+static BOOLEAN WINAPI g_GetUserNameExW(int f, wchar_t* b, ULONG* n) {
+    const wchar_t* v = f == 2 ? GUEST_MACHINE L"\\" GUEST_USER : f == 3 ? GUEST_USER : NULL;   /* SamCompatible, Display */
+    if (!v) { SetLastError(ERROR_NONE_MAPPED); return FALSE; }
+    if (!id_put(v, b, n, 0)) { SetLastError(ERROR_MORE_DATA); return FALSE; }
+    --*n;
+    return TRUE;
+}
+static BOOL lookup_sid(const wchar_t* sys, PSID sid, void* nm, DWORD* cn, void* dm, DWORD* cd, SID_NAME_USE* use, int ansi) {
+    wchar_t n[260], d[260];
+    const wchar_t* N, *D;
+    DWORD a = 260, b = 260, nn, dn;
+    SID_NAME_USE u;
+    if (!LookupAccountSidW(sys, sid, n, &a, d, &b, &u)) return FALSE;
+    N = id_map(n, wcslen(n)), D = id_map(d, wcslen(d));
+    if (!N) N = n;
+    if (!D) D = d;
+    nn = (DWORD)wcslen(N) + 1, dn = (DWORD)wcslen(D) + 1;
+    if (!cn || !cd || *cn < nn || *cd < dn || !nm || !dm) {
+        if (cn) *cn = nn;
+        if (cd) *cd = dn;
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return FALSE;
+    }
+    id_put(N, nm, cn, ansi), id_put(D, dm, cd, ansi);
+    --*cn, --*cd;
+    if (use) *use = u;
+    return TRUE;
+}
+static BOOL WINAPI g_LookupAccountSidW(const wchar_t* s, PSID p, wchar_t* n, DWORD* cn, wchar_t* d, DWORD* cd, SID_NAME_USE* u) {
+    return lookup_sid(s, p, n, cn, d, cd, u, 0);
+}
+static BOOL WINAPI g_LookupAccountSidA(const char* s, PSID p, char* n, DWORD* cn, char* d, DWORD* cd, SID_NAME_USE* u) {
+    wchar_t w[260];
+    if (s) MultiByteToWideChar(CP_ACP, 0, s, -1, w, 260);
+    return lookup_sid(s ? w : NULL, p, n, cn, d, cd, u, 1);
+}
+static BOOL WINAPI g_LookupAccountSidLocalW(PSID p, wchar_t* n, DWORD* cn, wchar_t* d, DWORD* cd, SID_NAME_USE* u) {
+    return lookup_sid(NULL, p, n, cn, d, cd, u, 0);
+}
+static BOOL WINAPI g_LookupAccountSidLocalA(PSID p, char* n, DWORD* cn, char* d, DWORD* cd, SID_NAME_USE* u) {
+    return lookup_sid(NULL, p, n, cn, d, cd, u, 1);
+}
+/* LSA: the host's answer, its names rewritten in place */
+typedef struct { ULONG Entries; struct { US Name; PSID Sid; }* Domains; } LSA_DOMS;
+static LONG lsa_names(LONG r, ULONG count, LSA_DOMS* dom, BYTE* names, size_t stride) {
+    if (r < 0) return r;
+    for (ULONG i = 0; names && i < count; i++) us_fix((US*)(names + i * stride + 4));   /* {Use; Name; DomainIndex[; Flags]} */
+    for (ULONG i = 0; dom && i < dom->Entries; i++) us_fix(&dom->Domains[i].Name);
+    return r;
+}
+static LONG WINAPI g_LsaLookupSids(HANDLE h, ULONG c, PSID* s, LSA_DOMS** d, BYTE** n) {
+    static LONG (WINAPI* f)(HANDLE, ULONG, PSID*, LSA_DOMS**, BYTE**);
+    if (!f) f = (void*)GetProcAddress(GetModuleHandleA("advapi32.dll"), "LsaLookupSids");
+    LONG r = f(h, c, s, d, n);
+    return lsa_names(r, c, r < 0 ? NULL : *d, r < 0 ? NULL : *n, 16);
+}
+static LONG WINAPI g_LsaLookupSids2(HANDLE h, ULONG fl, ULONG c, PSID* s, LSA_DOMS** d, BYTE** n) {
+    static LONG (WINAPI* f)(HANDLE, ULONG, ULONG, PSID*, LSA_DOMS**, BYTE**);
+    if (!f) f = (void*)GetProcAddress(GetModuleHandleA("advapi32.dll"), "LsaLookupSids2");
+    LONG r = f(h, fl, c, s, d, n);
+    return lsa_names(r, c, r < 0 ? NULL : *d, r < 0 ? NULL : *n, 20);
+}
+static LONG WINAPI g_LsaGetUserName(US** u, US** d) {
+    static LONG (WINAPI* f)(US**, US**);
+    if (!f) f = (void*)GetProcAddress(GetModuleHandleA("advapi32.dll"), "LsaGetUserName");
+    LONG r = f(u, d);
+    if (r >= 0) { if (u) us_fix(*u); if (d) us_fix(*d); }
+    return r;
+}
+static LONG WINAPI g_LsaQueryInformationPolicy(HANDLE h, int c, void** b) {
+    LONG r = ((LONG (WINAPI*)(HANDLE, int, void**))GetProcAddress(GetModuleHandleA("advapi32.dll"), "LsaQueryInformationPolicy"))(h, c, b);
+    if (r >= 0 && b && *b && (c == 3 || c == 5 || c == 12)) {   /* Primary/AccountDomain {Name, Sid}; DnsDomain {Name, DnsDomainName, DnsForestName, ...} */
+        US* u = (US*)*b;
+        for (int i = 0; i < (c == 12 ? 3 : 1); i++) us_fix(u + i);
+    }
+    return r;
+}
+static DWORD WINAPI g_NetWkstaGetInfo(void* srv, DWORD level, void** out) {
+    (void)srv; (void)level;
+    if (out) *out = NULL;
+    return ERROR_ACCESS_DENIED;                                   /* no workstation service to ask */
+}
+static const struct { const char* name; void* fn; } g_ids[] = {
+    { "GetUserNameW", g_GetUserNameW }, { "GetUserNameA", g_GetUserNameA }, { "GetUserNameExW", g_GetUserNameExW },
+    { "LookupAccountSidW", g_LookupAccountSidW }, { "LookupAccountSidA", g_LookupAccountSidA },
+    { "LookupAccountSidLocalW", g_LookupAccountSidLocalW }, { "LookupAccountSidLocalA", g_LookupAccountSidLocalA },
+    { "LsaLookupSids", g_LsaLookupSids }, { "LsaLookupSids2", g_LsaLookupSids2 }, { "LsaGetUserName", g_LsaGetUserName },
+    { "LsaQueryInformationPolicy", g_LsaQueryInformationPolicy }, { "NetWkstaGetInfo", g_NetWkstaGetInfo },
+};
+/* the guest's own answers for the registry values that name the machine or its user (the box answers first) */
+static void seed_ids(void) {
+    static const wchar_t* v[][3] = {
+        { L"HKLM\\SYSTEM\\CurrentControlSet\\Control\\ComputerName\\ComputerName", L"ComputerName", GUEST_MACHINE },
+        { L"HKLM\\SYSTEM\\CurrentControlSet\\Control\\ComputerName\\ActiveComputerName", L"ComputerName", GUEST_MACHINE },
+        { L"HKLM\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters", L"Hostname", GUEST_MACHINE },
+        { L"HKLM\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters", L"NV Hostname", GUEST_MACHINE },
+        { L"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon", L"DefaultUserName", GUEST_USER },
+        { L"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon", L"DefaultDomainName", GUEST_MACHINE },
+        { L"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", L"RegisteredOwner", GUEST_USER },
+        { L"HKCU\\Volatile Environment", L"USERNAME", GUEST_USER },
+        { L"HKCU\\Volatile Environment", L"USERDOMAIN", GUEST_MACHINE },
+        { L"HKCU\\Volatile Environment", L"LOGONSERVER", L"\\\\" GUEST_MACHINE },
+    };
+    for (int i = 0; i < (int)(sizeof v / sizeof v[0]); i++) {
+        wchar_t rel[KP];
+        _snwprintf(rel, KP - 1, L"%ls\\%ls", g_root_rel, v[i][0]), rel[KP - 1] = 0;
+        RegSetKeyValueW(HKEY_CURRENT_USER, rel, v[i][1], REG_SZ, v[i][2], (DWORD)(wcslen(v[i][2]) + 1) * 2);
+    }
+}
+
 static const struct { const char* name; void* fn; } g_fns[] = {
     { "SystemParametersInfoW", g_SystemParametersInfoW }, { "SystemParametersInfoA", g_SystemParametersInfoA },
     { "RegCreateKeyExW", g_RegCreateKeyExW }, { "RegCreateKeyExA", g_RegCreateKeyExA },
@@ -690,8 +869,10 @@ int native32_registry_sandbox(const char* name) {
     RegCloseKey(root);
     _snwprintf(g_root_nt, 511, L"%ls\\%ls", g_cu_nt, g_root_rel);
     g_on = 1;
+    seed_ids();
     for (int i = 0; i < NFNS; i++)
         if (g_fns[i].fn) native32_redirect(g_fns[i].name, g_fns[i].fn);
+    for (int i = 0; i < (int)(sizeof g_ids / sizeof g_ids[0]); i++) native32_redirect(g_ids[i].name, g_ids[i].fn);
     box_host_dlls();
     return 1;
 }
@@ -768,6 +949,8 @@ static uint32_t nt_query_value(uint32_t* a) {
     r = nt_fwd("NtQueryValueKey", a);
     if (r == ST_NOT_FOUND) { a[0] = b ? (uint32_t)(uintptr_t)o : k; r = nt_fwd("NtQueryValueKey", a); }
     a[0] = k;
+    /* a value naming the host's user or machine (a path under C:\Users\<name>, ...) is absent for the guest */
+    if (!r && a[3] && native32_host_identity_in((const wchar_t*)(uintptr_t)a[3], (a[5] ? *(uint32_t*)(uintptr_t)a[5] : a[4]) / 2)) r = ST_NOT_FOUND;
     RegCloseKey(o);
     return r;
 }
@@ -789,4 +972,5 @@ void native32_registry_sandbox_nt(void (*ovr)(const char*, native32_syscall_fn),
     for (int i = 0; i < (int)(sizeof deny / sizeof deny[0]); i++) ovr(deny[i], nt_deny);
     for (int i = 0; hook && i < NFNS; i++)                  /* the proxied host advapi32 */
         if (g_fns[i].fn && !strncmp(g_fns[i].name, "Reg", 3)) hook(g_fns[i].name, g_fns[i].fn);
+    for (int i = 0; hook && i < (int)(sizeof g_ids / sizeof g_ids[0]); i++) hook(g_ids[i].name, g_ids[i].fn);
 }

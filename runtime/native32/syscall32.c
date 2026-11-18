@@ -489,6 +489,12 @@ static int fb_install(const wchar_t* image_path, const wchar_t* dll_path, const 
 static uint32_t ovr_query_process(uint32_t* a) {
     if (fb_on && a[1] == 23 && (a[0] == 0xFFFFFFFFu || GetProcessId((HANDLE)(uintptr_t)a[0]) == GetCurrentProcessId()))
         return fb_devmap(a);                                  /* ProcessDeviceMap */
+    /* ProcessSessionInformation: the guest's session (the PEB's), not the host's */
+    if (a[1] == 24 && a[3] >= 4 && (a[0] == 0xFFFFFFFFu || GetProcessId((HANDLE)(uintptr_t)a[0]) == GetCurrentProcessId())) {
+        MEM32(a[2]) = MEM32(native32_guest_peb + 0x1D4);
+        if (a[4]) MEM32(a[4]) = 4;
+        return 0;
+    }
     uint32_t r = native32_nt_forward("NtQueryInformationProcess", a);
     if (!r && a[1] == 0 && (a[0] == 0xFFFFFFFFu || GetProcessId((HANDLE)(uintptr_t)a[0]) == GetCurrentProcessId()))
         MEM32(a[2] + 4) = native32_guest_peb;
@@ -1398,7 +1404,11 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
      * Its user32 answers GetSystemMetrics(SM_REMOTESESSION) with PEB SessionId
      * != 0, and every Windows 10/11 desktop is session 1+, so explorer showed the
      * "Windows 2000 Terminal" banner. Named objects use the host's session
-     * through BASE_STATIC_SERVER_DATA (csr32.c), not this field. */
+     * through BASE_STATIC_SERVER_DATA (csr32.c), not this field.
+     * XP's user32 asks SessionId != KUSER_SHARED_DATA.ActiveConsoleId (0x7FFE02D8,
+     * the host's page): the guest's session is the host's console one, so a host
+     * reached over RDP is not a remote session to it (no Start menu "Disconnect"). */
+    if (nt_guest_xp((uint32_t)(uintptr_t)peb)) *(uint32_t*)(peb + 0x1D4) = *(volatile uint32_t*)(uintptr_t)0x7FFE02D8;
 
     /* Process parameters, normalized, with the current directory's handle
      * open the way the creating process leaves it. */
@@ -1461,9 +1471,19 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
         wchar_t gp[MAX_PATH] = L"";
         GetEnvironmentVariableW(L"PCRECOMP_GUEST_PATH", gp, MAX_PATH);
         while (e[n] || e[n + 1]) n++;
-        wchar_t* copy = (wchar_t*)VirtualAlloc(NULL, (n + dl + MAX_PATH + 8) * 2, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        for (wchar_t* s = e; *s; s += wcslen(s) + 1)
-            if (_wcsnicmp(s, L"Path=", 5) && _wcsnicmp(s, L"PCRECOMP_GUEST_", 15)) { wcscpy(copy + o, s); if (fb_on && !ge) fb_guest_path(copy + o); o += wcslen(copy + o) + 1; }
+        wchar_t* copy = (wchar_t*)VirtualAlloc(NULL, (n + dl + MAX_PATH + 200) * 2, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        /* The guest's identity (regbox32.c): user User on PCRECOMP, at the console. No
+         * entry naming the host's user or machine (OneDrive=C:\Users\<name>\..., ...). */
+        static const wchar_t* idv[] = { L"USERNAME=User", L"USERDOMAIN=PCRECOMP", L"COMPUTERNAME=PCRECOMP",
+                                        L"LOGONSERVER=\\\\PCRECOMP", L"SESSIONNAME=Console" };
+        static const wchar_t* idn[] = { L"USERNAME=", L"USERDOMAIN", L"COMPUTERNAME=", L"LOGONSERVER=", L"SESSIONNAME=",
+                                        L"CLIENTNAME=", L"USERDNSDOMAIN=" };
+        for (wchar_t* s = e; *s; s += wcslen(s) + 1) {
+            int id = native32_host_identity_in(s, wcslen(s));
+            for (int i = 0; i < (int)(sizeof idn / sizeof idn[0]); i++) id |= !_wcsnicmp(s, idn[i], wcslen(idn[i]));
+            if (!id && _wcsnicmp(s, L"Path=", 5) && _wcsnicmp(s, L"PCRECOMP_GUEST_", 15)) { wcscpy(copy + o, s); if (fb_on && !ge) fb_guest_path(copy + o); o += wcslen(copy + o) + 1; }
+        }
+        for (int i = 0; i < (int)(sizeof idv / sizeof idv[0]); i++) wcscpy(copy + o, idv[i]), o += wcslen(idv[i]) + 1;
         wcscpy(copy + o, L"Path="), wcscpy(copy + o + 5, dll_path), o += 5 + dl;
         /* PCRECOMP_GUEST_PATH: more guest directories for a program search (cmd's
          * `find` and `more`: the box's C:\WINNT\system32, where a runner puts names) */

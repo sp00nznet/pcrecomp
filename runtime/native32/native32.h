@@ -79,6 +79,8 @@ void native32_net_loopback_only(void);
  * real one. Two instances with two names keep apart. Call before
  * native32_bind; 0 if the key can't be made. */
 int native32_registry_sandbox(const char* name);
+/* 1 if s (n characters) holds the host's user, account or machine name (regbox32.c) */
+int native32_host_identity_in(const wchar_t* s, size_t n);
 /* The same for a lifted ntdll's NtXxxKey services and a proxied host
  * advapi32: pass native32_nt_override, native32_nt_forward and
  * native32_nt_proxy_hook (before native32_nt_boot). */
