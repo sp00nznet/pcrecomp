@@ -1535,7 +1535,9 @@ static uint32_t s_register_msg(uint32_t* a) { return RegisterWindowMessageW(ustr
 static uint32_t s_atom_name(uint32_t* a) {
     uint32_t us = a[1];
     if (!us || !MEM32(us + 4) || MEM16(us + 2) < 2) return 0;
-    int n = GetClipboardFormatNameW(a[0], (LPWSTR)(uintptr_t)MEM32(us + 4), MEM16(us + 2) / 2);
+    /* an integer atom (the dialog class's 0x8002) is named "#n", as win32k's are */
+    int n = a[0] < 0xC000 ? _snwprintf((wchar_t*)(uintptr_t)MEM32(us + 4), MEM16(us + 2) / 2, L"#%u", a[0])
+                          : GetClipboardFormatNameW(a[0], (LPWSTR)(uintptr_t)MEM32(us + 4), MEM16(us + 2) / 2);
     if (n > 0) MEM16(us) = (uint16_t)(2 * n);
     return n > 0 ? (uint32_t)n : 0;
 }
