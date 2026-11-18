@@ -705,9 +705,9 @@ static uint32_t dib_plain(const dib_t* d, uint32_t bits) {
     static size_t cap;
     if (d->comp != 1 && d->comp != 2) return bits;
     size_t n = (size_t)d->stride * d->h;
-    if (n > cap) free(buf), buf = malloc(n), cap = n;
+    if (n > cap) buf = (uint8_t*)ADDR(ntp_alloc((uint32_t)n)), cap = n;   /* ponytail: the outgrown buffer is not freed (rare, RLE bitmaps only) */
     memset(buf, 0, n);
-    const uint8_t* p = (const uint8_t*)(uintptr_t)bits;
+    const uint8_t* p = (const uint8_t*)ADDR(bits);
     int x = 0, y = 0, four = d->comp == 2;
 #define PUT(v) do { if (x < d->w && y < d->h) { uint8_t* q = buf + (size_t)y * d->stride; \
         if (four) q[x >> 1] |= (uint8_t)(((v) & 0xF) << (x & 1 ? 0 : 4)); else q[x] = (uint8_t)(v); } x++; } while (0)
@@ -722,7 +722,7 @@ static uint32_t dib_plain(const dib_t* d, uint32_t bits) {
         p += (nb + 1) & ~1;
     }
 #undef PUT
-    return (uint32_t)(uintptr_t)buf;
+    return GVA(buf);
 }
 static uint32_t field(uint32_t v, uint32_t m) {
     if (!m) return 0;
@@ -763,7 +763,7 @@ static void dib_draw(gobj_t* d, int x, int y, int w, int h, int sx, int sy, int 
         for (int i = 0; i < sw; i++) {
             int X = sx + i;
             if (X < 0 || X >= D.w) continue;
-            tmpb.px[(size_t)j * sw + i] = dib_px(&D, (const uint8_t*)(uintptr_t)bits, X, scan - start);
+            tmpb.px[(size_t)j * sw + i] = dib_px(&D, (const uint8_t*)ADDR(bits), X, scan - start);
         }
     }
     {
@@ -805,7 +805,7 @@ static int dib_get(bmp_t* b, int start, int num, uint32_t bits, uint32_t bmi) {
     if (bpp == 1) { MEM32(bmi + hs) = 0; MEM32(bmi + hs + 4) = 0xFFFFFF; }
     for (int s = start; s < start + num && s < b->h; s++) {
         int top = td ? s : b->h - 1 - s;
-        uint8_t* r = (uint8_t*)(uintptr_t)(bits + (uint32_t)((s - start) * stride));
+        uint8_t* r = (uint8_t*)ADDR(bits + (uint32_t)((s - start) * stride));
         if (bpp == 1) memset(r, 0, stride);
         for (int x = 0; x < b->w; x++) {
             uint32_t c = b->px[(size_t)top * b->w + x];
@@ -934,7 +934,7 @@ static uint32_t s_bitmap(uint32_t* a) {
     int w = (int)a[0], h = (int)a[1], bpp = (int)(a[2] * a[3]);
     gobj_t* o = bitmap_new(w, h, bpp == 1);
     if (!o || !a[4]) return o ? o->h : 0;
-    const uint8_t* p = (const uint8_t*)(uintptr_t)a[4];
+    const uint8_t* p = (const uint8_t*)ADDR(a[4]);
     int stride = ((w * bpp + 15) / 16) * 2;                   /* DDB rows: WORD aligned */
     for (int y = 0; y < h; y++)
         for (int x = 0; x < w; x++) {
@@ -1130,7 +1130,7 @@ static void dib_into(bmp_t* b, int start, int num, uint32_t bits, uint32_t bmi, 
         int top = D.topdown ? s : D.h - 1 - s;
         if (top >= b->h) continue;
         for (int x = 0; x < D.w && x < b->w; x++) {
-            uint32_t c = dib_px(&D, (const uint8_t*)(uintptr_t)bits, x, s - start);
+            uint32_t c = dib_px(&D, (const uint8_t*)ADDR(bits), x, s - start);
             b->px[(size_t)top * b->w + x] = b->mono ? lum_mono(c) : c;
         }
     }
@@ -1175,7 +1175,7 @@ static uint32_t s_dibsection(uint32_t* a) {
 static void ds_sync(gobj_t* o) {
     struct dibsec* s = o->ds;
     size_t n = (size_t)s->D.stride * s->D.h;
-    const uint8_t* bits = (const uint8_t*)(uintptr_t)s->bits;
+    const uint8_t* bits = (const uint8_t*)ADDR(s->bits);
     s->touched = 1;                                         /* (GDI may draw on it now) */
     if (!memcmp(s->shadow, bits, n)) return;
     bmp_t* b = &o->bm;
@@ -1211,7 +1211,7 @@ static uint32_t s_gdiflush(uint32_t* a) {
         ds_sync(o);                                         /* (the program's own writes first) */
         struct dibsec* s = o->ds;
         const dib_t* D = &s->D;
-        uint8_t* bits = (uint8_t*)(uintptr_t)s->bits;
+        uint8_t* bits = (uint8_t*)ADDR(s->bits);
         for (int r = 0; r < D->h && r < o->bm.h; r++) {
             int top = D->topdown ? r : D->h - 1 - r;
             uint8_t* row = bits + (size_t)r * D->stride;
@@ -1267,7 +1267,7 @@ static uint32_t s_getobject(uint32_t* a) {
     case GDI_FONT: {
         if (!p) return 92;
         fnt_t* F = o->font >= 0 && g_nfnt ? &g_fnt[o->font] : NULL;
-        memset((void*)(uintptr_t)p, 0, a[1] < 92 ? a[1] : 92);
+        memset((void*)ADDR(p), 0, a[1] < 92 ? a[1] : 92);
         if (a[1] < 92) return a[1];
         MEM32(p) = (uint32_t)(F ? -(F->h - F->ilead) : -11);
         MEM32(p + 16) = o->bold ? 700 : 400;
@@ -1282,7 +1282,7 @@ static uint32_t s_textmetrics(uint32_t* a) {     /* NtGdiGetTextMetricsW(hdc, TM
     fnt_t* F = d ? dc_font(d, &fo) : NULL;
     uint32_t t = a[1];
     if (!F || !t) return 0;
-    memset((void*)(uintptr_t)t, 0, a[2]);
+    memset((void*)ADDR(t), 0, a[2]);
     MEM32(t + 0) = (uint32_t)F->h, MEM32(t + 4) = (uint32_t)F->ascent, MEM32(t + 8) = (uint32_t)(F->h - F->ascent);
     MEM32(t + 12) = (uint32_t)F->ilead, MEM32(t + 16) = (uint32_t)F->elead;
     MEM32(t + 20) = (uint32_t)F->avgw + (fo && fo->bold), MEM32(t + 24) = (uint32_t)F->maxw + (fo && fo->bold);
@@ -1299,14 +1299,14 @@ static uint32_t s_textextent(uint32_t* a) {
     gobj_t* d = DCH(a[0]), *fo = NULL;
     fnt_t* F = d ? dc_font(d, &fo) : NULL;
     if (!F || !a[3]) return 0;
-    MEM32(a[3]) = (uint32_t)text_width(F, fo, (const uint16_t*)(uintptr_t)a[1], (int)a[2]);
+    MEM32(a[3]) = (uint32_t)text_width(F, fo, (const uint16_t*)ADDR(a[1]), (int)a[2]);
     MEM32(a[3] + 4) = (uint32_t)F->h;
     return 1;
 }
 static uint32_t s_textextentex(uint32_t* a) {
     gobj_t* d = DCH(a[0]), *fo = NULL;
     fnt_t* F = d ? dc_font(d, &fo) : NULL;
-    const uint16_t* s = (const uint16_t*)(uintptr_t)a[1];
+    const uint16_t* s = (const uint16_t*)ADDR(a[1]);
     if (!F || !a[6]) return 0;
     int w = 0, n = (int)a[2], fit = 0;
     for (int i = 0; i < n; i++) {
@@ -1349,7 +1349,7 @@ static uint32_t s_font(uint32_t* a) {
 static uint32_t s_textout(uint32_t* a) {
     gobj_t* d = DCH(a[0]);
     if (!d) return 0;
-    textout(d, (int)a[1], (int)a[2], a[3], a[4], (const uint16_t*)(uintptr_t)a[5], (int)a[6], a[7]);
+    textout(d, (int)a[1], (int)a[2], a[3], a[4], (const uint16_t*)ADDR(a[5]), (int)a[6], a[7]);
     return 1;
 }
 static uint32_t s_select(uint32_t* a) {          /* NtGdiSelectBrush/Pen/Font: the DC_ATTR's (gdi32 sets it too) */
@@ -1395,7 +1395,7 @@ static uint32_t s_savedc(uint32_t* a) {
     gobj_t* d = DCH(a[0]);
     if (!d) return 0;
     d->saved = realloc(d->saved, sizeof *d->saved * (d->nsaved + 1));
-    memcpy(d->saved[d->nsaved].a, (void*)(uintptr_t)d->attr, DCA_SIZE);
+    memcpy(d->saved[d->nsaved].a, (void*)ADDR(d->attr), DCA_SIZE);
     d->saved[d->nsaved].clip = d->clip, d->saved[d->nsaved].hbm = d->hbm;
     return (uint32_t)++d->nsaved;
 }
@@ -1405,7 +1405,7 @@ static uint32_t s_restoredc(uint32_t* a) {
     if (!d || !d->nsaved) return 0;
     if (lv < 0) lv = d->nsaved + lv + 1;
     if (lv < 1 || lv > d->nsaved) return 0;
-    memcpy((void*)(uintptr_t)d->attr, d->saved[lv - 1].a, DCA_SIZE);
+    memcpy((void*)ADDR(d->attr), d->saved[lv - 1].a, DCA_SIZE);
     d->clip = d->saved[lv - 1].clip;
     d->nsaved = lv - 1;
     return 1;
@@ -1442,15 +1442,15 @@ static uint8_t* g_efd;
 static uint32_t g_efd_cb;
 static void a2u(uint16_t* d, const char* s, int cap) { int i = 0; for (; s[i] && i < cap - 1; i++) d[i] = (uint8_t)s[i]; d[i] = 0; }
 static void efd_put(uint8_t* e, const char* face, const fnt_t* F) {
-    uint32_t p = (uint32_t)(uintptr_t)e, lf = p + EFD_LF, tm = p + EFD_NTM;
+    uint32_t p = GVA(e), lf = p + EFD_LF, tm = p + EFD_NTM;
     memset(e, 0, EFD_SIZE);
     MEM32(p) = EFD_SIZE, MEM32(p + 4) = EFD_NTM - 8, MEM32(p + 8) = 1;              /* RASTER_FONTTYPE */
     MEM32(lf) = (uint32_t)(F ? F->h : 13), MEM32(lf + 4) = (uint32_t)(F ? F->avgw : 6);
     MEM32(lf + 16) = F ? (uint32_t)F->weight : 400;
     MEM8(lf + 23) = 0, MEM8(lf + 27) = (uint8_t)(F ? F->pitch : 0x22);              /* ANSI_CHARSET */
     for (int i = 0; face[i] && i < 31; i++) MEM16(lf + 28 + 2 * i) = (uint8_t)face[i], MEM16(lf + 92 + 2 * i) = (uint8_t)face[i];
-    a2u((uint16_t*)(uintptr_t)(lf + 220), "Regular", 32);
-    a2u((uint16_t*)(uintptr_t)(lf + 284), "Western", 32);
+    a2u((uint16_t*)ADDR(lf + 220), "Regular", 32);
+    a2u((uint16_t*)ADDR(lf + 284), "Western", 32);
     if (F) {
         MEM32(tm) = (uint32_t)F->h, MEM32(tm + 4) = (uint32_t)F->ascent, MEM32(tm + 8) = (uint32_t)(F->h - F->ascent);
         MEM32(tm + 12) = (uint32_t)F->ilead, MEM32(tm + 16) = (uint32_t)F->elead;
@@ -1464,8 +1464,9 @@ static void efd_put(uint8_t* e, const char* face, const fnt_t* F) {
 static uint32_t s_enumfont_open(uint32_t* a) {
     char face[33] = "";
     for (uint32_t i = 0; a[4] && i < 32 && MEM16(a[4] + 2 * i); i++) face[i] = (char)MEM16(a[4] + 2 * i), face[i + 1] = 0;
-    free(g_efd);
-    g_efd = calloc((size_t)(g_nfnt + 1), EFD_SIZE), g_efd_cb = 0;
+    static uint32_t cap;
+    if ((uint32_t)(g_nfnt + 1) * EFD_SIZE > cap) cap = (uint32_t)(g_nfnt + 1) * EFD_SIZE, g_efd = (uint8_t*)ADDR(ntp_alloc(cap));
+    g_efd_cb = 0;
     if (face[0]) {
         int k = fnt_pick(face, 0);
         efd_put(g_efd, face, k >= 0 && g_nfnt ? &g_fnt[k] : NULL), g_efd_cb = EFD_SIZE;
@@ -1481,7 +1482,7 @@ static uint32_t s_enumfont_open(uint32_t* a) {
 static uint32_t s_enumfont_chunk(uint32_t* a) {
     uint32_t n = a[2] < g_efd_cb ? a[2] : g_efd_cb;
     if (!g_efd || !a[4]) return 0;
-    memcpy((void*)(uintptr_t)a[4], g_efd, n);
+    memcpy((void*)ADDR(a[4]), g_efd, n);
     if (a[3]) MEM32(a[3]) = n;
     return 1;
 }
@@ -1559,7 +1560,7 @@ static void batch_cmd(uint32_t hdc, uint32_t cmd, uint32_t e, uint32_t len) {
             if (MEM32(e + 0x38)) AT(d, DCA_FONT) = MEM32(e + 0x38);
             AT(d, DCA_TEXTALIGN) = MEM32(e + 0x3C);
             textout(d, (int)MEM32(e + 0x10), (int)MEM32(e + 0x14), o & 0x7FFFFFFFu, (o & 0x80000000u) ? 0 : e + 0x1C,
-                    (const uint16_t*)(uintptr_t)(e + 0x48), (int)MEM32(e + 0x30), 0);
+                    (const uint16_t*)ADDR(e + 0x48), (int)MEM32(e + 0x30), 0);
             AT(d, DCA_TEXTCOLOR) = save[0], AT(d, DCA_BKCOLOR) = save[1], MEM8(d->attr + DCA_BKMODE) = (uint8_t)save[2], AT(d, DCA_FONT) = save[3];
             AT(d, DCA_TEXTALIGN) = sal;
         }
@@ -1585,7 +1586,7 @@ static void batch_cmd(uint32_t hdc, uint32_t cmd, uint32_t e, uint32_t len) {
         }
         break;
     case W2K_B_FONT: if (d) AT(d, DCA_FONT) = MEM32(e + 4); break;
-    case W2K_B_DELETE: s_delete((uint32_t*)(uintptr_t)(e + 4)); break;
+    case W2K_B_DELETE: s_delete((uint32_t*)ADDR(e + 4)); break;
     default: fprintf(stderr, "[gdi] batch command %u (%u bytes) dropped\n", cmd, len);
     }
 }
@@ -1641,7 +1642,7 @@ static uint32_t desk_alloc(uint32_t n) {
     uint32_t p = g_desk + g_desk_top;
     g_desk_top += (n + 15) & ~15u;
     if (g_desk_top > DESK_SIZE) { fprintf(stderr, "[user] desktop heap full\n"); exit(3); }
-    memset((void*)(uintptr_t)p, 0, n);
+    memset((void*)ADDR(p), 0, n);
     return p;
 }
 static uobj_t* U(uint32_t h, int type) {
@@ -1689,7 +1690,7 @@ static int u16len_(const uint16_t* s) { int n = 0; while (s && s[n]) n++; return
 /* a class by atom (a value below 0x10000) or name */
 static int cls_find(uint32_t name) {
     for (int i = 0; i < g_ncls; i++)
-        if (name < 0x10000 ? g_cls[i].atom == name : !u16icmp(g_cls[i].name, (const uint16_t*)(uintptr_t)name)) return i;
+        if (name < 0x10000 ? g_cls[i].atom == name : !u16icmp(g_cls[i].name, (const uint16_t*)ADDR(name))) return i;
     return -1;
 }
 /* LARGE_STRING (CreateWindowEx: buffer at +8, bAnsi bit 31 of +4) or an atom */
@@ -1701,12 +1702,12 @@ static uint32_t lstr(uint32_t ls, uint16_t* tmp, int cap) {
         int n = (int)MEM32(ls);
         for (int i = 0; i < n && i < cap - 1; i++) tmp[i] = MEM8(b + i), tmp[i + 1] = 0;
         if (!n) tmp[0] = 0;
-        return (uint32_t)(uintptr_t)tmp;
+        return GVA(tmp);
     }
     int n = (int)MEM32(ls) / 2;
     for (int i = 0; i < n && i < cap - 1; i++) tmp[i] = MEM16(b + 2 * i), tmp[i + 1] = 0;
     if (!n) tmp[0] = 0;
-    return (uint32_t)(uintptr_t)tmp;
+    return GVA(tmp);
 }
 
 /* ---- metrics -------------------------------------------------------------- */
@@ -1774,7 +1775,7 @@ static void wnd_sync(uobj_t* u) {
     /* (256 bytes, 1024 once a longer text comes: the bump heap is never freed) */
     if (!MEM32(w + WND_STRNAME + 8) || MEM32(w + WND_STRNAME + 4) < 2u * n + 2)
         MEM32(w + WND_STRNAME + 4) = 2 * n + 2 > 256 ? 1024 : 256, MEM32(w + WND_STRNAME + 8) = desk_alloc(MEM32(w + WND_STRNAME + 4));
-    memcpy((void*)(uintptr_t)MEM32(w + WND_STRNAME + 8), u->text, 2 * n + 2);
+    memcpy((void*)ADDR(MEM32(w + WND_STRNAME + 8)), u->text, 2 * n + 2);
     MEM32(w + WND_STRNAME) = (uint32_t)(2 * n);
 }
 static void sync_all(void) {
@@ -1807,15 +1808,15 @@ static uint32_t call_proc(uobj_t* u, uint32_t pfn, uint32_t m, uint32_t w, uint3
     sync_all();
     MEM32(teb + TEB_CBWND) = u->h, MEM32(teb + TEB_CBWND + 4) = u->obj;
     if ((m == 1 || m == 0x81) && l) {           /* WM_CREATE / WM_NCCREATE: __fnINLPCREATESTRUCT */
-        uint32_t msg[0x18] = { 0 };
-        msg[0] = sizeof msg;
+        GUEST_ARRAY(uint32_t, msg, 0x18, { 0 });
+        msg[0] = 0x18 * 4;
         msg[6] = u->obj, msg[7] = m, msg[8] = w, msg[9] = 1;
-        memcpy(&msg[0x0A], (void*)(uintptr_t)l, 0x30);
+        memcpy(&msg[0x0A], (void*)ADDR(l), 0x30);
         msg[0x16] = pfn, msg[0x17] = g_dcm;
-        st = ntp_callback(W2K_CB_INLPCREATESTRUCT, (uint32_t)(uintptr_t)msg, sizeof msg, &o, &olen);
+        st = ntp_callback(W2K_CB_INLPCREATESTRUCT, GVA(msg), 0x18 * 4, &o, &olen);
     } else {
-        uint32_t msg[6] = { u->obj, m, w, l, pfn, g_dcm };
-        st = ntp_callback(W2K_CB_DWORD, (uint32_t)(uintptr_t)msg, sizeof msg, &o, &olen);
+        GUEST_ARRAY(uint32_t, msg, 6, { u->obj, m, w, l, pfn, g_dcm });
+        st = ntp_callback(W2K_CB_DWORD, GVA(msg), 6 * 4, &o, &olen);
     }
     if (st == 0 && o && olen >= 4) r = MEM32(o);
     else if (st) fprintf(stderr, "[user] callback for message 0x%X: status %08X\n", m, st);
@@ -2216,11 +2217,11 @@ static void expose(rc_t r, uint32_t gone) {
     }
 }
 static void calcsize(uobj_t* u) {                /* WM_NCCALCSIZE(FALSE, the window rect) */
-    uint32_t rr[4];
+    GUEST_LOCAL(uint32_t, rr, 4);
     rc_t w = u->wrel;
     rr[0] = (uint32_t)w.l, rr[1] = (uint32_t)w.t, rr[2] = (uint32_t)w.r, rr[3] = (uint32_t)w.b;
-    send(u->h, 0x83, 0, (uint32_t)(uintptr_t)rr);
-    rc_t c = rc_get((uint32_t)(uintptr_t)rr);
+    send(u->h, 0x83, 0, GVA(rr));
+    rc_t c = rc_get(GVA(rr));
     if (c.r < c.l) c.r = c.l;
     if (c.b < c.t) c.b = c.t;
     u->cin = (rc_t){ c.l - w.l, c.t - w.t, c.r - w.l, c.b - w.t };
@@ -2232,10 +2233,10 @@ static void calcsize(uobj_t* u) {                /* WM_NCCALCSIZE(FALSE, the win
 #define SWP_SHOWWINDOW 0x40
 #define SWP_HIDEWINDOW 0x80
 static int setpos(uobj_t* u, int x, int y, int cx, int cy, uint32_t fl) {
-    uint32_t wp[7] = { u->h, 0, (uint32_t)x, (uint32_t)y, (uint32_t)cx, (uint32_t)cy, fl };
+    GUEST_ARRAY(uint32_t, wp, 7, { u->h, 0, (uint32_t)x, (uint32_t)y, (uint32_t)cx, (uint32_t)cy, fl });
     if (fl & SWP_NOMOVE) wp[2] = (uint32_t)u->wrel.l, wp[3] = (uint32_t)u->wrel.t;
     if (fl & SWP_NOSIZE) wp[4] = (uint32_t)(u->wrel.r - u->wrel.l), wp[5] = (uint32_t)(u->wrel.b - u->wrel.t);
-    send(u->h, 0x46, 0, (uint32_t)(uintptr_t)wp);                     /* WM_WINDOWPOSCHANGING */
+    send(u->h, 0x46, 0, GVA(wp));                     /* WM_WINDOWPOSCHANGING */
     rc_t old = u->wrel, oldscr = u->wr;
     int wasvis = visible(u);
     u->wrel = (rc_t){ (int)wp[2], (int)wp[3], (int)wp[2] + (int)wp[4], (int)wp[3] + (int)wp[5] };
@@ -2249,7 +2250,7 @@ static int setpos(uobj_t* u, int x, int y, int cx, int cy, uint32_t fl) {
     if (!(fl & SWP_NOREDRAW) && (sized || moved || (fl & (SWP_FRAMECHANGED | SWP_SHOWWINDOW)))) invalidate(u, 1);
     if (!moved) wp[6] |= SWP_NOMOVE;
     if (!sized) wp[6] |= SWP_NOSIZE;
-    send(u->h, 0x47, 0, (uint32_t)(uintptr_t)wp);                     /* WM_WINDOWPOSCHANGED */
+    send(u->h, 0x47, 0, GVA(wp));                     /* WM_WINDOWPOSCHANGED */
     return 1;
 }
 static void kid_activate(uobj_t* u);
@@ -2347,7 +2348,7 @@ static uint32_t defproc(uobj_t* u, uint32_t m, uint32_t w, uint32_t l) {
     case 0x81:                                                       /* WM_NCCREATE */
         if (l && MEM32(l + 0x24)) {
             uint32_t s = MEM32(l + 0x24);
-            if (s >= 0x10000) u16cpy(u->text, (const uint16_t*)(uintptr_t)s, 512);
+            if (s >= 0x10000) u16cpy(u->text, (const uint16_t*)ADDR(s), 512);
         }
         return 1;
     case 0x83: {                                                     /* WM_NCCALCSIZE */
@@ -2363,13 +2364,13 @@ static uint32_t defproc(uobj_t* u, uint32_t m, uint32_t w, uint32_t l) {
     case 0x86: u->ncdirty = 1; return 1;                             /* WM_NCACTIVATE */
     case 0x14: return erase_bk(u, w);                                /* WM_ERASEBKGND */
     case 0x0F: {                                                     /* WM_PAINT */
-        uint32_t ps[16];
-        uint32_t dc = paint_dc(u, (uint32_t)(uintptr_t)ps);
+        GUEST_LOCAL(uint32_t, ps, 16);
+        uint32_t dc = paint_dc(u, GVA(ps));
         dc_release(dc);
         return 0;
     }
     case 0x0C:                                                       /* WM_SETTEXT */
-        if (l) u16cpy(u->text, (const uint16_t*)(uintptr_t)l, 512); else u->text[0] = 0;
+        if (l) u16cpy(u->text, (const uint16_t*)ADDR(l), 512); else u->text[0] = 0;
         wnd_sync(u);
         u->ncdirty = 1;
         return 1;
@@ -2377,7 +2378,7 @@ static uint32_t defproc(uobj_t* u, uint32_t m, uint32_t w, uint32_t l) {
         int n = u16len_(u->text);
         if (!w || !l) return 0;
         if (n > (int)w - 1) n = (int)w - 1;
-        memcpy((void*)(uintptr_t)l, u->text, 2 * n);
+        memcpy((void*)ADDR(l), u->text, 2 * n);
         MEM16(l + 2 * n) = 0;
         return (uint32_t)n;
     }
@@ -2434,7 +2435,7 @@ static uint32_t paint_dc(uobj_t* u, uint32_t ps) {
     if (u->erase) { u->erase = 0; erased = send(u->h, 0x14, d->h, 0) != 0; }
     set_dirty(u, 0);
     if (ps) {
-        memset((void*)(uintptr_t)ps, 0, 64);
+        memset((void*)ADDR(ps), 0, 64);
         MEM32(ps) = d->h, MEM32(ps + 4) = !erased;
         rc_put(ps + 8, (rc_t){ 0, 0, u->cr.r - u->cr.l, u->cr.b - u->cr.t });
     }
@@ -2452,12 +2453,12 @@ static void menu_sync(uobj_t* m) {
     for (int i = 0; i < m->nitems && i < 64; i++) {
         uint32_t it = MEM32(o + MENU_RGITEMS) + i * ITEM_SIZE;
         uobj_t* s = U(m->items[i].sub, W2K_TYPE_MENU);
-        memset((void*)(uintptr_t)it, 0, ITEM_SIZE);
+        memset((void*)ADDR(it), 0, ITEM_SIZE);
         MEM32(it) = m->items[i].type, MEM32(it + 4) = m->items[i].state, MEM32(it + 8) = m->items[i].id;
         MEM32(it + 0xC) = s ? s->obj : 0;
         uint32_t t = MEM32(o + MENU_RGITEMS) + 64 * ITEM_SIZE + i * 128;
         int n = u16len_(m->items[i].text);
-        memcpy((void*)(uintptr_t)t, m->items[i].text, 2 * n + 2);
+        memcpy((void*)ADDR(t), m->items[i].text, 2 * n + 2);
         if (n) MEM32(it + 0x18) = t, MEM32(it + 0x1C) = (uint32_t)n;
         MEM32(it + 0x20) = m->items[i].data, MEM32(it + 0x40) = m->items[i].bmp;
     }
@@ -2500,7 +2501,7 @@ static void draw_icon(gobj_t* d, uobj_t* ic, int x, int y, int cx, int cy, uint3
 /* ======================================================================
  * USER services
  * ====================================================================== */
-#define UNI(p) ((const uint16_t*)(uintptr_t)(p))
+#define UNI(p) ((const uint16_t*)ADDR(p))
 /* NtUserRegisterClassExWOW(WNDCLASSEXW*, UNICODE_STRING* class, CLSMENUNAME*, fnid, flags, wow*) */
 static uint32_t s_register_class(uint32_t* a) {
     uint32_t wc = a[0], name = MEM32(a[1] + 4);
@@ -2548,7 +2549,8 @@ static uint32_t s_classinfo(uint32_t* a) {
  * style, x, y, cx, cy, parent, menu, hInstance, lpParam, flags) */
 #define CW_USEDEFAULT 0x80000000u
 static uint32_t s_create_window(uint32_t* a) {
-    uint16_t cn[64], wn[512];
+    GUEST_LOCAL(uint16_t, cn, 64);
+    GUEST_LOCAL(uint16_t, wn, 512);
     uint32_t cname = lstr(a[1], cn, 64), wname = a[2] ? lstr(a[2], wn, 512) : 0;
     int ci = cls_find(cname);
     if (g_trace) {
@@ -2578,8 +2580,9 @@ static uint32_t s_create_window(uint32_t* a) {
     else {
         u->parent = g_desktop, u->owner = parent ? parent->h : 0, u->menu = a[9];
         if (!u->menu && c->menu) {                             /* the class menu: __ClientLoadMenu(hinst, name) */
-            uint32_t msg[9] = { sizeof msg, 0, 0, 0, 0, 0, a[10] ? a[10] : c->inst, 0, c->menu }, o = 0, olen = 0;
-            if (!ntp_callback(W2K_CB_LOADMENU, (uint32_t)(uintptr_t)msg, sizeof msg, &o, &olen) && o && olen >= 4) u->menu = MEM32(o);
+            GUEST_ARRAY(uint32_t, msg, 9, { 9 * 4, 0, 0, 0, 0, 0, a[10] ? a[10] : c->inst, 0, c->menu });
+            uint32_t o = 0, olen = 0;
+            if (!ntp_callback(W2K_CB_LOADMENU, GVA(msg), 9 * 4, &o, &olen) && o && olen >= 4) u->menu = MEM32(o);
         }
     }
     if (wname >= 0x10000) u16cpy(u->text, UNI(wname), 512);
@@ -2602,24 +2605,24 @@ static uint32_t s_create_window(uint32_t* a) {
     if (!(st & WS_CHILD) && (!W(g_main) || !(W(g_main)->style & WS_VISIBLE))) g_main = u->h;   /* the first top-level window shown */
     wnd_sync(u);
     /* CREATESTRUCTW */
-    uint32_t cs[12] = { a[11], a[10], a[9], a[8], (uint32_t)cy, (uint32_t)cx, (uint32_t)y, (uint32_t)x, st, wname, cname, ex };
+    GUEST_ARRAY(uint32_t, cs, 12, { a[11], a[10], a[9], a[8], (uint32_t)cy, (uint32_t)cx, (uint32_t)y, (uint32_t)x, st, wname, cname, ex });
     if ((st & WS_THICKFRAME) || !(st & (WS_CHILD | 0x80000000u))) {   /* WM_GETMINMAXINFO */
-        uint32_t mm[10] = { 0, 0, (uint32_t)SM(61), (uint32_t)SM(62), (uint32_t)-SM(32), (uint32_t)-SM(33), (uint32_t)SM(34), (uint32_t)SM(35),
-                            (uint32_t)SM(59), (uint32_t)SM(60) };
-        send(u->h, 0x24, 0, (uint32_t)(uintptr_t)mm);
+        GUEST_ARRAY(uint32_t, mm, 10, { 0, 0, (uint32_t)SM(61), (uint32_t)SM(62), (uint32_t)-SM(32), (uint32_t)-SM(33), (uint32_t)SM(34), (uint32_t)SM(35),
+                            (uint32_t)SM(59), (uint32_t)SM(60) });
+        send(u->h, 0x24, 0, GVA(mm));
     }
     uint32_t h = u->h;
     if (g_cbt) {                                  /* HCBT_CREATEWND(hwnd, CBT_CREATEWND { lpcs, hwndInsertAfter }) */
-        uint32_t cbt[2] = { (uint32_t)(uintptr_t)cs, 0 };
-        uint32_t r = call_hook(g_cbt, 5, 3, h, (uint32_t)(uintptr_t)cbt);
+        GUEST_ARRAY(uint32_t, cbt, 2, { GVA(cs), 0 });
+        uint32_t r = call_hook(g_cbt, 5, 3, h, GVA(cbt));
         if (r) { if (W(h)) destroy(W(h)); return 0; }
         if (!W(h)) return 0;
     }
-    if (!send(h, 0x81, 0, (uint32_t)(uintptr_t)cs)) { TRACE("[user] WM_NCCREATE refused\n"); if (W(h)) destroy(W(h)); return 0; }
+    if (!send(h, 0x81, 0, GVA(cs))) { TRACE("[user] WM_NCCREATE refused\n"); if (W(h)) destroy(W(h)); return 0; }
     if (!W(h)) return 0;
     calcsize(u);
     wnd_sync(u);
-    if (send(h, 1, 0, (uint32_t)(uintptr_t)cs) == (uint32_t)-1) { if (W(h)) destroy(W(h)); return 0; }
+    if (send(h, 1, 0, GVA(cs)) == (uint32_t)-1) { if (W(h)) destroy(W(h)); return 0; }
     if (!W(h)) return 0;
     u->sizemove = 1;                              /* (WM_SIZE, WM_MOVE: when it is first shown) */
     if (st & WS_VISIBLE) show(u, 1);
@@ -2808,8 +2811,8 @@ static uint32_t s_peekmessage(uint32_t* a) {     /* NtUserPeekMessage(MSG*, hwnd
 }
 static uint32_t s_waitmessage(uint32_t* a) {
     (void)a;
-    uint32_t m[7];
-    while (!next_msg((uint32_t)(uintptr_t)m, 0, 0, 0, 0)) script_idle();
+    GUEST_LOCAL(uint32_t, m, 7);
+    while (!next_msg(GVA(m), 0, 0, 0, 0)) script_idle();
     return 1;
 }
 static uint32_t s_dispatch(uint32_t* a) {        /* NtUserDispatchMessage(MSG*) */
@@ -3201,13 +3204,14 @@ static uint32_t s_setlong(uint32_t* a) {
     case -16: case -20: {
         /* WM_STYLECHANGING/WM_STYLECHANGED (STYLESTRUCT old, new), as win32k sends them: comctl32
          * keeps its own copy of the style from them (the Start menu toolbar's CCS_NORESIZE) */
-        uint32_t* f = i == -16 ? &u->style : &u->ex, ss[2] = { *f, a[2] };
+        uint32_t* f = i == -16 ? &u->style : &u->ex;
+        GUEST_ARRAY(uint32_t, ss, 2, { *f, a[2] });
         old = *f;
         if (old == a[2]) return old;
-        send(u->h, 0x7C, (uint32_t)i, (uint32_t)(uintptr_t)ss);
+        send(u->h, 0x7C, (uint32_t)i, GVA(ss));
         *f = ss[1];
         wnd_sync(u);
-        send(u->h, 0x7D, (uint32_t)i, (uint32_t)(uintptr_t)ss);
+        send(u->h, 0x7D, (uint32_t)i, GVA(ss));
         return old;
     }
     case -12: old = u->id; u->id = a[2]; wnd_sync(u); return old;            /* GWL_ID */
@@ -3272,7 +3276,7 @@ static uint32_t s_removeprop(uint32_t* a) {      /* NtUserRemoveProp(hwnd, atom)
     for (uint32_t i = 0; i < n; i++)
         if (MEM16(pl + 8 + 8 * i + 4) == (uint16_t)a[1]) {
             uint32_t h = MEM32(pl + 8 + 8 * i);
-            memmove((void*)(uintptr_t)(pl + 8 + 8 * i), (void*)(uintptr_t)(pl + 8 + 8 * (i + 1)), 8 * (n - i - 1));
+            memmove((void*)ADDR(pl + 8 + 8 * i), (void*)ADDR(pl + 8 + 8 * (i + 1)), 8 * (n - i - 1));
             MEM32(pl + 4) = n - 1;
             return h;
         }
@@ -3292,7 +3296,7 @@ static uint32_t s_getbitmapbits(uint32_t* a) {
     uint32_t stride = b->mono ? (uint32_t)((b->w + 15) / 16 * 2) : (uint32_t)b->w * 4, n = stride * (uint32_t)b->h;
     if (!a[2]) return n;
     if (n > a[1]) n = a[1];
-    uint8_t* p = (uint8_t*)(uintptr_t)a[2];
+    uint8_t* p = (uint8_t*)ADDR(a[2]);
     memset(p, 0, n);
     for (uint32_t y = 0; y < (uint32_t)b->h; y++)
         for (uint32_t x = 0; x < (uint32_t)b->w; x++) {
@@ -3446,7 +3450,7 @@ static uint32_t s_enum_monitors(uint32_t* a) {
     static uint32_t rc;
     if (!a[2]) return 0;
     if (!rc) rc = ntp_alloc(16);
-    memcpy((void*)(uintptr_t)rc, (void*)(uintptr_t)(g_mon + 0x10), 16);
+    memcpy((void*)ADDR(rc), (void*)ADDR(g_mon + 0x10), 16);
     uint32_t args[4] = { MEM32(g_mon), a[0], rc, a[3] };
     ntp_guest(a[2], 4, args);
     return 1;
@@ -3569,7 +3573,7 @@ static uint32_t s_setplacement(uint32_t* a) {
 /* NtUserSystemParametersInfo(action, uiParam, pvParam, fWinIni): queries
  * answered with Windows 2000's defaults; a set is kept nowhere */
 static void logfont(uint32_t p, int h, int weight) {
-    memset((void*)(uintptr_t)p, 0, 92);
+    memset((void*)ADDR(p), 0, 92);
     MEM32(p) = (uint32_t)h, MEM32(p + 16) = (uint32_t)weight;
     static const char f[] = "MS Sans Serif";
     for (int i = 0; f[i]; i++) MEM16(p + 28 + 2 * i) = (uint8_t)f[i];
@@ -3577,9 +3581,9 @@ static void logfont(uint32_t p, int h, int weight) {
 static uint32_t s_spi(uint32_t* a) {
     uint32_t p = a[2];
     switch (a[0]) {
-    case 0x30: if (p) memcpy((void*)(uintptr_t)p, (void*)(uintptr_t)(g_mon + 0x20), 16); return 1;   /* SPI_GETWORKAREA */
+    case 0x30: if (p) memcpy((void*)ADDR(p), (void*)ADDR(g_mon + 0x20), 16); return 1;   /* SPI_GETWORKAREA */
     case 0x2F:                                   /* SPI_SETWORKAREA: the taskbar docking; SPIF_SENDCHANGE tells the windows */
-        if (p) memcpy((void*)(uintptr_t)(g_mon + 0x20), (void*)(uintptr_t)p, 16);
+        if (p) memcpy((void*)ADDR(g_mon + 0x20), (void*)ADDR(p), 16);
         else w2k_monitor(g_disp, g_mon, g_cx, g_cy, g_cy);
         if (a[3] & 2) broadcast(0x1A, 0x2F, 0, 0);                              /* WM_SETTINGCHANGE */
         return 1;
@@ -3590,7 +3594,7 @@ static uint32_t s_spi(uint32_t* a) {
     case 0x66: if (p) MEM32(p) = 400; return 1;                                 /* SPI_GETMOUSEHOVERTIME */
     case 0x29:                                                                  /* SPI_GETNONCLIENTMETRICS */
         if (!p) return 0;
-        memset((void*)(uintptr_t)(p + 4), 0, 0x1F0);
+        memset((void*)ADDR(p + 4), 0, 0x1F0);
         MEM32(p + 4) = 1, MEM32(p + 8) = 16, MEM32(p + 12) = 16, MEM32(p + 16) = 18, MEM32(p + 20) = 18;
         logfont(p + 24, -11, 700);
         MEM32(p + 116) = 12, MEM32(p + 120) = 14;
@@ -3626,7 +3630,7 @@ static void user_connect(uint32_t index, uint32_t ci, uint32_t len) {
         g_disp = ntp_alloc(0x1000);
         g_mon = ntp_alloc(0x100);
         g_defmsgs = ntp_alloc(0x80);
-        memset((void*)(uintptr_t)g_defmsgs, 0xFF, 0x80);
+        memset((void*)ADDR(g_defmsgs), 0xFF, 0x80);
         g_desk = ntp_alloc(DESK_SIZE);
         g_deskinfo = ntp_alloc(0x200);
         g_threadinfo = ntp_alloc(0x400);
@@ -3634,8 +3638,8 @@ static void user_connect(uint32_t index, uint32_t ci, uint32_t len) {
         g_desk_top = 0x100;
         MEM32(g_psi + SI_CHANDLES) = MAXU;
         w2k_metrics_2000(g_met, g_cx, g_cy);
-        memcpy((void*)(uintptr_t)(g_psi + SI_METRICS), g_met, sizeof g_met);
-        memcpy((void*)(uintptr_t)(g_psi + SI_COLORS), w2k_colors_2000, sizeof w2k_colors_2000);
+        memcpy((void*)ADDR(g_psi + SI_METRICS), g_met, sizeof g_met);
+        memcpy((void*)ADDR(g_psi + SI_COLORS), w2k_colors_2000, sizeof w2k_colors_2000);
         if (!g_gdit) s_gdi_init(NULL);
         for (int i = 0; i < 0x1D; i++) MEM32(g_psi + SI_BRUSHES + 4 * i) = g_sysbrush[i];
         MEM16(g_psi + SI_CXSYSFONT) = 8, MEM16(g_psi + SI_CYSYSFONT) = 16;

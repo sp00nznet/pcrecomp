@@ -28,8 +28,9 @@
  * The service table is the guest ntdll's own, read from its NtXxx stubs, so
  * each NT build brings its own numbering (as syscall32.c).
  *
- * Built with gcc -m32 and RECOMP_FLAT_MEMORY: a guest address is a host
- * address. One guest thread. See win2000's docs/linux.md.
+ * Flat (gcc -m32, RECOMP_FLAT_MEMORY) a guest address is a host address;
+ * based (x86-64, arm64: RECOMP_MEM_BASE) guest memory is one 4 GB span at
+ * ADDR(0) and every guest address is converted (ADDR, GVA). One guest thread. See win2000's docs/linux.md.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -52,8 +53,8 @@
 #include <execinfo.h>
 #include "ntposix.h"
 
-#if !defined(__i386__)
-#error "ntposix is flat: build it with gcc -m32 (docs/linux.md)"
+#if !defined(__i386__) && defined(RECOMP_FLAT_MEMORY)
+#error "flat is i386 only: gcc -m32, or based with RECOMP_MEM_BASE (docs/linux.md, docs/a64.md)"
 #endif
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
@@ -151,7 +152,7 @@ static int u8_to_u16(const char* s, uint16_t* out, int cap) {
 /* a UNICODE_STRING in guest memory -> UTF-8 */
 static void us_to_u8(uint32_t us, char* out, int cap) {
     if (!us || !MEM32(us + 4)) { out[0] = 0; return; }
-    u16_to_u8((const uint16_t*)(uintptr_t)MEM32(us + 4), MEM16(us) / 2, out, cap);
+    u16_to_u8((const uint16_t*)ADDR(MEM32(us + 4)), MEM16(us) / 2, out, cap);
 }
 
 static uint64_t filetime(time_t s, long ns) { return ((uint64_t)s + 11644473600ull) * 10000000ull + (uint64_t)ns / 100; }
@@ -200,7 +201,7 @@ recomp_func_t recomp_lookup_import(uint32_t va) {
 /* the hardware's other gates: not used by an NT userland */
 void recomp_int(int n) {
     if (n == 0x2D && g_eax == 1 && g_ecx) {                 /* DbgPrint: ecx the text, edx its length */
-        fprintf(stderr, "[dbgprint] %.*s", (int)(g_edx & 0xFFFF), (const char*)(uintptr_t)g_ecx);
+        fprintf(stderr, "[dbgprint] %.*s", (int)(g_edx & 0xFFFF), (const char*)ADDR(g_ecx));
         return;
     }
     fprintf(stderr, "[ntposix] int %02Xh in sub_%08X\n", n, g_cur_func);
@@ -256,6 +257,25 @@ static uint32_t pg_base[NPAGES];
 
 static int host_prot(uint32_t p) { return (p & 0xFF) == 0x01 ? PROT_NONE : PROT_READ | PROT_WRITE; }
 
+/* A host whose pages are bigger than NT's 4 KB (16 KB: Apple silicon, a
+ * Raspberry Pi 5's kernel; 64 KB: some arm64 servers) protects whole host
+ * pages: one is readable and writable when any 4 KB page in it is committed
+ * and not PAGE_NOACCESS. Reservations are 64 KB aligned, so they never share
+ * a host page. ponytail: a guard page sharing a host page with committed
+ * stack is already writable (the stack grows without the commit recorded). */
+static uint32_t g_hpg = 0x1000;
+static int host_protect(uint32_t lo, uint32_t hi, uint32_t prot) {
+    if (g_hpg == 0x1000) return mprotect((void*)ADDR(lo), hi - lo, host_prot(prot));
+    for (uint32_t h = lo & ~(g_hpg - 1); h < hi; h += g_hpg) {
+        int rw = 0;
+        for (uint32_t p = h >> 12; p < (h + g_hpg) >> 12; p++)
+            rw |= (p >= lo >> 12 && p < hi >> 12) ? host_prot(prot) != PROT_NONE
+                                                  : pg_state[p] == PG_COMMITTED && host_prot(pg_prot[p]) != PROT_NONE;
+        if (mprotect((void*)ADDR(h), g_hpg, rw ? PROT_READ | PROT_WRITE : PROT_NONE)) return -1;
+    }
+    return 0;
+}
+
 static int pages_free(uint32_t a, uint32_t size) {
     for (uint32_t p = a >> 12; p < (a + size) >> 12; p++) if (pg_state[p] != PG_FREE) return 0;
     return 1;
@@ -276,16 +296,16 @@ static uint32_t vm_reserve(uint32_t a, uint32_t size, int type, int top) {
     size = (size + 0xFFF) & ~0xFFFu;
     if (a) {
         if (a < 0x10000 || (uint64_t)a + size > GUEST_HI + 0x10000ull || !pages_free(a, size)) return 0;
-        void* p = mmap((void*)(uintptr_t)a, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+        void* p = mmap((void*)ADDR(a), size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
         if (p == MAP_FAILED) return 0;
-        if ((uintptr_t)p != a) { munmap(p, size); return 0; }
+        if (p != (void*)ADDR(a)) { munmap(p, size); return 0; }
     } else {
         uint32_t span = (size + 0xFFFF) & ~0xFFFFu;
         for (uint32_t c = top ? GUEST_HI - span : GUEST_LO; c >= GUEST_LO && c + span <= GUEST_HI; c = top ? c - 0x10000 : c + 0x10000) {
             if (!pages_free(c, span)) continue;
-            void* p = mmap((void*)(uintptr_t)c, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+            void* p = mmap((void*)ADDR(c), size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
             if (p == MAP_FAILED) continue;
-            if ((uintptr_t)p != c) { munmap(p, size); continue; }
+            if (p != (void*)ADDR(c)) { munmap(p, size); continue; }
             a = c;
             break;
         }
@@ -298,7 +318,7 @@ static uint32_t vm_reserve(uint32_t a, uint32_t size, int type, int top) {
 static int vm_commit(uint32_t a, uint32_t size, uint32_t prot) {
     uint32_t lo = a & ~0xFFFu, hi = (a + size + 0xFFF) & ~0xFFFu;
     for (uint32_t p = lo >> 12; p < hi >> 12; p++) if (pg_state[p] == PG_FREE) return 0;
-    if (mprotect((void*)(uintptr_t)lo, hi - lo, host_prot(prot))) return 0;
+    if (host_protect(lo, hi, prot)) return 0;
     for (uint32_t p = lo >> 12; p < hi >> 12; p++) pg_state[p] = PG_COMMITTED, pg_prot[p] = (uint16_t)prot;
     return 1;
 }
@@ -345,12 +365,13 @@ static uint32_t s_free_vm(uint32_t* a) {
     if (a[3] & 0x8000) {                                   /* MEM_RELEASE: the whole allocation */
         base = pg_base[base >> 12];
         size = alloc_extent(base);
-        munmap((void*)(uintptr_t)base, size);
+        munmap((void*)ADDR(base), size);
         mark(base, size, PG_FREE, 0, 0, 0);
     } else {                                               /* MEM_DECOMMIT */
         size = (size + (MEM32(a[1]) & 0xFFF) + 0xFFF) & ~0xFFFu;
         if (!MEM32(a[2])) size = alloc_extent(pg_base[base >> 12]) - (base - pg_base[base >> 12]);
-        mmap((void*)(uintptr_t)base, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0);
+        if (g_hpg == 0x1000) mmap((void*)ADDR(base), size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0);
+        else host_protect(base, base + size, 0x01);      /* (bigger host pages: kept, not zeroed) */
         for (uint32_t p = base >> 12; p < (base + size) >> 12; p++) pg_state[p] = PG_RESERVED, pg_prot[p] = 0x01;
     }
     MEM32(a[1]) = base;
@@ -416,11 +437,11 @@ uint32_t ntp_map(const char* path, uint32_t base, const char* name) {
         return 0;
     }
     for (uint32_t p = base >> 12; p < (base + size) >> 12; p++) pg_aprot[p] = 0x80;   /* EXECUTE_WRITECOPY */
-    memcpy((void*)(uintptr_t)base, raw, hdrs);
+    memcpy((void*)ADDR(base), raw, hdrs);
     for (int i = 0; i < nsec; i++) {
         uint8_t* s = raw + pe + 0x18 + opt + 40 * i;
         uint32_t va = *(uint32_t*)(s + 12), rawsz = *(uint32_t*)(s + 16), ptr = *(uint32_t*)(s + 20);
-        if (rawsz && ptr) memcpy((void*)(uintptr_t)(base + va), raw + ptr, rawsz);
+        if (rawsz && ptr) memcpy((void*)ADDR(base + va), raw + ptr, rawsz);
     }
     free(raw);
     if (g_nmod < MAX_MODS) {
@@ -435,7 +456,7 @@ uint32_t ntp_export(uint32_t base, const char* name) {
     if (!dir) return 0;
     uint32_t ed = base + dir, names = base + MEM32(ed + 0x20), ords = base + MEM32(ed + 0x24), funcs = base + MEM32(ed + 0x1C);
     for (uint32_t i = 0; i < MEM32(ed + 0x18); i++)
-        if (!strcmp((const char*)(uintptr_t)(base + MEM32(names + 4 * i)), name))
+        if (!strcmp((const char*)ADDR(base + MEM32(names + 4 * i)), name))
             return base + MEM32(funcs + 4 * MEM16(ords + 2 * i));
     return 0;
 }
@@ -468,7 +489,7 @@ static uint32_t proxy_image(int k) {
     uint32_t code = (pool + strs + 0xFFF) & ~0xFFFu, size = (code + 16 * n + 0xFFF) & ~0xFFFu;
     uint32_t b = vm_reserve(0, size, PT_IMAGE, 0);
     vm_commit(b, size, 0x20);
-    uint8_t* p = (uint8_t*)(uintptr_t)b;
+    uint8_t* p = (uint8_t*)ADDR(b);
     uint8_t* nt = p + 0x40;
     *(uint16_t*)p = 0x5A4D;
     *(uint32_t*)(p + 0x3C) = 0x40;
@@ -654,10 +675,10 @@ static uint32_t attrs_of(const struct stat* st) {
 
 /* FILE_BASIC_INFORMATION (40 bytes) */
 static void put_basic(uint32_t o, const struct stat* st) {
-    *(uint64_t*)(uintptr_t)(o + 0) = filetime(st->st_mtim.tv_sec, st->st_mtim.tv_nsec);
-    *(uint64_t*)(uintptr_t)(o + 8) = filetime(st->st_atim.tv_sec, st->st_atim.tv_nsec);
-    *(uint64_t*)(uintptr_t)(o + 16) = filetime(st->st_mtim.tv_sec, st->st_mtim.tv_nsec);
-    *(uint64_t*)(uintptr_t)(o + 24) = filetime(st->st_ctim.tv_sec, st->st_ctim.tv_nsec);
+    *(uint64_t*)ADDR(o + 0) = filetime(st->st_mtim.tv_sec, st->st_mtim.tv_nsec);
+    *(uint64_t*)ADDR(o + 8) = filetime(st->st_atim.tv_sec, st->st_atim.tv_nsec);
+    *(uint64_t*)ADDR(o + 16) = filetime(st->st_mtim.tv_sec, st->st_mtim.tv_nsec);
+    *(uint64_t*)ADDR(o + 24) = filetime(st->st_ctim.tv_sec, st->st_ctim.tv_nsec);
     MEM32(o + 32) = attrs_of(st);
     MEM32(o + 36) = 0;
 }
@@ -744,8 +765,8 @@ static uint32_t s_query_attributes(uint32_t* a) {
 /* FILE_NETWORK_OPEN_INFORMATION (0x38) */
 static void put_netopen(uint32_t o, const struct stat* st) {
     put_basic(o, st);
-    *(uint64_t*)(uintptr_t)(o + 32) = (uint64_t)st->st_blocks * 512;
-    *(uint64_t*)(uintptr_t)(o + 40) = S_ISDIR(st->st_mode) ? 0 : (uint64_t)st->st_size;
+    *(uint64_t*)ADDR(o + 32) = (uint64_t)st->st_blocks * 512;
+    *(uint64_t*)ADDR(o + 40) = S_ISDIR(st->st_mode) ? 0 : (uint64_t)st->st_size;
     MEM32(o + 48) = attrs_of(st);
     MEM32(o + 52) = 0;
 }
@@ -769,8 +790,8 @@ static uint32_t s_read_file(uint32_t* a) {
     if (!o || o->type != O_FILE || o->fd < 0) return ST_INVALID_HANDLE;
     ssize_t n;
     uint32_t off = a[7];
-    if (off && MEM32(off + 4) != 0xFFFFFFFFu) n = pread(o->fd, (void*)(uintptr_t)a[5], a[6], (off_t)*(int64_t*)(uintptr_t)off);
-    else n = read(o->fd, (void*)(uintptr_t)a[5], a[6]);
+    if (off && MEM32(off + 4) != 0xFFFFFFFFu) n = pread(o->fd, (void*)ADDR(a[5]), a[6], (off_t)*(int64_t*)ADDR(off));
+    else n = read(o->fd, (void*)ADDR(a[5]), a[6]);
     if (n < 0) { iosb_set(a[4], ST_ACCESS_DENIED, 0); return ST_ACCESS_DENIED; }
     event_set(a[1]);
     if (n == 0 && a[6]) { iosb_set(a[4], ST_END_OF_FILE, 0); return ST_END_OF_FILE; }
@@ -786,10 +807,10 @@ static uint32_t s_write_file(uint32_t* a) {
     uint32_t off = a[7];
     if (off && MEM32(off + 4) == 0xFFFFFFFFu && MEM32(off) == 0xFFFFFFFFu) {   /* FILE_WRITE_TO_END_OF_FILE */
         lseek(o->fd, 0, SEEK_END);
-        n = write(o->fd, (void*)(uintptr_t)a[5], a[6]);
+        n = write(o->fd, (void*)ADDR(a[5]), a[6]);
     } else if (off && MEM32(off + 4) != 0xFFFFFFFFu)
-        n = pwrite(o->fd, (void*)(uintptr_t)a[5], a[6], (off_t)*(int64_t*)(uintptr_t)off);
-    else n = write(o->fd, (void*)(uintptr_t)a[5], a[6]);
+        n = pwrite(o->fd, (void*)ADDR(a[5]), a[6], (off_t)*(int64_t*)ADDR(off));
+    else n = write(o->fd, (void*)ADDR(a[5]), a[6]);
     if (n < 0) { iosb_set(a[4], ST_ACCESS_DENIED, 0); return ST_ACCESS_DENIED; }
     event_set(a[1]);
     iosb_set(a[4], 0, (uint32_t)n);
@@ -804,13 +825,13 @@ static uint32_t s_query_info_file(uint32_t* a) {
     if (!o || o->type != O_FILE) return ST_INVALID_HANDLE;
     if (o->fd < 0) { memset(&st, 0, sizeof st); st.st_mode = S_IFREG | 0444; }
     else if (fstat(o->fd, &st)) return ST_INVALID_HANDLE;
-    memset((void*)(uintptr_t)b, 0, len);
+    memset((void*)ADDR(b), 0, len);
     switch (cls) {
     case 4: if (len < 40) return ST_INFO_LENGTH; put_basic(b, &st); n = 40; break;          /* Basic */
     case 5:                                                                               /* Standard */
         if (len < 24) return ST_INFO_LENGTH;
-        *(uint64_t*)(uintptr_t)b = (uint64_t)st.st_blocks * 512;
-        *(uint64_t*)(uintptr_t)(b + 8) = S_ISDIR(st.st_mode) ? 0 : (uint64_t)st.st_size;
+        *(uint64_t*)ADDR(b) = (uint64_t)st.st_blocks * 512;
+        *(uint64_t*)ADDR(b + 8) = S_ISDIR(st.st_mode) ? 0 : (uint64_t)st.st_size;
         MEM32(b + 16) = (uint32_t)st.st_nlink;
         MEM8(b + 20) = (uint8_t)o->del;
         MEM8(b + 21) = S_ISDIR(st.st_mode);
@@ -822,23 +843,23 @@ static uint32_t s_query_info_file(uint32_t* a) {
         if (g[0] && g[1] == ':') g += 2;
         int k = u8_to_u16(g, w, 1024);
         MEM32(b) = 2u * k;
-        if (len < 4 + 2u * k) { memcpy((void*)(uintptr_t)(b + 4), w, len - 4); iosb_set(a[1], ST_BUFFER_OVERFLOW, len); return ST_BUFFER_OVERFLOW; }
-        memcpy((void*)(uintptr_t)(b + 4), w, 2u * k);
+        if (len < 4 + 2u * k) { memcpy((void*)ADDR(b + 4), w, len - 4); iosb_set(a[1], ST_BUFFER_OVERFLOW, len); return ST_BUFFER_OVERFLOW; }
+        memcpy((void*)ADDR(b + 4), w, 2u * k);
         n = 4 + 2u * k;
         break;
     }
     case 0xE:                                                                             /* Position */
-        *(int64_t*)(uintptr_t)b = o->fd >= 0 ? (int64_t)lseek(o->fd, 0, SEEK_CUR) : 0;
+        *(int64_t*)ADDR(b) = o->fd >= 0 ? (int64_t)lseek(o->fd, 0, SEEK_CUR) : 0;
         n = 8;
         break;
     case 0x22: put_netopen(b, &st); n = 0x38; break;                                      /* NetworkOpen */
     case 0x11: MEM32(b) = 0; n = 4; break;                                                /* EaInformation */
     case 0x10: MEM32(b) = 0x0000FFFFu; n = 4; break;                                     /* Mode */
-    case 6: *(uint64_t*)(uintptr_t)b = (uint64_t)st.st_ino; n = 8; break;               /* Internal */
+    case 6: *(uint64_t*)ADDR(b) = (uint64_t)st.st_ino; n = 8; break;               /* Internal */
     case 0x23: {                                                                          /* AttributeTag: attributes, no reparse tag */
-        uint8_t t[40];
+        GUEST_LOCAL(uint8_t, t, 40);
         if (len < 8) return ST_INFO_LENGTH;
-        put_basic((uint32_t)(uintptr_t)t, &st);
+        put_basic(GVA(t), &st);
         MEM32(b) = *(uint32_t*)(t + 32), MEM32(b + 4) = 0, n = 8;
         break;
     }
@@ -868,13 +889,13 @@ static uint32_t s_set_info_file(uint32_t* a) {
     uint32_t b = a[2], cls = a[4];
     if (!o || o->type != O_FILE) return ST_INVALID_HANDLE;
     switch (cls) {
-    case 0xE: if (o->fd >= 0) lseek(o->fd, (off_t)*(int64_t*)(uintptr_t)b, SEEK_SET); break;   /* Position */
+    case 0xE: if (o->fd >= 0) lseek(o->fd, (off_t)*(int64_t*)ADDR(b), SEEK_SET); break;   /* Position */
     case 0xD: o->del = MEM8(b) != 0; break;                                                   /* Disposition */
-    case 0x14: case 0x13: if (o->fd >= 0 && ftruncate(o->fd, (off_t)*(int64_t*)(uintptr_t)b)) return ST_ACCESS_DENIED; break;   /* EndOfFile, Allocation */
+    case 0x14: case 0x13: if (o->fd >= 0 && ftruncate(o->fd, (off_t)*(int64_t*)ADDR(b))) return ST_ACCESS_DENIED; break;   /* EndOfFile, Allocation */
     case 4: break;                                                                            /* Basic: times kept */
     case 0xA: {                                                                               /* Rename */
         char name[1024], g[1024], hp[2048];
-        u16_to_u8((const uint16_t*)(uintptr_t)(b + 12), MEM32(b + 8) / 2, name, sizeof name);
+        u16_to_u8((const uint16_t*)ADDR(b + 12), MEM32(b + 8) / 2, name, sizeof name);
         snprintf(g, sizeof g, "%s", !strncmp(name, "\\??\\", 4) ? name + 4 : name);
         if (!to_host(g, hp, sizeof hp) || rename(o->host, hp)) return ST_ACCESS_DENIED;
         free(o->host); free(o->guest);
@@ -896,7 +917,7 @@ static uint32_t s_query_volume(uint32_t* a) {
     struct stat st;
     struct statvfs vf;
     if (!o || o->type != O_FILE) return ST_INVALID_HANDLE;
-    memset((void*)(uintptr_t)b, 0, len);
+    memset((void*)ADDR(b), 0, len);
     switch (a[4]) {
     case 4: {                                                                  /* Device: what GetFileType reads */
         uint32_t t = 7;                                                        /* DISK */
@@ -911,7 +932,7 @@ static uint32_t s_query_volume(uint32_t* a) {
     }
     case 1:                                                                    /* Volume: no label */
         if (len < 18) return ST_INFO_LENGTH;
-        *(uint64_t*)(uintptr_t)b = 0;
+        *(uint64_t*)ADDR(b) = 0;
         MEM32(b + 8) = 0x20000502u;                                            /* the serial number dir prints */
         n = 18;
         break;
@@ -921,16 +942,16 @@ static uint32_t s_query_volume(uint32_t* a) {
         MEM32(b) = 0x00000003u;                                                /* case sensitive search, case preserved */
         MEM32(b + 4) = 255;
         MEM32(b + 8) = 8;
-        memcpy((void*)(uintptr_t)(b + 12), fs, 8);
+        memcpy((void*)ADDR(b + 12), fs, 8);
         n = 20;
         break;
     }
     case 3: case 7:                                                            /* Size, FullSize */
         if (o->fd < 0 || fstatvfs(o->fd, &vf)) memset(&vf, 0, sizeof vf), vf.f_frsize = 4096;
-        *(uint64_t*)(uintptr_t)b = vf.f_blocks;
-        *(uint64_t*)(uintptr_t)(b + 8) = vf.f_bavail;
+        *(uint64_t*)ADDR(b) = vf.f_blocks;
+        *(uint64_t*)ADDR(b + 8) = vf.f_bavail;
         if (a[4] == 7) {
-            *(uint64_t*)(uintptr_t)(b + 16) = vf.f_bfree;
+            *(uint64_t*)ADDR(b + 16) = vf.f_bfree;
             MEM32(b + 24) = (uint32_t)(vf.f_frsize / 512), MEM32(b + 28) = 512;
             n = 32;
         } else MEM32(b + 16) = (uint32_t)(vf.f_frsize / 512), MEM32(b + 20) = 512, n = 24;
@@ -1012,17 +1033,17 @@ static uint32_t s_query_dir(uint32_t* a) {
             break;
         }
         uint32_t e = b + used;
-        memset((void*)(uintptr_t)e, 0, nameoff);
+        memset((void*)ADDR(e), 0, nameoff);
         if (prev) MEM32(prev) = e - prev;
         if (cls == 12) MEM32(e + 8) = 2u * k;
         else {
             put_basic(e + 8, &st);                     /* the four times at +8, then +0x28 sizes */
-            *(uint64_t*)(uintptr_t)(e + 0x28) = S_ISDIR(st.st_mode) ? 0 : (uint64_t)st.st_size;
-            *(uint64_t*)(uintptr_t)(e + 0x30) = (uint64_t)st.st_blocks * 512;
+            *(uint64_t*)ADDR(e + 0x28) = S_ISDIR(st.st_mode) ? 0 : (uint64_t)st.st_size;
+            *(uint64_t*)ADDR(e + 0x30) = (uint64_t)st.st_blocks * 512;
             MEM32(e + 0x38) = attrs_of(&st);
             MEM32(e + 0x3C) = 2u * k;
         }
-        memcpy((void*)(uintptr_t)(e + nameoff), w, 2u * k);
+        memcpy((void*)ADDR(e + nameoff), w, 2u * k);
         prev = e;
         used += esz;
         if (a[8]) { o->pos++; break; }
@@ -1212,8 +1233,8 @@ static uint32_t s_create_thread(uint32_t* a) {
     for (int i = 0; i < 8; i++) t->ctx[i] = MEM32(c + 0x9C + 4 * i);
     t->ctx[8] = MEM32(c + 0xC4);
     t->teb = ntp_alloc(0x2000);
-    memcpy((void*)(uintptr_t)t->teb, (void*)(uintptr_t)g_teb, 0x2000);   /* (the first thread's, USER's thread info with it) */
-    memset((void*)(uintptr_t)(t->teb + 0xE10), 0, 64 * 4);              /* but its own TlsSlots, empty (MFC keeps each thread's state there) */
+    memcpy((void*)ADDR(t->teb), (void*)ADDR(g_teb), 0x2000);   /* (the first thread's, USER's thread info with it) */
+    memset((void*)ADDR(t->teb + 0xE10), 0, 64 * 4);              /* but its own TlsSlots, empty (MFC keeps each thread's state there) */
     /* and none of the first thread's per-thread pointers: ReservedForOle (ole32's SOleTlsData:
      * shared, CoSetState on one thread released another's oleaut32 state), ReservedForNtRpc (rpcrt4's
      * thread object: a thread's exit freed the first thread's, a fault after shell32's execute thread),
@@ -1249,7 +1270,7 @@ static uint32_t wait_timeout(uint32_t to, const char* what) {
         fprintf(stderr, "[ntposix] %s waits forever with one guest thread: returning a timeout (from sub_%08X)\n", what, g_cur_func);
         return ST_TIMEOUT;
     }
-    int64_t t = *(int64_t*)(uintptr_t)to;
+    int64_t t = *(int64_t*)ADDR(to);
     if (t < 0) {
         int64_t ns = -t * 100;
         if (ns > 2000000000ll) ns = 2000000000ll;
@@ -1266,7 +1287,7 @@ static uint64_t real_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC
 static int wait_more(uint32_t to, uint64_t* end) {
     if (g_nthreads < 2) return 0;
     if (!*end) {
-        int64_t t = to ? *(int64_t*)(uintptr_t)to : 0;
+        int64_t t = to ? *(int64_t*)ADDR(to) : 0;
         *end = !to ? UINT64_MAX : t < 0 ? real_ms() + (uint64_t)(-t / 10000) : real_ms();
     }
     if (real_ms() >= *end) return 0;
@@ -1330,7 +1351,7 @@ static uint32_t g_atomref[0x1000];               /* (NT counts references: Globa
 static uint32_t atom_op(uint32_t* a, int add) {
     char n[512];
     uint32_t len = a[1] / 2 > 255 ? 255 : a[1] / 2;
-    u16_to_u8((const uint16_t*)(uintptr_t)a[0], len, n, sizeof n);
+    u16_to_u8((const uint16_t*)ADDR(a[0]), len, n, sizeof n);
     if (n[0] == '#') { if (a[2]) MEM16(a[2]) = (uint16_t)atoi(n + 1); return 0; }
     int i, fr = -1;
     for (i = 0; i < 0x1000; i++) {
@@ -1384,12 +1405,12 @@ static uint32_t map_view(obj_t* s, uint32_t want, uint32_t off, uint32_t size) {
     int shared = s->fd >= 0 && s->image == 2;     /* a memfd: views alias */
     uint32_t psz = (size + 0xFFF) & ~0xFFFu;
     if (s->fd >= 0) {
-        if (mmap((void*)(uintptr_t)a, psz, PROT_READ | PROT_WRITE, MAP_FIXED | (shared ? MAP_SHARED : MAP_PRIVATE), s->fd, off) == MAP_FAILED) {
-            munmap((void*)(uintptr_t)a, span);
+        if (mmap((void*)ADDR(a), psz, PROT_READ | PROT_WRITE, MAP_FIXED | (shared ? MAP_SHARED : MAP_PRIVATE), s->fd, off) == MAP_FAILED) {
+            munmap((void*)ADDR(a), span);
             mark(a, span, PG_FREE, 0, 0, 0);
             return 0;
         }
-    } else mprotect((void*)(uintptr_t)a, psz, PROT_READ | PROT_WRITE);
+    } else host_protect(a, a + psz, 0x04);
     for (uint32_t p = a >> 12; p < (a + psz) >> 12; p++) pg_state[p] = PG_COMMITTED, pg_prot[p] = 0x04, pg_aprot[p] = 0x04;
     for (int i = 0; i < MAX_VIEWS; i++) if (!g_view[i].base) { g_view[i].base = a, g_view[i].span = span; break; }
     return a;
@@ -1431,7 +1452,7 @@ static void img_writable(int m, int restore) {
             uint32_t h = sh + 40 * k, v = MEM32(h + 8);
             if (!(MEM32(h + 36) & 0x80000000u)) continue;          /* IMAGE_SCN_MEM_WRITE */
             if (!pass) { n += v; continue; }
-            void* at = (void*)(uintptr_t)(b + MEM32(h + 12));
+            void* at = (void*)ADDR(b + MEM32(h + 12));
             if (restore) memcpy(at, g_mod[m].snap + o, v); else memcpy(g_mod[m].snap + o, at, v);
             o += v;
         }
@@ -1515,7 +1536,7 @@ static uint32_t s_map_view(uint32_t* a) {
 static uint32_t s_unmap_view(uint32_t* a) {
     for (int i = 0; i < MAX_VIEWS; i++)
         if (g_view[i].base && a[1] >= g_view[i].base && a[1] < g_view[i].base + g_view[i].span) {
-            munmap((void*)(uintptr_t)g_view[i].base, g_view[i].span);
+            munmap((void*)ADDR(g_view[i].base), g_view[i].span);
             mark(g_view[i].base, g_view[i].span, PG_FREE, 0, 0, 0);
             g_view[i].base = 0;
             return 0;
@@ -1532,13 +1553,13 @@ static uint32_t s_query_section(uint32_t* a) {
     if (a[1] == 0 && a[3] >= 16) {                       /* SectionBasicInformation */
         MEM32(o) = s->type == O_IMAGE ? s->base : 0;
         MEM32(o + 4) = s->type == O_IMAGE ? 0x01000000u : 0x08000000u;
-        *(uint64_t*)(uintptr_t)(o + 8) = s->size;
+        *(uint64_t*)ADDR(o + 8) = s->size;
         if (a[4]) MEM32(a[4]) = 16;
         return 0;
     }
     if (a[1] != 1 || s->type != O_IMAGE || a[3] < 0x30) return ST_INVALID_INFO_CLASS;
     uint32_t nt = s->base + MEM32(s->base + 0x3C);
-    memset((void*)(uintptr_t)o, 0, 0x30);
+    memset((void*)ADDR(o), 0, 0x30);
     MEM32(o + 0x00) = MEM32(nt + 0x28) ? s->base + MEM32(nt + 0x28) : 0;
     MEM32(o + 0x08) = MEM32(nt + 0x60);                  /* stack reserve */
     MEM32(o + 0x0C) = MEM32(nt + 0x64);                  /* stack commit */
@@ -1557,7 +1578,7 @@ static uint32_t s_query_section(uint32_t* a) {
 static uint32_t g_peb, g_harderror;
 
 static void basic_info(uint32_t o) {
-    memset((void*)(uintptr_t)o, 0, 0x2C);
+    memset((void*)ADDR(o), 0, 0x2C);
     long pages = sysconf(_SC_PHYS_PAGES);
     MEM32(o + 4) = 156250;
     MEM32(o + 8) = 0x1000;
@@ -1571,13 +1592,13 @@ static void basic_info(uint32_t o) {
     MEM8(o + 40) = 1;
 }
 static void timeofday(uint32_t o) {
-    memset((void*)(uintptr_t)o, 0, 0x30);
+    memset((void*)ADDR(o), 0, 0x30);
     struct timespec up;
     clock_gettime(CLOCK_MONOTONIC, &up);
     uint64_t now = now_ft();
-    *(uint64_t*)(uintptr_t)o = now - ((uint64_t)up.tv_sec * 10000000ull);
-    *(uint64_t*)(uintptr_t)(o + 8) = now;
-    *(int64_t*)(uintptr_t)(o + 16) = tz_bias();
+    *(uint64_t*)ADDR(o) = now - ((uint64_t)up.tv_sec * 10000000ull);
+    *(uint64_t*)ADDR(o + 8) = now;
+    *(int64_t*)ADDR(o + 16) = tz_bias();
 }
 
 /* NtQuerySystemInformation(Class, Buffer, Length, ReturnLength*) */
@@ -1587,7 +1608,7 @@ static uint32_t s_query_system(uint32_t* a) {
     case 0: if (a[2] < 0x2C) return ST_INFO_LENGTH; basic_info(o); n = 0x2C; break;
     case 1:                                              /* Processor: i686 */
         if (a[2] < 12) return ST_INFO_LENGTH;
-        memset((void*)(uintptr_t)o, 0, 12);
+        memset((void*)ADDR(o), 0, 12);
         MEM16(o + 2) = 6;
         MEM16(o + 4) = 0x0801;
         MEM32(o + 8) = 0x2FFF;
@@ -1603,12 +1624,12 @@ static uint32_t s_query_system(uint32_t* a) {
     return 0;
 }
 
-static uint32_t s_query_system_time(uint32_t* a) { *(uint64_t*)(uintptr_t)a[0] = now_ft(); return 0; }
+static uint32_t s_query_system_time(uint32_t* a) { *(uint64_t*)ADDR(a[0]) = now_ft(); return 0; }
 static uint32_t s_query_perf(uint32_t* a) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
-    *(uint64_t*)(uintptr_t)a[0] = (uint64_t)t.tv_sec * 10000000ull + (uint64_t)t.tv_nsec / 100;
-    if (a[1]) *(uint64_t*)(uintptr_t)a[1] = 10000000ull;
+    *(uint64_t*)ADDR(a[0]) = (uint64_t)t.tv_sec * 10000000ull + (uint64_t)t.tv_nsec / 100;
+    if (a[1]) *(uint64_t*)ADDR(a[1]) = 10000000ull;
     return 0;
 }
 static uint32_t s_tick(uint32_t* a) { (void)a; return (uint32_t)mono_ms(); }
@@ -1622,7 +1643,7 @@ static uint32_t s_query_process(uint32_t* a) {
     switch (a[1]) {
     case 0:                                              /* Basic */
         if (a[3] < 24) return ST_INFO_LENGTH;
-        memset((void*)(uintptr_t)o, 0, 24);
+        memset((void*)ADDR(o), 0, 24);
         MEM32(o + 0) = 0x103;                            /* STILL_ACTIVE */
         MEM32(o + 4) = g_peb;
         MEM32(o + 8) = 1;
@@ -1653,7 +1674,7 @@ static uint32_t s_open_process(uint32_t* a) {
 static uint32_t s_query_security(uint32_t* a) {
     if (a[4]) MEM32(a[4]) = 20;
     if (a[3] < 20) return ST_BUFFER_TOO_SMALL;
-    memset((void*)(uintptr_t)a[2], 0, 20);
+    memset((void*)ADDR(a[2]), 0, 20);
     MEM8(a[2]) = 1;                                      /* SECURITY_DESCRIPTOR_REVISION */
     MEM16(a[2] + 2) = 0x8004;                            /* SE_SELF_RELATIVE | SE_DACL_PRESENT, Dacl 0: NULL DACL */
     return 0;
@@ -1664,7 +1685,7 @@ static uint32_t s_set_process(uint32_t* a) { if (a[1] == 0xC) g_harderror = MEM3
 static uint32_t s_query_thread(uint32_t* a) {
     uint32_t o = a[2];
     if (a[1] != 0 || a[3] < 28) return ST_INVALID_INFO_CLASS;
-    memset((void*)(uintptr_t)o, 0, 28);
+    memset((void*)ADDR(o), 0, 28);
     MEM32(o + 0) = 0x103;
     MEM32(o + 4) = g_teb;
     MEM32(o + 8) = g_pid;
@@ -1734,14 +1755,14 @@ static uint32_t s_query_token(uint32_t* a) {
         if (a[3] < need) return ST_BUFFER_TOO_SMALL;
         MEM32(b) = b + 8, MEM32(b + 4) = 0;
         MEM8(b + 8) = 1, MEM8(b + 9) = 5;                /* revision, 5 sub-authorities */
-        memset((void*)(uintptr_t)(b + 10), 0, 6), MEM8(b + 15) = 5;   /* NT authority */
+        memset((void*)ADDR(b + 10), 0, 6), MEM8(b + 15) = 5;   /* NT authority */
         MEM32(b + 16) = 21, MEM32(b + 20) = 1, MEM32(b + 24) = 2, MEM32(b + 28) = 3, MEM32(b + 32) = 1000;
         return 0;
     case 10:                                             /* TokenStatistics */
         need = 56;
         if (a[4]) MEM32(a[4]) = need;
         if (a[3] < need) return ST_BUFFER_TOO_SMALL;
-        memset((void*)(uintptr_t)b, 0, need);
+        memset((void*)ADDR(b), 0, need);
         MEM32(b) = 0x1001, MEM32(b + 8) = 0x3E7;         /* TokenId, AuthenticationId */
         MEM32(b + 24) = 1;                               /* TokenPrimary */
         return 0;
@@ -1917,9 +1938,9 @@ static uint32_t reg_out(uint32_t buf, uint32_t cap, uint32_t res, const void* hd
     uint32_t need = off + nt;
     if (res) MEM32(res) = need;
     if (cap < nh) return ST_BUFFER_TOO_SMALL;
-    memcpy((void*)(uintptr_t)buf, hdr, nh);
+    memcpy((void*)ADDR(buf), hdr, nh);
     if (cap < need) return ST_BUFFER_OVERFLOW;
-    if (nt) memcpy((void*)(uintptr_t)(buf + off), tail, nt);
+    if (nt) memcpy((void*)ADDR(buf + off), tail, nt);
     return 0;
 }
 static const char* leaf(const char* p) { const char* s = strrchr(p, '\\'); return s ? s + 1 : p; }
@@ -1961,10 +1982,10 @@ static uint32_t value_info(rval_t* v, uint32_t cls, uint32_t buf, uint32_t cap, 
     h[0] = 0, h[1] = v->type, h[2] = off, h[3] = v->len, h[4] = nl;
     if (res) MEM32(res) = need;
     if (cap < 20) return ST_BUFFER_TOO_SMALL;
-    memcpy((void*)(uintptr_t)buf, h, 20);
+    memcpy((void*)ADDR(buf), h, 20);
     if (cap < need) return ST_BUFFER_OVERFLOW;
-    memcpy((void*)(uintptr_t)(buf + 20), wn, nl);
-    memcpy((void*)(uintptr_t)(buf + off), v->data, v->len);
+    memcpy((void*)ADDR(buf + 20), wn, nl);
+    memcpy((void*)ADDR(buf + off), v->data, v->len);
     return 0;
 }
 /* NtQueryValueKey(Key, ValueName*, Class, Buffer, Length, ResultLength*) */
@@ -1994,7 +2015,7 @@ static uint32_t s_set_value(uint32_t* a) {
     pthread_mutex_lock(&g_regmu);
     int k = key_of(a[0]);
     us_to_u8(a[1], n, sizeof n);
-    if (k >= 0) { rv_set(k, n, a[3], (const void*)(uintptr_t)a[4], a[5]); reg_save(); }
+    if (k >= 0) { rv_set(k, n, a[3], (const void*)ADDR(a[4]), a[5]); reg_save(); }
     pthread_mutex_unlock(&g_regmu);
     return k < 0 ? ST_INVALID_HANDLE : 0;
 }
@@ -2154,11 +2175,11 @@ static uint32_t s_continue(uint32_t* a) { g_eax = MEM32(a[0] + 0xB0); return MEM
 static uint32_t g_port;
 
 static void ustr_u8(uint32_t at, const char* s) {
-    uint16_t* w = (uint16_t*)(uintptr_t)ntp_alloc(0x1000);
+    uint16_t* w = (uint16_t*)ADDR(ntp_alloc(0x1000));
     int n = u8_to_u16(s, w, 0x7FF);
     MEM16(at) = (uint16_t)(2 * n);
     MEM16(at + 2) = (uint16_t)(2 * n + 2);
-    MEM32(at + 4) = (uint32_t)(uintptr_t)w;
+    MEM32(at + 4) = GVA(w);
 }
 
 /* BASE_STATIC_SERVER_DATA, NT 5.0 (csr32.c) */
@@ -2174,7 +2195,7 @@ static uint32_t base_static_server_data(void) {
     if (MEM16(g_peb + 0xAE) >> 8) {
         char sp[32];
         snprintf(sp, sizeof sp, "Service Pack %u", MEM16(g_peb + 0xAE) >> 8);
-        u8_to_u16(sp, (uint16_t*)(uintptr_t)(d + 0x22), 128);
+        u8_to_u16(sp, (uint16_t*)ADDR(d + 0x22), 128);
     }
     basic_info(d + 0x124);
     timeofday(d + 0x150);
@@ -2191,14 +2212,14 @@ static uint32_t csr_client_connect(uint32_t data) {
     if (g_trace) fprintf(stderr, "[csr] client connect, server %u, info %08X len %u\n", index, ci, MEM32(data + 8));
     if (index != 2 && ntp_csr_connect && ci) ntp_csr_connect(index, ci, MEM32(data + 8));
     if (index == 2 && ci) {
-        uint32_t e;
+        GUEST_LOCAL(uint32_t, e, 1);
         MEM32(ci + 0x00) = 0x0C0Eu;
-        new_handle((uint32_t)(uintptr_t)&e, O_EVENT, 0, 1); MEM32(ci + 0x04) = e;
+        new_handle(GVA(e), O_EVENT, 0, 1); MEM32(ci + 0x04) = *e;
         MEM32(ci + 0x08) = g_std[0];
         MEM32(ci + 0x0C) = g_std[1];
         MEM32(ci + 0x10) = g_std[2];
-        new_handle((uint32_t)(uintptr_t)&e, O_EVENT, 1, 1); MEM32(ci + 0x14) = e;
-        new_handle((uint32_t)(uintptr_t)&e, O_EVENT, 0, 1); MEM32(ci + 0x18) = e;
+        new_handle(GVA(e), O_EVENT, 1, 1); MEM32(ci + 0x14) = *e;
+        new_handle(GVA(e), O_EVENT, 0, 1); MEM32(ci + 0x18) = *e;
     }
     return 0;
 }
@@ -2206,7 +2227,7 @@ static uint32_t csr_client_connect(uint32_t data) {
 static uint32_t csr_nls_user_info(uint32_t data) {
     uint32_t info = MEM32(data), len = MEM32(data + 4);
     if (!info || len < 0x1870) return ST_INVALID_PARAMETER;
-    memset((void*)(uintptr_t)info, 0, len);
+    memset((void*)ADDR(info), 0, len);
     MEM32(info + 0x1860) = 0x409;
     return 0;
 }
@@ -2254,14 +2275,14 @@ static uint32_t s_request_wait_reply(uint32_t* a) {
         /* basesrv CreateThread (csrss notes a thread), SetProcessShutdownParam, usersrv
          * GetThreadConsoleDesktop (none): success, nothing to keep */
         uint16_t total = MEM16(m + 2);
-        if (api == 0x30405 && total > 0x28 && total < 0x1000) memset((void*)(uintptr_t)(m + 0x28), 0, total - 0x28);
+        if (api == 0x30405 && total > 0x28 && total < 0x1000) memset((void*)ADDR(m + 0x28), 0, total - 0x28);
     } else {
         uint16_t total = MEM16(m + 2);
-        if (total > 0x28 && total < 0x1000) memset((void*)(uintptr_t)(m + 0x28), 0, total - 0x28);
+        if (total > 0x28 && total < 0x1000) memset((void*)ADDR(m + 0x28), 0, total - 0x28);
         if (g_trace) fprintf(stderr, "[csr] api %u:%u not answered, from sub_%08X\n", api >> 16, api & 0xFFFF, g_cur_func);
     }
     MEM32(m + 0x20) = r;
-    if (a[2] && a[2] != m) memcpy((void*)(uintptr_t)a[2], (void*)(uintptr_t)m, MEM16(m) + 0x18);
+    if (a[2] && a[2] != m) memcpy((void*)ADDR(a[2]), (void*)ADDR(m), MEM16(m) + 0x18);
     return 0;
 }
 
@@ -2279,7 +2300,7 @@ int ntp_win32k(const uint32_t* bases, int nbases, const char* names_file) {
     for (int m = 0; m < nbases; m++) {
         uint32_t base = bases[m], size = image_size(base);
         for (uint32_t p = base + 0x1000; p + 16 < base + size; p++) {
-            const uint8_t* b = (const uint8_t*)(uintptr_t)p;
+            const uint8_t* b = (const uint8_t*)ADDR(p);
             if (b[0] != 0xB8 || b[5] != 0x8D || b[6] != 0x54 || b[7] != 0x24 || b[8] != 0x04 || b[9] != 0xCD || b[10] != 0x2E) continue;
             uint32_t svc = *(const uint32_t*)(b + 1);
             if (svc < 0x1000 || svc >= 0x1000 + W32K_MAX) continue;
@@ -2380,7 +2401,7 @@ static void shim_rtl_unwind(void) {
     uint32_t target = MEM32(g_esp + 4), er = MEM32(g_esp + 12), ret = MEM32(g_esp + 16), esp = g_esp;
     g_esp = (g_esp - 0x400) & ~15u;                          /* a record and a context below the caller */
     uint32_t mine = g_esp, ctx = g_esp + 0x80;
-    memset((void*)(uintptr_t)mine, 0, 0x80 + 0x2CC);
+    memset((void*)ADDR(mine), 0, 0x80 + 0x2CC);
     MEM32(mine) = 0xC0000027u;                               /* STATUS_UNWIND */
     if (!er) er = mine;
     MEM32(er + 4) |= 2u | (target ? 0 : 4u);                 /* EXCEPTION_UNWINDING, EXIT_UNWIND */
@@ -2456,8 +2477,8 @@ int ntp_syscalls(uint32_t base) {
     uint32_t names = base + MEM32(ed + 0x20), ords = base + MEM32(ed + 0x24), funcs = base + MEM32(ed + 0x1C);
     int n = 0, impl = 0;
     for (uint32_t i = 0; i < MEM32(ed + 0x18); i++) {
-        const char* name = (const char*)(uintptr_t)(base + MEM32(names + 4 * i));
-        const uint8_t* p = (const uint8_t*)(uintptr_t)(base + MEM32(funcs + 4 * MEM16(ords + 2 * i)));
+        const char* name = (const char*)ADDR(base + MEM32(names + 4 * i));
+        const uint8_t* p = (const uint8_t*)ADDR(base + MEM32(funcs + 4 * MEM16(ords + 2 * i)));
         if (name[0] != 'N' || name[1] != 't') continue;
         if (p[0] != 0xB8 || p[5] != 0x8D || p[6] != 0x54 || p[7] != 0x24 || p[8] != 0x04 || p[9] != 0xCD || p[10] != 0x2E) continue;
         uint32_t svc = *(const uint32_t*)(p + 1);
@@ -2512,7 +2533,7 @@ static void kuser_init(void) {
     MEM32(KUSER + 0x04) = 1u << 24;                      /* TickCountMultiplier */
     ksystime(KUSER + 0x20, (uint64_t)tz_bias());
     MEM16(KUSER + 0x2C) = 0x14C, MEM16(KUSER + 0x2E) = 0x14C;
-    u8_to_u16("C:\\WINNT", (uint16_t*)(uintptr_t)(KUSER + 0x30), 260);
+    u8_to_u16("C:\\WINNT", (uint16_t*)ADDR(KUSER + 0x30), 260);
     MEM32(KUSER + 0x264) = 1;                            /* NtProductType: WinNt */
     MEM8(KUSER + 0x268) = 1;
     MEM32(KUSER + 0x26C) = 5;
@@ -2524,7 +2545,7 @@ static void kuser_init(void) {
 
 /* ------------------------------------------------------------- the gate */
 void recomp_syscall(int vector) {
-    uint32_t svc = g_eax, *args = (uint32_t*)(uintptr_t)g_edx, r;
+    uint32_t svc = g_eax, *args = (uint32_t*)ADDR(g_edx), r;
     if (vector == 0x2B) { callback_return(g_ecx, g_edx, g_eax); return; }   /* the callback dispatcher's own return */
     if (vector == 0x2E && svc >= 0x1000) { g_eax = win32k_call(svc, args); return; }
     if (vector != 0x2E || svc >= MAX_SVC || !g_svc[svc].name) {
@@ -2555,17 +2576,31 @@ void recomp_syscall(int vector) {
 /* ------------------------------------------------------------- process start */
 /* A host fault (a lifted function's stray access): where, the guest
  * function, its last indirect calls and the host frames (addr2line them) */
+#if defined(__i386__)
+#define HOST_PC(uc) ((ucontext_t*)(uc))->uc_mcontext.gregs[REG_EIP]
+#elif defined(__x86_64__)
+#define HOST_PC(uc) ((ucontext_t*)(uc))->uc_mcontext.gregs[REG_RIP]
+#elif defined(__aarch64__)
+#define HOST_PC(uc) ((ucontext_t*)(uc))->uc_mcontext.pc
+#else
+#define HOST_PC(uc) 0
+#endif
+void ntp_bad_gva(const void* p) {
+    fprintf(stderr, "[ntposix] host pointer %p handed to the guest (outside its 4 GB) in sub_%08X\n", p, g_cur_func);
+    abort();
+}
 static void crash(int sig, siginfo_t* si, void* uc) {
     /* a stack growing down: a reserved page right below a committed one (the guard page, which NT
      * moves down on the first touch) is committed and the access goes on */
-    uint32_t fa = (uint32_t)(uintptr_t)si->si_addr, fp = fa >> 12;
-    if (sig == SIGSEGV && fa >= GUEST_LO && fa < GUEST_HI && pg_state[fp] == PG_RESERVED &&
+    uintptr_t fd = (uintptr_t)si->si_addr - (uintptr_t)ADDR(0);
+    uint32_t fa = (uint32_t)fd, fp = fa >> 12;
+    if (sig == SIGSEGV && fd == fa && fa >= GUEST_LO && fa < GUEST_HI && pg_state[fp] == PG_RESERVED &&
         pg_state[fp + 1] == PG_COMMITTED && pg_base[fp] == pg_base[fp + 1] && vm_commit(fp << 12, 0x1000, 0x04))
         return;
     void* bt[32];
     int n = backtrace(bt, 32);
-    fprintf(stderr, "\n[ntposix] signal %d at %p (host eip %08X) in sub_%08X, esp %08X\n", sig, si->si_addr,
-            (unsigned)((ucontext_t*)uc)->uc_mcontext.gregs[REG_EIP], g_cur_func, g_esp);
+    fprintf(stderr, "\n[ntposix] signal %d at %p (host pc %08lX) in sub_%08X, esp %08X\n", sig, si->si_addr,
+            (unsigned long)HOST_PC(uc), g_cur_func, g_esp);
     for (uint32_t i = 0; i < 8 && i < g_icall_count; i++) {
         uint32_t k = (g_icall_trace_idx - 1 - i) & (ICALL_TRACE_SIZE - 1);
         fprintf(stderr, "  icall 0x%08X from 0x%08X\n", g_icall_trace[k], g_icall_from[k]);
@@ -2580,6 +2615,7 @@ volatile int ntp_tracing;
 static void on_usr1(int sig) { (void)sig; ntp_tracing = g_trace = !g_trace; }
 void ntp_init(void) {
     ntp_tracing = g_trace = getenv("NATIVE32_SYSCALLS") != NULL;
+    g_hpg = (uint32_t)sysconf(_SC_PAGESIZE);
     signal(SIGUSR1, on_usr1);
     {
         struct sigaction sa;
@@ -2609,7 +2645,7 @@ void ntp_init(void) {
 
 /* a UNICODE_STRING at `at`, its buffer from the pool */
 static void ustr_pool(uint32_t at, const char* s, uint32_t* pool, uint32_t extra) {
-    int n = u8_to_u16(s, (uint16_t*)(uintptr_t)*pool, 0x4000);
+    int n = u8_to_u16(s, (uint16_t*)ADDR(*pool), 0x4000);
     MEM16(at) = (uint16_t)(2 * n);
     MEM16(at + 2) = (uint16_t)(2 * n + 2 + extra);
     MEM32(at + 4) = *pool;
@@ -2625,7 +2661,7 @@ static uint32_t load_nls(const char* dir, const char* name) {
     long n = ftell(f);
     fseek(f, 0, SEEK_SET);
     uint32_t a = ntp_alloc((uint32_t)n);
-    size_t got = fread((void*)(uintptr_t)a, 1, n, f);
+    size_t got = fread((void*)ADDR(a), 1, n, f);
     fclose(f);
     return got == (size_t)n ? a : 0;
 }
@@ -2644,7 +2680,7 @@ static uint32_t environment(void) {
     };
     uint32_t e = ntp_alloc(0x4000), o = e;
     for (size_t i = 0; i < sizeof env / sizeof env[0]; i++)
-        o += 2u * (u8_to_u16(env[i], (uint16_t*)(uintptr_t)o, 0x1000) + 1);
+        o += 2u * (u8_to_u16(env[i], (uint16_t*)ADDR(o), 0x1000) + 1);
     MEM16(o) = 0;
     return e;
 }
@@ -2686,7 +2722,7 @@ int ntp_boot(uint32_t ntdll, uint32_t exe, const char* image, const char* cmdlin
     MEM32(peb + 0x10) = pp;
     MEM32(peb + 0x64) = 1;                                   /* NumberOfProcessors */
     if (getenv("NTP_GLOBALFLAG")) MEM32(peb + 0x68) = (uint32_t)strtoul(getenv("NTP_GLOBALFLAG"), NULL, 0);  /* e.g. 0x470: ntdll's heap checks */
-    *(int64_t*)(uintptr_t)(peb + 0x70) = -(int64_t)2592000 * 10000000;
+    *(int64_t*)ADDR(peb + 0x70) = -(int64_t)2592000 * 10000000;
     MEM32(peb + 0x78) = 0x100000;
     MEM32(peb + 0x7C) = 0x2000;
     MEM32(peb + 0x80) = 0x10000;
@@ -2713,16 +2749,17 @@ int ntp_boot(uint32_t ntdll, uint32_t exe, const char* image, const char* cmdlin
     MEM16(pp + 0x26) = 260 * 2;                              /* a MAX_PATH buffer: RtlSetCurrentDirectory_U writes in place */
     pool += 260 * 2;
     {
-        uint32_t oa[6] = { 0x18, 0, 0, 0x40, 0, 0 }, us[2], iosb[2], h = 0;
-        uint16_t w[1024];
+        /* (in guest memory, one page kept: do_open takes guest addresses) */
+        uint32_t g = ntp_alloc(0x1000), oa = g, us = g + 0x18, iosb = g + 0x20, h = g + 0x28, w = g + 0x30;
         char nt[1100];
         snprintf(nt, sizeof nt, "\\??\\%s", cur);
-        int n = u8_to_u16(nt, w, 1024);
-        us[0] = (uint32_t)(2 * n) | (uint32_t)(2 * n + 2) << 16, us[1] = (uint32_t)(uintptr_t)w;
-        oa[2] = (uint32_t)(uintptr_t)us;
-        if (do_open((uint32_t)(uintptr_t)&h, 0x100001, (uint32_t)(uintptr_t)oa, (uint32_t)(uintptr_t)iosb, 1, 0x21))
+        int n = u8_to_u16(nt, (uint16_t*)ADDR(w), 1000);
+        MEM32(oa) = 0x18, MEM32(oa + 12) = 0x40;
+        MEM32(us) = (uint32_t)(2 * n) | (uint32_t)(2 * n + 2) << 16, MEM32(us + 4) = w;
+        MEM32(oa + 8) = us;
+        if (do_open(h, 0x100001, oa, iosb, 1, 0x21))
             fprintf(stderr, "[nt] current directory %s: not found\n", cur);
-        MEM32(pp + 0x2C) = h;
+        MEM32(pp + 0x2C) = MEM32(h);
     }
     ustr_pool(pp + 0x30, dllpath, &pool, 0);
     ustr_pool(pp + 0x38, image, &pool, 0);

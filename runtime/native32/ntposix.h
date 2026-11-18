@@ -15,6 +15,29 @@
 #include <stdint.h>
 #include "recomp_types.h"
 
+/* a host pointer into guest memory -> its guest address (flat: the same number);
+ * based, a pointer outside the guest's 4 GB stops the run, named */
+void ntp_bad_gva(const void* p);
+static inline uint32_t GVA(const void* p) {
+#ifdef RECOMP_FLAT_MEMORY
+    return (uint32_t)(uintptr_t)p;
+#else
+    uintptr_t d = (uintptr_t)p - (uintptr_t)ADDR(0);
+    if (!p) return 0;
+    if (d >> 32) ntp_bad_gva(p);
+    return (uint32_t)d;
+#endif
+}
+/* T name[n] for one service call, in guest memory: carved below the guest's
+ * esp (as the kernel copies a user-mode callback's arguments onto the user
+ * stack) and given back when the scope ends. For a structure the guest is
+ * handed the address of (a CREATESTRUCT, a WINDOWPOS, an out handle):
+ * a host local has no guest address when based. */
+static inline void ntp_esp_restore(uint32_t* m) { g_esp = *m; }
+#define GUEST_LOCAL(T, name, n)     uint32_t name##_esp __attribute__((cleanup(ntp_esp_restore))) = g_esp;     T* name = (T*)ADDR(g_esp = (g_esp - (uint32_t)(sizeof(T) * (n))) & ~15u)
+/* the same with an initializer: GUEST_ARRAY(uint32_t, wp, 7, { a, b, ... }) */
+#define GUEST_ARRAY(T, name, n, ...)     GUEST_LOCAL(T, name, n);     do { const T name##_init[n] = __VA_ARGS__; memcpy(name, name##_init, sizeof name##_init); } while (0)
+
 void ntp_init(void);
 /* guest path prefix ("C:", "C:\\WINNT\\system32") -> host directory; longest wins */
 void ntp_mount(const char* guest, const char* host);
