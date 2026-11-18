@@ -924,9 +924,18 @@ __declspec(thread) uint16_t g_w16_callseg;
 void seg001_805D(CPU *);
 void w16_no_447(CPU *c) { (void)c; }
 #pragma comment(linker, "/alternatename:_seg001_805D=_w16_no_447")
+void seg001_8030(CPU *);
+#pragma comment(linker, "/alternatename:_seg001_8030=_w16_no_447")
+int native32_w9x_is_win95(void);
 void native32_w9x_yield(void);
 void w16_farcall(CPU *c, void (*f)(CPU *)) {
     if (f == seg001_805D && f != w16_no_447) native32_w9x_yield();
+    /* Windows 95: KERNEL.447 is 1:8030, and USER's PeekMessage (seg 3 0BE1) is the
+     * caller to hand over at (it calls 447 for a Win32 queue, es:[14] bit 2). GDI's call
+     * (seg 8 04CE) is left alone. Win98's 1:8030 is some other function, hence the build check.
+     * ponytail: matched by its return offset 0BEF; a symbol check if that ever collides. */
+    else if (f == seg001_8030 && f != w16_no_447 && mem_read16(c, c->ss, c->sp) == 0x0BEF
+             && native32_w9x_is_win95()) native32_w9x_yield();
     w16_ff fr = { g_ff, c->ss, c->sp };
     uint16_t seg = g_w16_callseg; g_w16_callseg = 0;
     g_ff = &fr;

@@ -235,6 +235,17 @@ static uint32_t vmm_demand_info(const uint32_t* a) {
 }
 static uint32_t vmm_reg_query_value_sub(const uint32_t* a) {   /* RegQueryValue(hkey, subkey, value, &cb): ole32 TreatAs */
     uint32_t r = (uint32_t)REG("RegQueryValueA", LONG(WINAPI*)(HKEY, LPCSTR, LPSTR, PLONG))((HKEY)P(0), P(1), P(2), P(3));
+    if (r == ERROR_FILE_NOT_FOUND) {
+        /* Win9x: a key that is there but has no default value answers "" (Win95's
+         * ShellExecute reads Folder's "shell\open" so, and took 2 as no association) */
+        HKEY k;
+        if (!REG("RegOpenKeyExA", LONG(WINAPI*)(HKEY, LPCSTR, DWORD, REGSAM, PHKEY))((HKEY)P(0), P(1), 0, KEY_READ, &k)) {
+            REG("RegCloseKey", LONG(WINAPI*)(HKEY))(k);
+            if (P(2) && P(3) && *(PLONG)P(3) > 0) *(char*)P(2) = 0;
+            if (P(3)) *(PLONG)P(3) = 1;
+            r = 0;
+        }
+    }
     if (getenv("W98_REGTRACE")) fprintf(stderr, "[reg] query %08X \"%s\" -> %u\n", a[0], a[1] ? (const char*)P(1) : "", r);
     return r;
 }
@@ -1223,7 +1234,10 @@ static uint32_t vwin32_crst_wake(const uint32_t* a) {
         uint32_t r0 = g_threads[t];
         if (MEM32(r0 + R0T_CRST) != a[0]) continue;
         MEM32(r0 + R0T_CRST) = 0;
-        MEM32(a[0] + 8) = MEM32(r0 + R0T_TDBX);
+        /* the owner as EnterCrst writes it: Win95's kernel32 (0xBFF7424F) and KRNL386
+         * (1:7EDE) store the thread object, Win98's the TDBX. With the TDBX here a woken
+         * Win95 thread re-entering its own crst waited on itself. */
+        MEM32(a[0] + 8) = MEM32(r0 + (native32_w9x_is_win95() ? R0T_THREAD : R0T_TDBX));
         MEM32(a[0] + 4) = 1;
         if (!MEM32(r0 + R0T_WAKE)) MEM32(r0 + R0T_WAKE) = (uint32_t)(uintptr_t)CreateEventA(NULL, FALSE, FALSE, NULL);
         SetEvent((HANDLE)(uintptr_t)MEM32(r0 + R0T_WAKE));
@@ -1331,7 +1345,7 @@ static uint32_t vwin32_thread_done(const uint32_t* a) {
          * level, then hand it on as LeaveCriticalSection's 1E would.
          * ponytail: 0xBFFC9470 is Win98 SE kernel32's Win16Mutex pointer. */
         uint32_t m = MEM32(k32()->win16mutex);
-        if (m && MEM32(m + 8) == MEM32(r0 + R0T_TDBX)) {
+        if (m && MEM32(m + 8) == MEM32(r0 + (native32_w9x_is_win95() ? R0T_THREAD : R0T_TDBX))) {   /* Win95: the thread object */
             uint32_t n = MEM32(m + 4);
             MEM32(m + 4) = 0; MEM32(m + 8) = 0; MEM32(m + 0x10) += n;   /* an enter decrements (0xBFF741CA, KRNL386 1:7D85): 1 is free */
             if (g_trace > 0) fprintf(stderr, "[vxd] thread %08X ended holding the Win16Mutex (%u): released (count %d)\n", g_cur[0], n, (int32_t)MEM32(m + 0x10));
@@ -1688,6 +1702,7 @@ static uint32_t vwin32_int21(const uint32_t* a) {
         DWORD share = ah == 0x3C ? FILE_SHARE_READ | FILE_SHARE_WRITE : (al & 0x70) == 0x10 ? 0 : (al & 0x70) == 0x20 ? FILE_SHARE_READ
                     : (al & 0x70) == 0x30 ? FILE_SHARE_WRITE : FILE_SHARE_READ | FILE_SHARE_WRITE;
         if (!host_path(g_edx, path)) { dos_fail(3); return g_eax; }
+        if (getenv("W9X_OPENTRACE")) fprintf(stderr, "[open] %s (8.3)\n", path);
         HANDLE fh = CreateFileA(path, acc, share, NULL, ah == 0x3C ? CREATE_ALWAYS : OPEN_EXISTING,
                                 ah == 0x3C && ((uint16_t)g_ecx & 0x27) ? ((uint16_t)g_ecx & 0x27) : FILE_ATTRIBUTE_NORMAL, NULL);
         if (fh == INVALID_HANDLE_VALUE) { dos_fail(host_err()); return g_eax; }
