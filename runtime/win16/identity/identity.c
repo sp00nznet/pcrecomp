@@ -40,17 +40,17 @@ void recomp_fn_hit(const char *n) {   /* g_fncount: W16_FN=1 (with fs when it ch
     static uint16_t fs;
     static int sp = -1;
     if (sp < 0) { const char *e = getenv("W16_FN"); sp = e && *e == '2'; }
-    if (g_watch_ds) {   /* W16_WSEL=sel: say which function first sees sel's LDT descriptor change */
+    if (g_watch_ds && g_wsel) {   /* W16_WSEL=sel: say which function first sees sel's LDT descriptor change */
         extern uint8_t* native32_w9x_desc(uint16_t);
         static uint32_t last[2];
         uint32_t *d = (uint32_t*)native32_w9x_desc(g_wsel);
         if (d[0] != last[0] || d[1] != last[1]) { last[0] = d[0]; last[1] = d[1]; fprintf(stderr, "WATCH %04X = %08X %08X at %s\n", g_wsel, d[0], d[1], n); }
         if (!g_fncount) return;
     }
-    {   /* W16_WW=ss:off: say which function first sees that word change */
+    {   /* W16_WW=sel:off: say which function first sees that word change (any selector) */
         static int ww = -1; static uint16_t wss, last;
         if (ww < 0) { const char *e = getenv("W16_WW"); char *t; wss = e ? (uint16_t)strtoul(e, &t, 16) : 0; ww = e && *t == ':' ? (int)strtoul(t + 1, 0, 16) : 0x10000; }
-        if (ww < 0x10000 && g_w16.ss == wss) { uint16_t v = mem_read16(&g_w16, g_w16.ss, (uint16_t)ww); if (v != last) { last = v; fprintf(stderr, "WW ss:%04X = %04X at %s\n", ww, v, n); } }
+        if (ww < 0x10000 && wss && W16_SEL_BASE(&g_w16, wss) != RECOMP_GUARD_BASE) { uint16_t v = mem_read16(&g_w16, wss, (uint16_t)ww); if (v != last) { last = v; fprintf(stderr, "WW %04X:%04X = %04X at %s (thread %lu)\n", wss, ww, v, n, GetCurrentThreadId()); } }
     }
     {   /* W16_DSW=sel: say which function first runs with ds = sel (a ds gone wrong) */
         static int dw = -1; static __declspec(thread) uint16_t lastds;
@@ -1270,6 +1270,7 @@ int w16_call(CPU *r) {
     CPU saved = g_w16;
     g_w16 = *r; g_w16.mem = NULL;
     if (getenv("W16_FN")) g_fncount = 1;
+    if (getenv("W16_WW")) g_watch_ds = 1;   /* the word watch below, without W16_FN's log */
     if (getenv("W16_WSEL")) { g_watch_ds = 1; g_wsel = (uint16_t)strtoul(getenv("W16_WSEL"), 0, 16); }   /* a descriptor watch (recomp_fn_hit) */
     push16(&g_w16, 0); push16(&g_w16, 0);
     int okc = w16_entry(&g_w16, seg_of(r->cs), r->ip);

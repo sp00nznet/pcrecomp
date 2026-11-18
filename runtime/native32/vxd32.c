@@ -1798,6 +1798,7 @@ static uint32_t vwin32_int21(const uint32_t* a) {
             DWORD disp = (act & 0x10) ? ((act & 3) == 1 ? OPEN_ALWAYS : (act & 3) == 2 ? CREATE_ALWAYS : CREATE_NEW)
                                       : ((act & 3) == 2 ? TRUNCATE_EXISTING : OPEN_EXISTING);
             if (!host_path(g_esi, path)) { dos_fail(3); return g_eax; }
+            if (getenv("W9X_OPENTRACE")) fprintf(stderr, "[open] %s\n", path);   /* every LFN open the guest makes */
             DWORD pre = GetFileAttributesA(path);
             HANDLE fh = CreateFileA(path, acc, share, NULL, disp, ((uint16_t)g_ecx & 0x27) ? ((uint16_t)g_ecx & 0x27) : FILE_ATTRIBUTE_NORMAL, NULL);
             if (fh == INVALID_HANDLE_VALUE) { dos_fail(host_err()); return g_eax; }

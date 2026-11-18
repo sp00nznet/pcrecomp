@@ -687,7 +687,13 @@ static void sys_fpu_save(CPU *c) { ret_far(c, 4); }
  * Timers run from the tick thread (below); W16_INPUT drives the mouse and keyboard procs. */
 static void kb_inquire(CPU *c) {
     uint8_t *k = (uint8_t *)farptr(argfar(c, 0));
-    k[0] = 0xFF; k[1] = 0xFE; k[2] = 0xFF; k[3] = 0xFE; put16((char *)k, 4, 0); put16((char *)k, 6, 12);
+    int native32_w9x_is_win95(void);
+    k[0] = 0xFF; k[1] = 0xFE; k[2] = 0xFF; k[3] = 0xFE; put16((char *)k, 4, 0);
+    /* Windows 95's KBINFO stops at StateSize: USER keeps its global hook table right
+     * after it (USER ds:0CC6 + 6 = 0CCC, WH_MSGFILTER's slot), so a NumFuncKeys
+     * there is a hook at 000C (its menu loop called 0100:0000) */
+    if (native32_w9x_is_win95()) { c->ax = 6; ret_far(c, 4); return; }
+    put16((char *)k, 6, 12);
     c->ax = 8; ret_far(c, 4);
 }
 static uint32_t g_kb_proc;
