@@ -38,6 +38,7 @@
 #include <wchar.h>
 
 #include "native32.h"
+#include "ntguest.h"
 
 #pragma comment(lib, "advapi32.lib")
 
@@ -145,6 +146,11 @@ static int os_owned_key(const wchar_t* nt) {
     if (!wcsncmp(r, L"\\WOW6432NODE", 12)) r += 12;
     for (int i = 0; i < 4; i++)
         if (n = wcslen(lm[i]), !wcsncmp(r, lm[i], n) && (!r[n] || r[n] == L'\\')) return 1;
+    /* XP's COM+ catalog (clbcatq): the host's COM3 names Windows 11's REGDB files, which
+     * XP's catalog cannot read; without the key it reads the classes from the registry */
+    if (nt_guest_xp(native32_guest_peb) && !wcsncmp(r, L"\\MICROSOFT\\COM3", 15) && (!r[15] || r[15] == L'\\')) return 1;
+    /* and the taskbar's default bands (Explorer\Streams\Desktop): Windows 11's streams are not XP's */
+    if (nt_guest_xp(native32_guest_peb) && !wcsncmp(r, L"\\MICROSOFT\\WINDOWS\\CURRENTVERSION\\EXPLORER\\STREAMS", 50)) return 1;
     return 0;
 }
 static int host_class_key(const wchar_t* nt) {
@@ -215,6 +221,7 @@ static LONG sb_open(const wchar_t* full, REGSAM sam, int create, DWORD opts, HKE
     wchar_t rel[KP], real[KP];
     to_box(full, rel);
     LONG r = RegOpenKeyExW(HKEY_CURRENT_USER, rel, 0, sam, out);
+    { const char* t = getenv("PCRECOMP_REGTRACE"); if (t && *t == '2') fprintf(stderr, "[regbox] open %ls -> %ld\n", full, r); }
     if (!r) { if (disp) *disp = REG_OPENED_EXISTING_KEY; return 0; }
     if (create) return RegCreateKeyExW(HKEY_CURRENT_USER, rel, 0, NULL, opts & ~REG_OPTION_BACKUP_RESTORE, sam, NULL, out, disp);
     if (in_box(full)) { if (!from_box(full, real)) return r; full = real; }
@@ -290,7 +297,9 @@ static LONG WINAPI g_RegOpenKeyExW(HKEY k, LPCWSTR sub, DWORD opt, REGSAM sam, P
          * an absolute NT path would miss (the Open dialog's COM classes) */
         wchar_t rel[KP];
         to_box(full, rel);
-        if (!RegOpenKeyExW(HKEY_CURRENT_USER, rel, 0, sam, out)) return 0;
+        { LONG r = RegOpenKeyExW(HKEY_CURRENT_USER, rel, 0, sam, out); const char* t = getenv("PCRECOMP_REGTRACE");
+          if (t && *t == '2') fprintf(stderr, "[regbox] Open %ls -> %ld\n", full, r);
+          if (!r) return 0; }
         if (host_class_key(full)) return ERROR_FILE_NOT_FOUND;
         if (getenv("PCRECOMP_REGTRACE")) fprintf(stderr, "[regbox] host key read: %ls\n", full);
         return RegOpenKeyExW(k, sub, opt, (sam & ~WRITE_BITS) | KEY_READ, out);

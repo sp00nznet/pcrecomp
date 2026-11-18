@@ -1856,6 +1856,13 @@ static int atl_thunk(CONTEXT* c, uint32_t pc) {
 static LONG CALLBACK native32_veh(EXCEPTION_POINTERS* ep) {
     EXCEPTION_RECORD* er = ep->ExceptionRecord;
     uint32_t pc = (uint32_t)(uintptr_t)er->ExceptionAddress;
+    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && getenv("PCRECOMP_FAULTTRACE")) {   /* the guest's stack at a host fault */
+        fprintf(stderr, "[fault] AV at %p (%08X) in %08X, guest esp %08X:", er->ExceptionAddress,
+                er->NumberParameters >= 2 ? (uint32_t)er->ExceptionInformation[1] : 0, g_cur_func, g_esp);
+        for (int i = 0; i < 24 && g_esp; i++) fprintf(stderr, " %08X", MEM32(g_esp + 4 * i));
+        fprintf(stderr, "\n");
+        recomp_dump_trace("fault");
+    }
     if (er->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION && lifted_in_native(pc)) {
         t_lin_va = pc;                          /* native code reached a lifted one */
         ep->ContextRecord->Eip = (DWORD)(uintptr_t)lin_tramp;
@@ -2153,6 +2160,30 @@ void native32_rpc_guard(uint32_t ndr_client_call2, uint32_t ndr_client_call) {
     recomp_func_t f;
     if (ndr_client_call2 && (f = recomp_lookup(ndr_client_call2)) != NULL) g_rpc_orig[0] = f, native32_replace(ndr_client_call2, shim_rpc_call2);
     if (ndr_client_call && (f = recomp_lookup(ndr_client_call)) != NULL) g_rpc_orig[1] = f, native32_replace(ndr_client_call, shim_rpc_call);
+}
+
+/* XP's ole32 registers a CLSCTX_LOCAL_SERVER class object by marshaling it
+ * through rpcss's OXID resolver, which a guest never has (no host RPC), so
+ * CoRegisterClassObject failed for explorer's own TaskBand, TrayBandSiteService
+ * and its desktop classes (INPROC|LOCAL): no taskbar bands. Another process
+ * cannot reach a guest's class object anyway; a failed registration that
+ * asked for the local server is made again in process only. */
+static recomp_func_t g_coreg_orig;
+static void shim_co_register(void) {
+    uint32_t sp = g_esp, a[6];
+    for (int i = 0; i < 6; i++) a[i] = MEM32(sp + 4 * i);
+    g_coreg_orig();
+    if ((int32_t)g_eax < 0 && (a[3] & 4) && (a[3] & ~4u)) {
+        g_esp = sp;
+        for (int i = 0; i < 6; i++) MEM32(sp + 4 * i) = a[i];
+        MEM32(sp + 0xC) = a[3] & ~4u;
+        g_coreg_orig();
+    }
+}
+void native32_co_register_guard(uint32_t co_register_class_object) {
+    recomp_func_t f;
+    if (co_register_class_object && (f = recomp_lookup(co_register_class_object)) != NULL)
+        g_coreg_orig = f, native32_replace(co_register_class_object, shim_co_register);
 }
 
 /* An RPC status (RPC_S_*, 0x6A4..0x7FF, or its HRESULT) no guest frame took

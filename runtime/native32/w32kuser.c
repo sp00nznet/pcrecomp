@@ -84,9 +84,10 @@ static void thread_setup(void) {
 }
 
 static uint8_t* desk_alloc(uint32_t n) {
-    uint8_t* p = g_desk + g_desk_top;
-    g_desk_top += (n + 15) & ~15u;
-    return g_desk_top <= DESK_SIZE ? p : NULL;
+    /* atomic: explorer's threads make windows at once, and two WNDs at one address
+     * (one's handle over the other's) gave GetWindowLong(hwnd, 0) another window's data */
+    uint32_t k = (n + 15) & ~15u, o = (uint32_t)InterlockedExchangeAdd((volatile LONG*)&g_desk_top, (LONG)k);
+    return o + k <= DESK_SIZE ? g_desk + o : NULL;
 }
 
 /* WND fields kept from the host window: +0x1C ExStyle, +0x20 style, +0x30
@@ -595,7 +596,19 @@ static void shell_pin(HWND h, UINT m, LPARAM l) {
     if (m == WM_WINDOWPOSCHANGING && h && h == g_shellwnd && l && !(((WINDOWPOS*)l)->flags & SWP_NOZORDER))
         ((WINDOWPOS*)l)->hwndInsertAfter = HWND_BOTTOM;
 }
+static LRESULT wnd_thunk_body(HWND h, UINT m, WPARAM w, LPARAM l);
+/* With the machine held from the start: the body reads this thread's TEB through
+ * g_fs_base and writes its CallbackWnd, and another guest thread holding the machine
+ * meanwhile had g_fs_base as its own (explorer's tray thread sending to the Start
+ * menu's: XP's user32 took that thread's hwnd with this window's procedure) */
 static LRESULT CALLBACK wnd_thunk(HWND h, UINT m, WPARAM w, LPARAM l) {
+    LRESULT r;
+    mach_enter();
+    r = wnd_thunk_body(h, m, w, l);
+    mach_leave();
+    return r;
+}
+static LRESULT wnd_thunk_body(HWND h, UINT m, WPARAM w, LPARAM l) {
     shell_pin(h, m, l);
     uint8_t* pw = native32_user_wnd(h);
     uint32_t pfn = pw ? *(uint32_t*)(pw + WO(0x5C)) : 0, args[4] = { (uint32_t)(uintptr_t)h, m, (uint32_t)w, (uint32_t)l };

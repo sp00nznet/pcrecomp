@@ -1284,6 +1284,7 @@ static void ntdll_version(uint32_t ntdll, uint32_t* major, uint32_t* minor, uint
 
 void csr32_install(void);   /* csr32.c */
 uint32_t csr32_sxs_blob(const char* manifest, size_t len);   /* csr32.c */
+uint32_t csr32_sxs_default(void);
 
 /* An image's resource (type, id), or 0: the first language */
 static uint32_t pe_resource(uint32_t base, uint32_t type, uint32_t id, uint32_t* size) {
@@ -1363,6 +1364,10 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
     /* PEB: the fields the kernel sets (NT 5 offsets). Ldr, the heap, the
      * locks and the TLS bitmap are the guest ntdll's to make. */
     ntdll_version(ntdll, &major, &minor, &build);
+    {   /* XP: a class object registers in process only when it cannot as a local server (native32.c) */
+        uint32_t ole = native32_module("ole32.dll");
+        if (ole && build >= 2600) native32_co_register_guard(native32_export(ole, "CoRegisterClassObject"));
+    }
     *(uint32_t*)(peb + 0x08) = exe;
     *(uint32_t*)(peb + 0x10) = (uint32_t)(uintptr_t)pp;
     SYSTEM_INFO si;
@@ -1386,6 +1391,8 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
          * activation context, which csrss builds at process creation */
         uint32_t ms = 0, m = pe_resource(exe, 24, 1, &ms);
         if (m && ms) *(uint32_t*)(peb + 0x1F8) = csr32_sxs_blob((const char*)(uintptr_t)m, ms);
+        /* and the system default context (csrss's, for every process): no assemblies, the empty sections */
+        *(uint32_t*)(peb + 0x200) = csr32_sxs_default();
     }
     /* SessionId (+0x1D4) stays 0: the guest is on Windows 2000's local console.
      * Its user32 answers GetSystemMetrics(SM_REMOTESESSION) with PEB SessionId

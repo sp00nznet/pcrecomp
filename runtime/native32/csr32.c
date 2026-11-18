@@ -327,24 +327,46 @@ uint32_t csr32_sxs_blob(const char* m, size_t len) {
         if (id && xml_attr(id, "name", name, 128)) sxs_dependency(name, &dll, &wc, (uint32_t)++deps + 1);
     }
     free(x);
-    /* header, TOC (2 entries), roster (deps + 2 entries: 0 unused, 1 the manifest's own), sections */
-    uint32_t toc = 0x20, roster = toc + 0x10 + 2 * 0x10, nr = (uint32_t)deps + 2;
+    /* header, TOC (3 entries), roster (deps + 2 entries: 0 unused, 1 the manifest's own), sections:
+     * DLL and window class redirection, and an empty COM server one (a GUID section, 'GsHd', no
+     * entries): ole32's CoRegisterClassObject and the COM catalog ask it for every class and take
+     * only "key not found" (14007) as "no redirection"; a context without the section answers 14000 */
+    uint32_t toc = 0x20, roster = toc + 0x10 + 3 * 0x10, nr = (uint32_t)deps + 2;
     uint32_t s2 = roster + 0x14 + 0x18 * nr, l2 = sxs_section(&dll, NULL, 2), s3 = (s2 + l2 + 3) & ~3u, l3 = sxs_section(&wc, NULL, 3);
-    uint32_t total = s3 + l3;
+    uint32_t s4 = (s3 + l3 + 3) & ~3u, l4 = 0x28, total = s4 + l4;
     uint8_t* b = (uint8_t*)VirtualAlloc(NULL, total, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!b) return 0;
     uint32_t h = (uint32_t)(uintptr_t)b;
     MEM32(h) = 0x78746341u, MEM32(h + 4) = 0x20, MEM32(h + 8) = 1, MEM32(h + 0xC) = total;
     MEM32(h + 0x10) = toc, MEM32(h + 0x14) = 0, MEM32(h + 0x18) = roster, MEM32(h + 0x1C) = 0;
-    MEM32(h + toc) = 0x10, MEM32(h + toc + 4) = 2, MEM32(h + toc + 8) = toc + 0x10, MEM32(h + toc + 0xC) = 2;
+    MEM32(h + toc) = 0x10, MEM32(h + toc + 4) = 3, MEM32(h + toc + 8) = toc + 0x10, MEM32(h + toc + 0xC) = 2;
     MEM32(h + toc + 0x10) = 2, MEM32(h + toc + 0x14) = s2, MEM32(h + toc + 0x18) = l2, MEM32(h + toc + 0x1C) = 1;
     MEM32(h + toc + 0x20) = 3, MEM32(h + toc + 0x24) = s3, MEM32(h + toc + 0x28) = l3, MEM32(h + toc + 0x2C) = 1;
+    MEM32(h + toc + 0x30) = 4, MEM32(h + toc + 0x34) = s4, MEM32(h + toc + 0x38) = l4, MEM32(h + toc + 0x3C) = 2;
+    MEM32(h + s4) = 0x64487347u, MEM32(h + s4 + 4) = 0x28, MEM32(h + s4 + 8) = 1, MEM32(h + s4 + 0xC) = 1;   /* 'GsHd', count 0 (VirtualAlloc'd: the rest 0) */
     MEM32(h + roster) = 0x14, MEM32(h + roster + 4) = 1, MEM32(h + roster + 8) = nr, MEM32(h + roster + 0xC) = roster + 0x14;
     for (uint32_t i = 1; i < nr; i++) MEM32(h + roster + 0x14 + 0x18 * i) = 1;   /* Flags: a valid entry */
     sxs_section(&dll, b + s2, 2);
     sxs_section(&wc, b + s3, 3);
     for (int i = 0; i < dll.n; i++) free(dll.e[i].data);
     for (int i = 0; i < wc.n; i++) free(wc.e[i].data);
+    return h;
+}
+
+/* The system default activation context (csrss's, every process's last resort):
+ * no assemblies, only an empty COM server redirection section (see above) */
+uint32_t csr32_sxs_default(void) {
+    uint32_t toc = 0x20, roster = toc + 0x20, s4 = roster + 0x14 + 0x18 * 2, total = s4 + 0x28;
+    uint8_t* b = (uint8_t*)VirtualAlloc(NULL, total, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!b) return 0;
+    uint32_t h = (uint32_t)(uintptr_t)b;
+    MEM32(h) = 0x78746341u, MEM32(h + 4) = 0x20, MEM32(h + 8) = 1, MEM32(h + 0xC) = total;
+    MEM32(h + 0x10) = toc, MEM32(h + 0x18) = roster;
+    MEM32(h + toc) = 0x10, MEM32(h + toc + 4) = 1, MEM32(h + toc + 8) = toc + 0x10, MEM32(h + toc + 0xC) = 2;
+    MEM32(h + toc + 0x10) = 4, MEM32(h + toc + 0x14) = s4, MEM32(h + toc + 0x18) = 0x28, MEM32(h + toc + 0x1C) = 2;
+    MEM32(h + roster) = 0x14, MEM32(h + roster + 4) = 1, MEM32(h + roster + 8) = 2, MEM32(h + roster + 0xC) = roster + 0x14;
+    MEM32(h + roster + 0x14 + 0x18) = 1;
+    MEM32(h + s4) = 0x64487347u, MEM32(h + s4 + 4) = 0x28, MEM32(h + s4 + 8) = 1, MEM32(h + s4 + 0xC) = 1;
     return h;
 }
 
