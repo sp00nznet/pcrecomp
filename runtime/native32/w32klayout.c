@@ -116,14 +116,14 @@ int w2k_gdi_valid(uint32_t table, uint32_t h) {
     return h && (h & 0xFFFF) < GDI_ENTRIES && MEM32(e) && MEM16(e + 8) == (uint16_t)(h >> 16);
 }
 
-void w2k_gdi_devcaps(uint32_t table, int (*caps)(int index)) {
+void w2k_gdi_devcaps(uint32_t table, uint32_t off, int (*caps)(int index)) {
     /* { index, offset }, read off gdi32's GetDeviceCaps; the rest it asks
      * NtGdiGetDeviceCaps for */
     static const uint8_t map[][2] = { { 0, 0 }, { 2, 4 }, { 4, 8 }, { 6, 0xC }, { 8, 0x18 }, { 0xA, 0x1C }, { 0xC, 0x20 },
         { 0xE, 0x24 }, { 0x12, 0x28 }, { 0x16, 0x2C }, { 0x18, 0x30 }, { 0x22, 0x64 }, { 0x26, 0x34 }, { 0x28, 0x38 },
         { 0x2A, 0x3C }, { 0x58, 0x44 }, { 0x5A, 0x48 }, { 0x68, 0x4C }, { 0x6C, 0x50 }, { 0x6E, 0x54 }, { 0x6F, 0x58 },
         { 0x70, 0x5C }, { 0x71, 0x60 }, { 0x74, 0x68 }, { 0x75, 0x70 }, { 0x76, 0x6C }, { 0x77, 0x74 } };
-    for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++) MEM32(table + 0x40000 + map[i][1]) = (uint32_t)caps(map[i][0]);
+    for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++) MEM32(table + off + map[i][1]) = (uint32_t)caps(map[i][0]);
 }
 
 void w2k_gdi_batch(uint32_t teb, void (*fn)(uint32_t hdc, uint32_t cmd, uint32_t entry, uint32_t len)) {

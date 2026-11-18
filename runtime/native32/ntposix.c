@@ -51,6 +51,7 @@
 #include <ucontext.h>
 #include <execinfo.h>
 #include "ntposix.h"
+#include "ntguest.h"
 
 #if !defined(__i386__)
 #error "ntposix is flat: build it with gcc -m32 (docs/linux.md)"
@@ -2280,10 +2281,10 @@ int ntp_win32k(const uint32_t* bases, int nbases, const char* names_file) {
         uint32_t base = bases[m], size = image_size(base);
         for (uint32_t p = base + 0x1000; p + 16 < base + size; p++) {
             const uint8_t* b = (const uint8_t*)(uintptr_t)p;
-            if (b[0] != 0xB8 || b[5] != 0x8D || b[6] != 0x54 || b[7] != 0x24 || b[8] != 0x04 || b[9] != 0xCD || b[10] != 0x2E) continue;
-            uint32_t svc = *(const uint32_t*)(b + 1);
+            uint32_t svc; uint8_t argc;
+            if (!ntstub_parse(b, &svc, &argc)) continue;
             if (svc < 0x1000 || svc >= 0x1000 + W32K_MAX) continue;
-            g_w32k[svc - 0x1000].argc = b[11] == 0xC2 ? (uint8_t)(*(const uint16_t*)(b + 12) / 4) : 0;
+            g_w32k[svc - 0x1000].argc = argc;
             stubs++;
         }
     }
@@ -2459,11 +2460,11 @@ int ntp_syscalls(uint32_t base) {
         const char* name = (const char*)(uintptr_t)(base + MEM32(names + 4 * i));
         const uint8_t* p = (const uint8_t*)(uintptr_t)(base + MEM32(funcs + 4 * MEM16(ords + 2 * i)));
         if (name[0] != 'N' || name[1] != 't') continue;
-        if (p[0] != 0xB8 || p[5] != 0x8D || p[6] != 0x54 || p[7] != 0x24 || p[8] != 0x04 || p[9] != 0xCD || p[10] != 0x2E) continue;
-        uint32_t svc = *(const uint32_t*)(p + 1);
+        uint32_t svc; uint8_t argc;
+        if (!ntstub_parse(p, &svc, &argc)) continue;
         if (svc >= MAX_SVC) continue;
         g_svc[svc].name = name;
-        g_svc[svc].argc = p[11] == 0xC2 ? (uint8_t)(*(const uint16_t*)(p + 12) / 4) : 0;
+        g_svc[svc].argc = argc;
         for (size_t k = 0; k < sizeof g_impl / sizeof g_impl[0]; k++)
             if (!strcmp(g_impl[k].name, name)) { g_svc[svc].fn = g_impl[k].fn; impl++; }
         n++;

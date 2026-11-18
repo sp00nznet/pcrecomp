@@ -115,7 +115,7 @@ void w2k_monitor(uint32_t disp, uint32_t mon, int cx, int cy, int work_cy);
  * +0x40000 the display's DEVCAPS for gdi32's own GetDeviceCaps. A handle's
  * high word is uniq << 8 | type, 0x80 a stock object. */
 #define GDI_ENTRIES    0x4000
-#define GDI_TABLE_SIZE 0x80000
+#define GDI_TABLE_SIZE 0x110000   /* XP's (ntguest.h NT_GDI_SHARED_SIZE) */
 #define PEB_GDITABLE   0x94
 enum { GDI_DC = 1, GDI_RGN = 4, GDI_BMP = 5, GDI_PAL = 8, GDI_FONT = 0xA, GDI_BRUSH = 0x10, GDI_PEN = 0x30 };
 #define GDI_STOCK      0x80
@@ -142,8 +142,9 @@ enum { GDI_DC = 1, GDI_RGN = 4, GDI_BMP = 5, GDI_PAL = 8, GDI_FONT = 0xA, GDI_BR
 void w2k_gdi_entry(uint32_t table, uint32_t h, uint32_t pid, uint32_t attr);
 void w2k_gdi_clear(uint32_t table, uint32_t h);
 int w2k_gdi_valid(uint32_t table, uint32_t h);
-/* the display's DEVCAPS at +0x40000, from a GetDeviceCaps-like function */
-void w2k_gdi_devcaps(uint32_t table, int (*caps)(int index));
+/* the display's DEVCAPS at table + off (+0x40000; XP's +0x100000, ntguest.h
+ * nt_gdi_devcaps), from a GetDeviceCaps-like function */
+void w2k_gdi_devcaps(uint32_t table, uint32_t off, int (*caps)(int index));
 
 /* The TEB batch: TEB+0x1D4 bytes used, +0x1D8 the DC, +0x1DC entries
  * { USHORT length, USHORT command, data }, +0xF70 their count. Commands:

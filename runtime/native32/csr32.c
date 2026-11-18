@@ -12,7 +12,7 @@
  *            basesrv publishes (BASE_STATIC_SERVER_DATA in the static server
  *            data's slot 1), and a port handle of ours;
  *   call     api numbers are (server << 16) | api: csrsrv 0 ClientConnect
- *            (consrv: the host's console), basesrv 26 NlsGetUserInfo; others
+ *            (consrv: the host's console), basesrv 26 (XP: 30) NlsGetUserInfo; others
  *            are logged and succeed with an empty reply.
  *
  * Layouts are NT 5.0's, from the offsets the lifted ntdll and kernel32 read.
@@ -195,6 +195,12 @@ static uint32_t lpc_connect(uint32_t* a, int secure) {
         MEM32(info + 0x14) = (uint32_t)(uintptr_t)shared;   /* SharedSectionHeap */
     }
     if (len) MEM32(len) = 0x148;
+    /* NlsGetUserInfo is basesrv 26 on NT 5.0 and 30 on NT 5.1 (Windows XP),
+     * where 26 is another api: the guest's build (its PEB, set by now) says */
+    {
+        uint32_t nls = MEM16(native32_guest_peb + 0xAC) >= 2600 ? 30 : 26;
+        if (!g_api[1][nls]) native32_csr_api(0x10000 | nls, nls_get_user_info);
+    }
     if (!g_port) g_port = CreateEventA(NULL, FALSE, FALSE, NULL);
     MEM32(a[0]) = (uint32_t)(uintptr_t)g_port;
     if (getenv("NATIVE32_SYSCALLS")) fprintf(stderr, "[csr] connected to %.*ls\n", n, s);
@@ -258,7 +264,6 @@ static uint32_t ovr_open_mutant(uint32_t* a) {
 void csr32_install(void) {
     native32_nt_override("NtOpenMutant", ovr_open_mutant);
     native32_csr_api(0x00000, client_connect);
-    if (!g_api[1][26]) native32_csr_api(0x1001A, nls_get_user_info);
     native32_nt_override("NtSecureConnectPort", ovr_secure_connect);
     native32_nt_override("NtConnectPort", ovr_connect);
     native32_nt_override("NtRequestWaitReplyPort", ovr_request_wait_reply);

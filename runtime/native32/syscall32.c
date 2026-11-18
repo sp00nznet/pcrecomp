@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "native32.h"
+#include "ntguest.h"
 
 #define MAX_SVC 0x400
 static struct { const char* name; uint8_t argc; native32_syscall_fn fn; void* host; } g_svc[MAX_SVC];
@@ -97,12 +98,11 @@ int native32_nt_syscalls(uint32_t base) {
         const char* name = (const char*)(b + names[i]);
         const uint8_t* p = b + funcs[ords[i]];
         if (name[0] != 'N' || name[1] != 't') continue;            /* Zw* are the same stubs */
-        if (p[0] != 0xB8 || p[5] != 0x8D || p[6] != 0x54 || p[7] != 0x24 || p[8] != 0x04 ||
-            p[9] != 0xCD || p[10] != 0x2E) continue;
-        uint32_t svc = *(uint32_t*)(p + 1);
+        uint32_t svc; uint8_t argc;
+        if (!ntstub_parse(p, &svc, &argc)) continue;
         if (svc >= MAX_SVC) continue;
         g_svc[svc].name = name;
-        g_svc[svc].argc = p[11] == 0xC2 ? (uint8_t)(*(uint16_t*)(p + 12) / 4) : 0;
+        g_svc[svc].argc = argc;
         g_svc[svc].host = backend_resolve(name);
         for (int k = 0; k < g_novr; k++)
             if (!strcmp(g_ovr[k].name, name)) g_svc[svc].fn = g_ovr[k].fn;
@@ -1067,11 +1067,10 @@ int native32_nt_win32k(const uint32_t* bases, int nbases, const char* names_file
         uint32_t base = bases[m], size = image_size(base);
         for (uint32_t p = base + 0x1000; p + 16 < base + size; p++) {
             const uint8_t* b = (const uint8_t*)(uintptr_t)p;
-            if (b[0] != 0xB8 || b[5] != 0x8D || b[6] != 0x54 || b[7] != 0x24 || b[8] != 0x04 ||
-                b[9] != 0xCD || b[10] != 0x2E) continue;
-            uint32_t svc = *(const uint32_t*)(b + 1);
+            uint32_t svc; uint8_t argc;
+            if (!ntstub_parse(b, &svc, &argc)) continue;
             if (svc < 0x1000 || svc >= 0x1000 + W32K_MAX) continue;
-            g_w32k[svc - 0x1000].argc = b[11] == 0xC2 ? (uint8_t)(*(const uint16_t*)(b + 12) / 4) : 0;
+            g_w32k[svc - 0x1000].argc = argc;
             stubs++;
         }
     }

@@ -50,6 +50,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "native32.h"
+#include "ntguest.h"
 
 #define GDI_ENTRIES 0x4000
 #define ATTR_SIZE 0x400
@@ -287,10 +288,11 @@ static void batch(void) {
 static uint32_t s_init(uint32_t* a) {
     (void)a;
     if (!g_table) {
-        /* the handle table and the shared data after it (gdi32 reads +0x40094) */
-        g_table = (uint8_t*)VirtualAlloc(NULL, 0x80000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        /* the handle table and the shared data after it (gdi32 reads +0x40094; XP's +0x100094) */
+        uint32_t dc_off = nt_gdi_devcaps(native32_guest_peb);
+        g_table = (uint8_t*)VirtualAlloc(NULL, NT_GDI_SHARED_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         MEM32(native32_guest_peb + 0x94) = (uint32_t)(uintptr_t)g_table;
-        /* +0x40000: the display's DEVCAPS, which GetDeviceCaps reads for a
+        /* +0x40000 (XP +0x100000, ntguest.h): the display's DEVCAPS, which GetDeviceCaps reads for a
          * display DC it made itself (CreateDC("DISPLAY"): RichEdit's measuring
          * DC; zeros there gave LOGPIXELSY 0 and a 1-pixel font, every
          * character on its own line). { index, offset }, read off gdi32's
@@ -301,7 +303,7 @@ static uint32_t s_init(uint32_t* a) {
             { 0x70, 0x5C }, { 0x71, 0x60 }, { 0x74, 0x68 }, { 0x75, 0x70 }, { 0x76, 0x6C }, { 0x77, 0x74 } };
         HDC s = GetDC(NULL);
         for (int i = 0; i < (int)(sizeof caps / sizeof caps[0]); i++)
-            MEM32((uint32_t)(uintptr_t)g_table + 0x40000 + caps[i][1]) = (uint32_t)GetDeviceCaps(s, caps[i][0]);
+            MEM32((uint32_t)(uintptr_t)g_table + dc_off + caps[i][1]) = (uint32_t)GetDeviceCaps(s, caps[i][0]);
         ReleaseDC(NULL, s);
     }
     return 1;

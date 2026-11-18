@@ -805,6 +805,7 @@ class Lifter:
             self._push_jmp = False   # a ret others branch to returns for them
         self._insn_flag_width = 32    # only this instruction's _flag_capture narrows it
         lines = self._lift_instruction(insn)
+        self._prev_bytes = bytes(insn.bytes)
         m, ops = insn.mnemonic, insn.operands
         # `push x; [mov r, y]; ret` is a jump to x (ole32's delay-load failure
         # path 7F44C4E7: `push [eax+8]; mov eax, 8; ret` into a `ret 18h` stub
@@ -1578,6 +1579,17 @@ class Lifter:
             target = insn.get_branch_target()
             lines.append(f"PUSH32(esp, 0x{insn.address + insn.size:08X}u); RECOMP_FLAGS_OUT();"
                          f" RECOMP_ITAIL(0x{target:08X}u); return; {comment}")
+
+        elif m == 'call' and not self.dos and bytes(insn.bytes) == b'\xff\x12' and \
+                getattr(self, '_prev_bytes', None) == b'\xba\x00\x03\xfe\x7f':
+            # Windows XP SP2+'s system call stub: `mov eax, N; mov edx, 7FFE0300h;
+            # call [edx]` goes through KUSER_SHARED_DATA's SystemCall to
+            # KiFastSystemCall's sysenter. The host's shared page has no such
+            # pointer (and the stub would run guest code to get there), so the
+            # call is the system call itself, with edx -> the arguments as
+            # Windows 2000's `lea edx, [esp+4]; int 2Eh` (native32 ntguest.h).
+            lines.append(f"edx = esp + 4; RECOMP_REGS_OUT(); recomp_syscall(0x2e); RECOMP_REGS_IN(); {comment}")
+            self._flag_state = None
 
         elif m == 'call':
             target = insn.get_branch_target()
