@@ -503,6 +503,9 @@ uint32_t native32_map(const char* path, uint32_t base) {
     uint32_t span = recomp_load_image(path, base);
     if (!span || g_mod_n == MAX_MODULES) return 0;
     const char* file = strrchr(path, '\\');
+    /* a side-by-side assembly's DLL keeps its "sxs\<assembly>\" (native32_module):
+     * by its bare name the guest's loader got the system comctl32 for 6.0's file */
+    for (const char* p = path; (p = strstr(p, "\\sxs\\")) != NULL; p++) file = p;
     g_mods[g_mod_n].base = base;
     g_mods[g_mod_n].span = span;
     strncpy(g_mods[g_mod_n++].name, file ? file + 1 : path, MAX_PATH - 1);

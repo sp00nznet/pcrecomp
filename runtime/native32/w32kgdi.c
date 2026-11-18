@@ -238,8 +238,9 @@ static void batch(void) {
             if (old) SelectObject(h, old);
         } else if (cmd == 1) {                                 /* PolyPatBlt { rop, mode, count, ?, colour, ?, ?, */
             HDC h = dc(hdc);                                   /* then count x { x, y, cx, cy, brush } at +0x24 } */
-            for (uint32_t k = 0, n = MEM32(e + 0xC); k < n && 0x24 + 0x14 * (k + 1) <= len; k++) {
-                uint32_t r = e + 0x24 + 0x14 * k, br = HOST(MEM32(r + 0x10));
+            uint32_t r0 = nt_batch_polypatblt(native32_guest_peb);
+            for (uint32_t k = 0, n = MEM32(e + 0xC); k < n && r0 + 0x14 * (k + 1) <= len; k++) {
+                uint32_t r = e + r0 + 0x14 * k, br = HOST(MEM32(r + 0x10));
                 HGDIOBJ old = br ? SelectObject(h, (HGDIOBJ)(uintptr_t)br) : NULL;
                 PatBlt(h, (int)MEM32(r), (int)MEM32(r + 4), (int)MEM32(r + 8), (int)MEM32(r + 0xC), MEM32(e + 4));
                 if (old) SelectObject(h, old);
@@ -266,13 +267,14 @@ static void batch(void) {
             if (a) AT32(a, 0x90) = MEM32(e + 4);
         } else if (cmd == 2) {                                 /* TextOut { fg, bk, bk mode, ?, ?, x, y, options (bit 31: */
             HDC h = dc(hdc);                                   /* no rect), RECT, cp, count, ?, font, align, viewport org, text } */
-            uint32_t f = HOST(MEM32(e + 0x38)), o = MEM32(e + 0x18);
+            uint32_t x = e + nt_batch_textout(native32_guest_peb);   /* (XP: from x on, 8 later) */
+            uint32_t f = HOST(MEM32(x + 0x38)), o = MEM32(x + 0x18);
             HGDIOBJ old = f ? SelectObject(h, (HGDIOBJ)(uintptr_t)f) : NULL;
             SetTextColor(h, MEM32(e + 4)), SetBkColor(h, MEM32(e + 8)), SetBkMode(h, (int)MEM32(e + 0xC));
-            SetTextAlign(h, MEM32(e + 0x3C));
-            SetViewportOrgEx(h, (int)MEM32(e + 0x40), (int)MEM32(e + 0x44), NULL);
-            ExtTextOutW(h, (int)MEM32(e + 0x10), (int)MEM32(e + 0x14), o & 0x7FFFFFFFu,
-                        (o & 0x80000000u) ? NULL : (RECT*)(uintptr_t)(e + 0x1C), (LPCWSTR)(uintptr_t)(e + 0x48), MEM32(e + 0x30), NULL);
+            SetTextAlign(h, MEM32(x + 0x3C));
+            SetViewportOrgEx(h, (int)MEM32(x + 0x40), (int)MEM32(x + 0x44), NULL);
+            ExtTextOutW(h, (int)MEM32(x + 0x10), (int)MEM32(x + 0x14), o & 0x7FFFFFFFu,
+                        (o & 0x80000000u) ? NULL : (RECT*)(uintptr_t)(x + 0x1C), (LPCWSTR)(uintptr_t)(x + 0x48), MEM32(x + 0x30), NULL);
             if (old) SelectObject(h, old);
         } else
             fprintf(stderr, "[gdi] batch command %u (%u bytes) dropped\n", cmd, len);

@@ -57,6 +57,10 @@ static inline uint32_t nt_si(uint32_t peb, uint32_t o) {
 }
 /* (an array's element i: nt_si(peb, start) + 4 * i, since XP's arrays are longer) */
 static inline int nt_ncolors(uint32_t peb) { return nt_guest_xp(peb) ? 0x1F : 0x1D; }
+/* gdi32's TEB batch: XP's PolyPatBlt has its rectangles at +0x30 (2000: +0x24),
+ * and its TextOut two more dwords before x (everything from x on is 8 later) */
+static inline uint32_t nt_batch_polypatblt(uint32_t peb) { return nt_guest_xp(peb) ? 0x30 : 0x24; }
+static inline uint32_t nt_batch_textout(uint32_t peb) { return nt_guest_xp(peb) ? 8 : 0; }
 /* SHAREDINFO.DefWindowMsgs: after awmControl[0x1D] (XP: [0x1F]) */
 static inline uint32_t nt_shared_defmsgs(uint32_t peb) { return nt_guest_xp(peb) ? 0x108 : 0xE8; }
 /* KernelCallbackTable: XP has one more entry at 3 and another before

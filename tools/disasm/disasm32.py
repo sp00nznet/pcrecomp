@@ -1277,8 +1277,21 @@ def seh_entries(read, code_start, code_end, resume=None):
         raw = read(va, 4)
         return int.from_bytes(raw, "little") if raw and len(raw) == 4 else 0
     out = set()
-    for m in re.finditer(rb"\x6A\xFF\x68(.{4})\x68(.{4})\x64\xA1\x00\x00\x00\x00", text, re.S):
-        table = int.from_bytes(m.group(1), "little")
+    tables = [int.from_bytes(m.group(1), "little")
+              for m in re.finditer(rb"\x6A\xFF\x68(.{4})\x68(.{4})\x64\xA1\x00\x00\x00\x00", text, re.S)]
+    # XP's ntdll and kernel32 build the same frame in a shared __SEH_prolog
+    # (`push handler; mov eax, fs:[0]; push eax; mov eax, [esp+10h];
+    # mov [esp+10h], ebp; lea ebp, [esp+10h]`), called as `push locals;
+    # push scopetable; call __SEH_prolog`. LdrpGetProcedureAddress's
+    # __finally is named only there; unseeded, GetProcAddress on a DLL
+    # not yet initialised (comctl32 6.0 from user32) never returned.
+    prologs = {code_start + m.start() for m in re.finditer(
+        rb"\x68.{4}\x64\xA1\x00\x00\x00\x00\x50\x8B\x44\x24\x10\x89\x6C\x24\x10\x8D\x6C\x24\x10", text, re.S)}
+    if prologs:
+        for m in re.finditer(rb"(?:\x6A.|\x68.{4})\x68(.{4})\xE8(.{4})", text, re.S):
+            if (code_start + m.end() + int.from_bytes(m.group(2), "little", signed=True)) & 0xFFFFFFFF in prologs:
+                tables.append(int.from_bytes(m.group(1), "little"))
+    for table in tables:
         for k in range(64):
             enclosing, flt, handler = dword(table + 12 * k), dword(table + 12 * k + 4), dword(table + 12 * k + 8)
             if not (enclosing == 0xFFFFFFFF or enclosing < k) or not code_start <= handler < code_end:
