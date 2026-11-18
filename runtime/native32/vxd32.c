@@ -1619,6 +1619,7 @@ static uint32_t vwin32_int21(const uint32_t* a) {
     g_eax = a[0];
     g_cf = 0;
     uint8_t ah = (uint8_t)(g_eax >> 8), al = (uint8_t)g_eax;
+    if (getenv("W9X_DOSTRACE")) { char t[96] = ""; if ((ah == 0x71 && (al == 0x4E || al == 0x6C || al == 0x43 || al == 0x60)) || ah == 0x3D || ah == 0x4E) { for (int k = 0; k < 95; k++) { uint32_t a = ah == 0x71 && al == 0x6C ? g_esi : g_edx; t[k] = (char)MEM8(a + k); if (!t[k]) break; } t[95] = 0; } fprintf(stderr, "[dos] %04X %s\n", (uint16_t)g_eax, t); }
     uint16_t ax = (uint16_t)g_eax;
     if (g_trace > 0) fprintf(stderr, "[int21] AX=%04X ebx=%08X ecx=%08X edx=%08X esi=%08X edi=%08X\n", ax, g_ebx, g_ecx, g_edx, g_esi, g_edi);
     switch (ah) {
