@@ -26,6 +26,33 @@
 void recomp_trace_flush(void);   /* recomp_trace.c: --calltrace before we end */
 
 static int g_trace = -1;          /* NATIVE32_VXD */
+
+/* The blocks this file makes for kernel32 (TDBX, ring-0 thread twins, ...):
+ * zeroed, never freed, and known, so a VMM _HeapFree of one is told apart.
+ * ponytail: a linear list; a set if threads ever number in the thousands. */
+static uint32_t g_blocks[4096];
+static int g_nblocks;
+static void* vxd_block(size_t n) {
+    void* b = calloc(1, n);
+    if (g_nblocks < (int)(sizeof g_blocks / sizeof *g_blocks)) g_blocks[g_nblocks++] = (uint32_t)(uintptr_t)b;
+    return b;
+}
+static int is_vxd_block(uint32_t p) { for (int i = 0; p && i < g_nblocks; i++) if (g_blocks[i] == p) return 1; return 0; }
+
+/* kernel32's internals that the answers below name, by build: Windows 98 SE
+ * (4.10.2222) unless the image is another one. Picked from the image itself:
+ * the KEXP header's boot entry (_FREQASM+0C, survey.md), never a fork.
+ * Windows 95 OSR2 (4.00.1111)'s were matched to Win98 SE's by masked bytes
+ * (win95-recomp tools/k32map.py). */
+typedef struct { uint32_t boot, qt_thunk, ft_target, win16mutex, console_new, krn32mutex, cur_thread, leave_krn32, pdb_console, tdbx_psp, thread_tdb; } w9x_k32_t;
+static const w9x_k32_t k32_w98se = { 0xBFFC7AE4u, 0xBFF727D9u, 0xBFF7268Du, 0xBFFC9470u, 0xBFF8E9E1u, 0, 0, 0, 0xB0, 0x50, 0x14 };
+static const w9x_k32_t k32_w95b  = { 0xBFFBB374u, 0xBFF728D0u, 0xBFF72791u, 0xBFFBF9E0u, 0xBFF8C35Eu, 0xBFFBFA60u, 0xBFFBC280u, 0xBFF743D3u, 0xAC, 0x40, 0x1C };   /* thread_tdb: KRNL386 1:5C14 reads THDB+1C (Win98 SE's 5C21: +14) */
+static const w9x_k32_t* k32(void) {
+    static const w9x_k32_t* v;
+    if (!v) v = !IsBadReadPtr((void*)(uintptr_t)0xBFF71000u, 16) && MEM32(0xBFF7100Cu) == k32_w95b.boot ? &k32_w95b : &k32_w98se;
+    return v;
+}
+int native32_w9x_is_win95(void) { return k32() == &k32_w95b; }
 static uint16_t g_cur_psp;         /* the current PSP selector (a TDBX points at it) */
 static char g_cwd[MAX_PATH];       /* the guest's current directory: no drive, no leading backslash */
 uint16_t native32_w9x_alloc_sel(uint32_t base, uint32_t limit);
@@ -45,7 +72,7 @@ static uint32_t vwin32_boot_sels(const uint32_t* a) { (void)a; return 0; }
  * ponytail: what the entries are (12 at most, {?, value} pairs copied into
  * a new thread at +DC) is open until one is needed. */
 static uint32_t vwin32_crst_create(const uint32_t* a) {
-    uint32_t* o = calloc(1, 0x40);
+    uint32_t* o = vxd_block(0x40);
     (void)a;
     o[0] = (uint32_t)(uintptr_t)&o[1];
     o[1] = (uint32_t)(uintptr_t)&o[2];
@@ -208,6 +235,17 @@ static uint32_t vmm_demand_info(const uint32_t* a) {
 }
 static uint32_t vmm_reg_query_value_sub(const uint32_t* a) {   /* RegQueryValue(hkey, subkey, value, &cb): ole32 TreatAs */
     uint32_t r = (uint32_t)REG("RegQueryValueA", LONG(WINAPI*)(HKEY, LPCSTR, LPSTR, PLONG))((HKEY)P(0), P(1), P(2), P(3));
+    if (r == ERROR_FILE_NOT_FOUND) {
+        /* Win9x: a key that is there but has no default value answers "" (Win95's
+         * ShellExecute reads Folder's "shell\open" so, and took 2 as no association) */
+        HKEY k;
+        if (!REG("RegOpenKeyExA", LONG(WINAPI*)(HKEY, LPCSTR, DWORD, REGSAM, PHKEY))((HKEY)P(0), P(1), 0, KEY_READ, &k)) {
+            REG("RegCloseKey", LONG(WINAPI*)(HKEY))(k);
+            if (P(2) && P(3) && *(PLONG)P(3) > 0) *(char*)P(2) = 0;
+            if (P(3)) *(PLONG)P(3) = 1;
+            r = 0;
+        }
+    }
     if (getenv("W98_REGTRACE")) fprintf(stderr, "[reg] query %08X \"%s\" -> %u\n", a[0], a[1] ? (const char*)P(1) : "", r);
     return r;
 }
@@ -380,7 +418,7 @@ static void krnl386_thunk(void) {
                   * and thread+14. A TDB like the boot task's (k32host): +16
                   * flags (10h, a Win32 task), +60 its PSP, +66 the drive with
                   * bit 7 (+100 holds the directory), 'TD' at +FA. */
-        uint8_t* tdb = calloc(1, 0x200);
+        uint8_t* tdb = vxd_block(0x200);
         tdb[0x16] = 0x10;
         *(uint16_t*)(tdb + 0x60) = MEM16(sp + 6);
         tdb[0x66] = 0x80 | 2;
@@ -509,8 +547,8 @@ static void qt_stub(void) {
         for (int i = 0; i < 48; i++) fprintf(stderr, " %08X", MEM32(g_ebp + 36 + 4 * i));
         fprintf(stderr, "\n");
     }
-    g_eax = 0xBFF727D9u;
-    recomp_lookup(0xBFF727D9u)();
+    g_eax = k32()->qt_thunk;
+    recomp_lookup(k32()->qt_thunk)();
 }
 
 /* The FT_Prolog form of the same stub (user32 0xBFF5D4AA, into USER.EXE):
@@ -532,7 +570,7 @@ static void ft_stub(void) {
     if (qa && (g_edx & 0xFFFF) == strtoul(qa, NULL, 16))
         fprintf(stderr, "[ft] %04X:%04X from %08X: %08X %08X %08X %08X %08X %08X %08X\n", g_edx >> 16, g_edx & 0xFFFF, MEM32(g_ebp + 4),
                 MEM32(g_ebp + 8), MEM32(g_ebp + 12), MEM32(g_ebp + 16), MEM32(g_ebp + 20), MEM32(g_ebp + 24), MEM32(g_ebp + 28), MEM32(g_ebp + 32));
-    recomp_lookup(0xBFF7268Du)();
+    recomp_lookup(k32()->ft_target)();
 }
 
 /* The same two stubs already rewritten (shell32's INSTDATA 0x7FD38508/28,
@@ -666,7 +704,13 @@ static uint32_t vmm_heap_alloc(const uint32_t* a) {
 }
 /* VMM service 10h (block, flags): _HeapFree of a service-5 block
  * (0xBFF7CF3B frees kernel32's ring-0 allocations through it). */
-static uint32_t vmm_heap_free(const uint32_t* a) { return a[0] ? HeapFree(vmm_heap(), 0, (void*)(uintptr_t)a[0]) : 1; }
+static uint32_t vmm_heap_free(const uint32_t* a) {
+    /* Win95 hands a dying thread's block (thread +60) back here
+     * (0xBFF87632), where Win98 SE uses VWIN32 58: one of the host's own
+     * (vxd_block), kept, as 58 keeps it */
+    if (is_vxd_block(a[0])) return 1;
+    return a[0] ? HeapFree(vmm_heap(), 0, (void*)(uintptr_t)a[0]) : 1;
+}
 /* VMM service 0Ch (block, nbytes, flags): _HeapReAllocate of a service-5 block
  * (a process's handle table at PDB+44h grows through it, 0xBFF7D7B0). */
 static uint32_t vmm_heap_realloc(const uint32_t* a) {
@@ -718,14 +762,14 @@ static void note_tid(uint32_t r0);
 /* A TDBX: +0 its thread, +4 its process (ExitProcess reads it, 0xBFF89768),
  * +50 -> the current PSP selector. */
 static uint32_t new_tdbx(uint32_t thread, uint32_t process) {
-    uint8_t* tdbx = calloc(1, 0x100);
+    uint8_t* tdbx = vxd_block(0x100);
     *(uint32_t*)(tdbx + 0x00) = thread;
     *(uint32_t*)(tdbx + 0x04) = process;
-    *(uint32_t*)(tdbx + 0x50) = (uint32_t)(uintptr_t)&g_cur_psp;
+    *(uint32_t*)(tdbx + k32()->tdbx_psp) = (uint32_t)(uintptr_t)&g_cur_psp;   /* the current PSP word (Win98 SE 0xBFF76547 +50, Win95 0xBFF76512 +40) */
     return (uint32_t)(uintptr_t)tdbx;
 }
 static uint32_t vwin32_create_thread(const uint32_t* a) {
-    uint8_t* r0 = calloc(1, 0x100);
+    uint8_t* r0 = vxd_block(0x100);
     track_thread((uint32_t)(uintptr_t)r0);
     *(uint32_t*)(r0 + R0T_ENTRY) = a[5];
     *(uint32_t*)(r0 + R0T_ESP) = a[7];
@@ -780,7 +824,7 @@ static void run_termination(uint32_t blk) {
 uint16_t* g_w9x_curtdb;
 static void cur_task(void) {
     uint16_t tdb;
-    if (g_w9x_curtdb && g_cur[0] && (tdb = *(uint16_t*)(uintptr_t)(g_cur[0] + 0x14)) != 0) *g_w9x_curtdb = tdb;
+    if (g_w9x_curtdb && g_cur[0] && (tdb = *(uint16_t*)(uintptr_t)(g_cur[0] + k32()->thread_tdb)) != 0) *g_w9x_curtdb = tdb;
 }
 
 static uint32_t vwin32_thread_done(const uint32_t* a);
@@ -1104,21 +1148,22 @@ static uint32_t vcond_init(const uint32_t* a) { (void)a; return 0; }
  * new console's object, which kernel32 flags at +10 (|= 20h). On Win98 the
  * agent builds it by calling back into kernel32 (16-bit entry 0xBFF941D9 ->
  * 0xBFF8E9E1 (info, word)): a 0x470-byte object with its crst at +20, two
- * buffers at +40/+44, +150 the VCOND handle (from VCOND 2), +46C an event.
+ * buffers at +40/+44, +150 the VCOND handle (from VCOND 2), +46C an event
+ * (Win95: 0xBFF8C35E, 0x478 bytes, each field 8 further, the process's +AC).
  * The host has no agent, so it runs that constructor itself, on the
  * creating thread, and puts back the process's +B0 the constructor sets
  * (the agent's, on Win98). */
 static uint32_t vcond_new_console(const uint32_t* a) {
     static uint8_t info[0x100];
-    uint32_t pdb = g_cur[1], b0 = MEM32(pdb + 0xB0);
+    uint32_t pdb = g_cur[1], b0 = MEM32(pdb + k32()->pdb_console);
     uint32_t saved[8] = { g_eax, g_ecx, g_edx, g_ebx, g_esp, g_ebp, g_esi, g_edi };
     uint32_t args[2] = { (uint32_t)(uintptr_t)info, 0 };
     (void)a;
-    native32_call_guest(0xBFF8E9E1, 2, args);
+    native32_call_guest(k32()->console_new, 2, args);
     uint32_t c = g_eax;
     g_eax = saved[0]; g_ecx = saved[1]; g_edx = saved[2]; g_ebx = saved[3];
     g_esp = saved[4]; g_ebp = saved[5]; g_esi = saved[6]; g_edi = saved[7];
-    MEM32(pdb + 0xB0) = b0;
+    MEM32(pdb + k32()->pdb_console) = b0;
     if (g_trace > 0) fprintf(stderr, "[vcond] console object %08X\n", c);
     return c;
 }
@@ -1189,7 +1234,10 @@ static uint32_t vwin32_crst_wake(const uint32_t* a) {
         uint32_t r0 = g_threads[t];
         if (MEM32(r0 + R0T_CRST) != a[0]) continue;
         MEM32(r0 + R0T_CRST) = 0;
-        MEM32(a[0] + 8) = MEM32(r0 + R0T_TDBX);
+        /* the owner as EnterCrst writes it: Win95's kernel32 (0xBFF7424F) and KRNL386
+         * (1:7EDE) store the thread object, Win98's the TDBX. With the TDBX here a woken
+         * Win95 thread re-entering its own crst waited on itself. */
+        MEM32(a[0] + 8) = MEM32(r0 + (native32_w9x_is_win95() ? R0T_THREAD : R0T_TDBX));
         MEM32(a[0] + 4) = 1;
         if (!MEM32(r0 + R0T_WAKE)) MEM32(r0 + R0T_WAKE) = (uint32_t)(uintptr_t)CreateEventA(NULL, FALSE, FALSE, NULL);
         SetEvent((HANDLE)(uintptr_t)MEM32(r0 + R0T_WAKE));
@@ -1296,8 +1344,8 @@ static uint32_t vwin32_thread_done(const uint32_t* a) {
          * {+04 recursion, +08 owner TDBX, +10 lock count}: give up every
          * level, then hand it on as LeaveCriticalSection's 1E would.
          * ponytail: 0xBFFC9470 is Win98 SE kernel32's Win16Mutex pointer. */
-        uint32_t m = MEM32(0xBFFC9470u);
-        if (m && MEM32(m + 8) == MEM32(r0 + R0T_TDBX)) {
+        uint32_t m = MEM32(k32()->win16mutex);
+        if (m && MEM32(m + 8) == MEM32(r0 + (native32_w9x_is_win95() ? R0T_THREAD : R0T_TDBX))) {   /* Win95: the thread object */
             uint32_t n = MEM32(m + 4);
             MEM32(m + 4) = 0; MEM32(m + 8) = 0; MEM32(m + 0x10) += n;   /* an enter decrements (0xBFF741CA, KRNL386 1:7D85): 1 is free */
             if (g_trace > 0) fprintf(stderr, "[vxd] thread %08X ended holding the Win16Mutex (%u): released (count %d)\n", g_cur[0], n, (int32_t)MEM32(m + 0x10));
@@ -1429,7 +1477,7 @@ static uint32_t vwin32_first_thread(const uint32_t* a) {
     g_cur[0] = blk[0]; g_cur[1] = blk[1]; g_cur[2] = new_tdbx(blk[0], blk[1]);
     g_cur_psp = g_w9x_psp_sel;
     g_k32_thread_term = blk[0x24 / 4];
-    blk[0x0C / 4] = g_boot_r0 = (uint32_t)(uintptr_t)calloc(1, 0x100);   /* its ring-0 twin */
+    blk[0x0C / 4] = g_boot_r0 = (uint32_t)(uintptr_t)vxd_block(0x100);   /* its ring-0 twin */
     MEM32(g_boot_r0 + R0T_THREAD) = blk[0];
     MEM32(g_boot_r0 + R0T_PROCESS) = blk[1];
     MEM32(g_boot_r0 + R0T_TDBX) = g_cur[2];
@@ -1451,7 +1499,9 @@ static uint32_t vwin32_first_thread(const uint32_t* a) {
     blk[0x10 / 4] = (uint32_t)(uintptr_t)g_cur;
     ((uint16_t*)blk)[0x1C / 2] = g_w9x_psp_sel;
     ((uint16_t*)blk)[0x1E / 2] = 0;
-    blk[0x44 / 4] = nls_block();
+    /* the NLS tables: +44 on Win98 SE; +3C on Win95, whose +44 is an input
+     * (0xBFFBB5D4; read back by 0xBFFBA30E into [0xBFFBC2B8]) */
+    blk[(native32_w9x_is_win95() ? 0x3C : 0x44) / 4] = nls_block();
     return 0;
 }
 
@@ -1476,8 +1526,11 @@ static int host_path(uint32_t guest, char* out) {
     char g[MAX_PATH], full[2 * MAX_PATH], *p = g;
     size_t i = 0;
     if (!g_root[0]) {
-        const char* r = getenv("NATIVE32_W9X_ROOT");
-        GetFullPathNameA(r ? r : "root", MAX_PATH, g_root, NULL);
+        /* the process's own environment: a host sets it with SetEnvironmentVariable,
+         * which the CRT's getenv copy does not see in this process */
+        char r[MAX_PATH];
+        DWORD n = GetEnvironmentVariableA("NATIVE32_W9X_ROOT", r, MAX_PATH);
+        GetFullPathNameA(n && n < MAX_PATH ? r : "root", MAX_PATH, g_root, NULL);
         CreateDirectoryA(g_root, NULL);
     }
     for (; i + 1 < sizeof g && MEM8(guest + i); i++) g[i] = (char)MEM8(guest + i);
@@ -1566,6 +1619,7 @@ static uint32_t vwin32_int21(const uint32_t* a) {
     g_eax = a[0];
     g_cf = 0;
     uint8_t ah = (uint8_t)(g_eax >> 8), al = (uint8_t)g_eax;
+    if (getenv("W9X_DOSTRACE")) { char t[96] = ""; if ((ah == 0x71 && (al == 0x4E || al == 0x6C || al == 0x43 || al == 0x60)) || ah == 0x3D || ah == 0x4E) { for (int k = 0; k < 95; k++) { uint32_t a = ah == 0x71 && al == 0x6C ? g_esi : g_edx; t[k] = (char)MEM8(a + k); if (!t[k]) break; } t[95] = 0; } fprintf(stderr, "[dos] %04X %s\n", (uint16_t)g_eax, t); }
     uint16_t ax = (uint16_t)g_eax;
     if (g_trace > 0) fprintf(stderr, "[int21] AX=%04X ebx=%08X ecx=%08X edx=%08X esi=%08X edi=%08X\n", ax, g_ebx, g_ecx, g_edx, g_esi, g_edi);
     switch (ah) {
@@ -1649,6 +1703,7 @@ static uint32_t vwin32_int21(const uint32_t* a) {
         DWORD share = ah == 0x3C ? FILE_SHARE_READ | FILE_SHARE_WRITE : (al & 0x70) == 0x10 ? 0 : (al & 0x70) == 0x20 ? FILE_SHARE_READ
                     : (al & 0x70) == 0x30 ? FILE_SHARE_WRITE : FILE_SHARE_READ | FILE_SHARE_WRITE;
         if (!host_path(g_edx, path)) { dos_fail(3); return g_eax; }
+        if (getenv("W9X_OPENTRACE")) fprintf(stderr, "[open] %s (8.3)\n", path);
         HANDLE fh = CreateFileA(path, acc, share, NULL, ah == 0x3C ? CREATE_ALWAYS : OPEN_EXISTING,
                                 ah == 0x3C && ((uint16_t)g_ecx & 0x27) ? ((uint16_t)g_ecx & 0x27) : FILE_ATTRIBUTE_NORMAL, NULL);
         if (fh == INVALID_HANDLE_VALUE) { dos_fail(host_err()); return g_eax; }
@@ -1759,6 +1814,7 @@ static uint32_t vwin32_int21(const uint32_t* a) {
             DWORD disp = (act & 0x10) ? ((act & 3) == 1 ? OPEN_ALWAYS : (act & 3) == 2 ? CREATE_ALWAYS : CREATE_NEW)
                                       : ((act & 3) == 2 ? TRUNCATE_EXISTING : OPEN_EXISTING);
             if (!host_path(g_esi, path)) { dos_fail(3); return g_eax; }
+            if (getenv("W9X_OPENTRACE")) fprintf(stderr, "[open] %s\n", path);   /* every LFN open the guest makes */
             DWORD pre = GetFileAttributesA(path);
             HANDLE fh = CreateFileA(path, acc, share, NULL, disp, ((uint16_t)g_ecx & 0x27) ? ((uint16_t)g_ecx & 0x27) : FILE_ATTRIBUTE_NORMAL, NULL);
             if (fh == INVALID_HANDLE_VALUE) { dos_fail(host_err()); return g_eax; }
@@ -1833,6 +1889,138 @@ int native32_w9x_int21(uint32_t eax, uint32_t ecx) {
     g_eax = vwin32_int21(a);
     return g_cf;
 }
+
+/* Windows 95's own services (kernel32 4.00.1111), tried first on that build.
+ * Its Krn32Mutex is a crst at a fixed address (0xBFFBFA60: +4 recursion, +8
+ * owner, +10 count, set up by _INIT) whose contention is VWIN32 4 (wait) and
+ * 5 (wake), with no pointer: Win98 SE made it a crst like any other (1D/1E).
+ * The woken waiter takes the ownership itself (kernel32 0xBFF743AF), so the
+ * wake hands nothing over. */
+static uint32_t w95_krn32_wait(const uint32_t* a) {
+    uint32_t r0 = t_r0 ? t_r0 : g_boot_r0;
+    (void)a;
+    MEM32(r0 + R0T_CRST) = k32()->krn32mutex;
+    if (g_trace > 0) fprintf(stderr, "[vxd] thread %08X waits for Krn32Mutex (owner %08X)\n", g_cur[0], MEM32(k32()->krn32mutex + 8));
+    while (MEM32(r0 + R0T_CRST)) w9x_wait(thread_wake(), INFINITE);
+    return 0;
+}
+static uint32_t w95_krn32_wake(const uint32_t* a) {
+    (void)a;
+    for (int t = 0; t < g_nthreads; t++) {
+        uint32_t r0 = g_threads[t];
+        if (MEM32(r0 + R0T_CRST) != k32()->krn32mutex) continue;
+        MEM32(r0 + R0T_CRST) = 0;
+        if (!MEM32(r0 + R0T_WAKE)) MEM32(r0 + R0T_WAKE) = (uint32_t)(uintptr_t)CreateEventA(NULL, FALSE, FALSE, NULL);
+        SetEvent((HANDLE)(uintptr_t)MEM32(r0 + R0T_WAKE));
+        break;
+    }
+    return 0;
+}
+/* A blocking VWIN32 call on Win95 is made holding the Krn32Mutex, and ring 0
+ * gives it up for the caller: kernel32 enters it just before (SleepEx,
+ * 0xBFF864B6) and does not leave it after. Here that is kernel32's own
+ * LeaveKrn32 (0xBFF743D3), run before the block when this thread owns it
+ * (the owner is the dword at *ppCurThread's thread, 0xBFFBC280). */
+static void w95_krn32_drop(void) {
+    uint32_t m = k32()->krn32mutex, pp = MEM32(k32()->cur_thread);
+    if (!pp || !MEM32(pp) || MEM32(m + 8) != MEM32(MEM32(pp))) return;
+    uint32_t saved[8] = { g_eax, g_ecx, g_edx, g_ebx, g_esp, g_ebp, g_esi, g_edi };
+    native32_call_guest(k32()->leave_krn32, 0, NULL);
+    g_eax = saved[0]; g_ecx = saved[1]; g_edx = saved[2]; g_ebx = saved[3];
+    g_esp = saved[4]; g_ebp = saved[5]; g_esi = saved[6]; g_edi = saved[7];
+}
+static uint32_t w95_block(const uint32_t* a) { w95_krn32_drop(); return vwin32_block(a); }
+/* Win95's waits. kernel32 keeps the objects' state itself, under the
+ * Krn32Mutex: a sync object is {+0 type: 1 semaphore, 2 event, 3 mutex;
+ * +0C ring 0's waiter list; +10 the count (an event's state); +18 an
+ * event's flags (bit 0 manual reset), a mutex's owner}; a process or a
+ * thread (type > 4) has one at +0C (0xBFF799E9). kernel32 tries the objects
+ * before it blocks (0xBFF96882), and when it signals one whose +0C is set it
+ * calls VWIN32 30 (0xBFF79969) to wake the waiters. So VWIN32 2E/2F is:
+ * try again, else mark the objects waited on, block, retry when woken.
+ * The tries are kernel32's own rules (0xBFF79985 any, 0xBFF9680A +
+ * 0xBFF9683D all), the owner *[0xBFFBC278]'s thread.
+ * ponytail: +0C holds a waiter count, not ring 0's list; every wake wakes
+ * all of an object's waiters, who race for it again. */
+static uint32_t w95_sync(uint32_t o) { return MEM32(o) > 4 ? MEM32(o + 0xC) : o; }
+static uint32_t w95_me(void) { return MEM32(MEM32(MEM32(0xBFF71008u))); }   /* KEXP+8 (0xBFFBC278): -> the current thread */
+static int w95_take_any(uint32_t o, uint32_t me) {   /* 0xBFF79985 */
+    switch (MEM32(o)) {
+    case 1: if ((int32_t)MEM32(o + 0x10) <= 0) return 0; MEM32(o + 0x10)--; return 1;
+    case 2: if ((int32_t)MEM32(o + 0x10) <= 0) return 0; if (!(MEM32(o + 0x18) & 1)) MEM32(o + 0x10) = 0; return 1;
+    case 3: if ((int32_t)MEM32(o + 0x10) <= 0 && MEM32(o + 0x18) != me) return 0;
+            MEM32(o + 0x18) = me; MEM32(o + 0x10)--; return 1;
+    }
+    return 0;
+}
+static int w95_signalled(uint32_t o, uint32_t me) {   /* 0xBFF9680A */
+    if (MEM32(o) == 3) return MEM32(o + 0x18) == me || (int32_t)MEM32(o + 0x10) > 0;
+    return (int32_t)MEM32(o + 0x10) > 0;
+}
+static void w95_take(uint32_t o, uint32_t me) {   /* 0xBFF9683D */
+    if (MEM32(o) == 2 && (MEM32(o + 0x18) & 1)) return;
+    if (MEM32(o) == 3) MEM32(o + 0x18) = me;
+    MEM32(o + 0x10)--;
+}
+/* a[]: count, objects, timeout ms, wait all, alertable */
+static uint32_t w95_wait(uint32_t n, uint32_t objs, uint32_t ms, uint32_t all) {
+    uint32_t r0 = t_r0 ? t_r0 : g_boot_r0, me = w95_me();
+    DWORD t0 = GetTickCount();
+    w95_krn32_drop();
+    /* console input: ready, the read blocks on stdin (as Win98's). kernel32
+     * hands 2E the console's sync object (+0C, ReadConsole 0xBFFA221B) */
+    for (uint32_t i = 0; g_console_obj && i < n; i++)
+        if (w95_sync(MEM32(objs + 4 * i)) == w95_sync(g_console_obj)) return i;
+    for (;;) {
+        uint32_t i, ok = 1;
+        if (all) {
+            for (i = 0; i < n; i++) ok &= w95_signalled(w95_sync(MEM32(objs + 4 * i)), me);
+            if (ok) { for (i = 0; i < n; i++) w95_take(w95_sync(MEM32(objs + 4 * i)), me); return 0; }
+        } else {
+            for (i = 0; i < n; i++) if (w95_take_any(w95_sync(MEM32(objs + 4 * i)), me)) return i;
+        }
+        for (i = 0; i < n; i++) MEM32(w95_sync(MEM32(objs + 4 * i)) + 0xC) += 1;   /* kernel32 calls VWIN32 30 on a signal */
+        MEM32(r0 + R0T_WAITN) = n;
+        MEM32(r0 + R0T_WAITS) = objs;
+        DWORD left = ms == 0xFFFFFFFFu ? INFINITE : (GetTickCount() - t0 >= ms ? 0 : ms - (GetTickCount() - t0));
+        if (g_trace > 0) fprintf(stderr, "[vxd] thread %08X waits on %u objects (%s, %d ms), first %08X\n", g_cur[0], n, all ? "all" : "any", (int)left, MEM32(objs));
+        DWORD rc = left ? w9x_wait(thread_wake(), left) : WAIT_TIMEOUT;
+        MEM32(r0 + R0T_WAITN) = 0;
+        for (i = 0; i < n; i++) { uint32_t y = w95_sync(MEM32(objs + 4 * i)); if (MEM32(y + 0xC)) MEM32(y + 0xC) -= 1; }
+        if (rc == WAIT_TIMEOUT) return 0x102;
+    }
+}
+static uint32_t w95_wait_single(const uint32_t* a) { uint32_t o[1] = { a[0] }; return w95_wait(1, (uint32_t)(uintptr_t)o, a[1], 0); }
+static uint32_t w95_wait_multiple(const uint32_t* a) { return w95_wait(a[0], a[1], a[2], a[3]); }
+/* VWIN32 30 (sync object, flag): kernel32 signalled it; wake its waiters */
+static uint32_t w95_wake_waiters(const uint32_t* a) {
+    for (int t = 0; t < g_nthreads; t++) {
+        uint32_t r0 = g_threads[t], n = MEM32(r0 + R0T_WAITN);
+        for (uint32_t i = 0; i < n; i++)
+            if (w95_sync(MEM32(MEM32(r0 + R0T_WAITS) + 4 * i)) == a[0]) {
+                MEM32(r0 + R0T_WAITN) = 0;
+                if (!MEM32(r0 + R0T_WAKE)) MEM32(r0 + R0T_WAKE) = (uint32_t)(uintptr_t)CreateEventA(NULL, FALSE, FALSE, NULL);
+                SetEvent((HANDLE)(uintptr_t)MEM32(r0 + R0T_WAKE));
+                break;
+            }
+    }
+    return 0;
+}
+static const vxd_service_t g_services_w95[] = {
+    { 0x002A002D, 2, w95_block, "VWIN32_95_BlockThread" },
+    { 0x002A002E, 3, w95_wait_single, "VWIN32_95_WaitSingle" },
+    { 0x002A002F, 5, w95_wait_multiple, "VWIN32_95_WaitMultiple" },
+    { 0x002A0030, 2, w95_wake_waiters, "VWIN32_95_WakeWaiters" },
+    { 0x002A0004, 1, w95_krn32_wait, "VWIN32_95_WaitKrn32Mutex" },
+    { 0x002A0005, 1, w95_krn32_wake, "VWIN32_95_WakeKrn32Mutex" },
+    { 0, 0, NULL, NULL },
+};
+/* Win95 ids that are a Win98 SE service under another number, paired from
+ * the two kernel32s' call graphs (win95-recomp tools/k32svc.py) and checked
+ * against what the caller does with it. */
+static const uint32_t g_renum_w95[][2] = {
+    { 0, 0 },
+};
 
 static const vxd_service_t g_services[] = {
     { 0x002A0010, 2, vwin32_int21, "VWIN32_Int21Dispatch" },
@@ -2150,7 +2338,15 @@ int recomp_farcall32(uint32_t ptr) {
     uint32_t id = g_eax, *a = (uint32_t*)(uintptr_t)(g_esp + 4);
     (void)ptr;
     if (g_trace < 0) g_trace = getenv("NATIVE32_VXD") != NULL;
-    for (const vxd_service_t* s = g_services; s->fn; s++) {
+    const vxd_service_t* s = g_services;
+    if (native32_w9x_is_win95()) {
+        for (s = g_services_w95; s->fn && s->id != id; s++) {}
+        if (!s->fn) {
+            for (int i = 0; g_renum_w95[i][0]; i++) if (g_renum_w95[i][0] == id) { id = g_renum_w95[i][1]; break; }
+            s = g_services;
+        }
+    }
+    for (; s->fn; s++) {
         if (s->id != id) continue;
         g_cf = 0;
         uint32_t r = s->fn(a);

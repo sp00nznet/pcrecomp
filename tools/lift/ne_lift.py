@@ -1117,21 +1117,34 @@ def lift_segment(ne: NEHeader, seg_num: int, func_offset: int = -1, xmod=None):
         # address. GDI seg1 9658: `push edi ... pop esi; pop bx; jmp 964E`
         # (the outer frame's epilogue), so a straight-line scan missed it.
         # ponytail: `add/sub/mov sp` and pusha end a path (not counted).
-        def _pops_past(start):
+        # After a call the depth is unknown (a pascal callee pops its own
+        # args): a pop, then a jmp out of the function, is still a return
+        # past (GDI seg1 8334: `call far ...; pop ax; pop bx; jmp 82F4`, the
+        # caller's epilogue). d is None there.
+        def _pops_past(start, end):
             work, seen, steps = [(start, 0)], set(), 0
             while work and steps < 400:
                 o, d = work.pop()
+                popped = False
                 while o in _by_off and (o, d) not in seen and steps < 400:
                     seen.add((o, d)); steps += 1
                     i = _by_off[o]
                     mn = i.mnemonic
                     w = 4 if 0x66 in bytes(i.raw[:2]) else 2
-                    if mn in ('push', 'pushf'):
+                    if d is None:
+                        if mn == 'jmp' and popped and i.op1 is not None and i.op1.type in (OpType.REL8, OpType.REL16)                                 and not start <= i.op1.disp < end:
+                            return True
+                        popped = mn == 'pop'
+                        if mn in ('enter', 'leave', 'ret', 'retf', 'iret', 'int', 'pusha', 'pushad', 'popa', 'popad'):
+                            break
+                    elif mn in ('push', 'pushf'):
                         d += w
                     elif mn in ('pop', 'popf'):
                         d -= w
                         if d < 0:
                             return True
+                    elif mn == 'call' and i.op1 is not None and i.op1.type == OpType.FAR:
+                        d = None
                     elif mn in ('call', 'enter', 'leave', 'ret', 'retf', 'iret', 'int', 'pusha', 'pushad', 'popa', 'popad'):
                         break
                     elif i.op1 is not None and i.op1.type == OpType.REG16 and REG16_NAMES[i.op1.reg] == 'sp' and mn not in ('cmp', 'test'):
@@ -1146,7 +1159,7 @@ def lift_segment(ne: NEHeader, seg_num: int, func_offset: int = -1, xmod=None):
                     o += i.length
             return False
         for f in functions:
-            if _pops_past(f.offset):
+            if _pops_past(f.offset, f.end):
                 lifter.popsret_offsets.add(f.offset)
 
     # Functions whose near `ret` is reached with words of their own still on
@@ -1251,6 +1264,28 @@ def lift_segment(ne: NEHeader, seg_num: int, func_offset: int = -1, xmod=None):
         last = func_insts[-1]
         e = last.offset - seg.file_offset + last.length
         dec = Decoder(seg.data, base_offset=seg.file_offset, use32=seg.use32)
+        # The last instruction can also run past the next start itself (Win95 GDI
+        # 1:8B53 `mov di, 1` over 8B55, a branch target in data decoded as code):
+        # the CPU goes on at its end, never at the start it straddles. Decode on
+        # from there the same way. (If this stream is the bogus one, it never runs.)
+        straddle = last.mnemonic not in TERMINATORS and e > func.end and e not in off_to_label
+        if straddle:
+            ext, ok, e2 = [], False, e
+            while len(ext) < 512 and 0 <= e2 < len(seg.data):
+                dec.pos = e2
+                i = dec.decode_one()
+                if i is None:
+                    break
+                ext.append(i)
+                e2 += i.length
+                if i.mnemonic in TERMINATORS or e2 in off_to_label:
+                    ok = True
+                    break
+            if ok:
+                func_insts = func_insts + ext
+                fall_off = e2
+        elif last.mnemonic not in TERMINATORS and e > func.end and e in off_to_label:
+            fall_off = e
         if last.mnemonic not in TERMINATORS and e < func.end and e not in off_to_label:
             dec.pos = e
             i = dec.decode_one()
@@ -1261,8 +1296,11 @@ def lift_segment(ne: NEHeader, seg_num: int, func_offset: int = -1, xmod=None):
             # and only the classic skip idiom: a 3-byte `mov r16, imm16` /
             # `cmp ax, imm16` / `test ax, imm16` whose immediate is the entry's
             # code (padding before a prologue straddles entries too, never runs)
-            if (i is not None and e + i.length > func.end and func.end in _known_entries
-                    and i.length == 3 and seg.data[e] in (0x3D, 0xA9, *range(0xB8, 0xC0))):
+            # Or any instruction over a start that is only the code map's guess (Win95 GDI
+            # 1:5665 `mov ax, [bp+0Ch]` over 5666: CreatePen fell into 5666 and lost
+            # `push ax`); the CPU can never land inside an instruction it is running.
+            if (i is not None and e + i.length > func.end and (func.end not in _known_entries or (
+                    i.length == 3 and seg.data[e] in (0x3D, 0xA9, *range(0xB8, 0xC0))))):
                 ext, ok = [], False
                 while len(ext) < 512 and 0 <= e < len(seg.data):
                     dec.pos = e

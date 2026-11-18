@@ -583,7 +583,7 @@ static void disp_checkcursor(CPU *c) { ret_far(c, 0); }
  * scans copied. A DIB is bottom-up, BITMAPINFOHEADER then its color table; 1/4/8/16/24/32 bpp
  * (16 as 5-5-5). A 4/8 bpp get from a DIB of that depth copies its indices and color table
  * (comctl32 ImageList_Draw goes through one), else the nearest entry of the given table.
- * ponytail: BI_RGB only. */
+ * BI_RLE4/8 sets are unpacked first (dib_unrle). */
 static uint16_t dib_px(const uint8_t *row, int x, int bpp, const uint8_t *pal) {
     const uint8_t *q;
     switch (bpp) {
@@ -596,6 +596,27 @@ static uint16_t dib_px(const uint8_t *row, int x, int bpp, const uint8_t *pal) {
     }
     return rgb565((uint32_t)q[2] | (uint32_t)q[1] << 8 | (uint32_t)q[0] << 16);
 }
+/* BI_RLE8 (1) / BI_RLE4 (2) bits unpacked to plain bottom-up rows of the same depth (calloc'd,
+ * the caller frees; NULL for BI_RGB). Explorer's Start-menu banner (bitmap 157) is RLE4. */
+static uint8_t *dib_unrle(const uint8_t *bi, const uint8_t *src, int w, int hh, int bpp, int stride) {
+    uint32_t comp = *(const uint32_t *)(bi + 16), n = *(const uint32_t *)(bi + 20);
+    if ((comp != 1 && comp != 2) || bpp != (comp == 1 ? 8 : 4)) return NULL;
+    uint8_t *out = (uint8_t *)calloc((size_t)hh, (size_t)stride);
+    const uint8_t *p = src, *e = src + (n ? n : (uint32_t)(hh * stride * 2));
+    int x = 0, y = 0;
+#define PUT(v) do { if (x < w && y < hh) { uint8_t *r_ = out + (size_t)y * stride;         if (bpp == 8) r_[x] = (uint8_t)(v); else r_[x >> 1] |= (uint8_t)(((v) & 15) << ((x & 1) ? 0 : 4)); } x++; } while (0)
+    while (p + 1 < e && y < hh) {
+        int a = p[0], b = p[1]; p += 2;
+        if (a) { for (int k = 0; k < a; k++) PUT(bpp == 8 ? b : (k & 1) ? b & 15 : b >> 4); continue; }
+        if (b == 0) { x = 0; y++; continue; }               /* end of line */
+        if (b == 1) break;                                   /* end of bitmap */
+        if (b == 2) { if (p + 1 >= e) break; x += p[0]; y += p[1]; p += 2; continue; }   /* delta */
+        for (int k = 0; k < b; k++) PUT(bpp == 8 ? p[k] : (k & 1) ? p[k >> 1] & 15 : p[k >> 1] >> 4);   /* absolute run */
+        p += bpp == 8 ? (b + 1) & ~1 : ((b + 3) / 4) * 2;
+    }
+#undef PUT
+    return out;
+}
 static void disp_dibbits(CPU *c) {
     uint32_t lpbi = argfar(c, 4), lpbits = argfar(c, 6), lpbm = argfar(c, 11);
     int scans = arg16(c, 8), start = arg16(c, 9), get = arg16(c, 10);
@@ -604,7 +625,8 @@ static void disp_dibbits(CPU *c) {
     int ncol = *(const uint32_t *)(bi + 32); if (!ncol && bpp <= 8) ncol = 1 << bpp;
     const uint8_t *pal = bi + *(const uint32_t *)bi;
     int stride = ((w * bpp + 31) / 32) * 4, hh = h < 0 ? -h : h;
-    uint8_t *bits = (uint8_t *)farptr(lpbits);
+    uint8_t *bits = (uint8_t *)farptr(lpbits), *unrle = get ? NULL : dib_unrle(bi, bits, w, hh, bpp, stride);
+    if (unrle) bits = unrle + (size_t)start * stride;
     surf_t s; int done = 0;
     int same = 0;   /* a get from a palettized DIB of this depth: its indices and color table as they are */
     if (surf_of(lpbm, &s) && get && bpp <= 8 && bpp > 1) {
@@ -643,6 +665,7 @@ static void disp_dibbits(CPU *c) {
             done++;
         }
     (void)ncol;
+    free(unrle);
     if (getenv("W16_TRACE")) fprintf(stderr, "[drv] DISPLAY.DeviceBitmapBits %s %dx%d %dbpp scans %d+%d -> %d (bi %08X bits %08X: %08X %08X, table %08X %08X same %d)\n", get ? "get" : "set", w, h, bpp, start, scans, done,
                                          lpbi, lpbits, *(const uint32_t *)(bits + 8 * stride), *(const uint32_t *)(bits + 8 * stride + 4), *(const uint32_t *)(pal + 4), *(const uint32_t *)(pal + 36), same);
     c->ax = (uint16_t)done; ret_far(c, 26);
@@ -661,6 +684,8 @@ static void disp_dibtodev(CPU *c) {
     int w = *(const int32_t *)(bi + 4), h = *(const int32_t *)(bi + 8), bpp = *(const uint16_t *)(bi + 14);
     const uint8_t *pal = bi + *(const uint32_t *)bi;
     int stride = ((w * bpp + 31) / 32) * 4, hh = h < 0 ? -h : h, done = 0;
+    uint8_t *unrle = dib_unrle(bi, bits, w, hh, bpp, stride);
+    if (unrle) bits = unrle + (size_t)start * stride;
     surf_t s;
     if (surf_of(argfar(c, 14), &s))
         for (int i = 0; i < scans && start + i < hh; i++, done++) {
@@ -670,6 +695,7 @@ static void disp_dibtodev(CPU *c) {
             for (int x = 0; x < w; x++)
                 if (!cr || (x0 + x >= cr->l && x0 + x < cr->r)) surf_put(&s, x0 + x, y, dib_px(row, x, bpp, pal));
         }
+    free(unrle);
     if (getenv("W16_TRACE")) fprintf(stderr, "[drv] DISPLAY.DIBtoDevice %d,%d %dx%d %dbpp scans %d+%d -> %d\n", x0, y0, w, h, bpp, start, scans, done);
     c->ax = (uint16_t)done; ret_far(c, 32);
 }
@@ -687,7 +713,13 @@ static void sys_fpu_save(CPU *c) { ret_far(c, 4); }
  * Timers run from the tick thread (below); W16_INPUT drives the mouse and keyboard procs. */
 static void kb_inquire(CPU *c) {
     uint8_t *k = (uint8_t *)farptr(argfar(c, 0));
-    k[0] = 0xFF; k[1] = 0xFE; k[2] = 0xFF; k[3] = 0xFE; put16((char *)k, 4, 0); put16((char *)k, 6, 12);
+    int native32_w9x_is_win95(void);
+    k[0] = 0xFF; k[1] = 0xFE; k[2] = 0xFF; k[3] = 0xFE; put16((char *)k, 4, 0);
+    /* Windows 95's KBINFO stops at StateSize: USER keeps its global hook table right
+     * after it (USER ds:0CC6 + 6 = 0CCC, WH_MSGFILTER's slot), so a NumFuncKeys
+     * there is a hook at 000C (its menu loop called 0100:0000) */
+    if (native32_w9x_is_win95()) { c->ax = 6; ret_far(c, 4); return; }
+    put16((char *)k, 6, 12);
     c->ax = 8; ret_far(c, 4);
 }
 static uint32_t g_kb_proc;
