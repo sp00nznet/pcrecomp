@@ -265,10 +265,12 @@ static void batch(void) {
         } else if (cmd == 6) {                                 /* select a font: DC_ATTR's is current */
             uint8_t* a = native32_gdi_attr(hdc);
             if (a) AT32(a, 0x90) = MEM32(e + 4);
+            if (getenv("PCRECOMP_TEXTTRACE")) fprintf(stderr, "[gdi] batch font dc %08X font %08X\n", hdc, MEM32(e + 4));
         } else if (cmd == 2) {                                 /* TextOut { fg, bk, bk mode, ?, ?, x, y, options (bit 31: */
             HDC h = dc(hdc);                                   /* no rect), RECT, cp, count, ?, font, align, viewport org, text } */
             uint32_t x = e + nt_batch_textout(native32_guest_peb);   /* (XP: from x on, 8 later) */
             uint32_t f = HOST(MEM32(x + 0x38)), o = MEM32(x + 0x18);
+            if (getenv("PCRECOMP_TEXTTRACE")) fprintf(stderr, "[gdi] text dc %08X font %08X host %08X attrfont %08X n %u\n", hdc, MEM32(x + 0x38), f, native32_gdi_attr(hdc) ? AT32(native32_gdi_attr(hdc), 0x90) : 0, MEM32(x + 0x30));
             HGDIOBJ old = f ? SelectObject(h, (HGDIOBJ)(uintptr_t)f) : NULL;
             SetTextColor(h, MEM32(e + 4)), SetBkColor(h, MEM32(e + 8)), SetBkMode(h, (int)MEM32(e + 0xC));
             SetTextAlign(h, MEM32(x + 0x3C));
@@ -722,7 +724,13 @@ static void cb_in(uint32_t* a) {
     if (!g_table || !IsWindow((HWND)(uintptr_t)a[0])) return;
     /* (a handle that is already the guest's came through a guest -> host ->
      * guest CallWindowProc and stays) */
-    if (is_dc_msg(a[1]) && a[2] && ((a[2] >> 16) & 0x1F) == 1 && !HOST(a[2])) a[2] = fresh(a[2]);
+    /* XP's gdi32 selects a font client-side (DC_ATTR +0x90 and a batched command, never
+     * the host DC): a WM_CTLCOLOR* DC is a guest control's own, already entered, and
+     * entering it afresh read the host DC's stock font back over the control's
+     * (comctl32 6.0's Edit and Static drew in the bold System font) */
+    if (a[1] >= WM_CTLCOLORMSGBOX && a[1] <= WM_CTLCOLORSTATIC && a[2] && nt_guest_xp(native32_guest_peb) && hfind(a[2]))
+        a[2] = (a[2] & 0xFFFF0000u) | (uint32_t)hfind(a[2]);
+    else if (is_dc_msg(a[1]) && a[2] && ((a[2] >> 16) & 0x1F) == 1 && !HOST(a[2])) a[2] = fresh(a[2]);
     else if (a[1] == WM_DRAWITEM && a[3]) {
         DRAWITEMSTRUCT* d = (DRAWITEMSTRUCT*)(uintptr_t)a[3];
         if (!HOST(d->hDC)) d->hDC = (HDC)(uintptr_t)fresh((uint32_t)(uintptr_t)d->hDC);
