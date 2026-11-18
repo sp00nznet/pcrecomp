@@ -82,13 +82,18 @@ void recomp_eh_resume(recomp_ehframe_t* f, uint32_t resume) {
 
 /* The FuncInfo a C++ frame's handler stub names, or 0 if it is not one. */
 static uint32_t funcinfo(uint32_t handler) {
+    /* mov eax, FuncInfo; jmp __CxxFrameHandler. With /GS the stub checks the
+     * frame's cookies first, so the mov can sit a few dozen bytes in. */
     const uint8_t* h = (const uint8_t*)(uintptr_t)handler;
-    if (handler < 0x10000u || IsBadReadPtr(h, 11) || h[0] != 0xB8) return 0;
-    if (h[5] != 0xE9 && !(h[5] == 0xFF && h[6] == 0x25)) return 0;
-    uint32_t fi = *(const uint32_t*)(h + 1);
-    if (IsBadReadPtr((void*)(uintptr_t)fi, 20)) return 0;
-    uint32_t magic = MEM32(fi);
-    return magic == EH_MAGIC_VC6 || magic == EH_MAGIC_VC7 || magic == EH_MAGIC_VC8 ? fi : 0;
+    if (handler < 0x10000u || IsBadReadPtr(h, 72)) return 0;
+    for (int i = 0; i < 64; i++) {
+        if (h[i] != 0xB8 || (h[i + 5] != 0xE9 && !(h[i + 5] == 0xFF && h[i + 6] == 0x25))) continue;
+        uint32_t fi = *(const uint32_t*)(h + i + 1);
+        if (IsBadReadPtr((void*)(uintptr_t)fi, 20)) continue;
+        uint32_t magic = MEM32(fi);
+        if (magic == EH_MAGIC_VC6 || magic == EH_MAGIC_VC7 || magic == EH_MAGIC_VC8) return fi;
+    }
+    return 0;
 }
 
 /* Run guest code at va as MSVC's _CallSettingFrame does: ebp = the frame's,
@@ -234,4 +239,31 @@ void native32_shim_CxxThrowException(void) {
     static cxx_throw_t real;
     if (!real) real = (cxx_throw_t)GetProcAddress(LoadLibraryA("msvcrt.dll"), "_CxxThrowException");
     real((void*)(uintptr_t)obj, (void*)(uintptr_t)info);
+}
+
+/* std::rethrow_exception: MSVCP140's __ExceptionPtrRethrow(const exception_ptr*),
+ * cdecl. A pplx task's get() rethrows what a native worker stored, from
+ * native code, so it would walk the host's SEH chain past every guest catch
+ * (Rise of Nations EE aborted in SteamAPI_Init's neighbourhood on a cpprest
+ * failure the game catches). exception_ptr is {EXCEPTION_RECORD*, refcount};
+ * a C++ one carries the object and ThrowInfo in ExceptionInformation[1..2]. */
+typedef void (__cdecl *ptr_rethrow_t)(const void*);
+
+void native32_shim_ExceptionPtrRethrow(void) {
+    uint32_t p = MEM32(g_esp + 4);
+    EXCEPTION_RECORD* er = p ? (EXCEPTION_RECORD*)(uintptr_t)MEM32(p) : NULL;
+    if (eh_trace < 0) eh_trace = getenv("NATIVE32_TRACE_EH") != NULL;
+    if (er && er->ExceptionCode == 0xE06D7363u && er->NumberParameters >= 3) {
+        uint32_t obj = (uint32_t)er->ExceptionInformation[1], info = (uint32_t)er->ExceptionInformation[2];
+        if (eh_trace)
+            fprintf(stderr, "[eh32] rethrow_exception %s 0x%08X from sub_%08X\n", throw_type(info), obj, g_cur_func);
+        uint32_t ret_esp = g_esp;
+        g_esp += 4;
+        dispatch(obj, info);
+        g_esp = ret_esp;
+        if (eh_trace) fprintf(stderr, "[eh32] %s: no guest frame catches it\n", throw_type(info));
+    }
+    static ptr_rethrow_t real;
+    if (!real) real = (ptr_rethrow_t)GetProcAddress(LoadLibraryA("msvcp140.dll"), "?__ExceptionPtrRethrow@@YAXPBX@Z");
+    real((const void*)(uintptr_t)p);
 }

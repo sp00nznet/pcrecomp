@@ -28,13 +28,22 @@ FUNCLET_WINDOW = 0x800   # bytes of a catch funclet scanned for its returns
 
 
 def funcinfo(read, handler):
-    """FuncInfo VA a C++ EH handler stub names, or None."""
-    h = read(handler, 11)
-    if not h or h[0] != 0xB8 or not (h[5] == 0xE9 or h[5:7] == b'\xFF\x25'):
+    """FuncInfo VA a C++ EH handler stub names, or None.
+
+    The stub is `mov eax, FuncInfo; jmp __CxxFrameHandler`. With /GS it first
+    checks the frame's cookies (mov edx, [esp+8]; ...; call
+    __security_check_cookie), so the mov can sit a few dozen bytes in.
+    """
+    h = read(handler, 72)
+    if not h:
         return None
-    fi = struct.unpack_from('<I', h, 1)[0]
-    m = read(fi, 4)
-    return fi if m and struct.unpack('<I', m)[0] in EH_MAGICS else None
+    for i in range(64):
+        if h[i] == 0xB8 and (h[i + 5] == 0xE9 or h[i + 5:i + 7] == b'\xFF\x25'):
+            fi = struct.unpack_from('<I', h, i + 1)[0]
+            m = read(fi, 4)
+            if m and struct.unpack('<I', m)[0] in EH_MAGICS:
+                return fi
+    return None
 
 
 def catch_funclets(read, fi):
@@ -106,6 +115,9 @@ def _selftest():
     put(0x3300, struct.pack('<4I', 0, 0, 0, 0x1100))
     put(0x1100, bytes.fromhex('b850100000' 'c3'))
     insns = list(md.disasm(read(0x1000, 24), 0x1000))
+    assert resume_points(md, read, insns) == {0x1050}, resume_points(md, read, insns)
+    # A /GS stub: cookie checks before the mov (Rise of Nations EE, VS2015).
+    put(0x2000, bytes.fromhex('8b5424088d420c8b8a94fdffff33c8e800000000' 'b800300000' 'e900000000'))
     assert resume_points(md, read, insns) == {0x1050}, resume_points(md, read, insns)
     # Without push ebp; mov ebp, esp first, no landing pad.
     assert resume_points(md, read, insns[1:]) is None
