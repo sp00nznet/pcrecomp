@@ -1117,21 +1117,34 @@ def lift_segment(ne: NEHeader, seg_num: int, func_offset: int = -1, xmod=None):
         # address. GDI seg1 9658: `push edi ... pop esi; pop bx; jmp 964E`
         # (the outer frame's epilogue), so a straight-line scan missed it.
         # ponytail: `add/sub/mov sp` and pusha end a path (not counted).
-        def _pops_past(start):
+        # After a call the depth is unknown (a pascal callee pops its own
+        # args): a pop, then a jmp out of the function, is still a return
+        # past (GDI seg1 8334: `call far ...; pop ax; pop bx; jmp 82F4`, the
+        # caller's epilogue). d is None there.
+        def _pops_past(start, end):
             work, seen, steps = [(start, 0)], set(), 0
             while work and steps < 400:
                 o, d = work.pop()
+                popped = False
                 while o in _by_off and (o, d) not in seen and steps < 400:
                     seen.add((o, d)); steps += 1
                     i = _by_off[o]
                     mn = i.mnemonic
                     w = 4 if 0x66 in bytes(i.raw[:2]) else 2
-                    if mn in ('push', 'pushf'):
+                    if d is None:
+                        if mn == 'jmp' and popped and i.op1 is not None and i.op1.type in (OpType.REL8, OpType.REL16)                                 and not start <= i.op1.disp < end:
+                            return True
+                        popped = mn == 'pop'
+                        if mn in ('enter', 'leave', 'ret', 'retf', 'iret', 'int', 'pusha', 'pushad', 'popa', 'popad'):
+                            break
+                    elif mn in ('push', 'pushf'):
                         d += w
                     elif mn in ('pop', 'popf'):
                         d -= w
                         if d < 0:
                             return True
+                    elif mn == 'call' and i.op1 is not None and i.op1.type == OpType.FAR:
+                        d = None
                     elif mn in ('call', 'enter', 'leave', 'ret', 'retf', 'iret', 'int', 'pusha', 'pushad', 'popa', 'popad'):
                         break
                     elif i.op1 is not None and i.op1.type == OpType.REG16 and REG16_NAMES[i.op1.reg] == 'sp' and mn not in ('cmp', 'test'):
@@ -1146,7 +1159,7 @@ def lift_segment(ne: NEHeader, seg_num: int, func_offset: int = -1, xmod=None):
                     o += i.length
             return False
         for f in functions:
-            if _pops_past(f.offset):
+            if _pops_past(f.offset, f.end):
                 lifter.popsret_offsets.add(f.offset)
 
     # Functions whose near `ret` is reached with words of their own still on
