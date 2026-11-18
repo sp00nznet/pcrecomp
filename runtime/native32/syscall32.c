@@ -992,6 +992,10 @@ static uint32_t host_setting(const char* svc) {
     fprintf(stderr, "[guard] %s: a host setting, refused\n", svc);
     return 0xC0000061u;
 }
+/* NtQueryDebugFilterState (XP): the host's says yes for components a stock
+ * XP keeps quiet, and the guest's DbgPrint then raises its int 2Dh. No debug
+ * output, as on a machine with no kernel debugger set up. */
+static uint32_t ovr_debug_filter(uint32_t* a) { (void)a; return 0; }
 static uint32_t ovr_set_time(uint32_t* a) { return a[0] ? host_setting("NtSetSystemTime") : native32_nt_forward("NtSetSystemTime", a); }
 #define HOST_SETTING(n) static uint32_t ovr_##n(uint32_t* a) { (void)a; return host_setting(#n); }
 HOST_SETTING(NtSetSystemInformation) HOST_SETTING(NtSetDefaultLocale) HOST_SETTING(NtSetDefaultUILanguage)
@@ -1117,7 +1121,13 @@ static uint32_t win32k_call(uint32_t svc, uint32_t* args) {
         fprintf(stderr, "[win32k] t%lu enters %s(%08X %08X), window of t%lu\n", GetCurrentThreadId(), nm, args[0], args[1],
                 args[0] ? GetWindowThreadProcessId((HWND)(uintptr_t)args[0], NULL) : 0);
     int held = blocks ? mach_release() : 0;
-    uint32_t r = g_w32k[i].fn ? g_w32k[i].fn(args) : 0;
+    uint32_t xa[16];
+    int drop = g_w32k[i].fn && nt_guest_xp(native32_guest_peb) ? nt_w32k_xp_extra(nm) : -1;
+    if (drop >= 0 && g_w32k[i].argc <= 16) {
+        /* XP's argument list has one more (ntguest.h): the handlers take 2000's */
+        for (int k = 0, j = 0; k < g_w32k[i].argc; k++) if (k != drop) xa[j++] = args[k];
+    }
+    uint32_t r = g_w32k[i].fn ? g_w32k[i].fn(drop >= 0 ? xa : args) : 0;
     if (blocks) mach_reacquire(held);
     if (g_trace && blocks) fprintf(stderr, "[win32k] t%lu left %s\n", GetCurrentThreadId(), nm);
     if (g_trace || (!g_w32k[i].fn && !g_w32k[i].seen)) {
@@ -1309,6 +1319,7 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
     native32_nt_override("NtSetDefaultLocale", ovr_NtSetDefaultLocale);
     native32_nt_override("NtSetDefaultUILanguage", ovr_NtSetDefaultUILanguage);
     native32_nt_override("NtShutdownSystem", ovr_NtShutdownSystem);
+    native32_nt_override("NtQueryDebugFilterState", ovr_debug_filter);
     native32_nt_override("NtSetSystemPowerState", ovr_NtSetSystemPowerState);
     native32_nt_override("NtInitiatePowerAction", ovr_NtInitiatePowerAction);
     native32_nt_override("NtLoadDriver", ovr_NtLoadDriver);

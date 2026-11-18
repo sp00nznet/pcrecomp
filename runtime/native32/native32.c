@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "native32.h"
+#include "ntguest.h"
 #include "image_loader.h"
 #include "recomp_trace.h"
 
@@ -119,6 +120,12 @@ static uint32_t make_tib(uint32_t lo, uint32_t hi) {
         t[0xBF8 / 4] = 0x020A0000u;                       /* Length 0, MaximumLength 0x20A */
         t[0xBFC / 4] = (uint32_t)(uintptr_t)t + 0xC00;    /* -> StaticUnicodeBuffer */
         t[0xE0C / 4] = lo;                                /* DeallocationStack */
+        if (nt_guest_xp(native32_guest_peb)) {
+            /* XP's TEB+0x1A8 ACTIVATION_CONTEXT_STACK: its FrameListCache
+             * (+0xC) an empty list, as XP's kernel makes it (ntdll's
+             * RtlActivateActivationContextEx walks it) */
+            t[0x1B4 / 4] = t[0x1B8 / 4] = (uint32_t)(uintptr_t)t + 0x1B4;
+        }
     }
     if (g_tls_n) {
         uint32_t* slots = (uint32_t*)calloc(MAX_TLS, 4);

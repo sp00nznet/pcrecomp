@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "native32.h"
+#include "ntguest.h"
 
 extern uint32_t g_cur_func;
 
@@ -110,7 +111,7 @@ static uint32_t client_connect(uint32_t data, uint32_t capture) {
             ahe = native32_user_ahe = (uint8_t*)VirtualAlloc(NULL, 0xC0000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             disp = native32_user_disp = (uint8_t*)VirtualAlloc(NULL, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             *(uint32_t*)(psi + 8) = 0x10000;                  /* cHandleEntries */
-            *(uint32_t*)(psi + 0x864) = 1;                    /* cCaptures: never 0, so GetCapture asks NtUserGetThreadState(2) */
+            *(uint32_t*)(psi + nt_si(native32_guest_peb, 0x864)) = 1;                    /* cCaptures: never 0, so GetCapture asks NtUserGetThreadState(2) */
         }
         MEM32(ci + 0x04) = MEM32(ci + 0x00);
         MEM32(ci + 0x0C) = (uint32_t)(uintptr_t)psi;
@@ -127,8 +128,9 @@ static uint32_t client_connect(uint32_t data, uint32_t capture) {
              * the ones user32 answers itself from the WND: none. */
             static uint8_t all[0x80];
             memset(all, 0xFF, sizeof all);
-            MEM32(ci + 0x0C + 0xE8) = 0x3FF;
-            MEM32(ci + 0x0C + 0xEC) = (uint32_t)(uintptr_t)all;
+            uint32_t dm = ci + 0x0C + nt_shared_defmsgs(native32_guest_peb);   /* (XP: +0x108) */
+            MEM32(dm) = 0x3FF;
+            MEM32(dm + 4) = (uint32_t)(uintptr_t)all;
         }
     }
     if (index == 2 && ci) {
@@ -156,6 +158,16 @@ static uint32_t nls_get_user_info(uint32_t data, uint32_t capture) {
     memset((void*)(uintptr_t)info, 0, len);
     MEM32(info + 0x1860) = GetUserDefaultLCID();
     return 0;
+}
+
+/* basesrv 27 on XP: BaseSrvSxsCreateActivationContext, csrss building an
+ * activation context from a manifest (shell32's DllMain asks for its own,
+ * resource 124, comctl32 v6). ponytail: refused until SxS is answered; the
+ * caller then runs without the context (comctl32 v5), as XP does when the
+ * manifest is bad. */
+static uint32_t sxs_create_actctx(uint32_t data, uint32_t capture) {
+    (void)data, (void)capture;
+    return 0xC0000002u;                                  /* STATUS_NOT_IMPLEMENTED */
 }
 
 /* ---- the port ------------------------------------------------------------ */
@@ -200,6 +212,7 @@ static uint32_t lpc_connect(uint32_t* a, int secure) {
     {
         uint32_t nls = MEM16(native32_guest_peb + 0xAC) >= 2600 ? 30 : 26;
         if (!g_api[1][nls]) native32_csr_api(0x10000 | nls, nls_get_user_info);
+        if (nls == 30 && !g_api[1][27]) native32_csr_api(0x1001B, sxs_create_actctx);
     }
     if (!g_port) g_port = CreateEventA(NULL, FALSE, FALSE, NULL);
     MEM32(a[0]) = (uint32_t)(uintptr_t)g_port;
