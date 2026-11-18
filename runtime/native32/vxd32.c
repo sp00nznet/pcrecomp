@@ -1510,8 +1510,11 @@ static int host_path(uint32_t guest, char* out) {
     char g[MAX_PATH], full[2 * MAX_PATH], *p = g;
     size_t i = 0;
     if (!g_root[0]) {
-        const char* r = getenv("NATIVE32_W9X_ROOT");
-        GetFullPathNameA(r ? r : "root", MAX_PATH, g_root, NULL);
+        /* the process's own environment: a host sets it with SetEnvironmentVariable,
+         * which the CRT's getenv copy does not see in this process */
+        char r[MAX_PATH];
+        DWORD n = GetEnvironmentVariableA("NATIVE32_W9X_ROOT", r, MAX_PATH);
+        GetFullPathNameA(n && n < MAX_PATH ? r : "root", MAX_PATH, g_root, NULL);
         CreateDirectoryA(g_root, NULL);
     }
     for (; i + 1 < sizeof g && MEM8(guest + i); i++) g[i] = (char)MEM8(guest + i);

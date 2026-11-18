@@ -321,7 +321,8 @@ static void host_far(CPU *c, uint16_t off) {
                   * Win32 kernel is there: kernel32's base, ponytail: a guess, only tested != 0).
                   * KRNL386 then finds kernel32's export block ('KEXP', its first section) at flat
                   * 1000h and stores its DGROUP:1AC7 through the pointer at +4, into kernel32. */
-        c->ax = 0x040A; c->edx = 0xBFF70000u;
+        {   int native32_w9x_is_win95(void);   /* vxd32.c: the build, from kernel32's image */
+            c->ax = native32_w9x_is_win95() ? 0x0400 : 0x040A; c->edx = 0xBFF70000u; }   /* 4.00 on Windows 95 */
         if (!memcmp((void *)(uintptr_t)0xBFF71000u, "KEXP", 4)) memcpy(g_w16_low + 0x1000, (void *)(uintptr_t)0xBFF71000u, 0x100);
         ok(c); return;
     case 0x04:   /* KERNEL.442 VWIN32_EventCreate (seg001_7898, shld into dx:ax): KRNL386 keeps one at
