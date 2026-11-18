@@ -95,4 +95,9 @@ static inline int nt_w32k_xp_extra(const char* name) {
     if (!strcmp(name, "NtUserCreateWindowEx") || !strcmp(name, "NtUserRegisterClassExWOW")) return 2;
     return -1;
 }
+/* FNIDs: XP has two more before the controls' (from 2000's 0x2A0 on they
+ * are 2 higher: FNID_DIALOG 0x2A4, FNID_SENDMESSAGE 0x2B0); XP's as 2000's */
+static inline uint32_t nt_fnid(uint32_t peb, uint32_t x) {
+    return nt_guest_xp(peb) && x >= 0x2A2 && x < 0x2C0 ? x - 2 : x;
+}
 #endif

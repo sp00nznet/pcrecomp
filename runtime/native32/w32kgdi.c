@@ -403,6 +403,11 @@ static uint32_t s_dibitmap(uint32_t* a) {
     BITMAPINFO* bi = (BITMAPINFO*)(uintptr_t)a[5];
     HDC h = (HDC)(uintptr_t)HOST(a[0]);
     if (!bi) return GUEST(CreateCompatibleBitmap(h ? h : GetDC(NULL), (int)a[1], (int)a[2]));
+    /* fInit 2 (CBM_CREATEDIB) with colour bits: the DIB's own colours, so a
+     * screen-format bitmap, whatever the DC holds (XP's user32 makes an icon's
+     * colour bitmap on its memory DC, whose 1-bpp bitmap made it black) */
+    static HDC screen;
+    if ((a[3] & 2) && bi->bmiHeader.biBitCount > 1) h = screen ? screen : (screen = GetDC(NULL));
     return GUEST(CreateDIBitmap(h ? h : GetDC(NULL), &bi->bmiHeader, a[3] & CBM_INIT, (void*)(uintptr_t)a[4], bi, a[6]));
 }
 /* NtGdiGetRegionData(hrgn, count, RGNDATA*). NtGdiGetDeviceWidth stays

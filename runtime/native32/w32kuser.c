@@ -1159,6 +1159,7 @@ static void screen_caption(HWND h) {
  * DefWindowProc's: the host's. */
 static uint32_t s_message_call(uint32_t* a) {
     HWND h = (HWND)(uintptr_t)a[0];
+    a[5] = nt_fnid(native32_guest_peb, a[5]);   /* (XP: its FNIDs, as 2000's) */
     /* a DC the guest got in the message (WM_ERASEBKGND, WM_CTLCOLOR*, ...)
      * goes back to the host as the host's */
     if (a[2] && ((a[2] >> 16) & 0x1F) == 1 && native32_gdi_host(a[2])) a[2] = native32_gdi_host(a[2]);
@@ -1528,6 +1529,16 @@ static uint32_t s_setcapture(uint32_t* a) { return (uint32_t)(uintptr_t)SetCaptu
 
 /* NtUserRegisterWindowMessage(UNICODE_STRING*) */
 static uint32_t s_register_msg(uint32_t* a) { return RegisterWindowMessageW(ustr_name(a[0])); }
+/* NtUserGetAtomName(atom, UNICODE_STRING* name): a name in USER's atom table
+ * (window classes, registered messages, clipboard formats; XP's dialog
+ * manager asks for its class's), from the host's, which is that table */
+static uint32_t s_atom_name(uint32_t* a) {
+    uint32_t us = a[1];
+    if (!us || !MEM32(us + 4) || MEM16(us + 2) < 2) return 0;
+    int n = GetClipboardFormatNameW(a[0], (LPWSTR)(uintptr_t)MEM32(us + 4), MEM16(us + 2) / 2);
+    if (n > 0) MEM16(us) = (uint16_t)(2 * n);
+    return n > 0 ? (uint32_t)n : 0;
+}
 /* NtUserSetWindowPos(hwnd, after, x, y, cx, cy, flags) */
 static uint32_t s_setpos(uint32_t* a) {
     /* HWND_TOPMOST / NOTOPMOST on a window of the virtual screen (a host
@@ -1852,7 +1863,7 @@ void native32_user_install(void) {
         { "NtUserCallHwndParamLock", s_hwnd_param_lock }, { "NtUserCallHwndParam", s_hwnd_param },
         { "NtUserDestroyWindow", s_destroy }, { "NtUserSetWindowFNID", s_set_fnid }, { "NtUserSetFocus", s_setfocus },
         { "NtUserQueryWindow", s_query_window }, { "NtUserFillWindow", s_fill_window }, { "NtUserSetCapture", s_setcapture },
-        { "NtUserWaitMessage", s_waitmessage }, { "NtUserRegisterWindowMessage", s_register_msg }, { "NtUserCallHwndLock", s_hwnd_lock }, { "NtUserSetWindowLong", s_setlong },
+        { "NtUserWaitMessage", s_waitmessage }, { "NtUserRegisterWindowMessage", s_register_msg }, { "NtUserGetAtomName", s_atom_name }, { "NtUserCallHwndLock", s_hwnd_lock }, { "NtUserSetWindowLong", s_setlong },
         { "NtUserSetWindowPos", s_setpos }, { "NtUserGetForegroundWindow", s_foreground }, { "NtUserGetSystemMenu", s_sysmenu }, { "NtUserCallNoParam", s_call_noparam }, { "NtUserCallOneParam", s_call_oneparam },
     };
     for (int i = 0; i < (int)(sizeof svc / sizeof svc[0]); i++) native32_nt_win32k_override(svc[i].name, svc[i].fn);
