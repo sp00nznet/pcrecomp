@@ -135,10 +135,13 @@ static int g_cur = -1;                                            /* being recor
 static int g_next;                                                /* the slot after the last used */
 static uint64_t g_serial, g_last;                                 /* the last begun, the last submitted */
 
+#define CHUNK_USE (VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT)   /* vertices, or pixels on their way up */
 static buf_t g_pool[64];
 static int g_npool;
 static buf_t g_vb;                                                /* the vertex chunk being filled */
 static uint32_t g_voff;
+static buf_t g_sb;                                                /* the chunk texture uploads are staged in */
+static uint32_t g_soff;
 
 static int g_rendering;                                           /* a dynamic-rendering pass is open */
 static surf_t *g_ts, *g_zs;                                       /* the pass's target and z-buffer */
@@ -157,6 +160,10 @@ static void vk_fail(const char *what, VkResult r) {
     if (!g_failed++) fprintf(stderr, "[vulkan] %s failed (%d)\n", what, (int)r);
 }
 #define VKC(call) do { VkResult r_ = (call); if (r_ != VK_SUCCESS) vk_fail(#call, r_); } while (0)
+
+/* HLE_VULKAN_STATS: what a second cost - the CPU's waits for the GPU,
+ * surfaces freed, pipelines made, textures sent up, memory allocated. */
+static uint32_t g_st_waits, g_st_wait_ms, g_st_frees, g_st_pipes, g_st_pipe_ms, g_st_tex, g_st_tex_kb, g_st_allocs, g_st_alloc_ms;
 
 /* ---- memory, buffers, images ---- */
 static int mem_type(uint32_t bits, VkMemoryPropertyFlags want, VkMemoryPropertyFlags prefer) {
@@ -183,7 +190,9 @@ static buf_t buf_new(VkDeviceSize size, VkBufferUsageFlags use, int readback) {
     int t = mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                      readback ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : 0);
     ai.memoryTypeIndex = (uint32_t)(t < 0 ? 0 : t);
+    uint32_t t0 = hle_ticks_ms();
     VKC(vkAllocateMemory(g_dev, &ai, NULL, &o.m));
+    g_st_allocs++, g_st_alloc_ms += hle_ticks_ms() - t0;
     VKC(vkBindBufferMemory(g_dev, o.b, o.m, 0));
     void *p = NULL;
     VKC(vkMapMemory(g_dev, o.m, 0, VK_WHOLE_SIZE, 0, &p));
@@ -212,7 +221,9 @@ static img_t img_new(VkFormat f, int w, int h, VkImageUsageFlags use, VkImageAsp
     int t = mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
     if (t < 0) t = mem_type(mr.memoryTypeBits, 0, 0);
     ai.memoryTypeIndex = (uint32_t)(t < 0 ? 0 : t);
+    uint32_t t0 = hle_ticks_ms();
     VKC(vkAllocateMemory(g_dev, &ai, NULL, &o.m));
+    g_st_allocs++, g_st_alloc_ms += hle_ticks_ms() - t0;
     VKC(vkBindImageMemory(g_dev, o.i, o.m, 0));
     VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
     vi.image = o.i, vi.viewType = VK_IMAGE_VIEW_TYPE_2D, vi.format = f;
@@ -243,7 +254,11 @@ static void retire(sub_t *s) {
 }
 static void sub_wait(sub_t *s) {
     if (!s->busy) return;
-    VKC(vkWaitForFences(g_dev, 1, &s->fence, VK_TRUE, UINT64_MAX));
+    if (vkGetFenceStatus(g_dev, s->fence) != VK_SUCCESS) {
+        uint32_t t0 = hle_ticks_ms();
+        VKC(vkWaitForFences(g_dev, 1, &s->fence, VK_TRUE, UINT64_MAX));
+        g_st_waits++, g_st_wait_ms += hle_ticks_ms() - t0;
+    }
     retire(s);
 }
 static VkCommandBuffer cb(void) {
@@ -276,7 +291,7 @@ static int done(uint64_t serial) {
 static void end_pass(void);
 static void commit(int wait) {
     end_pass();
-    g_vb.b = VK_NULL_HANDLE;                             /* it goes back to the pool with this submission */
+    g_vb.b = g_sb.b = VK_NULL_HANDLE;                    /* they go back to the pool with this submission */
     if (g_cur < 0) { if (wait && g_last) { sub_t *s = sub_of(g_last); if (s) sub_wait(s); } return; }
     sub_t *s = &g_sub[g_cur];
     VKC(vkEndCommandBuffer(s->cb));
@@ -478,21 +493,47 @@ static void upload(grec_t *r) {
     }
     r->gen = r->s->gen, r->stale = 0;
 }
-/* Bytes into an image, through a buffer that goes when the copy is done
- * (outside any pass). Draws recorded before it read what was there before. */
+/* Bytes into an image, staged in a pooled chunk that goes back with the
+ * submission (or, too big for one, a buffer of their own that goes when the
+ * copy is done) - outside any pass. Draws recorded before it read what was
+ * there before. */
 static void copy_in(img_t *i, const void *px, size_t n, VkImageAspectFlags aspect) {
     end_pass();
-    buf_t st = buf_new(n, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 0);
-    memcpy(st.map, px, n);
     VkCommandBuffer c = cb();
+    sub_t *s = &g_sub[g_cur];
+    buf_t own;
+    memset(&own, 0, sizeof own);
+    VkBuffer src;
+    VkDeviceSize off = 0;
+    if (n <= VCHUNK) {
+        uint32_t at = (g_soff + 15u) & ~15u;             /* a multiple of the texel size, as copies need */
+        if (!g_sb.b || at + n > VCHUNK) {
+            if (s->nchunks == 256) goto own_buf;
+            buf_t b = g_npool ? g_pool[--g_npool] : buf_new(VCHUNK, CHUNK_USE, 0);
+            if (s->nchunks == s->capchunks) {
+                s->capchunks = s->capchunks ? s->capchunks * 2 : 8;
+                s->chunks = (buf_t *)realloc(s->chunks, sizeof *s->chunks * (size_t)s->capchunks);
+            }
+            s->chunks[s->nchunks++] = b;
+            g_sb = b, at = 0;
+        }
+        memcpy(g_sb.map + at, px, n);
+        src = g_sb.b, off = at, g_soff = at + (uint32_t)n;
+    } else {
+    own_buf:
+        own = buf_new(n, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 0);
+        memcpy(own.map, px, n);
+        src = own.b;
+    }
     barrier();
     VkBufferImageCopy bc;
     memset(&bc, 0, sizeof bc);
+    bc.bufferOffset = off;
     bc.imageSubresource.aspectMask = aspect, bc.imageSubresource.layerCount = 1;
     bc.imageExtent.width = (uint32_t)i->w, bc.imageExtent.height = (uint32_t)i->h, bc.imageExtent.depth = 1;
-    vkCmdCopyBufferToImage(c, st.b, i->i, VK_IMAGE_LAYOUT_GENERAL, 1, &bc);
+    vkCmdCopyBufferToImage(c, src, i->i, VK_IMAGE_LAYOUT_GENERAL, 1, &bc);
     g_need_barrier = 1;
-    junk_buf(&st);
+    junk_buf(&own);
 }
 /* A texture's pixels as d3d_raster_prepare left them (argb, keyed). */
 static grec_t *texture(surf_t *s) {
@@ -509,6 +550,7 @@ static grec_t *texture(surf_t *s) {
         r->tex_gen = 0;
     }
     if (r->tex_gen != s->argb_gen || !r->tex_gen) {
+        g_st_tex++, g_st_tex_kb += (uint32_t)((size_t)s->w * (size_t)s->h * 5 / 1024);
         copy_in(&r->tex, s->argb, (size_t)s->w * (size_t)s->h * 4, VK_IMAGE_ASPECT_COLOR_BIT);
         copy_in(&r->key, s->keyed, (size_t)s->w * (size_t)s->h, VK_IMAGE_ASPECT_COLOR_BIT);
         r->tex_gen = s->argb_gen;
@@ -663,7 +705,9 @@ static VkPipeline pipe(uint32_t key) {
     for (int n = 0; n < NPIPES; n++, h = (h + 1) & (NPIPES - 1)) {
         if (g_pipes[h].key == key) return g_pipes[h].p;
         if (!g_pipes[h].key) {
+            uint32_t t0 = hle_ticks_ms();
             VkPipeline p = make_pipe(key);
+            g_st_pipes++, g_st_pipe_ms += hle_ticks_ms() - t0;
             if (!p) return VK_NULL_HANDLE;
             g_pipes[h].key = key, g_pipes[h].p = p;
             return p;
@@ -686,7 +730,7 @@ static gv_t *vspace(uint32_t n) {
         cb();
         sub_t *s = &g_sub[g_cur];
         if (s->nchunks == 256) { commit(0); cb(); s = &g_sub[g_cur]; }
-        buf_t b = g_npool ? g_pool[--g_npool] : buf_new(VCHUNK, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, 0);
+        buf_t b = g_npool ? g_pool[--g_npool] : buf_new(VCHUNK, CHUNK_USE, 0);
         if (s->nchunks == s->capchunks) {
             s->capchunks = s->capchunks ? s->capchunks * 2 : 8;
             s->chunks = (buf_t *)realloc(s->chunks, sizeof *s->chunks * (size_t)s->capchunks);
@@ -937,6 +981,7 @@ static void v_free(surf_t *s) {
     if (s == g_show_s) show_none();
     grec_t *r = (grec_t *)s->gpu;
     if (!r) return;
+    g_st_frees++;
     forget_dirty(r);
     s->gpu = NULL;
     if (g_ts == s || g_zs == s) end_pass();
@@ -948,15 +993,21 @@ static void v_free(surf_t *s) {
  * down for the presenter. */
 static void stats(void) {
     static int on = -1;
-    static uint32_t since, flips;
+    static uint32_t since, flips, last, worst;
     if (on < 0) on = getenv("HLE_VULKAN_STATS") != NULL;
     if (!on) return;
     uint32_t now = hle_ticks_ms();
-    if (!since) since = now;
+    if (!since) since = last = now;
+    if (now - last > worst) worst = now - last;
+    last = now;
     flips++;
-    if (now - since >= 5000) {
-        fprintf(stderr, "[vulkan] %.1f flips a second\n", flips * 1000.0 / (now - since));
-        since = now, flips = 0;
+    if (now - since >= 1000) {
+        fprintf(stderr, "[vulkan] %.1f flips a second, slowest %u ms; %u waits for the GPU (%u ms), %u surfaces freed, "
+                "%u pipelines (%u ms), %u textures up (%u KB), %u allocations (%u ms)\n",
+                flips * 1000.0 / (now - since), worst, g_st_waits, g_st_wait_ms, g_st_frees, g_st_pipes, g_st_pipe_ms,
+                g_st_tex, g_st_tex_kb, g_st_allocs, g_st_alloc_ms);
+        since = now, flips = 0, worst = 0;
+        g_st_waits = g_st_wait_ms = g_st_frees = g_st_pipes = g_st_pipe_ms = g_st_tex = g_st_tex_kb = g_st_allocs = g_st_alloc_ms = 0;
     }
 }
 static void v_flip(surf_t *front, surf_t *back) {
