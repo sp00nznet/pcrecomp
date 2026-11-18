@@ -1251,6 +1251,28 @@ def lift_segment(ne: NEHeader, seg_num: int, func_offset: int = -1, xmod=None):
         last = func_insts[-1]
         e = last.offset - seg.file_offset + last.length
         dec = Decoder(seg.data, base_offset=seg.file_offset, use32=seg.use32)
+        # The last instruction can also run past the next start itself (Win95 GDI
+        # 1:8B53 `mov di, 1` over 8B55, a branch target in data decoded as code):
+        # the CPU goes on at its end, never at the start it straddles. Decode on
+        # from there the same way. (If this stream is the bogus one, it never runs.)
+        straddle = last.mnemonic not in TERMINATORS and e > func.end and e not in off_to_label
+        if straddle:
+            ext, ok, e2 = [], False, e
+            while len(ext) < 512 and 0 <= e2 < len(seg.data):
+                dec.pos = e2
+                i = dec.decode_one()
+                if i is None:
+                    break
+                ext.append(i)
+                e2 += i.length
+                if i.mnemonic in TERMINATORS or e2 in off_to_label:
+                    ok = True
+                    break
+            if ok:
+                func_insts = func_insts + ext
+                fall_off = e2
+        elif last.mnemonic not in TERMINATORS and e > func.end and e in off_to_label:
+            fall_off = e
         if last.mnemonic not in TERMINATORS and e < func.end and e not in off_to_label:
             dec.pos = e
             i = dec.decode_one()

@@ -52,6 +52,11 @@ void recomp_fn_hit(const char *n) {   /* g_fncount: W16_FN=1 (with fs when it ch
         if (ww < 0) { const char *e = getenv("W16_WW"); char *t; wss = e ? (uint16_t)strtoul(e, &t, 16) : 0; ww = e && *t == ':' ? (int)strtoul(t + 1, 0, 16) : 0x10000; }
         if (ww < 0x10000 && g_w16.ss == wss) { uint16_t v = mem_read16(&g_w16, g_w16.ss, (uint16_t)ww); if (v != last) { last = v; fprintf(stderr, "WW ss:%04X = %04X at %s\n", ww, v, n); } }
     }
+    {   /* W16_DSW=sel: say which function first runs with ds = sel (a ds gone wrong) */
+        static int dw = -1; static __declspec(thread) uint16_t lastds;
+        if (dw < 0) { const char *e = getenv("W16_DSW"); dw = e ? (int)strtoul(e, 0, 16) : 0x10000; }
+        if (dw < 0x10000 && g_w16.ds != lastds) { if (g_w16.ds == dw) fprintf(stderr, "DSW ds %04X (was %04X) at %s ss:sp %04X:%04X\n", g_w16.ds, lastds, n, g_w16.ss, g_w16.sp); lastds = g_w16.ds; }
+    }
     {   /* W16_ARGS=fn,fn: those functions' first 16 stack words on entry (above the far return) */
         static const char *wa = (const char *)-1;
         if (wa == (const char *)-1) wa = getenv("W16_ARGS");
