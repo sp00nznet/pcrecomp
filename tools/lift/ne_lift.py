@@ -1296,8 +1296,11 @@ def lift_segment(ne: NEHeader, seg_num: int, func_offset: int = -1, xmod=None):
             # and only the classic skip idiom: a 3-byte `mov r16, imm16` /
             # `cmp ax, imm16` / `test ax, imm16` whose immediate is the entry's
             # code (padding before a prologue straddles entries too, never runs)
-            if (i is not None and e + i.length > func.end and func.end in _known_entries
-                    and i.length == 3 and seg.data[e] in (0x3D, 0xA9, *range(0xB8, 0xC0))):
+            # Or any instruction over a start that is only the code map's guess (Win95 GDI
+            # 1:5665 `mov ax, [bp+0Ch]` over 5666: CreatePen fell into 5666 and lost
+            # `push ax`); the CPU can never land inside an instruction it is running.
+            if (i is not None and e + i.length > func.end and (func.end not in _known_entries or (
+                    i.length == 3 and seg.data[e] in (0x3D, 0xA9, *range(0xB8, 0xC0))))):
                 ext, ok = [], False
                 while len(ext) < 512 and 0 <= e < len(seg.data):
                     dec.pos = e
