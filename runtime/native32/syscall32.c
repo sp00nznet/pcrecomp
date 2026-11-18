@@ -1363,8 +1363,14 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
     if (cur[wcslen(cur) - 1] != L'\\') wcscat(cur, L"\\");
     wchar_t curh[MAX_PATH + 4];
     wcscpy(curh, cur);
-    if (fb_install(image_path, dll_path, nls_dir))           /* in the box: C:\ is the box's C */
-        wcscpy(cur, L"C:\\"), _snwprintf(curh, MAX_PATH + 3, L"%ls\\C\\", fb_root);
+    /* A guest on its own ntdll reaches files only through the box: without
+     * one it would see the host's drives, so it does not start. */
+    if (!fb_install(image_path, dll_path, nls_dir)) {
+        fprintf(stderr, "[guard] no FILEBOX: set PCRECOMP_FILEBOX to the guest's drive folder (work\\profile); not starting\n");
+        fflush(stderr);
+        return 0;
+    }
+    wcscpy(cur, L"C:\\"), _snwprintf(curh, MAX_PATH + 3, L"%ls\\C\\", fb_root);   /* in the box: C:\ is the box's C */
     {   /* a guest's child: its launcher's guest directory (the launch path sets it;
          * a box drive path, X:\rest, never a host one while the box is on) */
         wchar_t gc[MAX_PATH];
