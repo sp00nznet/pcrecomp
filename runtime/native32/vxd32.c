@@ -44,9 +44,9 @@ static int is_vxd_block(uint32_t p) { for (int i = 0; p && i < g_nblocks; i++) i
  * the KEXP header's boot entry (_FREQASM+0C, survey.md), never a fork.
  * Windows 95 OSR2 (4.00.1111)'s were matched to Win98 SE's by masked bytes
  * (win95-recomp tools/k32map.py). */
-typedef struct { uint32_t boot, qt_thunk, ft_target, win16mutex, console_new, krn32mutex, cur_thread, leave_krn32, pdb_console; } w9x_k32_t;
-static const w9x_k32_t k32_w98se = { 0xBFFC7AE4u, 0xBFF727D9u, 0xBFF7268Du, 0xBFFC9470u, 0xBFF8E9E1u, 0, 0, 0, 0xB0 };
-static const w9x_k32_t k32_w95b  = { 0xBFFBB374u, 0xBFF728D0u, 0xBFF72791u, 0xBFFBF9E0u, 0xBFF8C35Eu, 0xBFFBFA60u, 0xBFFBC280u, 0xBFF743D3u, 0xAC };
+typedef struct { uint32_t boot, qt_thunk, ft_target, win16mutex, console_new, krn32mutex, cur_thread, leave_krn32, pdb_console, tdbx_psp; } w9x_k32_t;
+static const w9x_k32_t k32_w98se = { 0xBFFC7AE4u, 0xBFF727D9u, 0xBFF7268Du, 0xBFFC9470u, 0xBFF8E9E1u, 0, 0, 0, 0xB0, 0x50 };
+static const w9x_k32_t k32_w95b  = { 0xBFFBB374u, 0xBFF728D0u, 0xBFF72791u, 0xBFFBF9E0u, 0xBFF8C35Eu, 0xBFFBFA60u, 0xBFFBC280u, 0xBFF743D3u, 0xAC, 0x40 };
 static const w9x_k32_t* k32(void) {
     static const w9x_k32_t* v;
     if (!v) v = !IsBadReadPtr((void*)(uintptr_t)0xBFF71000u, 16) && MEM32(0xBFF7100Cu) == k32_w95b.boot ? &k32_w95b : &k32_w98se;
@@ -754,7 +754,7 @@ static uint32_t new_tdbx(uint32_t thread, uint32_t process) {
     uint8_t* tdbx = vxd_block(0x100);
     *(uint32_t*)(tdbx + 0x00) = thread;
     *(uint32_t*)(tdbx + 0x04) = process;
-    *(uint32_t*)(tdbx + 0x50) = (uint32_t)(uintptr_t)&g_cur_psp;
+    *(uint32_t*)(tdbx + k32()->tdbx_psp) = (uint32_t)(uintptr_t)&g_cur_psp;   /* the current PSP word (Win98 SE 0xBFF76547 +50, Win95 0xBFF76512 +40) */
     return (uint32_t)(uintptr_t)tdbx;
 }
 static uint32_t vwin32_create_thread(const uint32_t* a) {
