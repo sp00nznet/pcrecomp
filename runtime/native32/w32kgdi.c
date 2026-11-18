@@ -379,6 +379,17 @@ static uint32_t s_delete(uint32_t* a) {
 static uint32_t s_bitblt(uint32_t* a) {
     return BitBlt(dc(a[0]), a[1], a[2], a[3], a[4], a[5] ? dc(a[5]) : NULL, a[6], a[7], a[8]);
 }
+/* NtGdiStretchBlt(dst, x, y, cx, cy, src, xs, ys, cxs, cys, rop, crBack) */
+static uint32_t s_stretchblt(uint32_t* a) {
+    return StretchBlt(dc(a[0]), a[1], a[2], a[3], a[4], a[5] ? dc(a[5]) : NULL, a[6], a[7], a[8], a[9], a[10]);
+}
+/* NtGdiAlphaBlend(dst, x, y, cx, cy, src, xs, ys, cxs, cys, BLENDFUNCTION, hcmXform):
+ * comctl32 6's image lists draw their 32-bit icons with it (XP's desktop, Start button) */
+static uint32_t s_alphablend(uint32_t* a) {
+    BLENDFUNCTION bf;
+    memcpy(&bf, &a[10], 4);
+    return GdiAlphaBlend(dc(a[0]), a[1], a[2], a[3], a[4], dc(a[5]), a[6], a[7], a[8], a[9], bf);
+}
 static uint32_t s_lineto(uint32_t* a) {
     BOOL r = LineTo(dc(a[0]), (int)a[1], (int)a[2]);
     dc_back(a[0]);
@@ -860,6 +871,7 @@ void native32_gdi_install(void) {
         { "NtGdiSetBoundsRect", s_setbounds }, { "NtGdiGetBoundsRect", s_getbounds }, { "NtGdiRectVisible", s_rectvisible }, { "NtGdiExtSelectClipRgn", s_selectcliprgn }, { "NtGdiCreateSolidBrush", s_brush },
         { "NtGdiSelectBitmap", s_select_bitmap }, { "NtGdiSelectBrush", s_select }, { "NtGdiSelectPen", s_select },
         { "NtGdiSelectFont", s_select }, { "NtGdiDeleteObjectApp", s_delete }, { "NtGdiBitBlt", s_bitblt },
+        { "NtGdiStretchBlt", s_stretchblt }, { "NtGdiAlphaBlend", s_alphablend },
         { "NtGdiLineTo", s_lineto }, { "NtGdiMoveTo", s_moveto }, { "NtGdiSetPixel", s_setpixel },
         { "NtGdiGetDeviceCaps", s_devcaps }, { "NtGdiSetLayout", s_setlayout },
         { "NtGdiSetDIBitsToDeviceInternal", s_setdibits }, { "NtGdiFlush", s_one },
