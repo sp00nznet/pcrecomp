@@ -1123,6 +1123,7 @@ static uint32_t win32k_call(uint32_t svc, uint32_t* args) {
     int held = blocks ? mach_release() : 0;
     uint32_t xa[16];
     int drop = g_w32k[i].fn && nt_guest_xp(native32_guest_peb) ? nt_w32k_xp_extra(nm) : -1;
+    if (drop == 2 && args[2]) drop = 1;   /* the version-specific class name, when there is one (ntguest.h) */
     if (drop >= 0 && g_w32k[i].argc <= 16) {
         /* XP's argument list has one more (ntguest.h): the handlers take 2000's */
         for (int k = 0, j = 0; k < g_w32k[i].argc; k++) if (k != drop) xa[j++] = args[k];
@@ -1282,6 +1283,25 @@ static void ntdll_version(uint32_t ntdll, uint32_t* major, uint32_t* minor, uint
 }
 
 void csr32_install(void);   /* csr32.c */
+uint32_t csr32_sxs_blob(const char* manifest, size_t len);   /* csr32.c */
+
+/* An image's resource (type, id), or 0: the first language */
+static uint32_t pe_resource(uint32_t base, uint32_t type, uint32_t id, uint32_t* size) {
+    IMAGE_NT_HEADERS32* nt = (IMAGE_NT_HEADERS32*)(uintptr_t)(base + MEM32(base + 0x3C));
+    uint32_t root = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE].VirtualAddress, dir, want[2] = { type, id };
+    if (!root) return 0;
+    root += base, dir = root;
+    for (int level = 0; level < 3; level++) {
+        uint32_t n = MEM16(dir + 12) + MEM16(dir + 14), e = dir + 16, hit = 0;
+        for (uint32_t k = 0; k < n && !hit; k++, e += 8)
+            if (level == 2 || MEM32(e) == want[level]) hit = e;
+        if (!hit) return 0;
+        uint32_t o = MEM32(hit + 4);
+        if (level < 2) { if (!(o & 0x80000000u)) return 0; dir = root + (o & 0x7FFFFFFFu); }
+        else { uint32_t d = root + o; *size = MEM32(d + 4); return base + MEM32(d); }
+    }
+    return 0;
+}
 
 /* What the kernel hands a new process, then the guest's own process start:
  * ntdll's LdrInitializeThunk does what LdrpInitializeProcess does on NT
@@ -1361,6 +1381,12 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
     *(uint32_t*)(peb + 0xB4) = ent->OptionalHeader.Subsystem;
     *(uint32_t*)(peb + 0xB8) = ent->OptionalHeader.MajorSubsystemVersion;
     *(uint32_t*)(peb + 0xBC) = ent->OptionalHeader.MinorSubsystemVersion;
+    if (nt_guest_xp((uint32_t)(uintptr_t)peb)) {
+        /* XP: the program's manifest (RT_MANIFEST 1) is its process default
+         * activation context, which csrss builds at process creation */
+        uint32_t ms = 0, m = pe_resource(exe, 24, 1, &ms);
+        if (m && ms) *(uint32_t*)(peb + 0x1F8) = csr32_sxs_blob((const char*)(uintptr_t)m, ms);
+    }
     /* SessionId (+0x1D4) stays 0: the guest is on Windows 2000's local console.
      * Its user32 answers GetSystemMetrics(SM_REMOTESESSION) with PEB SessionId
      * != 0, and every Windows 10/11 desktop is session 1+, so explorer showed the

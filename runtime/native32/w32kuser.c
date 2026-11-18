@@ -506,7 +506,8 @@ static uint32_t s_register_class(uint32_t* a) {
     w.hIconSm = (HICON)(uintptr_t)cur_host((uint32_t)(uintptr_t)w.hIconSm);
     w.hCursor = (HCURSOR)(uintptr_t)cur_host((uint32_t)(uintptr_t)w.hCursor);
     if (getenv("NATIVE32_SYSCALLS"))
-        fprintf(stderr, "[user] class background %p (guest %08X)\n", w.hbrBackground, ((WNDCLASSEXW*)(uintptr_t)a[0])->hbrBackground);
+        fprintf(stderr, "[user] class %ls background %p (guest %08X)\n", (uintptr_t)w.lpszClassName < 0x10000 ? L"(atom)" : w.lpszClassName,
+                w.hbrBackground, ((WNDCLASSEXW*)(uintptr_t)a[0])->hbrBackground);
     uint32_t guest_proc = (uint32_t)(uintptr_t)w.lpfnWndProc;
     w.lpfnWndProc = wnd_thunk;
     ATOM r = RegisterClassExW(&w);
@@ -726,7 +727,15 @@ static uint32_t s_create_window(uint32_t* a) {
     HWND h = CreateWindowExW(a[0] & ~0x80000000u, lstr_name(a[1]), lstr_name(a[2]), a[3], (int)a[4], (int)a[5], cx, cy,
                              (HWND)(uintptr_t)a[8], (HMENU)(uintptr_t)a[9], (HINSTANCE)(uintptr_t)a[10],
                              (void*)(uintptr_t)a[11]);
-    if (!h) fprintf(stderr, "[user] CreateWindowExW %08X %ls failed: %lu (style %08X ex %08X parent %08X menu %08X inst %08X)\n", a[1], (uintptr_t)lstr_name(a[1]) < 0x10000 ? L"(atom)" : lstr_name(a[1]), GetLastError(), a[3], a[0], a[8], a[9], a[10]);
+    if (!h) {
+        DWORD e = GetLastError();
+        /* win32k's failure is the thread's last error (TEB LastErrorValue): XP's user32 reads
+         * ERROR_CANNOT_FIND_WND_CLASS to load the class's side-by-side DLL (comctl32 6.0
+         * registers "6.0.2600.5512!Button" then) and create again */
+        MEM32(MEM32(g_fs_base + 0x18) + 0x34) = e;
+        if (getenv("NATIVE32_SYSCALLS") || !(nt_guest_xp(native32_guest_peb) && e == ERROR_CANNOT_FIND_WND_CLASS && wcschr(lstr_name(a[1]) && (uintptr_t)lstr_name(a[1]) >= 0x10000 ? lstr_name(a[1]) : L"", L'!')))
+            fprintf(stderr, "[user] CreateWindowExW %08X %ls failed: %lu (style %08X ex %08X parent %08X menu %08X inst %08X)\n", a[1], (uintptr_t)lstr_name(a[1]) < 0x10000 ? L"(atom)" : lstr_name(a[1]), e, a[3], a[0], a[8], a[9], a[10]);
+    }
     if (h && g_screen && !(a[3] & WS_CHILD)) {   /* a top-level window: on the screen */
         /* the host activates a top-level window it makes a child; win32k never
          * activates at create (the tray lost activation to each hidden window

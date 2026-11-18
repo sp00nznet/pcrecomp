@@ -88,8 +88,11 @@ static inline uint32_t nt_routine(uint32_t peb, uint32_t x) {
 }
 /* win32k services whose XP argument list has one more than 2000's: the
  * index of the extra one, which a 2000-shaped handler drops (-1: none).
- * CreateWindowEx and RegisterClassExWOW take the class's version name after
- * the class name (CreateWindowEx also a last one, past 2000's 13). */
+ * CreateWindowEx and RegisterClassExWOW take the class's version-specific
+ * name after the class name ("6.0.2600.5512!Button" under comctl32 v6's
+ * activation context, else the name itself): the win32k layer registers and
+ * creates by that one, dropping the base name (index 1) when it is there.
+ * CreateWindowEx also has a last one, past 2000's 13. */
 #include <string.h>
 static inline int nt_w32k_xp_extra(const char* name) {
     if (!strcmp(name, "NtUserCreateWindowEx") || !strcmp(name, "NtUserRegisterClassExWOW")) return 2;

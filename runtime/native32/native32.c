@@ -534,9 +534,18 @@ uint32_t native32_map(const char* path, uint32_t base) {
 
 uint32_t native32_module(const char* name) {
     const char* file = strrchr(name, '\\');
+    size_t n = strlen(name);
     file = file ? file + 1 : name;
+    /* a module named with a directory ("sxs\X\comctl32.dll": a side-by-side
+     * assembly's DLL next to the system one of the same name) is that path's
+     * tail; it is never the answer for the bare name */
+    for (int i = 0; i < g_mod_n; i++) {
+        size_t k = strlen(g_mods[i].name);
+        if (strchr(g_mods[i].name, '\\') && n > k && name[n - k - 1] == '\\' && !_stricmp(name + n - k, g_mods[i].name))
+            return g_mods[i].base;
+    }
     for (int i = 0; i < g_mod_n; i++)
-        if (!_stricmp(g_mods[i].name, file)) return g_mods[i].base;
+        if (!strchr(g_mods[i].name, '\\') && !_stricmp(g_mods[i].name, file)) return g_mods[i].base;
     return 0;
 }
 
