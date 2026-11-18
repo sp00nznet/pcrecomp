@@ -24,9 +24,16 @@ static inline int ntstub_parse(const uint8_t* b, uint32_t* svc, uint8_t* argc) {
     return 1;
 }
 
+/* a guest address as a host pointer: ADDR() where recomp_types.h is in (the
+ * Linux host, based on 64-bit hosts: a64), flat otherwise */
+#ifdef ADDR
+#define NTGUEST_VA(va) ADDR(va)
+#else
+#define NTGUEST_VA(va) ((uintptr_t)(uint32_t)(va))
+#endif
 /* NT 5.1 (Windows XP, build 2600) or later, by the guest PEB's build number */
 static inline int nt_guest_xp(uint32_t peb) {
-    return peb && *(const uint16_t*)(uintptr_t)(peb + 0xAC) >= 2600;
+    return peb && *(const uint16_t*)NTGUEST_VA(peb + 0xAC) >= 2600;
 }
 
 /* GDI's shared memory (Peb->GdiSharedHandleTable): the handle table, then
