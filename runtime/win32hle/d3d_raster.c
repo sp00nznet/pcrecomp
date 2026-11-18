@@ -85,6 +85,30 @@ static inline void fmt_unpack(const rfmt_t *f, uint32_t v, float c[4]) {
     for (int i = 0; i < 4; i++)
         c[i] = f->bits[i] ? (float)((v & f->mask[i]) >> f->sh[i]) / (float)((1u << f->bits[i]) - 1) : 1.0f;
 }
+/* A texel value's ARGB8888, as d3d_texel's colour would round to. */
+static uint32_t argb_of(const surf_t *s, uint32_t v) {
+    float c[4];
+    unpack(s, v, c);
+    return (uint32_t)(c[3] * 255.f + .5f) << 24 | (uint32_t)(c[0] * 255.f + .5f) << 16 |
+           (uint32_t)(c[1] * 255.f + .5f) << 8 | (uint32_t)(c[2] * 255.f + .5f);
+}
+/* Every 16-bit value's ARGB in one format, made once: games stream their
+ * textures, and unpacking each texel on its own costs whole frames. */
+static const uint32_t *lut16(const surf_t *s) {
+    static struct { uint32_t m[4]; uint32_t *t; } cache[8];
+    static int n;
+    uint32_t m[4];
+    masks_of(s, &m[0], &m[1], &m[2], &m[3]);
+    for (int i = 0; i < n; i++)
+        if (!memcmp(cache[i].m, m, sizeof m)) return cache[i].t;
+    uint32_t *t = (uint32_t *)malloc(65536 * 4);
+    if (!t) return NULL;
+    for (uint32_t v = 0; v < 65536; v++) t[v] = argb_of(s, v);
+    int i = n < 8 ? n++ : 7;                             /* more formats than games use: the last slot turns over */
+    if (i == 7 && cache[7].t) free(cache[7].t);
+    memcpy(cache[i].m, m, sizeof m), cache[i].t = t;
+    return t;
+}
 /* The texture as ARGB8888, remade when its pixels or key have changed. */
 static void tex_cache(surf_t *t) {
     if (t->argb && t->argb_gen == t->gen && t->argb_w == t->w && t->argb_h == t->h) return;
@@ -98,15 +122,22 @@ static void tex_cache(surf_t *t) {
         if (!t->argb || !t->keyed) hle_fatal("no memory for a %dx%d texture's cache", t->w, t->h);
         t->argb_w = t->w, t->argb_h = t->h;
     }
-    for (int y = 0; y < t->h; y++)
+    uint32_t pal[256];
+    const uint32_t *lut = NULL;
+    if (t->bpp == 16) lut = lut16(t);
+    else if (t->bpp == 8) { for (uint32_t v = 0; v < 256; v++) pal[v] = argb_of(t, v); lut = pal; }
+    uint32_t lo = t->ck_lo, hi = t->ck_hi < t->ck_lo ? t->ck_lo : t->ck_hi;
+    int ck = t->ck_src != 0;
+    for (int y = 0; y < t->h; y++) {
+        uint32_t *o = t->argb + (size_t)y * (size_t)t->w;
+        uint8_t *k = t->keyed + (size_t)y * (size_t)t->w;
+        const uint8_t *row = t->px + (size_t)y * (size_t)t->pitch;
         for (int x = 0; x < t->w; x++) {
-            float c[4];
-            int k;
-            d3d_texel(t, x, y, c, &k);
-            t->argb[(size_t)y * (size_t)t->w + (size_t)x] = (uint32_t)(c[3] * 255.f + .5f) << 24 | (uint32_t)(c[0] * 255.f + .5f) << 16 |
-                                                            (uint32_t)(c[1] * 255.f + .5f) << 8 | (uint32_t)(c[2] * 255.f + .5f);
-            t->keyed[(size_t)y * (size_t)t->w + (size_t)x] = (uint8_t)k;
+            uint32_t v = t->bpp == 16 ? ((const uint16_t *)row)[x] : t->bpp == 8 ? row[x] : raw(t, x, y);
+            o[x] = lut ? lut[v] : argb_of(t, v);
+            k[x] = (uint8_t)(ck && v >= lo && v <= hi);
         }
+    }
     t->argb_gen = t->gen;
 }
 void d3d_raster_prepare(rstate_t *st) {
