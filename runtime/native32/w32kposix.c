@@ -41,6 +41,7 @@
 #include <ctype.h>
 #include "ntposix.h"
 #include "w32klayout.h"
+#include "ntguest.h"
 #include "w32kposix.h"
 
 static int g_trace;
@@ -899,7 +900,7 @@ static uint32_t s_gdi_init(uint32_t* a) {
     if (g_gdit) return 1;
     g_gdit = ntp_alloc(GDI_TABLE_SIZE);
     MEM32(ntp_peb() + PEB_GDITABLE) = g_gdit;
-    w2k_gdi_devcaps(g_gdit, devcaps);
+    w2k_gdi_devcaps(g_gdit, nt_gdi_devcaps(ntp_peb()), devcaps);
     /* the stock objects */
     static const uint32_t bc[] = { 0xFFFFFF, 0xC0C0C0, 0x808080, 0x404040, 0 };
     for (int i = 0; i <= 4; i++) { gobj_t* o = gnew(GDI_BRUSH, 1); o->color = bc[i]; g_stock[i] = o->h; }

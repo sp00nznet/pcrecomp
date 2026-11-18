@@ -79,6 +79,8 @@ void native32_net_loopback_only(void);
  * real one. Two instances with two names keep apart. Call before
  * native32_bind; 0 if the key can't be made. */
 int native32_registry_sandbox(const char* name);
+/* 1 if s (n characters) holds the host's user, account or machine name (regbox32.c) */
+int native32_host_identity_in(const wchar_t* s, size_t n);
 /* The same for a lifted ntdll's NtXxxKey services and a proxied host
  * advapi32: pass native32_nt_override, native32_nt_forward and
  * native32_nt_proxy_hook (before native32_nt_boot). */
@@ -238,6 +240,7 @@ int native32_headless(void);
 void native32_seh_continue(uint32_t va);
 void native32_rpc_guard(uint32_t ndr_client_call2, uint32_t ndr_client_call);   /* guest RPC failures end the call (native32.c) */
 void native32_rpc_fail(uint32_t exception_record, uint32_t context);
+void native32_co_register_guard(uint32_t co_register_class_object);   /* XP: no local server registration (native32.c) */
 int native32_local_unwind2(void);   /* MSVC __local_unwind2 copies in the guest modules: a finally that exits its function (native32.c) */
 extern int native32_guest_seh;   /* 1: RaiseException goes to the guest chain */
 /* A Visual Basic 5/6 guest on the real MSVBVM60/50 (vb6rt.c): the runtime is

@@ -38,6 +38,9 @@ import struct
 EH_MAGICS = (0x19930520, 0x19930521, 0x19930522)
 PROLOGUE_WINDOW = 12     # instructions: the frame is installed right at entry
 FUNCLET_WINDOW = 0x800   # bytes of a catch funclet scanned for its returns
+# __SEH_prolog: push handler (5 bytes, any); mov eax, fs:[0]; push eax; mov eax, [esp+10h];
+# mov [esp+10h], ebp; lea ebp, [esp+10h] (disasm32.seh_entries looks for the same)
+SEH_PROLOG = bytes.fromhex('6800000000' '64a100000000' '50' '8b442410' '896c2410' '8d6c2410')
 STUB_WINDOW = 40         # bytes of a handler stub searched for its FuncInfo
 
 
@@ -117,6 +120,13 @@ def frame(md, read, insns):
     """None if the function installs no MSVC EH frame in its prologue; else
     (resume points, off): the addresses inside it that a handler continues
     at, and entry esp minus the ebp its handlers use (RECOMP_EH_FRAME)."""
+    # XP's ntdll/kernel32/netapi32: `push locals; push scopetable; call __SEH_prolog`,
+    # which builds the same record (ebp = entry esp - 4, like `push ebp; mov ebp, esp`)
+    if len(insns) >= 3 and [i.mnemonic for i in insns[:3]] == ['push', 'push', 'call']:
+        table, tgt = _int(insns[1].op_str), _int(insns[2].op_str)
+        if table is not None and tgt is not None and (read(tgt, len(SEH_PROLOG)) or b'')[5:] == SEH_PROLOG[5:]:
+            out = {h for flt, h in scope_table(read, table, max(try_levels(insns), 64)) if flt}
+            return (out, 4) if out else None
     depth, imms = 0, []      # bytes pushed since entry; immediates pushed
     for ins in insns[:PROLOGUE_WINDOW]:
         m, op = ins.mnemonic, ins.op_str
@@ -188,6 +198,11 @@ def _selftest():
     put(0x5000, bytes.fromhex('558bec'))       # _except_handler3: not a FuncInfo stub
     seh = list(md.disasm(read(0x1600, 40), 0x1600))
     assert frame(md, read, seh) == ({0x1710}, 4), frame(md, read, seh)
+    # The same table through XP's __SEH_prolog at 0x6000: push 0x20; push 0x4000; call 0x6000.
+    put(0x6000, bytes.fromhex('6800500000') + SEH_PROLOG[5:])
+    put(0x1800, bytes.fromhex('6a20' '6800400000' 'e8f4470000'))
+    xp = list(md.disasm(read(0x1800, 12), 0x1800))
+    assert frame(md, read, xp) == ({0x1710}, 4), frame(md, read, xp)
     print('eh32 selftest: ok')
 
 

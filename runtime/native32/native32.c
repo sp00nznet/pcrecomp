@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "native32.h"
+#include "ntguest.h"
 #include "image_loader.h"
 #include "recomp_trace.h"
 
@@ -119,6 +120,12 @@ static uint32_t make_tib(uint32_t lo, uint32_t hi) {
         t[0xBF8 / 4] = 0x020A0000u;                       /* Length 0, MaximumLength 0x20A */
         t[0xBFC / 4] = (uint32_t)(uintptr_t)t + 0xC00;    /* -> StaticUnicodeBuffer */
         t[0xE0C / 4] = lo;                                /* DeallocationStack */
+        if (nt_guest_xp(native32_guest_peb)) {
+            /* XP's TEB+0x1A8 ACTIVATION_CONTEXT_STACK: its FrameListCache
+             * (+0xC) an empty list, as XP's kernel makes it (ntdll's
+             * RtlActivateActivationContextEx walks it) */
+            t[0x1B4 / 4] = t[0x1B8 / 4] = (uint32_t)(uintptr_t)t + 0x1B4;
+        }
     }
     if (g_tls_n) {
         uint32_t* slots = (uint32_t*)calloc(MAX_TLS, 4);
@@ -276,7 +283,7 @@ static void native32_yield(void) {
 
 /* ---------------------------------------------------------------- modules */
 
-#define MAX_MODULES 32
+#define MAX_MODULES 64
 static struct { uint32_t base, span; int native; char name[MAX_PATH]; } g_mods[MAX_MODULES];
 static int g_mod_n;
 
@@ -494,8 +501,12 @@ int native32_hold_image(const char* path, uint32_t base) {
 
 uint32_t native32_map(const char* path, uint32_t base) {
     uint32_t span = recomp_load_image(path, base);
-    if (!span || g_mod_n == MAX_MODULES) return 0;
+    if (g_mod_n == MAX_MODULES) { fprintf(stderr, "[load] more than %d modules\n", MAX_MODULES); return 0; }
+    if (!span) return 0;
     const char* file = strrchr(path, '\\');
+    /* a side-by-side assembly's DLL keeps its "sxs\<assembly>\" (native32_module):
+     * by its bare name the guest's loader got the system comctl32 for 6.0's file */
+    for (const char* p = path; (p = strstr(p, "\\sxs\\")) != NULL; p++) file = p;
     g_mods[g_mod_n].base = base;
     g_mods[g_mod_n].span = span;
     strncpy(g_mods[g_mod_n++].name, file ? file + 1 : path, MAX_PATH - 1);
@@ -527,9 +538,18 @@ uint32_t native32_map(const char* path, uint32_t base) {
 
 uint32_t native32_module(const char* name) {
     const char* file = strrchr(name, '\\');
+    size_t n = strlen(name);
     file = file ? file + 1 : name;
+    /* a module named with a directory ("sxs\X\comctl32.dll": a side-by-side
+     * assembly's DLL next to the system one of the same name) is that path's
+     * tail; it is never the answer for the bare name */
+    for (int i = 0; i < g_mod_n; i++) {
+        size_t k = strlen(g_mods[i].name);
+        if (strchr(g_mods[i].name, '\\') && n > k && name[n - k - 1] == '\\' && !_stricmp(name + n - k, g_mods[i].name))
+            return g_mods[i].base;
+    }
     for (int i = 0; i < g_mod_n; i++)
-        if (!_stricmp(g_mods[i].name, file)) return g_mods[i].base;
+        if (!strchr(g_mods[i].name, '\\') && !_stricmp(g_mods[i].name, file)) return g_mods[i].base;
     return 0;
 }
 
@@ -1836,6 +1856,13 @@ static int atl_thunk(CONTEXT* c, uint32_t pc) {
 static LONG CALLBACK native32_veh(EXCEPTION_POINTERS* ep) {
     EXCEPTION_RECORD* er = ep->ExceptionRecord;
     uint32_t pc = (uint32_t)(uintptr_t)er->ExceptionAddress;
+    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && getenv("PCRECOMP_FAULTTRACE")) {   /* the guest's stack at a host fault */
+        fprintf(stderr, "[fault] AV at %p (%08X) in %08X, guest esp %08X:", er->ExceptionAddress,
+                er->NumberParameters >= 2 ? (uint32_t)er->ExceptionInformation[1] : 0, g_cur_func, g_esp);
+        for (int i = 0; i < 24 && g_esp; i++) fprintf(stderr, " %08X", MEM32(g_esp + 4 * i));
+        fprintf(stderr, "\n");
+        recomp_dump_trace("fault");
+    }
     if (er->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION && lifted_in_native(pc)) {
         t_lin_va = pc;                          /* native code reached a lifted one */
         ep->ContextRecord->Eip = (DWORD)(uintptr_t)lin_tramp;
@@ -2133,6 +2160,30 @@ void native32_rpc_guard(uint32_t ndr_client_call2, uint32_t ndr_client_call) {
     recomp_func_t f;
     if (ndr_client_call2 && (f = recomp_lookup(ndr_client_call2)) != NULL) g_rpc_orig[0] = f, native32_replace(ndr_client_call2, shim_rpc_call2);
     if (ndr_client_call && (f = recomp_lookup(ndr_client_call)) != NULL) g_rpc_orig[1] = f, native32_replace(ndr_client_call, shim_rpc_call);
+}
+
+/* XP's ole32 registers a CLSCTX_LOCAL_SERVER class object by marshaling it
+ * through rpcss's OXID resolver, which a guest never has (no host RPC), so
+ * CoRegisterClassObject failed for explorer's own TaskBand, TrayBandSiteService
+ * and its desktop classes (INPROC|LOCAL): no taskbar bands. Another process
+ * cannot reach a guest's class object anyway; a failed registration that
+ * asked for the local server is made again in process only. */
+static recomp_func_t g_coreg_orig;
+static void shim_co_register(void) {
+    uint32_t sp = g_esp, a[6];
+    for (int i = 0; i < 6; i++) a[i] = MEM32(sp + 4 * i);
+    g_coreg_orig();
+    if ((int32_t)g_eax < 0 && (a[3] & 4) && (a[3] & ~4u)) {
+        g_esp = sp;
+        for (int i = 0; i < 6; i++) MEM32(sp + 4 * i) = a[i];
+        MEM32(sp + 0xC) = a[3] & ~4u;
+        g_coreg_orig();
+    }
+}
+void native32_co_register_guard(uint32_t co_register_class_object) {
+    recomp_func_t f;
+    if (co_register_class_object && (f = recomp_lookup(co_register_class_object)) != NULL)
+        g_coreg_orig = f, native32_replace(co_register_class_object, shim_co_register);
 }
 
 /* An RPC status (RPC_S_*, 0x6A4..0x7FF, or its HRESULT) no guest frame took

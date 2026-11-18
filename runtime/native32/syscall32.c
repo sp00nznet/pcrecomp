@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "native32.h"
+#include "ntguest.h"
 
 #define MAX_SVC 0x400
 static struct { const char* name; uint8_t argc; native32_syscall_fn fn; void* host; } g_svc[MAX_SVC];
@@ -97,12 +98,11 @@ int native32_nt_syscalls(uint32_t base) {
         const char* name = (const char*)(b + names[i]);
         const uint8_t* p = b + funcs[ords[i]];
         if (name[0] != 'N' || name[1] != 't') continue;            /* Zw* are the same stubs */
-        if (p[0] != 0xB8 || p[5] != 0x8D || p[6] != 0x54 || p[7] != 0x24 || p[8] != 0x04 ||
-            p[9] != 0xCD || p[10] != 0x2E) continue;
-        uint32_t svc = *(uint32_t*)(p + 1);
+        uint32_t svc; uint8_t argc;
+        if (!ntstub_parse(p, &svc, &argc)) continue;
         if (svc >= MAX_SVC) continue;
         g_svc[svc].name = name;
-        g_svc[svc].argc = p[11] == 0xC2 ? (uint8_t)(*(uint16_t*)(p + 12) / 4) : 0;
+        g_svc[svc].argc = argc;
         g_svc[svc].host = backend_resolve(name);
         for (int k = 0; k < g_novr; k++)
             if (!strcmp(g_ovr[k].name, name)) g_svc[svc].fn = g_ovr[k].fn;
@@ -489,6 +489,12 @@ static int fb_install(const wchar_t* image_path, const wchar_t* dll_path, const 
 static uint32_t ovr_query_process(uint32_t* a) {
     if (fb_on && a[1] == 23 && (a[0] == 0xFFFFFFFFu || GetProcessId((HANDLE)(uintptr_t)a[0]) == GetCurrentProcessId()))
         return fb_devmap(a);                                  /* ProcessDeviceMap */
+    /* ProcessSessionInformation: the guest's session (the PEB's), not the host's */
+    if (a[1] == 24 && a[3] >= 4 && (a[0] == 0xFFFFFFFFu || GetProcessId((HANDLE)(uintptr_t)a[0]) == GetCurrentProcessId())) {
+        MEM32(a[2]) = MEM32(native32_guest_peb + 0x1D4);
+        if (a[4]) MEM32(a[4]) = 4;
+        return 0;
+    }
     uint32_t r = native32_nt_forward("NtQueryInformationProcess", a);
     if (!r && a[1] == 0 && (a[0] == 0xFFFFFFFFu || GetProcessId((HANDLE)(uintptr_t)a[0]) == GetCurrentProcessId()))
         MEM32(a[2] + 4) = native32_guest_peb;
@@ -992,6 +998,10 @@ static uint32_t host_setting(const char* svc) {
     fprintf(stderr, "[guard] %s: a host setting, refused\n", svc);
     return 0xC0000061u;
 }
+/* NtQueryDebugFilterState (XP): the host's says yes for components a stock
+ * XP keeps quiet, and the guest's DbgPrint then raises its int 2Dh. No debug
+ * output, as on a machine with no kernel debugger set up. */
+static uint32_t ovr_debug_filter(uint32_t* a) { (void)a; return 0; }
 static uint32_t ovr_set_time(uint32_t* a) { return a[0] ? host_setting("NtSetSystemTime") : native32_nt_forward("NtSetSystemTime", a); }
 #define HOST_SETTING(n) static uint32_t ovr_##n(uint32_t* a) { (void)a; return host_setting(#n); }
 HOST_SETTING(NtSetSystemInformation) HOST_SETTING(NtSetDefaultLocale) HOST_SETTING(NtSetDefaultUILanguage)
@@ -1067,11 +1077,10 @@ int native32_nt_win32k(const uint32_t* bases, int nbases, const char* names_file
         uint32_t base = bases[m], size = image_size(base);
         for (uint32_t p = base + 0x1000; p + 16 < base + size; p++) {
             const uint8_t* b = (const uint8_t*)(uintptr_t)p;
-            if (b[0] != 0xB8 || b[5] != 0x8D || b[6] != 0x54 || b[7] != 0x24 || b[8] != 0x04 ||
-                b[9] != 0xCD || b[10] != 0x2E) continue;
-            uint32_t svc = *(const uint32_t*)(b + 1);
+            uint32_t svc; uint8_t argc;
+            if (!ntstub_parse(b, &svc, &argc)) continue;
             if (svc < 0x1000 || svc >= 0x1000 + W32K_MAX) continue;
-            g_w32k[svc - 0x1000].argc = b[11] == 0xC2 ? (uint8_t)(*(const uint16_t*)(b + 12) / 4) : 0;
+            g_w32k[svc - 0x1000].argc = argc;
             stubs++;
         }
     }
@@ -1118,7 +1127,14 @@ static uint32_t win32k_call(uint32_t svc, uint32_t* args) {
         fprintf(stderr, "[win32k] t%lu enters %s(%08X %08X), window of t%lu\n", GetCurrentThreadId(), nm, args[0], args[1],
                 args[0] ? GetWindowThreadProcessId((HWND)(uintptr_t)args[0], NULL) : 0);
     int held = blocks ? mach_release() : 0;
-    uint32_t r = g_w32k[i].fn ? g_w32k[i].fn(args) : 0;
+    uint32_t xa[16];
+    int drop = g_w32k[i].fn && nt_guest_xp(native32_guest_peb) ? nt_w32k_xp_extra(nm) : -1;
+    if (drop == 2 && args[2]) drop = 1;   /* the version-specific class name, when there is one (ntguest.h) */
+    if (drop >= 0 && g_w32k[i].argc <= 16) {
+        /* XP's argument list has one more (ntguest.h): the handlers take 2000's */
+        for (int k = 0, j = 0; k < g_w32k[i].argc; k++) if (k != drop) xa[j++] = args[k];
+    }
+    uint32_t r = g_w32k[i].fn ? g_w32k[i].fn(drop >= 0 ? xa : args) : 0;
     if (blocks) mach_reacquire(held);
     if (g_trace && blocks) fprintf(stderr, "[win32k] t%lu left %s\n", GetCurrentThreadId(), nm);
     if (g_trace || (!g_w32k[i].fn && !g_w32k[i].seen)) {
@@ -1273,6 +1289,26 @@ static void ntdll_version(uint32_t ntdll, uint32_t* major, uint32_t* minor, uint
 }
 
 void csr32_install(void);   /* csr32.c */
+uint32_t csr32_sxs_blob(const char* manifest, size_t len);   /* csr32.c */
+uint32_t csr32_sxs_default(void);
+
+/* An image's resource (type, id), or 0: the first language */
+static uint32_t pe_resource(uint32_t base, uint32_t type, uint32_t id, uint32_t* size) {
+    IMAGE_NT_HEADERS32* nt = (IMAGE_NT_HEADERS32*)(uintptr_t)(base + MEM32(base + 0x3C));
+    uint32_t root = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE].VirtualAddress, dir, want[2] = { type, id };
+    if (!root) return 0;
+    root += base, dir = root;
+    for (int level = 0; level < 3; level++) {
+        uint32_t n = MEM16(dir + 12) + MEM16(dir + 14), e = dir + 16, hit = 0;
+        for (uint32_t k = 0; k < n && !hit; k++, e += 8)
+            if (level == 2 || MEM32(e) == want[level]) hit = e;
+        if (!hit) return 0;
+        uint32_t o = MEM32(hit + 4);
+        if (level < 2) { if (!(o & 0x80000000u)) return 0; dir = root + (o & 0x7FFFFFFFu); }
+        else { uint32_t d = root + o; *size = MEM32(d + 4); return base + MEM32(d); }
+    }
+    return 0;
+}
 
 /* What the kernel hands a new process, then the guest's own process start:
  * ntdll's LdrInitializeThunk does what LdrpInitializeProcess does on NT
@@ -1310,6 +1346,7 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
     native32_nt_override("NtSetDefaultLocale", ovr_NtSetDefaultLocale);
     native32_nt_override("NtSetDefaultUILanguage", ovr_NtSetDefaultUILanguage);
     native32_nt_override("NtShutdownSystem", ovr_NtShutdownSystem);
+    native32_nt_override("NtQueryDebugFilterState", ovr_debug_filter);
     native32_nt_override("NtSetSystemPowerState", ovr_NtSetSystemPowerState);
     native32_nt_override("NtInitiatePowerAction", ovr_NtInitiatePowerAction);
     native32_nt_override("NtLoadDriver", ovr_NtLoadDriver);
@@ -1333,6 +1370,10 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
     /* PEB: the fields the kernel sets (NT 5 offsets). Ldr, the heap, the
      * locks and the TLS bitmap are the guest ntdll's to make. */
     ntdll_version(ntdll, &major, &minor, &build);
+    {   /* XP: a class object registers in process only when it cannot as a local server (native32.c) */
+        uint32_t ole = native32_module("ole32.dll");
+        if (ole && build >= 2600) native32_co_register_guard(native32_export(ole, "CoRegisterClassObject"));
+    }
     *(uint32_t*)(peb + 0x08) = exe;
     *(uint32_t*)(peb + 0x10) = (uint32_t)(uintptr_t)pp;
     SYSTEM_INFO si;
@@ -1351,11 +1392,23 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
     *(uint32_t*)(peb + 0xB4) = ent->OptionalHeader.Subsystem;
     *(uint32_t*)(peb + 0xB8) = ent->OptionalHeader.MajorSubsystemVersion;
     *(uint32_t*)(peb + 0xBC) = ent->OptionalHeader.MinorSubsystemVersion;
+    if (nt_guest_xp((uint32_t)(uintptr_t)peb)) {
+        /* XP: the program's manifest (RT_MANIFEST 1) is its process default
+         * activation context, which csrss builds at process creation */
+        uint32_t ms = 0, m = pe_resource(exe, 24, 1, &ms);
+        if (m && ms) *(uint32_t*)(peb + 0x1F8) = csr32_sxs_blob((const char*)(uintptr_t)m, ms);
+        /* and the system default context (csrss's, for every process): no assemblies, the empty sections */
+        *(uint32_t*)(peb + 0x200) = csr32_sxs_default();
+    }
     /* SessionId (+0x1D4) stays 0: the guest is on Windows 2000's local console.
      * Its user32 answers GetSystemMetrics(SM_REMOTESESSION) with PEB SessionId
      * != 0, and every Windows 10/11 desktop is session 1+, so explorer showed the
      * "Windows 2000 Terminal" banner. Named objects use the host's session
-     * through BASE_STATIC_SERVER_DATA (csr32.c), not this field. */
+     * through BASE_STATIC_SERVER_DATA (csr32.c), not this field.
+     * XP's user32 asks SessionId != KUSER_SHARED_DATA.ActiveConsoleId (0x7FFE02D8,
+     * the host's page): the guest's session is the host's console one, so a host
+     * reached over RDP is not a remote session to it (no Start menu "Disconnect"). */
+    if (nt_guest_xp((uint32_t)(uintptr_t)peb)) *(uint32_t*)(peb + 0x1D4) = *(volatile uint32_t*)(uintptr_t)0x7FFE02D8;
 
     /* Process parameters, normalized, with the current directory's handle
      * open the way the creating process leaves it. */
@@ -1418,9 +1471,19 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
         wchar_t gp[MAX_PATH] = L"";
         GetEnvironmentVariableW(L"PCRECOMP_GUEST_PATH", gp, MAX_PATH);
         while (e[n] || e[n + 1]) n++;
-        wchar_t* copy = (wchar_t*)VirtualAlloc(NULL, (n + dl + MAX_PATH + 8) * 2, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        for (wchar_t* s = e; *s; s += wcslen(s) + 1)
-            if (_wcsnicmp(s, L"Path=", 5) && _wcsnicmp(s, L"PCRECOMP_GUEST_", 15)) { wcscpy(copy + o, s); if (fb_on && !ge) fb_guest_path(copy + o); o += wcslen(copy + o) + 1; }
+        wchar_t* copy = (wchar_t*)VirtualAlloc(NULL, (n + dl + MAX_PATH + 200) * 2, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        /* The guest's identity (regbox32.c): user User on PCRECOMP, at the console. No
+         * entry naming the host's user or machine (OneDrive=C:\Users\<name>\..., ...). */
+        static const wchar_t* idv[] = { L"USERNAME=User", L"USERDOMAIN=PCRECOMP", L"COMPUTERNAME=PCRECOMP",
+                                        L"LOGONSERVER=\\\\PCRECOMP", L"SESSIONNAME=Console" };
+        static const wchar_t* idn[] = { L"USERNAME=", L"USERDOMAIN", L"COMPUTERNAME=", L"LOGONSERVER=", L"SESSIONNAME=",
+                                        L"CLIENTNAME=", L"USERDNSDOMAIN=" };
+        for (wchar_t* s = e; *s; s += wcslen(s) + 1) {
+            int id = native32_host_identity_in(s, wcslen(s));
+            for (int i = 0; i < (int)(sizeof idn / sizeof idn[0]); i++) id |= !_wcsnicmp(s, idn[i], wcslen(idn[i]));
+            if (!id && _wcsnicmp(s, L"Path=", 5) && _wcsnicmp(s, L"PCRECOMP_GUEST_", 15)) { wcscpy(copy + o, s); if (fb_on && !ge) fb_guest_path(copy + o); o += wcslen(copy + o) + 1; }
+        }
+        for (int i = 0; i < (int)(sizeof idv / sizeof idv[0]); i++) wcscpy(copy + o, idv[i]), o += wcslen(idv[i]) + 1;
         wcscpy(copy + o, L"Path="), wcscpy(copy + o + 5, dll_path), o += 5 + dl;
         /* PCRECOMP_GUEST_PATH: more guest directories for a program search (cmd's
          * `find` and `more`: the box's C:\WINNT\system32, where a runner puts names) */

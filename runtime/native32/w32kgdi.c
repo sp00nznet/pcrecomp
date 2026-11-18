@@ -50,6 +50,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "native32.h"
+#include "ntguest.h"
 
 #define GDI_ENTRIES 0x4000
 #define ATTR_SIZE 0x400
@@ -237,8 +238,9 @@ static void batch(void) {
             if (old) SelectObject(h, old);
         } else if (cmd == 1) {                                 /* PolyPatBlt { rop, mode, count, ?, colour, ?, ?, */
             HDC h = dc(hdc);                                   /* then count x { x, y, cx, cy, brush } at +0x24 } */
-            for (uint32_t k = 0, n = MEM32(e + 0xC); k < n && 0x24 + 0x14 * (k + 1) <= len; k++) {
-                uint32_t r = e + 0x24 + 0x14 * k, br = HOST(MEM32(r + 0x10));
+            uint32_t r0 = nt_batch_polypatblt(native32_guest_peb);
+            for (uint32_t k = 0, n = MEM32(e + 0xC); k < n && r0 + 0x14 * (k + 1) <= len; k++) {
+                uint32_t r = e + r0 + 0x14 * k, br = HOST(MEM32(r + 0x10));
                 HGDIOBJ old = br ? SelectObject(h, (HGDIOBJ)(uintptr_t)br) : NULL;
                 PatBlt(h, (int)MEM32(r), (int)MEM32(r + 4), (int)MEM32(r + 8), (int)MEM32(r + 0xC), MEM32(e + 4));
                 if (old) SelectObject(h, old);
@@ -263,15 +265,18 @@ static void batch(void) {
         } else if (cmd == 6) {                                 /* select a font: DC_ATTR's is current */
             uint8_t* a = native32_gdi_attr(hdc);
             if (a) AT32(a, 0x90) = MEM32(e + 4);
+            if (getenv("PCRECOMP_TEXTTRACE")) fprintf(stderr, "[gdi] batch font dc %08X font %08X\n", hdc, MEM32(e + 4));
         } else if (cmd == 2) {                                 /* TextOut { fg, bk, bk mode, ?, ?, x, y, options (bit 31: */
             HDC h = dc(hdc);                                   /* no rect), RECT, cp, count, ?, font, align, viewport org, text } */
-            uint32_t f = HOST(MEM32(e + 0x38)), o = MEM32(e + 0x18);
+            uint32_t x = e + nt_batch_textout(native32_guest_peb);   /* (XP: from x on, 8 later) */
+            uint32_t f = HOST(MEM32(x + 0x38)), o = MEM32(x + 0x18);
+            if (getenv("PCRECOMP_TEXTTRACE")) fprintf(stderr, "[gdi] text dc %08X font %08X host %08X attrfont %08X n %u\n", hdc, MEM32(x + 0x38), f, native32_gdi_attr(hdc) ? AT32(native32_gdi_attr(hdc), 0x90) : 0, MEM32(x + 0x30));
             HGDIOBJ old = f ? SelectObject(h, (HGDIOBJ)(uintptr_t)f) : NULL;
             SetTextColor(h, MEM32(e + 4)), SetBkColor(h, MEM32(e + 8)), SetBkMode(h, (int)MEM32(e + 0xC));
-            SetTextAlign(h, MEM32(e + 0x3C));
-            SetViewportOrgEx(h, (int)MEM32(e + 0x40), (int)MEM32(e + 0x44), NULL);
-            ExtTextOutW(h, (int)MEM32(e + 0x10), (int)MEM32(e + 0x14), o & 0x7FFFFFFFu,
-                        (o & 0x80000000u) ? NULL : (RECT*)(uintptr_t)(e + 0x1C), (LPCWSTR)(uintptr_t)(e + 0x48), MEM32(e + 0x30), NULL);
+            SetTextAlign(h, MEM32(x + 0x3C));
+            SetViewportOrgEx(h, (int)MEM32(x + 0x40), (int)MEM32(x + 0x44), NULL);
+            ExtTextOutW(h, (int)MEM32(x + 0x10), (int)MEM32(x + 0x14), o & 0x7FFFFFFFu,
+                        (o & 0x80000000u) ? NULL : (RECT*)(uintptr_t)(x + 0x1C), (LPCWSTR)(uintptr_t)(x + 0x48), MEM32(x + 0x30), NULL);
             if (old) SelectObject(h, old);
         } else
             fprintf(stderr, "[gdi] batch command %u (%u bytes) dropped\n", cmd, len);
@@ -287,10 +292,11 @@ static void batch(void) {
 static uint32_t s_init(uint32_t* a) {
     (void)a;
     if (!g_table) {
-        /* the handle table and the shared data after it (gdi32 reads +0x40094) */
-        g_table = (uint8_t*)VirtualAlloc(NULL, 0x80000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        /* the handle table and the shared data after it (gdi32 reads +0x40094; XP's +0x100094) */
+        uint32_t dc_off = nt_gdi_devcaps(native32_guest_peb);
+        g_table = (uint8_t*)VirtualAlloc(NULL, NT_GDI_SHARED_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         MEM32(native32_guest_peb + 0x94) = (uint32_t)(uintptr_t)g_table;
-        /* +0x40000: the display's DEVCAPS, which GetDeviceCaps reads for a
+        /* +0x40000 (XP +0x100000, ntguest.h): the display's DEVCAPS, which GetDeviceCaps reads for a
          * display DC it made itself (CreateDC("DISPLAY"): RichEdit's measuring
          * DC; zeros there gave LOGPIXELSY 0 and a 1-pixel font, every
          * character on its own line). { index, offset }, read off gdi32's
@@ -301,7 +307,7 @@ static uint32_t s_init(uint32_t* a) {
             { 0x70, 0x5C }, { 0x71, 0x60 }, { 0x74, 0x68 }, { 0x75, 0x70 }, { 0x76, 0x6C }, { 0x77, 0x74 } };
         HDC s = GetDC(NULL);
         for (int i = 0; i < (int)(sizeof caps / sizeof caps[0]); i++)
-            MEM32((uint32_t)(uintptr_t)g_table + 0x40000 + caps[i][1]) = (uint32_t)GetDeviceCaps(s, caps[i][0]);
+            MEM32((uint32_t)(uintptr_t)g_table + dc_off + caps[i][1]) = (uint32_t)GetDeviceCaps(s, caps[i][0]);
         ReleaseDC(NULL, s);
     }
     return 1;
@@ -373,6 +379,17 @@ static uint32_t s_delete(uint32_t* a) {
 static uint32_t s_bitblt(uint32_t* a) {
     return BitBlt(dc(a[0]), a[1], a[2], a[3], a[4], a[5] ? dc(a[5]) : NULL, a[6], a[7], a[8]);
 }
+/* NtGdiStretchBlt(dst, x, y, cx, cy, src, xs, ys, cxs, cys, rop, crBack) */
+static uint32_t s_stretchblt(uint32_t* a) {
+    return StretchBlt(dc(a[0]), a[1], a[2], a[3], a[4], a[5] ? dc(a[5]) : NULL, a[6], a[7], a[8], a[9], a[10]);
+}
+/* NtGdiAlphaBlend(dst, x, y, cx, cy, src, xs, ys, cxs, cys, BLENDFUNCTION, hcmXform):
+ * comctl32 6's image lists draw their 32-bit icons with it (XP's desktop, Start button) */
+static uint32_t s_alphablend(uint32_t* a) {
+    BLENDFUNCTION bf;
+    memcpy(&bf, &a[10], 4);
+    return GdiAlphaBlend(dc(a[0]), a[1], a[2], a[3], a[4], dc(a[5]), a[6], a[7], a[8], a[9], bf);
+}
 static uint32_t s_lineto(uint32_t* a) {
     BOOL r = LineTo(dc(a[0]), (int)a[1], (int)a[2]);
     dc_back(a[0]);
@@ -401,6 +418,11 @@ static uint32_t s_dibitmap(uint32_t* a) {
     BITMAPINFO* bi = (BITMAPINFO*)(uintptr_t)a[5];
     HDC h = (HDC)(uintptr_t)HOST(a[0]);
     if (!bi) return GUEST(CreateCompatibleBitmap(h ? h : GetDC(NULL), (int)a[1], (int)a[2]));
+    /* fInit 2 (CBM_CREATEDIB) with colour bits: the DIB's own colours, so a
+     * screen-format bitmap, whatever the DC holds (XP's user32 makes an icon's
+     * colour bitmap on its memory DC, whose 1-bpp bitmap made it black) */
+    static HDC screen;
+    if ((a[3] & 2) && bi->bmiHeader.biBitCount > 1) h = screen ? screen : (screen = GetDC(NULL));
     return GUEST(CreateDIBitmap(h ? h : GetDC(NULL), &bi->bmiHeader, a[3] & CBM_INIT, (void*)(uintptr_t)a[4], bi, a[6]));
 }
 /* NtGdiGetRegionData(hrgn, count, RGNDATA*). NtGdiGetDeviceWidth stays
@@ -713,7 +735,13 @@ static void cb_in(uint32_t* a) {
     if (!g_table || !IsWindow((HWND)(uintptr_t)a[0])) return;
     /* (a handle that is already the guest's came through a guest -> host ->
      * guest CallWindowProc and stays) */
-    if (is_dc_msg(a[1]) && a[2] && ((a[2] >> 16) & 0x1F) == 1 && !HOST(a[2])) a[2] = fresh(a[2]);
+    /* XP's gdi32 selects a font client-side (DC_ATTR +0x90 and a batched command, never
+     * the host DC): a WM_CTLCOLOR* DC is a guest control's own, already entered, and
+     * entering it afresh read the host DC's stock font back over the control's
+     * (comctl32 6.0's Edit and Static drew in the bold System font) */
+    if (a[1] >= WM_CTLCOLORMSGBOX && a[1] <= WM_CTLCOLORSTATIC && a[2] && nt_guest_xp(native32_guest_peb) && hfind(a[2]))
+        a[2] = (a[2] & 0xFFFF0000u) | (uint32_t)hfind(a[2]);
+    else if (is_dc_msg(a[1]) && a[2] && ((a[2] >> 16) & 0x1F) == 1 && !HOST(a[2])) a[2] = fresh(a[2]);
     else if (a[1] == WM_DRAWITEM && a[3]) {
         DRAWITEMSTRUCT* d = (DRAWITEMSTRUCT*)(uintptr_t)a[3];
         if (!HOST(d->hDC)) d->hDC = (HDC)(uintptr_t)fresh((uint32_t)(uintptr_t)d->hDC);
@@ -843,6 +871,7 @@ void native32_gdi_install(void) {
         { "NtGdiSetBoundsRect", s_setbounds }, { "NtGdiGetBoundsRect", s_getbounds }, { "NtGdiRectVisible", s_rectvisible }, { "NtGdiExtSelectClipRgn", s_selectcliprgn }, { "NtGdiCreateSolidBrush", s_brush },
         { "NtGdiSelectBitmap", s_select_bitmap }, { "NtGdiSelectBrush", s_select }, { "NtGdiSelectPen", s_select },
         { "NtGdiSelectFont", s_select }, { "NtGdiDeleteObjectApp", s_delete }, { "NtGdiBitBlt", s_bitblt },
+        { "NtGdiStretchBlt", s_stretchblt }, { "NtGdiAlphaBlend", s_alphablend },
         { "NtGdiLineTo", s_lineto }, { "NtGdiMoveTo", s_moveto }, { "NtGdiSetPixel", s_setpixel },
         { "NtGdiGetDeviceCaps", s_devcaps }, { "NtGdiSetLayout", s_setlayout },
         { "NtGdiSetDIBitsToDeviceInternal", s_setdibits }, { "NtGdiFlush", s_one },
