@@ -283,7 +283,7 @@ static void native32_yield(void) {
 
 /* ---------------------------------------------------------------- modules */
 
-#define MAX_MODULES 32
+#define MAX_MODULES 64
 static struct { uint32_t base, span; int native; char name[MAX_PATH]; } g_mods[MAX_MODULES];
 static int g_mod_n;
 
@@ -501,7 +501,8 @@ int native32_hold_image(const char* path, uint32_t base) {
 
 uint32_t native32_map(const char* path, uint32_t base) {
     uint32_t span = recomp_load_image(path, base);
-    if (!span || g_mod_n == MAX_MODULES) return 0;
+    if (g_mod_n == MAX_MODULES) { fprintf(stderr, "[load] more than %d modules\n", MAX_MODULES); return 0; }
+    if (!span) return 0;
     const char* file = strrchr(path, '\\');
     /* a side-by-side assembly's DLL keeps its "sxs\<assembly>\" (native32_module):
      * by its bare name the guest's loader got the system comctl32 for 6.0's file */

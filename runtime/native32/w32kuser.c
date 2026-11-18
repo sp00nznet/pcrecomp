@@ -1338,6 +1338,16 @@ static uint32_t s_set_cursor_data(uint32_t* a) {
 /* NtUserCallOneParam(param, index): 0x29 ReleaseDC; the rest read off the
  * user32 exports that call them */
 static uint32_t s_call_oneparam(uint32_t* a) {
+    uint32_t own = a[1];
+    /* XP's 0x26: GetCursorPos(POINT*), a service of its own on 2000; on the
+     * virtual screen, in its coordinates (the guest's windows are its children) */
+    if (nt_guest_xp(native32_guest_peb) && own == 0x26) {
+        POINT p;
+        if (!GetCursorPos(&p)) return 0;
+        if (g_screen) ScreenToClient(g_screen, &p);
+        MEM32(a[0]) = (uint32_t)p.x, MEM32(a[0] + 4) = (uint32_t)p.y;
+        return 1;
+    }
     a[1] = nt_routine(native32_guest_peb, a[1]);   /* (XP: its routine numbers, as 2000's) */
     if (a[1] == 0x19) return cur_new();
     if (a[1] == 0x18) return 1;   /* AllowSetForegroundWindow(pid): the guest's own, never the host's */
@@ -1356,7 +1366,7 @@ static uint32_t s_call_oneparam(uint32_t* a) {
         uint32_t h = native32_gdi_host(a[0]);
         return ReleaseDC(NULL, (HDC)(uintptr_t)(h ? h : a[0]));
     }
-    fprintf(stderr, "[user] NtUserCallOneParam(%08X, 0x%X) not answered\n", a[0], a[1]);
+    fprintf(stderr, "[user] NtUserCallOneParam(%08X, 0x%X; the guest's 0x%X) not answered\n", a[0], a[1], own);
     return 0;
 }
 

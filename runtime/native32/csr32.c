@@ -132,6 +132,9 @@ static uint32_t client_connect(uint32_t data, uint32_t capture) {
             uint32_t dm = ci + 0x0C + nt_shared_defmsgs(native32_guest_peb);   /* (XP: +0x108) */
             MEM32(dm) = 0x3FF;
             MEM32(dm + 4) = (uint32_t)(uintptr_t)all;
+            /* (DefWindowSpecMsgs said so; left as the buffer had it, XP's explorer
+             * read 0x020A0000 messages from a NULL bitmap) */
+            MEM32(dm + 8) = 0, MEM32(dm + 12) = 0;
         }
     }
     if (index == 2 && ci) {
@@ -348,7 +351,7 @@ uint32_t csr32_sxs_blob(const char* m, size_t len) {
 /* basesrv 27 on XP, BaseSrvSxsCreateActivationContext { Flags, ProcessorArchitecture,
  * LangId, Manifest { FileType, PathType, HandleType, Path, FileHandle, Handle,
  * Offset (8), Size } at +8, Policy at +0x30, AssemblyDirectory +0x58,
- * TextualAssemblyIdentity +0x60; out: ActivationContextData +0x68 }. The
+ * TextualAssemblyIdentity +0x60; out: *ActivationContextData +0x68 }. The
  * manifest is read through the section (+0x18) or file (+0x14) handle the
  * caller made (a DLL's resource: the file mapped, its Offset and Size). */
 static uint32_t sxs_create_actctx(uint32_t data, uint32_t capture) {
@@ -370,7 +373,9 @@ static uint32_t sxs_create_actctx(uint32_t data, uint32_t capture) {
     if (!m) { fprintf(stderr, "[sxs] create: no manifest (section %p file %p)\n", sec, file); return 0xC0000034u; }
     r = csr32_sxs_blob(m, size);
     free(m);
-    MEM32(data + 0x68) = r;
+    /* +0x68 is where the client wants it (PVOID*: csrss writes the view's address
+     * into the caller's variable), not the address itself */
+    if (r && MEM32(data + 0x68)) MEM32(MEM32(data + 0x68)) = r;
     return r ? 0 : 0xC0000017u;                          /* STATUS_NO_MEMORY */
 }
 
