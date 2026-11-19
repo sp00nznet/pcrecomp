@@ -46,6 +46,7 @@ static const wchar_t* lstr_name(uint32_t ls) {
     return w;
 }
 
+static const wchar_t* g_create_name;   /* the name of the window CreateWindowEx is making (NT 4.0: s_message_call) */
 /* ---- the desktop heap, CLIENTINFO and the handle table -------------------
  * user32's ValidateHwnd: index = LOWORD(h) < psi->cHandleEntries (+8);
  * aheList entry (12 bytes) { phead, pOwner, bType (+8, 1 a window), bFlags
@@ -160,8 +161,8 @@ static uint32_t desktop_wnd(void) {
     if (g_screen) return (uint32_t)(uintptr_t)native32_user_wnd(g_screen);
     if (!d && (d = desk_alloc(0x100)) != NULL) {
         memset(d, 0, 0x100);
-        *(uint32_t*)(d + 0x20) = WS_VISIBLE;
-        *(uint16_t*)(d + 0x2A) = 0x29D;
+        *(uint32_t*)(d + WO(0x20)) = WS_VISIBLE;
+        *(uint16_t*)(d + WO(0x2A)) = 0x29D;
     }
     return (uint32_t)(uintptr_t)d;
 }
@@ -798,7 +799,8 @@ static uint32_t s_create_window(uint32_t* a) {
             }
     }
     /* 0x80000000 WS_EX_ANSICREATOR: CreateWindowExA's mark for win32k, not the host's */
-    HWND h = CreateWindowExW(a[0] & ~0x80000000u, lstr_name(a[1]), lstr_name(a[2]), a[3], (int)a[4], (int)a[5], cx, cy,
+    g_create_name = lstr_name(a[2]);
+    HWND h = CreateWindowExW(a[0] & ~0x80000000u, lstr_name(a[1]), g_create_name, a[3], (int)a[4], (int)a[5], cx, cy,
                              (HWND)(uintptr_t)a[8], (HMENU)(uintptr_t)a[9], (HINSTANCE)(uintptr_t)a[10],
                              (void*)(uintptr_t)a[11]);
     if (!h) {
@@ -1427,6 +1429,13 @@ static uint32_t s_message_call(uint32_t* a) {
         xp_ncrect(h, (RECT*)(uintptr_t)a[3]);
         return 0;
     }
+    if (a[5] == 0x29E && a[1] == WM_NCCREATE && nt_guest_nt4(native32_guest_peb) && a[3]) {
+        /* NT 4.0's DefWindowProcA hands win32k the CREATESTRUCT with the host's wide name:
+         * the text the window is being created with, as the host's */
+        CREATESTRUCTW cs = *(CREATESTRUCTW*)(uintptr_t)a[3];
+        cs.lpszName = g_create_name;
+        return (uint32_t)DefWindowProcW(h, a[1], a[2], (LPARAM)&cs);
+    }
     if (a[5] == 0x29E) {
         LRESULT r = a[6] ? DefWindowProcA(h, a[1], a[2], a[3]) : DefWindowProcW(h, a[1], a[2], a[3]);
         if (a[1] == WM_NCPAINT || a[1] == WM_NCACTIVATE || a[1] == WM_SETTEXT) screen_caption(h);
@@ -1436,6 +1445,13 @@ static uint32_t s_message_call(uint32_t* a) {
     }
     fprintf(stderr, "[user] NtUserMessageCall fnid 0x%X (msg 0x%X) not answered\n", a[5], a[1]);
     return 0;
+}
+
+/* NT 4.0's NtUserfnINSTRING / INSTRINGNULL: lParam is the LARGE_STRING user32 made of the
+ * text (WM_SETTEXT, LB_ADDSTRING, ...), its buffer as the message's lParam, wide or ANSI by bAnsi */
+static uint32_t s_message_call_str(uint32_t* a) {
+    if (a[3]) a[3] = MEM32(a[3] + 8);
+    return s_message_call(a);
 }
 
 /* Any USER object a guest handle should validate as: menus (bType 2) get an
@@ -1728,7 +1744,7 @@ static uint32_t s_hwnd_param(uint32_t* a) {
         static uint32_t ddp;
         if (!ddp) ddp = native32_export(native32_module("user32.dll"), "DefDlgProcW");
         *(uint32_t*)(w + WO(0x9C)) = a[1];
-        w[0x16] |= 1;
+        w[WO(0x16)] |= 1;
         /* (a dialog of the guest's own class, calc's SciCalc, keeps its
          * procedure: that calls DefDlgProc itself) */
         if (ddp && !class_proc((HWND)(uintptr_t)a[0])) {
@@ -1741,12 +1757,12 @@ static uint32_t s_hwnd_param(uint32_t* a) {
      * +0x14) << 8 | mask (user32 tests it client-side first; a dialog sets
      * 0x502 at each WM_CTLCOLOR) */
     if (a[2] == 0x46 && w && (a[1] >> 8) < 8) {
-        w[0x14 + (a[1] >> 8)] |= (uint8_t)a[1];
+        w[WO(0x14) + (a[1] >> 8)] |= (uint8_t)a[1];
         return 1;
     }
     /* 0x41 ClearWindowState, its mirror (user32 calls it only when the bit is set) */
     if (a[2] == 0x41 && w && (a[1] >> 8) < 8) {
-        w[0x14 + (a[1] >> 8)] &= (uint8_t)~a[1];
+        w[WO(0x14) + (a[1] >> 8)] &= (uint8_t)~a[1];
         return 1;
     }
     fprintf(stderr, "[user] NtUserCallHwndParam index 0x%X not answered\n", a[2]);
@@ -1872,7 +1888,7 @@ static uint32_t s_setlong(uint32_t* a) {
     if ((int)a[1] >= 0) {
         uint8_t* w = native32_user_wnd(h);
         uint32_t old;
-        if (!w || ((w[0x16] & 1) && a[1] != DWLP_USER) || a[1] + 4 > *(uint32_t*)(w + WO(0x88)) || a[1] + 4 > 0x200 - WO(0x98)) return 0;
+        if (!w || ((w[WO(0x16)] & 1) && a[1] != DWLP_USER) || a[1] + 4 > *(uint32_t*)(w + WO(0x88)) || a[1] + 4 > 0x200 - WO(0x98)) return 0;
         old = *(uint32_t*)(w + WO(0x98) + a[1]);
         *(uint32_t*)(w + WO(0x98) + a[1]) = a[2];
         return old;
@@ -2200,7 +2216,7 @@ void native32_user_install(void) {
         char n[64];
         for (int i = 0; i < (int)(sizeof fn / sizeof fn[0]); i++) {
             _snprintf(n, sizeof n - 1, "NtUserfn%s", fn[i]), n[sizeof n - 1] = 0;
-            native32_nt_win32k_override_opt(n, s_message_call);
+            native32_nt_win32k_override_opt(n, strncmp(fn[i], "INSTRING", 8) ? s_message_call : s_message_call_str);
         }
     }
     native32_nt_win32k_override("NtUserCreateAcceleratorTable", s_accel);
