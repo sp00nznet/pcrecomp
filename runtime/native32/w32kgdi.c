@@ -367,7 +367,11 @@ static uint32_t s_dcforbitmap(uint32_t* a) {
 static uint32_t s_savedc(uint32_t* a) { return (uint32_t)SaveDC(dc(a[0])); }
 static uint32_t s_restoredc(uint32_t* a) { return RestoreDC(dc(a[0]), (int)a[1]); }
 static uint32_t s_select(uint32_t* a) {
-    return GUEST(SelectObject((HDC)(uintptr_t)HOST(a[0]), (HGDIOBJ)(uintptr_t)HOST(a[1])));
+    uint32_t r = GUEST(SelectObject((HDC)(uintptr_t)HOST(a[0]), (HGDIOBJ)(uintptr_t)HOST(a[1])));
+    /* a font: the DC_ATTR's too, which dc() selects again (NT 4.0's gdi32 leaves it to win32k) */
+    uint8_t* at = native32_gdi_attr(a[0]);
+    if (at && nt_guest_nt4(native32_guest_peb) && ((a[1] >> 16) & 0x1F) == 0x0A) DA32(at, 0x90) = a[1];
+    return r;
 }
 static uint32_t s_delete(uint32_t* a) {
     uint32_t h = HOST(a[0]);
@@ -710,7 +714,21 @@ static uint32_t s_charwidth(uint32_t* a) {
 }
 /* NtGdiGetTextFaceW(hdc, cChar, pszOut, bAliasName) */
 static uint32_t s_textface(uint32_t* a) {
-    return GetTextFaceW(dc(a[0]), (int)a[1], (wchar_t*)(uintptr_t)a[2]);
+    HDC h = dc(a[0]);
+    /* NT 4.0's GDI named a FontSubstitutes alias by the alias ("MS Shell Dlg"); its user32 drops a
+     * dialog font whose face reads otherwise (the host's "Tahoma") for the bold system font */
+    /* ponytail: any face the host maps elsewhere reads as asked, not only a FontSubstitutes alias */
+    if (nt_guest_nt4(native32_guest_peb) && a[2] && (int)a[1] > 0) {
+        LOGFONTW lf;
+        wchar_t real[LF_FACESIZE];
+        if (GetObjectW(GetCurrentObject(h, OBJ_FONT), sizeof lf, &lf) && lf.lfFaceName[0] &&
+            GetTextFaceW(h, LF_FACESIZE, real) && _wcsicmp(real, lf.lfFaceName)) {
+            wcsncpy((wchar_t*)(uintptr_t)a[2], lf.lfFaceName, a[1]);
+            ((wchar_t*)(uintptr_t)a[2])[a[1] - 1] = 0;
+            return (uint32_t)wcslen((wchar_t*)(uintptr_t)a[2]) + 1;
+        }
+    }
+    return GetTextFaceW(h, (int)a[1], (wchar_t*)(uintptr_t)a[2]);
 }
 /* NtGdiEnumFontOpen(hdc, iType, fl, cwchMax, pwszFace, lfCharSet, ULONG* cj)
  * gives the size of the whole enumeration; NtGdiEnumFontChunk(hdc, id, cj,

@@ -465,8 +465,13 @@ static void server_info(void) {
 
 /* SERVERINFO +0x75C ahbrSystem[0x1D] (GetSysColorBrush; DrawEdge reads
  * them directly), as guest handles of the host's: once the GDI table is up */
+static uint32_t g_nt4_ahbr, g_nt4_gray;   /* NT 4.0: user32's own copies (NtUserInitBrushes) */
 static void sys_brushes(void) {
     uint8_t* psi = native32_user_psi;
+    if (g_nt4_ahbr && psi && *(uint32_t*)(psi + SO(0x75C)) && !MEM32(g_nt4_ahbr)) {
+        for (int i = 0; i < nt_ncolors(native32_guest_peb); i++) MEM32(g_nt4_ahbr + 4 * i) = *(uint32_t*)(psi + SO(0x75C) + 4 * i);
+        if (g_nt4_gray) MEM32(g_nt4_gray) = native32_gdi_handle((uint32_t)(uintptr_t)GetStockObject(GRAY_BRUSH));
+    }
     if (!psi || *(uint32_t*)(psi + SO(0x75C))) return;
     {   /* (no table yet) */
         uint32_t s = (uint32_t)(uintptr_t)GetSysColorBrush(0);
@@ -1449,6 +1454,14 @@ static uint32_t s_message_call(uint32_t* a) {
 
 /* NT 4.0's NtUserfnINSTRING / INSTRINGNULL: lParam is the LARGE_STRING user32 made of the
  * text (WM_SETTEXT, LB_ADDSTRING, ...), its buffer as the message's lParam, wide or ANSI by bAnsi */
+/* NT 4.0's NtUserInitBrushes(HBRUSH ahbrSystem[0x19], HBRUSH* hbrGray): user32 keeps the system
+ * colour brushes itself (DrawEdge, GetSysColorBrush); filled once the GDI table is up (sys_brushes).
+ * ponytail: the gray brush is the stock GRAY_BRUSH, not win32k's dither pattern */
+static uint32_t s_init_brushes(uint32_t* a) {
+    if (!nt_guest_nt4(native32_guest_peb)) return 0;   /* (as before: not answered) */
+    g_nt4_ahbr = a[0], g_nt4_gray = a[1];
+    return 1;
+}
 static uint32_t s_message_call_str(uint32_t* a) {
     if (a[3]) a[3] = MEM32(a[3] + 8);
     return s_message_call(a);
@@ -1481,19 +1494,22 @@ static uint32_t menu(HMENU m) { user_object((uint32_t)(uintptr_t)m, 2, 0x100); r
 static void menu_sync(HMENU m) {
     uint32_t h = (uint32_t)(uintptr_t)m, e = (uint32_t)(uintptr_t)native32_user_ahe + 12 * (h & 0xFFFF);
     uint8_t* o;
+    /* NT 4.0's MENU: pSelf +0xC, cItems +0x28, rgItems +0x38; its ITEM is 0x40 bytes */
+    int nt4 = nt_guest_nt4(native32_guest_peb);
+    uint32_t mself = nt4 ? 0xC : 0x10, mcount = nt4 ? 0x28 : 0x20, mitems = nt4 ? 0x38 : 0x34, isz = nt4 ? 0x40 : 0x4C;
     int n = GetMenuItemCount(m);
     if (!native32_user_ahe || n < 0 || !MEM32(e) || MEM8(e + 8) != 2) return;
     o = (uint8_t*)(uintptr_t)MEM32(e);
-    if (!*(uint32_t*)(o + 0x34)) *(uint32_t*)(o + 0x34) = (uint32_t)(uintptr_t)desk_alloc(MENU_ITEMS * 0x4C);
-    if (!*(uint32_t*)(o + 0x34)) return;
+    if (!*(uint32_t*)(o + mitems)) *(uint32_t*)(o + mitems) = (uint32_t)(uintptr_t)desk_alloc(MENU_ITEMS * isz);
+    if (!*(uint32_t*)(o + mitems)) return;
     if (n > MENU_ITEMS) n = MENU_ITEMS;
-    *(uint32_t*)(o + 0x10) = (uint32_t)(uintptr_t)o;
-    *(uint32_t*)(o + 0x20) = (uint32_t)n;
+    *(uint32_t*)(o + mself) = (uint32_t)(uintptr_t)o;
+    *(uint32_t*)(o + mcount) = (uint32_t)n;
     for (int i = 0; i < n; i++) {
-        uint8_t* it = (uint8_t*)(uintptr_t)*(uint32_t*)(o + 0x34) + i * 0x4C;
+        uint8_t* it = (uint8_t*)(uintptr_t)*(uint32_t*)(o + mitems) + i * isz;
         MENUITEMINFOW mi = { sizeof mi, MIIM_FTYPE | MIIM_STATE | MIIM_ID | MIIM_SUBMENU | MIIM_DATA | MIIM_STRING };
         uint32_t str = *(uint32_t*)(it + 0x18), cap = *(uint32_t*)(it + 0x1C);   /* reused when the text fits */
-        memset(it, 0, 0x4C);
+        memset(it, 0, isz);
         if (!GetMenuItemInfoW(m, i, TRUE, &mi)) continue;
         if (mi.cch) {
             if (mi.cch > cap || !str) str = (uint32_t)(uintptr_t)desk_alloc(2 * (mi.cch + 1));
@@ -2219,6 +2235,7 @@ void native32_user_install(void) {
             native32_nt_win32k_override_opt(n, strncmp(fn[i], "INSTRING", 8) ? s_message_call : s_message_call_str);
         }
     }
+    native32_nt_win32k_override_opt("NtUserInitBrushes", s_init_brushes);
     native32_nt_win32k_override("NtUserCreateAcceleratorTable", s_accel);
     native32_nt_win32k_override("NtUserTranslateAccelerator", s_translate_accel);
     native32_nt_win32k_override("NtUserScrollWindowEx", s_scrollwindow);

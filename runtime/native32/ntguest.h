@@ -124,6 +124,12 @@ static inline uint32_t nt_si(uint32_t peb, uint32_t o) {
         if (o >= 0x75C && o < 0x7D0) return o - 0x75C + 0x304;
         if (o >= 0x1A0 && o < 0x1C0) return o - 0x1A0 + 0x788;
         if (o >= 0x800 && o < 0x810) return o - 0x800 + 0x7D4;
+        /* the display: dmLogPixels +0x754 (the dialog font's height), Planes / BitsPixel +0x75A /
+         * +0x75B, BitCount +0x75C (DrawEdge, DrawFrameControl compare it with 1 and 8) */
+        if (o == 0xE4A) return 0x754;
+        if (o == 0xE4C) return 0x75A;
+        if (o == 0xE4D) return 0x75B;
+        if (o == 0xE48) return 0x75C;
         return 0xF000 + (o & 0xFFF);
     }
     if (!nt_guest_xp(peb) || o < 0x10) return o;
@@ -134,7 +140,7 @@ static inline uint32_t nt_si(uint32_t peb, uint32_t o) {
 static inline int nt_ncolors(uint32_t peb) { return nt_guest_xp(peb) ? 0x1F : nt_guest_nt4(peb) ? 0x19 : 0x1D; }
 /* gdi32's TEB batch: XP's PolyPatBlt has its rectangles at +0x30 (2000: +0x24),
  * and its TextOut two more dwords before x (everything from x on is 8 later) */
-static inline uint32_t nt_batch_polypatblt(uint32_t peb) { return nt_guest_xp(peb) ? 0x30 : 0x24; }
+static inline uint32_t nt_batch_polypatblt(uint32_t peb) { return nt_guest_xp(peb) ? 0x30 : nt_guest_nt4(peb) ? 0x18 : 0x24; }   /* (NT 4.0: gdi32 PolyPatBlt) */
 static inline uint32_t nt_batch_textout(uint32_t peb) { return nt_guest_xp(peb) ? 8 : 0; }
 /* SHAREDINFO.DefWindowMsgs: after awmControl[0x1D] (XP: [0x1F]; NT 4.0: [0x1B] from +0xC) */
 static inline uint32_t nt_shared_defmsgs(uint32_t peb) { return nt_guest_xp(peb) ? 0x108 : nt_guest_nt4(peb) ? 0xE4 : 0xE8; }
