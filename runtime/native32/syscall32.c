@@ -1364,6 +1364,7 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
     {   /* an RPC failure no guest frame takes fails its client call (native32.c) */
         uint32_t rpc = native32_module("rpcrt4.dll");
         if (rpc) native32_rpc_guard(native32_export(rpc, "NdrClientCall2"), native32_export(rpc, "NdrClientCall"));
+        native32_netapi_refuse();
     }
     native32_local_unwind2();
 

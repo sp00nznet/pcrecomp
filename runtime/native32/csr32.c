@@ -451,8 +451,139 @@ static uint32_t lpc_connect(uint32_t* a, int secure) {
     return 0;
 }
 
+/* ---- \ThemeApiPort: Windows XP's theme service --------------------------
+ * XP's uxtheme asks the theme service (shsvcs in winlogon) for the session's
+ * theme: a section its own loader (CThemeLoader) filled from the .msstyles,
+ * which the service keeps and hands to every process. Answered here, per
+ * process: the guest's uxtheme loads the theme itself (InitUserTheme, at the
+ * first window: native32_theme_start), the section it passes is kept, and
+ * the user32 hooks (ThemeInitApiHook) go in as win32k would put them, through
+ * user32's __ClientLoadLibrary callback. Messages: PORT_MESSAGE (0x18), api
+ * at +0x18; the reply's status +0x18, result +0x1C, value +0x20.
+ * ponytail: per process (each one loads luna itself, ~a second lifted); a
+ * named section shared from the first if starts ever matter */
+static HANDLE g_theme_port, g_theme_sec;
+static uint32_t g_theme_change = 1, g_theme_ux;
+static int g_theme_hooked, g_theme_on;
+int native32_themed;     /* the guest's visual style draws (its user32 hooks are in) */
+
+static HANDLE dup_here(HANDLE h) {
+    HANDLE d = NULL;
+    if (h) DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &d, 0, FALSE, DUPLICATE_SAME_ACCESS);
+    return d;
+}
+/* The user32 hooks: what win32k does for RegisterUserApiHook in every GUI
+ * process, the __ClientLoadLibrary callback (XP's KernelCallbackTable 66)
+ * with the module and the init function's offset. The offset is uxtheme's own
+ * ThemeHooksInstall's (ordinal 34, a thread procedure: call ->
+ * push ThemeInitApiHook; push [g_hInst]; call [RegisterUserApiHook]). */
+static void theme_hooks(void) {
+    uint32_t t = g_theme_ux ? native32_export(g_theme_ux, (const char*)34) : 0, pfn = 0;
+    static const wchar_t ux[] = L"uxtheme.dll";
+    for (uint32_t p = t; t && p < t + 0x20 && !pfn; p++)
+        if (MEM8(p) == 0xE8) {
+            uint32_t f = p + 5 + MEM32(p + 1);
+            for (uint32_t q = f; q < f + 0x30; q++)
+                if (MEM8(q) == 0x68 && MEM8(q + 5) == 0xFF && MEM8(q + 6) == 0x35) { pfn = MEM32(q + 1); break; }
+        }
+    if (!pfn || g_theme_hooked) return;
+    g_theme_hooked = native32_themed = 1;
+    uint32_t msg[0x0C] = { 0 };
+    msg[0x1C / 4] = (uint32_t)(uintptr_t)ux;
+    msg[0x20 / 4] = pfn - g_theme_ux;
+    uint32_t r = native32_nt_callback(66, (uint32_t)(uintptr_t)msg, sizeof msg, NULL, NULL);
+    if (getenv("NATIVE32_SYSCALLS")) fprintf(stderr, "[theme] user32 hooks: ThemeInitApiHook %08X, %08X\n", pfn, r);
+}
+
+static uint32_t theme_request(uint32_t* a) {
+    uint32_t m = a[1], r = a[2] ? a[2] : a[1], api = MEM32(m + 0x18), hr = 0, out = 0;
+    switch (api) {
+    /* ThemeHooksOn: ApplyTheme asks before it sets the theme; the hooks read it at
+     * init, so they go in once there is one (as the service's WM_THEMECHANGED would
+     * have them read it again) */
+    case 1: g_theme_on = 1; if (g_theme_sec) theme_hooks(); break;
+    case 2: break;                                                     /* ThemeHooksOff */
+    case 3: out = 3; break;                                            /* GetStatusFlags: available, running */
+    case 4: out = g_theme_change; break;                               /* GetCurrentChangeNumber */
+    case 5: out = ++g_theme_change; break;                             /* GetNewChangeNumber */
+    case 6:                                                            /* SetGlobalTheme(section) */
+        if (g_theme_sec) CloseHandle(g_theme_sec);
+        g_theme_sec = dup_here((HANDLE)(uintptr_t)MEM32(m + 0x1C));
+        g_theme_change++;
+        if (g_theme_on && g_theme_sec) theme_hooks();
+        break;
+    case 7: out = (uint32_t)(uintptr_t)dup_here(g_theme_sec); break;   /* GetGlobalTheme */
+    case 8: break;                                                     /* CheckThemeSignature: signed */
+    case 1005: break;                                                  /* the connection's (re)start */
+    case 9: {                                                          /* LoadTheme: the service's copy */
+        /* as uxtheme's own server half (CThemeServer::LoadTheme): the data into a
+         * section of its own (header +0x1C: the size), and the stock bitmaps
+         * handed over, the client's header losing bit 4 (+0xC) so closing it
+         * leaves them (else every image part drew from deleted bitmaps) */
+        uint8_t* v = (uint8_t*)MapViewOfFile((HANDLE)(uintptr_t)MEM32(m + 0x34), FILE_MAP_WRITE | FILE_MAP_READ, 0, 0, 0);
+        uint32_t size = v ? *(uint32_t*)(v + 0x1C) : 0;
+        HANDLE c = size ? CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, size, NULL) : NULL;
+        uint8_t* w = c ? (uint8_t*)MapViewOfFile(c, FILE_MAP_WRITE, 0, 0, size) : NULL;
+        if (w) {
+            memcpy(w, v, size);
+            *(uint32_t*)(v + 0xC) &= ~4u;
+            *(uint32_t*)(w + 0xC) |= 2;   /* and the copy's as already cleared: nobody here deletes them */
+            UnmapViewOfFile(w);
+            out = (uint32_t)(uintptr_t)c;
+        } else {
+            if (c) CloseHandle(c);
+            hr = 0x8007000E;                                           /* E_OUTOFMEMORY */
+        }
+        if (v) UnmapViewOfFile(v);
+        break;
+    }
+    default:
+        hr = 0x80004001;                                               /* E_NOTIMPL */
+        fprintf(stderr, "[theme] api %u not answered\n", api);
+    }
+    if (r != m) memcpy((void*)(uintptr_t)r, (void*)(uintptr_t)m, 0x18);
+    MEM16(r) = 0x20, MEM16(r + 2) = 0x38;
+    MEM32(r + 0x18) = 0, MEM32(r + 0x1C) = hr, MEM32(r + 0x20) = out;
+    if (getenv("NATIVE32_SYSCALLS")) fprintf(stderr, "[theme] api %u (%08X) -> %08X %08X, section %p\n", api, MEM32(m + 0x1C), hr, out, (void*)g_theme_sec);
+    return 0;
+}
+
+/* The theme, once per XP process at its first window when the box says one
+ * is active (HKCU ThemeManager ThemeActive "1"): the guest's uxtheme's own
+ * logon path, InitUserTheme(FALSE) (ordinal 31), which reads ThemeManager,
+ * loads the .msstyles as data and applies it through the port above. */
+void native32_theme_start(void) {
+    static int done;
+    wchar_t v[8];
+    if (done || !nt_guest_xp(native32_guest_peb)) return;
+    done = 1;
+    if (!native32_registry_box_sz(L"Software\\Microsoft\\Windows\\CurrentVersion\\ThemeManager", L"ThemeActive", v, 8) || v[0] != L'1')
+        return;
+    static const wchar_t ux[] = L"uxtheme.dll";
+    uint32_t k32 = native32_module("kernel32.dll"), ll = k32 ? native32_export(k32, "LoadLibraryW") : 0;
+    uint32_t arg = (uint32_t)(uintptr_t)ux;
+    if (!ll) return;
+    native32_call_guest(ll, 1, &arg);
+    g_theme_ux = g_eax;
+    uint32_t init = g_theme_ux ? native32_export(g_theme_ux, (const char*)31) : 0;
+    if (!init) { fprintf(stderr, "[theme] no uxtheme in the guest\n"); return; }
+    arg = 0;
+    native32_call_guest(init, 1, &arg);
+    fprintf(stderr, "[theme] InitUserTheme: %08X%s (thread %lu)\n", g_eax, g_theme_hooked ? ", hooks in" : "", GetCurrentThreadId());
+}
+
 static uint32_t ovr_secure_connect(uint32_t* a) { return lpc_connect(a, 1); }
-static uint32_t ovr_connect(uint32_t* a) { return lpc_connect(a, 0); }
+static uint32_t ovr_connect(uint32_t* a) {
+    uint32_t name = a[1];
+    int n = name ? MEM16(name) / 2 : 0;
+    const wchar_t* s = name ? (const wchar_t*)(uintptr_t)MEM32(name + 4) : L"";
+    if (nt_guest_xp(native32_guest_peb) && n >= 13 && !_wcsnicmp(s + n - 13, L"\\ThemeApiPort", 13)) {
+        if (!g_theme_port) g_theme_port = CreateEventA(NULL, FALSE, FALSE, NULL);
+        MEM32(a[0]) = (uint32_t)(uintptr_t)g_theme_port;
+        return 0;
+    }
+    return lpc_connect(a, 0);
+}
 
 static int is_port(uint32_t h) { return g_port && (HANDLE)(uintptr_t)h == g_port; }
 
@@ -460,6 +591,7 @@ static int is_port(uint32_t h) { return g_port && (HANDLE)(uintptr_t)h == g_port
  * PORT_MESSAGE (0x18) + CaptureBuffer, ApiNumber, ReturnValue (0x20),
  * Reserved, then the api's data (0x28). */
 static uint32_t ovr_request_wait_reply(uint32_t* a) {
+    if (g_theme_port && (HANDLE)(uintptr_t)a[0] == g_theme_port) return theme_request(a);
     if (!is_port(a[0])) return native32_nt_forward("NtRequestWaitReplyPort", a);
     uint32_t m = a[1], api = MEM32(m + 0x1C), r = 0;
     native32_csr_api_fn fn = (api >> 16) < 8 && (api & 0xFFFF) < 1024 ? g_api[api >> 16][api & 0xFFFF] : NULL;

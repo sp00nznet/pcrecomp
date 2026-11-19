@@ -2186,6 +2186,33 @@ void native32_co_register_guard(uint32_t co_register_class_object) {
         g_coreg_orig = f, native32_replace(co_register_class_object, shim_co_register);
 }
 
+/* A lifted netapi32's workstation calls go to wkssvc over \pipe\wkssvc, which
+ * the file box refuses: rpcrt4 raises ERROR_ACCESS_DENIED (not an RPC_S_*
+ * status, so not the guard's above) into netapi32's own RpcExcept, and that
+ * resume sometimes went to address 0 (XP explorer, ~1 run in 8, through
+ * shdocvw's NetGetJoinInformation). They are refused before the RPC, as the
+ * host proxy's NetWkstaGetInfo is (regbox32.c): no workstation service to ask.
+ * All are stdcall (server, x, out*): *out = NULL, and for
+ * NetGetJoinInformation *type = NetSetupUnknownStatus. */
+static void net_refuse3(void) {
+    uint32_t sp = g_esp;
+    if (MEM32(sp + 12)) MEM32(MEM32(sp + 12)) = 0;
+    g_eax = ERROR_ACCESS_DENIED, g_esp += 4 + 12;
+}
+static void net_join_refuse(void) {
+    uint32_t sp = g_esp;
+    if (MEM32(sp + 8)) MEM32(MEM32(sp + 8)) = 0;
+    if (MEM32(sp + 12)) MEM32(MEM32(sp + 12)) = 0;
+    g_eax = ERROR_ACCESS_DENIED, g_esp += 4 + 12;
+}
+void native32_netapi_refuse(void) {
+    static const char* wks[] = { "NetWkstaGetInfo", "NetWkstaUserGetInfo" };
+    uint32_t n = native32_module("netapi32.dll"), va;
+    if (!n) return;
+    for (int i = 0; i < 2; i++) if ((va = native32_export(n, wks[i]))) native32_replace(va, net_refuse3);
+    if ((va = native32_export(n, "NetGetJoinInformation"))) native32_replace(va, net_join_refuse);
+}
+
 /* An RPC status (RPC_S_*, 0x6A4..0x7FF, or its HRESULT) no guest frame took
  * inside a guarded call: unwind the guest frames the call entered and end
  * it. Returns only if there is no such call (or a callback is newer). */

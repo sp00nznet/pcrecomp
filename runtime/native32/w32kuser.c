@@ -183,6 +183,14 @@ static void wnd_sync(HWND h, uint8_t* w) {
         *(uint16_t*)(w + WO(0x2A)) = 0x29D;
     }
     *(uint32_t*)(w + WO(0x38)) = own ? (uint32_t)(uintptr_t)native32_user_wnd(own) : 0;
+    /* +0x14 state bit 0x40 WFFRAMEON (an active frame): XP's uxtheme paints the
+     * caption by it. The screen's topmost captioned window, as screen_caption */
+    if (native32_themed && g_screen && p == g_screen) {
+        HWND top = GetWindow(g_screen, GW_CHILD);
+        while (top && (!IsWindowVisible(top) || (GetWindowLongW(top, GWL_STYLE) & WS_CAPTION) != WS_CAPTION)) top = GetWindow(top, GW_HWNDNEXT);
+        if (top == h) *(uint32_t*)(w + WO(0x14)) |= 0x40;
+        else *(uint32_t*)(w + WO(0x14)) &= ~0x40u;
+    }
     /* +0x64 hrgnUpdate: user32's GetUpdateRect answers FALSE client-side
      * when it is 0 (the listview then never painted: WM_PAINT forever, no
      * icons or labels). HRGN_FULL (1) when the host window has one; the
@@ -286,6 +294,40 @@ static COLORREF sys_color(int i) {
     }
     return GetSysColor(i);
 }
+/* The frame metrics of the box's Control Panel\Desktop\WindowMetrics (negative
+ * twips, as XP writes them when a visual style is applied: Luna's 25 px
+ * caption, 19 px menu, 1 px border), over the host's in aiSysMet: XP's user32
+ * and uxtheme lay frames out by them, and so does xp_ncrect. Only a box that
+ * has them (an XP profile with Luna: tools/profile.py) */
+static void box_metrics(int32_t* m) {
+    static const struct { const wchar_t* name; int add, idx[2]; } k[] = {
+        { L"CaptionHeight", 1, { SM_CYCAPTION, -1 } }, { L"SmCaptionHeight", 1, { SM_CYSMCAPTION, -1 } },
+        { L"MenuHeight", 1, { SM_CYMENU, -1 } }, { L"BorderWidth", 3, { SM_CXFRAME, SM_CYFRAME } },
+        { L"ScrollWidth", 0, { SM_CXVSCROLL, SM_CXHSCROLL } }, { L"ScrollHeight", 0, { SM_CYHSCROLL, SM_CYVSCROLL } },
+        { L"CaptionWidth", 0, { SM_CXSIZE, -1 } }, { L"SmCaptionWidth", 0, { SM_CXSMSIZE, -1 } } };
+    wchar_t v[32];
+    if (!nt_guest_xp(native32_guest_peb)) return;
+    for (unsigned i = 0; i < sizeof k / sizeof k[0]; i++)
+        if (native32_registry_box_sz(L"Control Panel\\Desktop\\WindowMetrics", k[i].name, v, 32) && _wtoi(v) < 0)
+            for (int j = 0; j < 2 && k[i].idx[j] >= 0; j++) m[k[i].idx[j]] = -_wtoi(v) / 15 + k[i].add;
+    if (native32_registry_box_sz(L"Control Panel\\Desktop\\WindowMetrics", L"CaptionHeight", v, 32) && _wtoi(v) < 0)
+        m[SM_CYSIZE] = -_wtoi(v) / 15, m[SM_CXDLGFRAME] = m[SM_CYDLGFRAME] = 3, m[SM_CXEDGE] = m[SM_CYEDGE] = 2;
+}
+/* A themed top-level frame's client area, as XP's win32k computes it from those
+ * metrics (the host's frame is another size: XP's uxtheme paints the frame it
+ * lays out, so the host's client edge would leave a gap) */
+static void xp_ncrect(HWND h, RECT* r) {
+    int32_t* m = (int32_t*)(native32_user_psi + SO(0x59C));
+    uint32_t st = (uint32_t)GetWindowLongW(h, GWL_STYLE), ex = (uint32_t)GetWindowLongW(h, GWL_EXSTYLE);
+    int t = (st & WS_THICKFRAME) ? 0 : ((st & WS_DLGFRAME) || (ex & WS_EX_DLGMODALFRAME)) ? 1 : (st & WS_BORDER) ? 2 : 3;
+    int bx[4] = { m[SM_CXFRAME], m[SM_CXDLGFRAME], m[SM_CXBORDER], 0 }, by[4] = { m[SM_CYFRAME], m[SM_CYDLGFRAME], m[SM_CYBORDER], 0 };
+    InflateRect(r, -bx[t], -by[t]);
+    if ((st & WS_CAPTION) == WS_CAPTION) r->top += (ex & WS_EX_TOOLWINDOW) ? m[SM_CYSMCAPTION] : m[SM_CYCAPTION];
+    if (GetMenu(h)) r->top += m[SM_CYMENU];
+    if (ex & WS_EX_CLIENTEDGE) InflateRect(r, -m[SM_CXEDGE], -m[SM_CYEDGE]);
+    if (r->bottom < r->top) r->bottom = r->top;
+    if (r->right < r->left) r->right = r->left;
+}
 static HFONT g_capfont, g_msgfont;   /* +0x854 / +0x858, given guest handles once gdi32's table exists */
 static void msg_fonts(void) {
     uint8_t* psi = native32_user_psi;
@@ -314,6 +356,7 @@ static void server_info(void) {
         m[SM_CXMAXTRACK] = m[SM_CXMAXIMIZED] + 4 * GetSystemMetrics(SM_CXFRAME);
         m[SM_CYMAXTRACK] = m[SM_CYMAXIMIZED] + 4 * GetSystemMetrics(SM_CYFRAME);
     }
+    box_metrics((int32_t*)(psi + SO(0x59C)));
     for (int i = 0; i < nt_ncolors(native32_guest_peb); i++) *(uint32_t*)(psi + SO(0x6E8) + 4 * i) = sys_color(i);
     /* +0x800 / +0x804 the system font's character size (GetDialogBaseUnits) */
     *(uint16_t*)(psi + SO(0x800)) = (uint16_t)LOWORD(GetDialogBaseUnits());
@@ -687,6 +730,7 @@ static LRESULT wnd_thunk_body(HWND h, UINT m, WPARAM w, LPARAM l) {
  * creation and at every later size of a window of the virtual screen
  * (winmine sizes itself after creation and was clipped by 10 px). */
 static int frame_pad(uint32_t style, uint32_t ex) {
+    if (native32_themed) return 0;      /* XP's frame, laid out by the guest's own metrics (xp_ncrect) */
     int b = (ex & WS_EX_WINDOWEDGE) ? 2 : (ex & WS_EX_STATICEDGE) ? 1 : 0;
     RECT r = { 0, 0, 0, 0 };
     if (style & WS_CHILD) return 0;
@@ -720,6 +764,7 @@ static LRESULT CALLBACK cbt_noactivate(int c, WPARAM w, LPARAM l) { return c == 
 /* NtUserCreateWindowEx(exstyle, LARGE_STRING* class, LARGE_STRING* name, style,
  * x, y, cx, cy, parent, menu, hInstance, lpParam, flags) */
 static uint32_t s_create_window(uint32_t* a) {
+    native32_theme_start();
     int cx = (int)a[6], cy = (int)a[7], p = frame_pad(a[3], a[0]);
     if (a[4] != CW_USEDEFAULT && cx > 0 && cy > 0 && cx != CW_USEDEFAULT) cx += 2 * p, cy += 2 * p;
     /* The guest's own class, under the instance it was registered with: win32k
@@ -941,10 +986,75 @@ static void shell_poll(void) {
         if (i == n) shell_post(HSHELL_WINDOWDESTROYED, g_tasks[k]);
     }
     if (top != g_task_top) shell_post(HSHELL_WINDOWACTIVATED, top);
+    /* a themed frame is drawn active or not by what WM_NCACTIVATE said (the host
+     * never activates the screen's windows): the top one active, as on XP */
+    if (native32_themed && top != g_task_top) {
+        if (g_task_top && IsWindow(g_task_top)) SendNotifyMessageW(g_task_top, WM_NCACTIVATE, FALSE, 0);
+        if (top) SendNotifyMessageW(top, WM_NCACTIVATE, TRUE, 0);
+    }
     memcpy(g_tasks, now, n * sizeof *now), g_ntasks = n, g_task_top = top;
+}
+/* The desktop's wallpaper, as win32k paints it: the box's Control Panel\Desktop
+ * Wallpaper, a BMP named by its guest path (the file box's X:\ is
+ * PCRECOMP_FILEBOX\X), stretched over the virtual screen (WallpaperStyle 2)
+ * or centred, COLOR_BACKGROUND around it. ponytail: no tiling */
+static HBITMAP wallpaper(int* style) {
+    static int done, st;
+    static HBITMAP bm;
+    wchar_t v[MAX_PATH], box[MAX_PATH], path[2 * MAX_PATH];
+    if (!done) {
+        done = 1;
+        if (native32_registry_box_sz(L"Control Panel\\Desktop", L"Wallpaper", v, MAX_PATH) && v[0] && v[1] == L':' &&
+            GetEnvironmentVariableW(L"PCRECOMP_FILEBOX", box, MAX_PATH)) {
+            _snwprintf(path, 2 * MAX_PATH - 1, L"%ls\\%c%ls", box, (wchar_t)(v[0] & ~0x20), v + 2), path[2 * MAX_PATH - 1] = 0;
+            bm = (HBITMAP)LoadImageW(NULL, path, IMAGE_BITMAP, 0, 0, LR_LOADFROMFILE);
+            if (native32_registry_box_sz(L"Control Panel\\Desktop", L"WallpaperStyle", v, MAX_PATH)) st = _wtoi(v);
+            fprintf(stderr, "[user] wallpaper: %s\n", bm ? "loaded" : "not loaded");
+        }
+    }
+    *style = st;
+    return bm;
+}
+/* the wallpaper into a DC of window w (its client area), in screen coordinates */
+static int paint_wallpaper(HDC dc, HWND w) {
+    int st;
+    HBITMAP bm = wallpaper(&st);
+    BITMAP b;
+    if (!bm || !g_screen || !GetObjectW(bm, sizeof b, &b)) return 0;
+    POINT o = { 0, 0 };
+    if (w && w != g_screen) MapWindowPoints(g_screen, w, &o, 1);
+    RECT all = { o.x, o.y, o.x + g_scx, o.y + g_scy };
+    HBRUSH bg = CreateSolidBrush(sys_color(COLOR_BACKGROUND));
+    FillRect(dc, &all, bg);
+    DeleteObject(bg);
+    HDC m = CreateCompatibleDC(dc);
+    HGDIOBJ old = SelectObject(m, bm);
+    SetStretchBltMode(dc, COLORONCOLOR);
+    if (st == 2) StretchBlt(dc, o.x, o.y, g_scx, g_scy, m, 0, 0, b.bmWidth, b.bmHeight, SRCCOPY);
+    else BitBlt(dc, o.x + (g_scx - b.bmWidth) / 2, o.y + (g_scy - b.bmHeight) / 2, b.bmWidth, b.bmHeight, m, 0, 0, SRCCOPY);
+    SelectObject(m, old);
+    DeleteDC(m);
+    return 1;
+}
+/* NtUserBuildNameList(hwinsta, cb, buffer, needed*): the window stations and desktops
+ * are the host's, never listed (EnumDesktops fails; XP's uxtheme sent WM_THEMECHANGED
+ * to every desktop it named, and named stack bytes forever) */
+static uint32_t s_namelist(uint32_t* a) { (void)a; return 0xC0000022u; }   /* STATUS_ACCESS_DENIED */
+/* NtUserPaintDesktop(hdc): the wallpaper; without one, COLOR_BACKGROUND */
+static uint32_t s_paintdesktop(uint32_t* a) {
+    HDC dc = (HDC)(uintptr_t)(native32_gdi_host(a[0]) ? native32_gdi_host(a[0]) : a[0]);
+    HWND w = WindowFromDC(dc);
+    if (paint_wallpaper(dc, w)) return 1;
+    RECT r;
+    HBRUSH bg = CreateSolidBrush(sys_color(COLOR_BACKGROUND));
+    GetClipBox(dc, &r);
+    FillRect(dc, &r, bg);
+    DeleteObject(bg);
+    return 1;
 }
 static LRESULT CALLBACK screen_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_TIMER && w == 1) { shell_poll(); return 0; }
+    if (m == WM_ERASEBKGND && paint_wallpaper((HDC)w, h)) return 1;
     return DefWindowProcW(h, m, w, l);
 }
 /* NtUserCallHwnd(hwnd, index): 0x3C RegisterShellHookWindow, 0x39 Deregister */
@@ -1001,6 +1111,50 @@ static uint32_t s_dblclick(uint32_t* a) { (void)a; return GetDoubleClickTime(); 
 static uint32_t s_kblist(uint32_t* a) { return (uint32_t)GetKeyboardLayoutList((int)a[0], (HKL*)(uintptr_t)a[1]); }
 static uint32_t s_showcaret(uint32_t* a) { return ShowCaret((HWND)(uintptr_t)a[0]); }
 static uint32_t s_hidecaret(uint32_t* a) { return HideCaret((HWND)(uintptr_t)a[0]); }
+/* NtUserBuildHwndList(hdesk, hwndParent, fChildren, idThread, cMax, HWND* list,
+ * ULONG* count): a parent's descendants, the thread's windows, or the
+ * screen's top-level ones (never the host's others), then 1 as the end
+ * (count takes it in; too small: STATUS_BUFFER_TOO_SMALL and the count).
+ * Unanswered, user32 enumerated 63 stack words: XP's uxtheme walks a
+ * window's children with it. ponytail: idThread is this thread */
+#define HWNDLIST_MAX 1024
+static struct { HWND h[HWNDLIST_MAX]; int n; } g_hl;
+static BOOL CALLBACK hwndlist_add(HWND h, LPARAM l) { (void)l; if (g_hl.n < HWNDLIST_MAX) g_hl.h[g_hl.n++] = h; return TRUE; }
+static uint32_t s_hwndlist(uint32_t* a) {
+    g_hl.n = 0;
+    if (a[1] && a[2]) EnumChildWindows((HWND)(uintptr_t)a[1], hwndlist_add, 0);
+    else if (a[3]) EnumThreadWindows(GetCurrentThreadId(), hwndlist_add, 0);
+    else if (g_screen) for (HWND h = GetWindow(g_screen, GW_CHILD); h; h = GetWindow(h, GW_HWNDNEXT)) hwndlist_add(h, 0);
+    else {
+        DWORD pid;
+        for (HWND h = GetTopWindow(NULL); h; h = GetWindow(h, GW_HWNDNEXT))
+            if (GetWindowThreadProcessId(h, &pid) && pid == GetCurrentProcessId()) hwndlist_add(h, 0);
+    }
+    if (a[6]) MEM32(a[6]) = (uint32_t)g_hl.n + 1;
+    if ((uint32_t)g_hl.n + 1 > a[4]) return 0xC0000023u;                /* STATUS_BUFFER_TOO_SMALL */
+    for (int i = 0; i < g_hl.n; i++) MEM32(a[5] + 4 * i) = (uint32_t)(uintptr_t)g_hl.h[i];
+    MEM32(a[5] + 4 * g_hl.n) = 1;
+    return 0;
+}
+/* NtUserGetAncestor(hwnd, flags), NtUserGetTitleBarInfo(hwnd, TITLEBARINFO*),
+ * NtUserGetGUIThreadInfo(tid, GUITHREADINFO*): the host's (XP's uxtheme
+ * draws a frame's caption buttons from the title bar's states) */
+static uint32_t s_ancestor(uint32_t* a) { return (uint32_t)(uintptr_t)GetAncestor((HWND)(uintptr_t)a[0], a[1]); }
+static uint32_t s_titlebarinfo(uint32_t* a) { return GetTitleBarInfo((HWND)(uintptr_t)a[0], (TITLEBARINFO*)(uintptr_t)a[1]); }
+static uint32_t s_guithreadinfo(uint32_t* a) { (void)a[0]; return GetGUIThreadInfo(GetCurrentThreadId(), (GUITHREADINFO*)(uintptr_t)a[1]); }
+/* NtUserGetProcessWindowStation(): the host's. NtUserGetObjectInformation(h,
+ * index, buf, len, needed*): only UOI_NAME (2) of it, the interactive
+ * "WinSta0" (XP's uxtheme themes no process elsewhere); nothing else of the
+ * host's objects (names, SIDs) is told */
+static uint32_t s_winsta(uint32_t* a) { (void)a; return (uint32_t)(uintptr_t)GetProcessWindowStation(); }
+static uint32_t s_objinfo(uint32_t* a) {
+    static const wchar_t n[] = L"WinSta0";
+    if (a[1] != 2 || (HWINSTA)(uintptr_t)a[0] != GetProcessWindowStation()) return 0;
+    if (a[4]) MEM32(a[4]) = sizeof n;
+    if (a[3] < sizeof n) return 0;
+    memcpy((void*)(uintptr_t)a[2], n, sizeof n);
+    return 1;
+}
 /* NtUserGetThreadDesktop(tid, hdeskConsole): this thread's (the guest tid is not the host's) */
 static uint32_t s_threaddesk(uint32_t* a) { (void)a; return (uint32_t)(uintptr_t)GetThreadDesktop(GetCurrentThreadId()); }
 static uint32_t s_showsb(uint32_t* a) { return ShowScrollBar((HWND)(uintptr_t)a[0], (int)a[1], a[2]); }
@@ -1038,6 +1192,13 @@ static int spi_get(uint32_t act, uint32_t pv) {
 static uint32_t s_spi(uint32_t* a) {
     /* the virtual screen's work area: the taskbar sets it, kept here only */
     if (g_screen && a[0] == SPI_GETWORKAREA && a[2]) { memcpy((void*)(uintptr_t)a[2], &g_work, sizeof g_work); return 1; }
+    /* SPI_GETDESKWALLPAPER: the box's (the host's names a host path), else none */
+    if (a[0] == SPI_GETDESKWALLPAPER && a[2] && a[1]) {
+        wchar_t v[MAX_PATH] = L"";
+        native32_registry_box_sz(L"Control Panel\\Desktop", L"Wallpaper", v, MAX_PATH);
+        lstrcpynW((wchar_t*)(uintptr_t)a[2], v, (int)a[1]);
+        return 1;
+    }
     if (g_screen && a[0] == SPI_SETWORKAREA) {
         if (a[2]) memcpy(&g_work, (void*)(uintptr_t)a[2], sizeof g_work);
         else SetRect(&g_work, 0, 0, g_scx, g_scy);
@@ -1068,7 +1229,11 @@ static uint32_t s_spi(uint32_t* a) {
 }
 /* NtUserGetDCEx(hwnd, hrgnClip, flags), NtUserGetWindowDC(hwnd) */
 static uint32_t s_getdcex(uint32_t* a) {
-    return native32_gdi_handle((uint32_t)(uintptr_t)GetDCEx((HWND)(uintptr_t)a[0], (HRGN)(uintptr_t)native32_gdi_host(a[1]), a[2]));
+    /* a region the guest never had a handle for is the host's own, passed through:
+     * WM_NCPAINT's update region (XP's uxtheme paints a frame on GetDCEx(hwnd,
+     * wParam, DCX_WINDOW | DCX_INTERSECTRGN); 1 is the whole window) */
+    uint32_t r = native32_gdi_host(a[1]) ? native32_gdi_host(a[1]) : a[1] > 1 && GetObjectType((HGDIOBJ)(uintptr_t)a[1]) == OBJ_REGION ? a[1] : 0;
+    return native32_gdi_handle((uint32_t)(uintptr_t)GetDCEx((HWND)(uintptr_t)a[0], (HRGN)(uintptr_t)r, a[2]));
 }
 static uint32_t s_getwindowdc(uint32_t* a) { return native32_gdi_handle((uint32_t)(uintptr_t)GetWindowDC((HWND)(uintptr_t)a[0])); }
 static uint32_t s_getdc(uint32_t* a) { return native32_gdi_handle((uint32_t)(uintptr_t)GetDC((HWND)(uintptr_t)a[0])); }
@@ -1129,7 +1294,51 @@ static void screen_menubar(HWND h) {
     DeleteObject(font);
     ReleaseDC(h, dc);
 }
+/* NtUserCalcMenuBar(hwnd, xLeft, xRight, yTop, RECT* window) and
+ * NtUserPaintMenuBar(hwnd, hdc, xLeft, xRight, yTop, fActive): XP's uxtheme
+ * lays out and paints a themed frame's menu bar through win32k; the menus are
+ * the host's, drawn here: one row, each item's text in the menu font on
+ * COLOR_MENUBAR, its height the answer. ponytail: no wrapping, no bitmaps,
+ * no hot item (the host tracks the menu) */
+static int menubar(HWND h, HDC dc, int left, int right, int top) {
+    HMENU m = GetMenu(h);
+    RECT w;
+    int n = m ? GetMenuItemCount(m) : 0, cy = GetSystemMetrics(SM_CYMENU);
+    if (n <= 0 || !GetWindowRect(h, &w)) return 0;
+    if (!dc) return cy;
+    NONCLIENTMETRICSW ncm = { sizeof ncm };
+    SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof ncm, &ncm, 0);
+    HFONT font = CreateFontIndirectW(&ncm.lfMenuFont), old = (HFONT)SelectObject(dc, font);
+    HBRUSH bg = CreateSolidBrush(sys_color(COLOR_MENUBAR));
+    RECT bar = { left, top, w.right - w.left - right, top + cy };
+    FillRect(dc, &bar, bg);
+    SetBkMode(dc, TRANSPARENT);
+    for (int i = 0, x = left; i < n; i++) {
+        wchar_t text[128];
+        RECT r = { 0, 0, 0, 0 };
+        MENUITEMINFOW mi = { sizeof mi, MIIM_STATE | MIIM_FTYPE };
+        if (!GetMenuItemInfoW(m, (UINT)i, TRUE, &mi) || (mi.fType & (MFT_BITMAP | MFT_OWNERDRAW)) ||
+            GetMenuStringW(m, (UINT)i, text, 128, MF_BYPOSITION) <= 0) continue;
+        DrawTextW(dc, text, -1, &r, DT_SINGLELINE | DT_CALCRECT | DT_HIDEPREFIX);
+        RECT t = { x, top, x + r.right + 12, top + cy };
+        SetTextColor(dc, sys_color((mi.fState & MFS_DISABLED) ? COLOR_GRAYTEXT : COLOR_MENUTEXT));
+        DrawTextW(dc, text, -1, &t, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_HIDEPREFIX);
+        x = t.right;
+    }
+    DeleteObject(bg);
+    SelectObject(dc, old);
+    DeleteObject(font);
+    return cy;
+}
+static uint32_t s_calcmenubar(uint32_t* a) { return (uint32_t)menubar((HWND)(uintptr_t)a[0], NULL, (int)a[1], (int)a[2], (int)a[3]); }
+static uint32_t s_paintmenubar(uint32_t* a) {
+    HDC dc = (HDC)(uintptr_t)(native32_gdi_host(a[1]) ? native32_gdi_host(a[1]) : a[1]);
+    return (uint32_t)menubar((HWND)(uintptr_t)a[0], dc, (int)a[2], (int)a[3], (int)a[4]);
+}
 static void screen_caption(HWND h) {
+    /* XP's visual style draws a guest window's frame (uxtheme's hooks); a host-class one
+     * (the Run dialog's #32770) keeps the host's classic frame, its caption in the box's colours */
+    if (native32_themed && class_proc(h)) return;
     if (!g_screen || GetAncestor(h, GA_PARENT) != g_screen || (GetWindowLongW(h, GWL_STYLE) & WS_CAPTION) != WS_CAPTION) return;
     HWND top = GetWindow(g_screen, GW_CHILD);
     while (top && (!IsWindowVisible(top) || (GetWindowLongW(top, GWL_STYLE) & WS_CAPTION) != WS_CAPTION)) top = GetWindow(top, GW_HWNDNEXT);
@@ -1197,6 +1406,10 @@ static uint32_t s_message_call(uint32_t* a) {
         if ((img || ((a[1] == BM_GETIMAGE || a[1] == STM_GETIMAGE) && a[2] == IMAGE_BITMAP)) && r)
             return native32_gdi_handle((uint32_t)r);
         return (uint32_t)(a[1] == WM_GETFONT && r ? native32_gdi_handle((uint32_t)r) : r);
+    }
+    if (a[5] == 0x29E && a[1] == WM_NCCALCSIZE && native32_themed && a[3] && g_screen && GetAncestor(h, GA_PARENT) == g_screen) {
+        xp_ncrect(h, (RECT*)(uintptr_t)a[3]);
+        return 0;
     }
     if (a[5] == 0x29E) {
         LRESULT r = a[6] ? DefWindowProcA(h, a[1], a[2], a[3]) : DefWindowProcW(h, a[1], a[2], a[3]);
@@ -1913,6 +2126,8 @@ void native32_user_install(void) {
     native32_nt_win32k_override("NtUserGetDCEx", s_getdcex);
     native32_nt_win32k_override("NtUserGetWindowDC", s_getwindowdc);
     native32_nt_win32k_override("NtUserSystemParametersInfo", s_spi);
+    native32_nt_win32k_override("NtUserPaintDesktop", s_paintdesktop);
+    native32_nt_win32k_override("NtUserBuildNameList", s_namelist);
     native32_nt_win32k_override("NtUserPostMessage", s_post);
     native32_nt_win32k_override("NtUserValidateTimerCallback", s_validate_timer);
     native32_nt_win32k_override("NtUserEnableScrollBar", s_enable_sb);
@@ -1939,6 +2154,14 @@ void native32_user_install(void) {
     native32_nt_win32k_override("NtUserShowCaret", s_showcaret);
     native32_nt_win32k_override("NtUserHideCaret", s_hidecaret);
     native32_nt_win32k_override("NtUserGetThreadDesktop", s_threaddesk);
+    native32_nt_win32k_override("NtUserGetProcessWindowStation", s_winsta);
+    native32_nt_win32k_override("NtUserBuildHwndList", s_hwndlist);
+    native32_nt_win32k_override("NtUserCalcMenuBar", s_calcmenubar);
+    native32_nt_win32k_override("NtUserPaintMenuBar", s_paintmenubar);
+    native32_nt_win32k_override("NtUserGetAncestor", s_ancestor);
+    native32_nt_win32k_override("NtUserGetTitleBarInfo", s_titlebarinfo);
+    native32_nt_win32k_override("NtUserGetGUIThreadInfo", s_guithreadinfo);
+    native32_nt_win32k_override("NtUserGetObjectInformation", s_objinfo);
     native32_nt_win32k_override("NtUserShowScrollBar", s_showsb);
     native32_nt_win32k_override("NtUserGetKeyState", s_keystate);
     native32_nt_win32k_override("NtUserCountClipboardFormats", s_nclipfmt);

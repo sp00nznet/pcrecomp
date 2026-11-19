@@ -241,6 +241,7 @@ void native32_seh_continue(uint32_t va);
 void native32_rpc_guard(uint32_t ndr_client_call2, uint32_t ndr_client_call);   /* guest RPC failures end the call (native32.c) */
 void native32_rpc_fail(uint32_t exception_record, uint32_t context);
 void native32_co_register_guard(uint32_t co_register_class_object);   /* XP: no local server registration (native32.c) */
+void native32_netapi_refuse(void);   /* a lifted netapi32's wkssvc calls refused before the RPC (native32.c) */
 int native32_local_unwind2(void);   /* MSVC __local_unwind2 copies in the guest modules: a finally that exits its function (native32.c) */
 extern int native32_guest_seh;   /* 1: RaiseException goes to the guest chain */
 /* A Visual Basic 5/6 guest on the real MSVBVM60/50 (vb6rt.c): the runtime is
@@ -341,6 +342,9 @@ extern void (*native32_win32k_pre)(void);
  * ntdll's KiUserCallbackDispatcher runs KernelCallbackTable[api](in, len);
  * returns its status, and the NtCallbackReturn output. */
 uint32_t native32_nt_callback(uint32_t api, uint32_t in, uint32_t len, uint32_t* out, uint32_t* outlen);
+/* Windows XP: the guest's visual style, once per process at its first window (csr32.c) */
+void native32_theme_start(void);
+extern int native32_themed;   /* its user32 hooks are in: uxtheme draws the frames */
 /* A host function in place of a host DLL's export in its proxy image (same
  * signature): a host notes what the guest gets from the host's DLLs. */
 void native32_nt_proxy_hook(const char* name, void* fn);

@@ -425,6 +425,110 @@ static uint32_t s_dibitmap(uint32_t* a) {
     if ((a[3] & 2) && bi->bmiHeader.biBitCount > 1) h = screen ? screen : (screen = GetDC(NULL));
     return GUEST(CreateDIBitmap(h ? h : GetDC(NULL), &bi->bmiHeader, a[3] & CBM_INIT, (void*)(uintptr_t)a[4], bi, a[6]));
 }
+/* NtGdiGetDIBitsInternal(hdc, hbm, iStartScan, cScans, pBits, pbmi, iUsage,
+ * cjMaxBits, cjMaxInfo): the host's GetDIBits (XP's uxtheme reads the
+ * .msstyles' bitmaps back as DIBs into its theme section) */
+static uint32_t s_getdibits(uint32_t* a) {
+    static HDC screen;
+    HDC h = (HDC)(uintptr_t)HOST(a[0]);
+    if (!h) h = screen ? screen : (screen = GetDC(NULL));
+    return (uint32_t)GetDIBits(h, (HBITMAP)(uintptr_t)HOST(a[1]), a[2], a[3], (void*)(uintptr_t)a[4], (BITMAPINFO*)(uintptr_t)a[5], a[6]);
+}
+/* NtGdiDrawStream(hdc, cjIn, pvIn): XP SP2's uxtheme draws every image part
+ * as a stream ('SwrD', then commands): 0 SETTARGET {hdc, RECTL}, 1 SETSOURCE
+ * {hbm}, 9 NINEGRID {RECTL dest, RECTL src, flags, left, right, top, bottom
+ * widths, crTransparent}. Flags: 1 stretch (else tile), 4 per-pixel alpha,
+ * 8 transparent colour, 0x10 mirror, 0x20 true size. The nine pieces each go
+ * through the host's AlphaBlend / TransparentBlt / StretchBlt.
+ * ponytail: no mirroring (no RTL guest) */
+static void ds_blt(HDC d, int x, int y, int w, int h, HDC s, int sx, int sy, int sw, int sh, uint32_t fl, COLORREF key) {
+    if (w <= 0 || h <= 0 || sw <= 0 || sh <= 0) return;
+    if (fl & 4) {
+        BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+        GdiAlphaBlend(d, x, y, w, h, s, sx, sy, sw, sh, bf);
+    } else if (fl & 8) GdiTransparentBlt(d, x, y, w, h, s, sx, sy, sw, sh, key);
+    else StretchBlt(d, x, y, w, h, s, sx, sy, sw, sh, SRCCOPY);
+}
+/* a piece stretched (or, for tiled edges and centre, repeated at source size) */
+static void ds_piece(HDC d, int x, int y, int w, int h, HDC s, int sx, int sy, int sw, int sh, uint32_t fl, COLORREF key, int tile) {
+    if (!tile || sw <= 0 || sh <= 0) { ds_blt(d, x, y, w, h, s, sx, sy, sw, sh, fl, key); return; }
+    for (int ty = 0; ty < h; ty += sh)
+        for (int tx = 0; tx < w; tx += sw)
+            ds_blt(d, x + tx, y + ty, min(sw, w - tx), min(sh, h - ty), s, sx, sy, min(sw, w - tx), min(sh, h - ty), fl, key);
+}
+static uint32_t s_drawstream(uint32_t* a) {
+    const uint8_t* p = (const uint8_t*)(uintptr_t)a[2], *end = p + a[1];
+    uint32_t tdc = a[0];
+    HBITMAP src = NULL;
+    if (a[1] < 4 || MEM32(a[2]) != 0x44727753u) return 0;
+    for (p += 4; p + 4 <= end;) {
+        uint32_t cmd = *(const uint32_t*)p;
+        if (cmd == 0 && p + 0x18 <= end) { tdc = *(const uint32_t*)(p + 4); p += 0x18; continue; }
+        if (cmd == 1 && p + 8 <= end) { src = (HBITMAP)(uintptr_t)HOST(*(const uint32_t*)(p + 4)); p += 8; continue; }
+        if (cmd != 9 || p + 0x3C > end) { fprintf(stderr, "[gdi] DrawStream command %u not drawn\n", cmd); return 0; }
+        const int32_t* q = (const int32_t*)(p + 4);
+        RECT dr = { q[0], q[1], q[2], q[3] }, sr = { q[4], q[5], q[6], q[7] };
+        uint32_t fl = (uint32_t)q[8];
+        int l = q[9], r = q[10], t = q[11], b = q[12], tile = !(fl & 1);
+        COLORREF key = (COLORREF)q[13];
+        p += 0x3C;
+        HDC d = dc(tdc), s = CreateCompatibleDC(d);
+        HGDIOBJ old = SelectObject(s, src);
+        int dw = dr.right - dr.left, dh = dr.bottom - dr.top, sw = sr.right - sr.left, sh = sr.bottom - sr.top;
+        if (fl & 0x20) {                                   /* true size: the image as it is, centred */
+            ds_blt(d, dr.left + (dw - sw) / 2, dr.top + (dh - sh) / 2, sw, sh, s, sr.left, sr.top, sw, sh, fl, key);
+        } else {
+            if (l + r > dw) l = dw * l / max(l + r, 1), r = dw - l;    /* a part smaller than its margins */
+            if (t + b > dh) t = dh * t / max(t + b, 1), b = dh - t;
+            int xs[4] = { dr.left, dr.left + l, dr.right - r, dr.right }, ys[4] = { dr.top, dr.top + t, dr.bottom - b, dr.bottom };
+            int ws[3] = { q[9], sw - q[9] - q[10], q[10] }, hs[3] = { q[11], sh - q[11] - q[12], q[12] };
+            int sx[3] = { sr.left, sr.left + q[9], sr.right - q[10] }, sy[3] = { sr.top, sr.top + q[11], sr.bottom - q[12] };
+            for (int j = 0; j < 3; j++)
+                for (int i = 0; i < 3; i++)
+                    ds_piece(d, xs[i], ys[j], xs[i + 1] - xs[i], ys[j + 1] - ys[j], s, sx[i], sy[j], ws[i], hs[j], fl, key,
+                             tile && (i == 1 || j == 1));
+        }
+        SelectObject(s, old);
+        DeleteDC(s);
+        dc_back(tdc);
+    }
+    return 1;
+}
+/* NtGdiExtCreateRegion(XFORM*, cj, RGNDATA*) and NtGdiCombineRgn(dst, a, b,
+ * mode): XP's uxtheme makes a themed frame's rounded window region with them */
+static void rgn_attr_set(uint32_t g, HRGN h, int r) {     /* the client-side RGNATTR, as the host region now is */
+    uint8_t* at = native32_gdi_attr(g);
+    if (!at || r == ERROR) return;
+    *(uint32_t*)at &= ~0x20u;
+    *(uint32_t*)(at + 4) = (uint32_t)r;
+    GetRgnBox(h, (RECT*)(at + 8));
+}
+static uint32_t s_extcreatergn(uint32_t* a) {
+    HRGN h = ExtCreateRegion((XFORM*)(uintptr_t)a[0], a[1], (RGNDATA*)(uintptr_t)a[2]);
+    uint32_t g = h ? GUEST(h) : 0;
+    RECT b;
+    if (g) rgn_attr_set(g, h, GetRgnBox(h, &b));
+    return g;
+}
+/* NtGdiOffsetRgn(hrgn, x, y) */
+static uint32_t s_offsetrgn(uint32_t* a) {
+    HRGN h = (HRGN)(uintptr_t)native32_gdi_rgn(a[0]);
+    int r = h ? OffsetRgn(h, (int)a[1], (int)a[2]) : ERROR;
+    if (h) rgn_attr_set(a[0], h, r);
+    return (uint32_t)r;
+}
+static uint32_t s_combinergn(uint32_t* a) {
+    /* each operand as gdi32 left it client-side (RGNATTR, native32_gdi_rgn), and
+     * the result written back there, no longer dirty (else the next sync put
+     * the stale rectangle over it) */
+    HRGN d = (HRGN)(uintptr_t)native32_gdi_rgn(a[0]);
+    int r = CombineRgn(d, (HRGN)(uintptr_t)native32_gdi_rgn(a[1]), a[2] ? (HRGN)(uintptr_t)native32_gdi_rgn(a[2]) : NULL, (int)a[3]);
+    rgn_attr_set(a[0], d, r);
+    return (uint32_t)r;
+}
+/* NtGdiSetBitmapAttributes(hbm, flags): SBA_STOCK (a bitmap no process deletes:
+ * uxtheme's shared ones); one process here, the same handle */
+static uint32_t s_bitmap_attrs(uint32_t* a) { return a[0]; }
 /* NtGdiGetRegionData(hrgn, count, RGNDATA*). NtGdiGetDeviceWidth stays
  * unanswered (0): answered with HORZRES, gdisol looped in gdi32 */
 static uint32_t s_rgndata(uint32_t* a) { return GetRegionData((HRGN)(uintptr_t)HOST(a[0]), a[1], (RGNDATA*)(uintptr_t)a[2]); }
@@ -864,7 +968,7 @@ void native32_gdi_install(void) {
     static const struct { const char* name; native32_syscall_fn fn; } svc[] = {
         { "NtGdiInit", s_init }, { "NtGdiQueryFontAssocInfo", s_zero }, { "NtGdiGetStockObject", s_stock },
         { "NtGdiCreateCompatibleDC", s_compat_dc }, { "NtGdiCreateCompatibleBitmap", s_compat_bitmap },
-        { "NtGdiCreatePen", s_pen }, { "NtGdiCreateRectRgn", s_rectrgn }, { "NtGdiCreateDIBitmapInternal", s_dibitmap }, { "NtGdiCreateBitmap", s_bitmap }, { "NtGdiCreatePatternBrushInternal", s_patbrush }, { "NtGdiCreateDIBSection", s_dibsection },
+        { "NtGdiCreatePen", s_pen }, { "NtGdiCreateRectRgn", s_rectrgn }, { "NtGdiCreateDIBitmapInternal", s_dibitmap }, { "NtGdiGetDIBitsInternal", s_getdibits }, { "NtGdiSetBitmapAttributes", s_bitmap_attrs }, { "NtGdiDrawStream", s_drawstream }, { "NtGdiExtCreateRegion", s_extcreatergn }, { "NtGdiCombineRgn", s_combinergn }, { "NtGdiOffsetRgn", s_offsetrgn }, { "NtGdiClearBitmapAttributes", s_bitmap_attrs }, { "NtGdiCreateBitmap", s_bitmap }, { "NtGdiCreatePatternBrushInternal", s_patbrush }, { "NtGdiCreateDIBSection", s_dibsection },
         { "NtGdiGetDCObject", s_dcobject }, { "NtGdiExcludeClipRect", s_excludeclip },
         { "NtGdiGetRegionData", s_rgndata }, { "NtGdiEqualRgn", s_equalrgn }, { "NtGdiPolyPolyDraw", s_polypolydraw }, { "NtGdiGetDCforBitmap", s_dcforbitmap }, { "NtGdiSaveDC", s_savedc }, { "NtGdiRestoreDC", s_restoredc },
         { "NtGdiGetRandomRgn", s_randomrgn }, { "NtGdiIntersectClipRect", s_intersectclip }, { "NtGdiGetAppClipBox", s_appclipbox },
