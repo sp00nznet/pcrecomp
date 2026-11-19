@@ -406,8 +406,8 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
             nxt_i = instructions[k + 1] if k + 1 < len(instructions) else None
             # (`push L; jmp func` is push_return_label's; `push L; jmp [iat]` is ours: kernel32's
             # GetStartupInfoA leaves its critical section with `push cont; jmp [RtlLeaveCriticalSection]`)
-            if i.mnemonic == 'push' and not (nxt_i is not None and nxt_i.mnemonic == 'jmp'
-                                             and nxt_i.get_branch_target() is not None):
+            if i.mnemonic == 'push' and (lift32.W9X or lift32.finally_push(instructions[k - 1] if k else None)) and \
+                    not (nxt_i is not None and nxt_i.mnemonic == 'jmp' and nxt_i.get_branch_target() is not None):
                 t = i.get_branch_target()
                 if t is not None and t in addrs and t != i.end_address:
                     push_ret.add(t)
@@ -687,7 +687,9 @@ def true_extent(md, code, code_start, start, hard_end, entries, reached=None, be
             if va in seen or not (low <= va < hard_end):
                 continue
             after_call = False
+            prev_ins = cur_ins = None
             for ins in decode(md, view[va - code_start:hard_end - code_start], va):
+                prev_ins, cur_ins = cur_ins, ins
                 if ins.address in seen:
                     break
                 if after_call and ins.address in entries:
@@ -718,7 +720,7 @@ def true_extent(md, code, code_start, start, hard_end, entries, reached=None, be
                     (deferred.add if t in entries else work.append)(t)
                 # LIFT32_PUSHRET: `push cont; jmp finally` / `push cont; ...; ret` returns to
                 # `cont`, a few bytes on: part of this body (NT 4.0 ntdll 0x77F664AB)
-                elif (lift32.PUSHRET and m == 'push' and t is not None
+                elif (lift32.PUSHRET and m == 'push' and t is not None and lift32.finally_push(prev_ins)
                         and ins.address + ins.size < t < min(hard_end, ins.address + ins.size + 0x100)):
                     work.append(t)
                 # Hand-written CRT routines (strchr, strlen) put a shared exit

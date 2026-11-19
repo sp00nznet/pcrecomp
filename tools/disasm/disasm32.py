@@ -33,9 +33,15 @@ CALLS = {'call'}
 
 # Return instructions
 RETS = {'ret', 'retn', 'retf'}
-# LIFT32_PUSHRET=1: a near-forward pushed address is a block of the pushing
-# function (lift32.PUSHRET, generate.py's push/ret pairs)
+# LIFT32_PUSHRET=1: a near-forward pushed address right after a try level of -1 is a block of
+# the pushing function (lift32.PUSHRET, generate.py's push/ret pairs)
 PUSHRET = __import__('os').environ.get('LIFT32_PUSHRET') == '1'
+
+
+def finally_push(prev):
+    """The instruction before a __finally's `push cont`: the try level set to -1 (an
+    argument push of a code address, cmd's parser tables, has no such thing before it)."""
+    return prev is not None and prev.mnemonic == 'mov' and prev.op_str == 'dword ptr [ebp - 4], 0xffffffff'
 # Instructions no 32-bit compiler emits. A candidate whose decode meets one
 # before its terminator is data: a string decodes as `arpl`, `bound`, BCD.
 NOT_COMPILED = {"arpl", "bound", "into", "salc", "sldt", "str", "lsl", "lar", "ud2",
@@ -593,8 +599,8 @@ class Disassembler:
             insns = self.disassemble_at(addr, max_bytes=SCAN_WINDOW)
             last = None
             for insn in insns:
-                last = insn
-                if PUSHRET and insn.mnemonic == 'push':
+                prev, last = last, insn
+                if PUSHRET and insn.mnemonic == 'push' and finally_push(prev):
                     # LIFT32_PUSHRET: `push cont; [finally]; ret` or `push cont; jmp finally`
                     # (NT 4.0's compiler) returns to `cont`, a few bytes on: code of this function
                     t = insn.get_branch_target()
