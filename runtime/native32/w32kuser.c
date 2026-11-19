@@ -1467,6 +1467,17 @@ static uint32_t s_message_call_str(uint32_t* a) {
     return s_message_call(a);
 }
 
+/* NT 4.0's NtUserfnOUTSTRING (WM_GETTEXT, ...): lParam is a LARGE_STRING for the text to come;
+ * its buffer takes it and its Length the bytes written */
+static uint32_t s_message_call_outstr(uint32_t* a) {
+    uint32_t ls = a[3], r;
+    if (!ls || !nt_guest_nt4(native32_guest_peb)) return s_message_call(a);
+    a[3] = MEM32(ls + 8);
+    r = s_message_call(a);
+    MEM32(ls) = r * (a[6] ? 1 : 2);
+    return r;
+}
+
 /* Any USER object a guest handle should validate as: menus (bType 2) get an
  * entry and a zeroed object in the desktop heap, like windows (1). */
 static void user_object(uint32_t h, uint8_t type, uint32_t size) {
@@ -2232,7 +2243,8 @@ void native32_user_install(void) {
         char n[64];
         for (int i = 0; i < (int)(sizeof fn / sizeof fn[0]); i++) {
             _snprintf(n, sizeof n - 1, "NtUserfn%s", fn[i]), n[sizeof n - 1] = 0;
-            native32_nt_win32k_override_opt(n, strncmp(fn[i], "INSTRING", 8) ? s_message_call : s_message_call_str);
+            native32_nt_win32k_override_opt(n, !strncmp(fn[i], "INSTRING", 8) ? s_message_call_str
+                                               : !strcmp(fn[i], "OUTSTRING") ? s_message_call_outstr : s_message_call);
         }
     }
     native32_nt_win32k_override_opt("NtUserInitBrushes", s_init_brushes);
