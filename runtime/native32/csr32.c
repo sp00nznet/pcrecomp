@@ -442,7 +442,8 @@ static uint32_t lpc_connect(uint32_t* a, int secure) {
      * where 26 is another api: the guest's build (its PEB, set by now) says */
     {
         uint32_t nls = MEM16(native32_guest_peb + 0xAC) >= 2600 ? 30 : 26;
-        if (!g_api[1][nls]) native32_csr_api(0x10000 | nls, nls_get_user_info);
+        /* (NT 4.0 has no NlsGetUserInfo: kernel32 reads the static server data) */
+        if (!g_api[1][nls] && !nt_guest_nt4(native32_guest_peb)) native32_csr_api(0x10000 | nls, nls_get_user_info);
         if (nls == 30 && !g_api[1][27]) native32_csr_api(0x1001B, sxs_create_actctx);
     }
     if (!g_port) g_port = CreateEventA(NULL, FALSE, FALSE, NULL);
@@ -593,7 +594,7 @@ static int is_port(uint32_t h) { return g_port && (HANDLE)(uintptr_t)h == g_port
 static uint32_t ovr_request_wait_reply(uint32_t* a) {
     if (g_theme_port && (HANDLE)(uintptr_t)a[0] == g_theme_port) return theme_request(a);
     if (!is_port(a[0])) return native32_nt_forward("NtRequestWaitReplyPort", a);
-    uint32_t m = a[1], api = MEM32(m + 0x1C), r = 0;
+    uint32_t m = a[1], api = nt_csr_api(native32_guest_peb, MEM32(m + 0x1C)), r = 0;
     native32_csr_api_fn fn = (api >> 16) < 8 && (api & 0xFFFF) < 1024 ? g_api[api >> 16][api & 0xFFFF] : NULL;
     if (fn) r = fn(m + 0x28, MEM32(m + 0x18));
     else {

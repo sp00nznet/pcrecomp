@@ -1,6 +1,6 @@
 /*
- * ntguest: what differs between the NT guests this runtime serves (Windows
- * 2000, NT 5.0, and Windows XP, NT 5.1), answered from the guest's own image
+ * ntguest: what differs between the NT guests this runtime serves (NT 4.0,
+ * Windows 2000, NT 5.0, and Windows XP, NT 5.1), answered from the guest's own image
  * or its PEB's OSBuildNumber (+0xAC), never from a build-time switch.
  *
  * ntstub_parse: the service number and argument count of an NT system-call stub,
@@ -34,6 +34,21 @@ static inline int ntstub_parse(const uint8_t* b, uint32_t* svc, uint8_t* argc) {
 /* NT 5.1 (Windows XP, build 2600) or later, by the guest PEB's build number */
 static inline int nt_guest_xp(uint32_t peb) {
     return peb && *(const uint16_t*)NTGUEST_VA(peb + 0xAC) >= 2600;
+}
+
+/* NT 4.0 (build 1381), by the guest PEB's build number (Windows 2000's
+ * release candidates, 2128..2183, are NT 5.0) */
+static inline int nt_guest_nt4(uint32_t peb) {
+    return peb && *(const uint16_t*)NTGUEST_VA(peb + 0xAC) < 2000;
+}
+/* csrss api numbers, the guest's to Windows 2000's ((server << 16) | api;
+ * 0xFFFFFFFF: an api Windows 2000 does not have). NT 4.0's csrsrv has
+ * CsrNullApiCall at 0, so ClientConnect is 1 (2000: 0), ThreadConnect 2,
+ * ProfileControl 3, IdentifyAlertableThread 4, SetPriorityClass 5 (read off
+ * NT 4.0 SP6a ntdll's Csr* exports). */
+static inline uint32_t nt_csr_api(uint32_t peb, uint32_t api) {
+    if (!nt_guest_nt4(peb) || (api >> 16) != 0) return api;
+    return (api & 0xFFFF) ? api - 1 : 0xFFFFFFFFu;
 }
 
 /* GDI's shared memory (Peb->GdiSharedHandleTable): the handle table, then

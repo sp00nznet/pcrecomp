@@ -33,6 +33,9 @@ CALLS = {'call'}
 
 # Return instructions
 RETS = {'ret', 'retn', 'retf'}
+# LIFT32_PUSHRET=1: a near-forward pushed address is a block of the pushing
+# function (lift32.PUSHRET, generate.py's push/ret pairs)
+PUSHRET = __import__('os').environ.get('LIFT32_PUSHRET') == '1'
 # Instructions no 32-bit compiler emits. A candidate whose decode meets one
 # before its terminator is data: a string decodes as `arpl`, `bound`, BCD.
 NOT_COMPILED = {"arpl", "bound", "into", "salc", "sldt", "str", "lsl", "lar", "ud2",
@@ -591,6 +594,14 @@ class Disassembler:
             last = None
             for insn in insns:
                 last = insn
+                if PUSHRET and insn.mnemonic == 'push':
+                    # LIFT32_PUSHRET: `push cont; [finally]; ret` or `push cont; jmp finally`
+                    # (NT 4.0's compiler) returns to `cont`, a few bytes on: code of this function
+                    t = insn.get_branch_target()
+                    if t and insn.end_address < t < insn.end_address + 0x100 and self.is_code_address(t):
+                        block_leaders.add(t)
+                        if t not in visited:
+                            work.append(t)
                 if insn.is_call:
                     target = insn.get_branch_target()
                     if target and self.is_code_address(target):

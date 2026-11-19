@@ -394,14 +394,14 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
     targets |= {a for a in gaps.values() if a in addrs}
     body_addrs = addrs
 
-    # LIFT32_W9X: `push L; ...; ret` with L in this body is a jump to L, not a
+    # LIFT32_W9X / LIFT32_PUSHRET: `push L; ...; ret` with L in this body is a jump to L, not a
     # return (Windows 98 kernel32 runs an inline finally that way: 0xBFF850F4
     # pushes 0xBFF85117 and the block ends in a bare `ret`). A lifted `ret`
     # returns from the C function, so it left the frame on the stack and the
     # service thread's APC loop overflowed its stack. Each such L gets a label,
     # and every bare `ret` here first checks the stack top against them.
     push_ret, push_ret_far = set(), set()
-    if lift32.W9X:
+    if lift32.PUSHRET:
         for k, i in enumerate(instructions):
             nxt_i = instructions[k + 1] if k + 1 < len(instructions) else None
             if i.mnemonic == 'push' and not (nxt_i is not None and nxt_i.mnemonic == 'jmp'):
@@ -502,7 +502,12 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
     # function the compiler did not) has to become a real tail call.
     refed = set(re.findall(r'goto\s+(L_[0-9A-Fa-f]{8})', '\n'.join(lines)))
     for lbl in sorted(refed - set(defined)):
-        lines.append(f'    {lbl}: RECOMP_ITAIL(0x{int(lbl[2:], 16):08X}u); return;')
+        # LIFT32_PUSHRET: `push cont; ...; jmp finally` where finally's `ret` returns to `cont`
+        # (NT 4.0 ntdll 0x77F65AED: `push cont; call _abnormal_termination; ...; jmp ReleasePebLock`)
+        x = int(lbl[2:], 16)
+        pre = ''.join(f'if (MEM32(esp) == 0x{t:08X}u) {{ esp += 4; RECOMP_ICALL(0x{x:08X}u); RECOMP_FLAGS_IN(); goto L_{t:08X}; }} '
+                      for t in sorted(push_ret))
+        lines.append(f'    {lbl}: {pre}RECOMP_ITAIL(0x{x:08X}u); return;')
 
     # With RECOMP_LOCAL_REGS every exit writes the registers back (the macro
     # is empty otherwise), including a body that runs off its closing brace.
@@ -706,6 +711,11 @@ def true_extent(md, code, code_start, start, hard_end, entries, reached=None, be
                     far.add(t)
                 if branch and t is not None and start < t < hard_end:
                     (deferred.add if t in entries else work.append)(t)
+                # LIFT32_PUSHRET: `push cont; jmp finally` / `push cont; ...; ret` returns to
+                # `cont`, a few bytes on: part of this body (NT 4.0 ntdll 0x77F664AB)
+                elif (lift32.PUSHRET and m == 'push' and t is not None
+                        and ins.address + ins.size < t < min(hard_end, ins.address + ins.size + 0x100)):
+                    work.append(t)
                 # Hand-written CRT routines (strchr, strlen) put a shared exit
                 # just BELOW their entry, after int3 padding, and jump back to
                 # it. Padding before the target says it is not the middle of

@@ -258,6 +258,10 @@ def _is_far_indirect(insn) -> bool:
 # LIFT32_W9X=1: Windows 9x system code (kernel32): a flat `retf` is a far jump
 # (see 'retf') and es is a real selector (it writes the LDT through an alias).
 W9X = __import__('os').environ.get('LIFT32_W9X') == '1'
+# LIFT32_PUSHRET=1 (implied by W9X): `push L; ...; ret` with L in the same body is a jump to L.
+# NT 4.0's compiler runs a __finally inline that way (SP6a ntdll 0x77F6C2DB, in the critical
+# sections' debug-info allocator: `push cont; <finally>; ret`), without W9X's segment handling.
+PUSHRET = W9X or __import__('os').environ.get('LIFT32_PUSHRET') == '1'
 
 # Lifted only with Lifter(dos=True); see Lifter._lift_dos.
 DOS_OPS = {'int', 'iretd', 'in', 'out', 'insb', 'insw', 'insd', 'outsb', 'outsw', 'outsd',
