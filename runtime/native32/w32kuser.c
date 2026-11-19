@@ -602,7 +602,23 @@ static uint32_t find_dcm(void) {
     if (!u) return 0;
     da = native32_export(u, "DefDlgProcA"), dw = native32_export(u, "DefDlgProcW");
     uint32_t size = MEM32(u + MEM32(u + 0x3C) + 0x50);
-    uint32_t k = nt_guest_xp(native32_guest_peb) ? 0x28 : 0x24;   /* (XP: pfnGhostWndProc before it) */
+    if (nt_guest_nt4(native32_guest_peb)) {
+        /* NT 4.0's user32 builds apfnClientW on its stack: `mov [ebp+d], DefDlgProcW` (C7 45 d),
+         * and +0x20 on `mov [ebp+d+0x20], reg` (89 modrm d+0x20) after `mov reg, DispatchClientMessage` */
+        for (uint32_t o = 0x1000; o + 7 < size; o++) {
+            if (MEM8(u + o) != 0xC7 || MEM8(u + o + 1) != 0x45 || MEM32(u + o + 3) != dw) continue;
+            uint8_t d2 = (uint8_t)(MEM8(u + o + 2) + 0x20);
+            for (uint32_t q = o > 0x100 ? o - 0x100 : 0; q < o + 0x100 && q + 3 < size; q++) {
+                uint8_t mr = MEM8(u + q + 1);
+                if (MEM8(u + q) != 0x89 || (mr & 0xC7) != 0x45 || MEM8(u + q + 2) != d2) continue;
+                for (uint32_t b = q - 5; b + 0x100 > q; b--)
+                    if (MEM8(u + b) == 0xB8 + ((mr >> 3) & 7) && MEM32(u + b + 1) - u - 0x1000 < size)
+                        return MEM32(u + b + 1);
+            }
+        }
+        return 0;
+    }
+    uint32_t k =nt_guest_xp(native32_guest_peb) ? 0x28 : 0x24;   /* (XP: pfnGhostWndProc before it) */
     for (uint32_t o = 0x1000; o + 0x2C < size; o += 4)
         if (MEM32(u + o) == dw)
             for (uint32_t p = 0x1000; p + 0x2C < size; p += 4)

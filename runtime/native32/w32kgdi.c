@@ -19,7 +19,7 @@
  *                 current position, +0x7C the text alignment, +0x90 the font,
  *                 +0x1B0/+0x1B4 the brush origin.
  *   TEB batch     some calls are queued in the TEB, not made: TEB+0x1D4 the
- *                 bytes used, +0x1D8 the DC, +0x1DC the entries
+ *                 bytes used, +0x1D8 the DC, +0x1DC the entries (NT 4.0: +0x1FC..)
  *                 { USHORT length, USHORT command, data }, +0xF70 their count.
  *                 win32k runs them on entry to any GDI service and at
  *                 NtGdiFlushUserBatch. Commands: 0 PatBlt { x, y, cx, cy,
@@ -227,10 +227,11 @@ static void dc_back(uint32_t g) {          /* after a draw that moves the pen */
 /* ---- the TEB batch -------------------------------------------------------- */
 static uint32_t s_delete(uint32_t* a);
 static void batch(void) {
-    uint32_t teb = MEM32(g_fs_base + 0x18), used = MEM32(teb + 0x1D4), hdc = MEM32(teb + 0x1D8);
+    uint32_t teb = MEM32(g_fs_base + 0x18), tb = teb + nt_teb_batch(native32_guest_peb);
+    uint32_t used = MEM32(tb), hdc = MEM32(tb + 4);
     if (!used) return;
     for (uint32_t off = 0; off + 4 <= used && off < 0x4D8; ) {
-        uint32_t e = teb + 0x1DC + off, len = MEM16(e), cmd = MEM16(e + 2);
+        uint32_t e = tb + 8 + off, len = MEM16(e), cmd = MEM16(e + 2);
         if (cmd == 0) {                                        /* PatBlt { x, y, cx, cy, brush, rop, ... } */
             HDC h = dc(hdc);
             uint32_t br = HOST(MEM32(e + 0x14));
@@ -284,8 +285,8 @@ static void batch(void) {
         if (len < 4) break;
         off += (len + 3) & ~3u;
     }
-    MEM32(teb + 0x1D4) = 0;
-    MEM32(teb + 0x1D8) = 0;
+    MEM32(tb) = 0;
+    MEM32(tb + 4) = 0;
     MEM32(teb + 0xF70) = 0;
 }
 

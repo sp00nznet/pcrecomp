@@ -45,6 +45,8 @@ static inline int nt_guest_nt4(uint32_t peb) {
  * NT 4.0, with pDeskInfo and ulClientDelta at the same +0x18 / +0x1C. NT 4.0 has no
  * CallbackWnd (2000's +0x28): its DispatchClientMessage takes the hwnd from the WND. */
 static inline uint32_t nt_teb_ci(uint32_t peb) { return nt_guest_nt4(peb) ? 0x44 : 0x6CC; }
+/* the TEB's GDI batch: bytes used, then the DC, then the entries (NT 4.0's gdi32 PatBlt: +0x1FC) */
+static inline uint32_t nt_teb_batch(uint32_t peb) { return nt_guest_nt4(peb) ? 0x1FC : 0x1D4; }
 static inline uint32_t nt_teb_cbwnd(uint32_t peb) { return nt_guest_nt4(peb) ? 0 : 0x6F4; }
 /* csrss api numbers, the guest's to Windows 2000's ((server << 16) | api;
  * 0xFFFFFFFF: an api Windows 2000 does not have). NT 4.0's csrsrv has
@@ -71,6 +73,23 @@ static inline uint32_t nt_gdi_devcaps(uint32_t peb) { return nt_guest_xp(peb) ? 
  * WND: XP inserts spwndPrev at 0x30 (+4 from there), and two dwords after
  * dwUserData (pActCtx, ...): the extra bytes are at 0xA4, not 0x98. */
 static inline uint32_t nt_wnd(uint32_t peb, uint32_t o) {
+    /* NT 4.0 (its user32: GetWindowLong's GWL_* cases, GetWindowRect, GetClientRect,
+     * GetParent, GetDlgCtrlID, IsWindowVisible): pSelf at 0xC, the links first (Next 0x14,
+     * Parent 0x18, Child 0x1C, Owner 0x20), rcWindow 0x28, rcClient 0x38, lpfnWndProc 0x48,
+     * pcls 0x4C, cbwndExtra 0x50, hrgnUpdate 0x54, spmenu (ID) 0x68, hMod16/fnid 0x78/0x7A,
+     * dwUserData 0x80, then state, state2, ExStyle, style, hModule (0x9C..0xAC), extra 0xB0.
+     * ponytail: spwndLastActive at 0x24 is a guess (the gap); fields not listed stay put. */
+    if (nt_guest_nt4(peb)) {
+        static const uint8_t m[][2] = {
+            { 0x10, 0x0C }, { 0x14, 0x9C }, { 0x18, 0xA0 }, { 0x1C, 0xA4 }, { 0x20, 0xA8 }, { 0x24, 0xAC },
+            { 0x28, 0x78 }, { 0x2A, 0x7A }, { 0x2C, 0x14 }, { 0x30, 0x18 }, { 0x34, 0x1C }, { 0x38, 0x20 },
+            { 0x5C, 0x48 }, { 0x60, 0x4C }, { 0x64, 0x54 }, { 0x74, 0x68 }, { 0x88, 0x50 }, { 0x8C, 0x24 },
+            { 0x94, 0x80 } };
+        if (o >= 0x3C && o < 0x5C) return o - 0x14;          /* rcWindow, rcClient */
+        if (o >= 0x98) return o + 0x18;                      /* the extra bytes */
+        for (unsigned i = 0; i < sizeof m / sizeof m[0]; i++) if (m[i][0] == (o & ~3u)) return m[i][1] + (o & 3);
+        return o;
+    }
     if (!nt_guest_xp(peb) || o < 0x30) return o;
     return o < 0x98 ? o + 4 : o + 0xC;
 }
@@ -78,12 +97,25 @@ static inline uint32_t nt_wnd(uint32_t peb, uint32_t o) {
  * wMaxBtnSize through aiSysMet; argbSystem (+0xB8) then ahbrSystem (+0xC0)
  * hold 0x1F colours, not 0x1D; +0xC8 after them. */
 static inline uint32_t nt_si(uint32_t peb, uint32_t o) {
+    /* NT 4.0 (its user32: ValidateHwnd, GetSystemMetrics, GetSysColor, GetDialogBaseUnits, the
+     * dialog template's class ordinals): cHandleEntries +4, aiSysMet[0x4C] +0x170, argbSystem[0x19]
+     * +0x2A0, ahbrSystem +0x304, atomSysClass +0x788, cx/cySysFontChar +0x7D4, cx/cyMsgFontChar
+     * +0x7DC. A field NT 4.0 lacks or that is unmapped goes to scratch past its SERVERINFO. */
+    if (nt_guest_nt4(peb)) {
+        if (o == 0x8) return 0x4;
+        if (o >= 0x59C && o < 0x6E8) return o - 0x59C + 0x170;
+        if (o >= 0x6E8 && o < 0x75C) return o - 0x6E8 + 0x2A0;
+        if (o >= 0x75C && o < 0x7D0) return o - 0x75C + 0x304;
+        if (o >= 0x1A0 && o < 0x1C0) return o - 0x1A0 + 0x788;
+        if (o >= 0x800 && o < 0x810) return o - 0x800 + 0x7D4;
+        return 0xF000 + (o & 0xFFF);
+    }
     if (!nt_guest_xp(peb) || o < 0x10) return o;
     return o < 0x1A0 ? o + 0xC : o < 0x1D4 ? o + 0x20 : o < 0x6E8 ? o + 0x24
          : o < 0x75C ? o + 0xB8 : o < 0x7D0 ? o + 0xC0 : o + 0xC8;
 }
 /* (an array's element i: nt_si(peb, start) + 4 * i, since XP's arrays are longer) */
-static inline int nt_ncolors(uint32_t peb) { return nt_guest_xp(peb) ? 0x1F : 0x1D; }
+static inline int nt_ncolors(uint32_t peb) { return nt_guest_xp(peb) ? 0x1F : nt_guest_nt4(peb) ? 0x19 : 0x1D; }
 /* gdi32's TEB batch: XP's PolyPatBlt has its rectangles at +0x30 (2000: +0x24),
  * and its TextOut two more dwords before x (everything from x on is 8 later) */
 static inline uint32_t nt_batch_polypatblt(uint32_t peb) { return nt_guest_xp(peb) ? 0x30 : 0x24; }
