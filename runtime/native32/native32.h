@@ -341,6 +341,9 @@ extern void (*native32_win32k_pre)(void);
  * ntdll's KiUserCallbackDispatcher runs KernelCallbackTable[api](in, len);
  * returns its status, and the NtCallbackReturn output. */
 uint32_t native32_nt_callback(uint32_t api, uint32_t in, uint32_t len, uint32_t* out, uint32_t* outlen);
+/* Windows XP: the guest's visual style, once per process at its first window (csr32.c) */
+void native32_theme_start(void);
+extern int native32_themed;   /* its user32 hooks are in: uxtheme draws the frames */
 /* A host function in place of a host DLL's export in its proxy image (same
  * signature): a host notes what the guest gets from the host's DLLs. */
 void native32_nt_proxy_hook(const char* name, void* fn);
