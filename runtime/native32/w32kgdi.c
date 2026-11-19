@@ -464,7 +464,7 @@ static uint32_t s_drawstream(uint32_t* a) {
     for (p += 4; p + 4 <= end;) {
         uint32_t cmd = *(const uint32_t*)p;
         if (cmd == 0 && p + 0x18 <= end) { tdc = *(const uint32_t*)(p + 4); p += 0x18; continue; }
-        if (cmd == 1 && p + 8 <= end) { src = (HBITMAP)(uintptr_t)HOST(*(const uint32_t*)(p + 4)); if (getenv("DSDBG")) fprintf(stderr, "[ds] source %08X\n", *(const uint32_t*)(p + 4)); p += 8; continue; }
+        if (cmd == 1 && p + 8 <= end) { src = (HBITMAP)(uintptr_t)HOST(*(const uint32_t*)(p + 4)); p += 8; continue; }
         if (cmd != 9 || p + 0x3C > end) { fprintf(stderr, "[gdi] DrawStream command %u not drawn\n", cmd); return 0; }
         const int32_t* q = (const int32_t*)(p + 4);
         RECT dr = { q[0], q[1], q[2], q[3] }, sr = { q[4], q[5], q[6], q[7] };
@@ -474,13 +474,6 @@ static uint32_t s_drawstream(uint32_t* a) {
         p += 0x3C;
         HDC d = dc(tdc), s = CreateCompatibleDC(d);
         HGDIOBJ old = SelectObject(s, src);
-        if (getenv("DSDBG")) {
-            BITMAP bm = { 0 };
-            GetObjectW(src, sizeof bm, &bm);
-            fprintf(stderr, "[ds] dc %08X src %p %dx%d %dbpp dest %ld,%ld,%ld,%ld src %ld,%ld,%ld,%ld fl %X m %d %d %d %d px %08lX sel %p\n", tdc, (void*)src,
-                    bm.bmWidth, bm.bmHeight, bm.bmBitsPixel, dr.left, dr.top, dr.right, dr.bottom, sr.left, sr.top, sr.right, sr.bottom, fl,
-                    q[9], q[10], q[11], q[12], GetPixel(s, sr.left + 2, sr.top + 2), (void*)old);
-        }
         int dw = dr.right - dr.left, dh = dr.bottom - dr.top, sw = sr.right - sr.left, sh = sr.bottom - sr.top;
         if (fl & 0x20) {                                   /* true size: the image as it is, centred */
             ds_blt(d, dr.left + (dw - sw) / 2, dr.top + (dh - sh) / 2, sw, sh, s, sr.left, sr.top, sw, sh, fl, key);
@@ -530,16 +523,6 @@ static uint32_t s_combinergn(uint32_t* a) {
      * the stale rectangle over it) */
     HRGN d = (HRGN)(uintptr_t)native32_gdi_rgn(a[0]);
     int r = CombineRgn(d, (HRGN)(uintptr_t)native32_gdi_rgn(a[1]), a[2] ? (HRGN)(uintptr_t)native32_gdi_rgn(a[2]) : NULL, (int)a[3]);
-    if (getenv("DSDBG")) {
-        RECT b1 = { 0 }, b2 = { 0 }, b0;
-        uint8_t* at1 = native32_gdi_attr(a[1]);
-        GetRgnBox((HRGN)(uintptr_t)HOST(a[1]), &b1);
-        if (a[2]) GetRgnBox((HRGN)(uintptr_t)HOST(a[2]), &b2);
-        GetRgnBox(d, &b0);
-        fprintf(stderr, "[rgn] combine %d: %ld,%ld,%ld,%ld | %ld,%ld,%ld,%ld -> %ld,%ld,%ld,%ld (attr1 %08X %ld,%ld,%ld,%ld)\n", a[3], b1.left, b1.top, b1.right, b1.bottom,
-                b2.left, b2.top, b2.right, b2.bottom, b0.left, b0.top, b0.right, b0.bottom, at1 ? *(uint32_t*)at1 : 0, at1 ? *(int32_t*)(at1 + 8) : 0,
-                at1 ? *(int32_t*)(at1 + 12) : 0, at1 ? *(int32_t*)(at1 + 16) : 0, at1 ? *(int32_t*)(at1 + 20) : 0);
-    }
     rgn_attr_set(a[0], d, r);
     return (uint32_t)r;
 }

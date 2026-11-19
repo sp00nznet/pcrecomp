@@ -478,7 +478,6 @@ static HANDLE dup_here(HANDLE h) {
  * ThemeHooksInstall's (ordinal 34, a thread procedure: call ->
  * push ThemeInitApiHook; push [g_hInst]; call [RegisterUserApiHook]). */
 static void theme_hooks(void) {
-    if (getenv("THEMENOHOOK")) return;
     uint32_t t = g_theme_ux ? native32_export(g_theme_ux, (const char*)34) : 0, pfn = 0;
     static const wchar_t ux[] = L"uxtheme.dll";
     for (uint32_t p = t; t && p < t + 0x20 && !pfn; p++)
@@ -571,7 +570,6 @@ void native32_theme_start(void) {
     arg = 0;
     native32_call_guest(init, 1, &arg);
     fprintf(stderr, "[theme] InitUserTheme: %08X%s (thread %lu)\n", g_eax, g_theme_hooked ? ", hooks in" : "", GetCurrentThreadId());
-    if (getenv("THEMEDBG")) fprintf(stderr, "[theme] DBG state %08X init %08X\n", MEM32(0x22631008), MEM32(0x22631004));
 }
 
 static uint32_t ovr_secure_connect(uint32_t* a) { return lpc_connect(a, 1); }

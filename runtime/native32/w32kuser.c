@@ -1094,12 +1094,6 @@ static uint32_t s_setrgn(uint32_t* a) {
     HRGN g = (HRGN)(uintptr_t)native32_gdi_rgn(a[1]), c = NULL;
     if (!own_window(a[0])) return 0;
     if (g && (c = CreateRectRgn(0, 0, 0, 0)) != NULL) CombineRgn(c, g, NULL, RGN_COPY);
-    if (c && getenv("DSDBG")) {
-        RECT b, w;
-        GetRgnBox(c, &b), GetWindowRect((HWND)(uintptr_t)a[0], &w);
-        fprintf(stderr, "[rgn] SetWindowRgn %08X box %ld,%ld,%ld,%ld (%lu bytes) window %ldx%ld\n", a[0], b.left, b.top, b.right, b.bottom,
-                GetRegionData(c, 0, NULL), w.right - w.left, w.bottom - w.top);
-    }
     return SetWindowRgn((HWND)(uintptr_t)a[0], c, (BOOL)a[2]);
 }
 /* (hdc, lprcClip, proc, lParam): the one monitor, server_info's, to the
