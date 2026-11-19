@@ -265,9 +265,9 @@ PUSHRET = W9X or __import__('os').environ.get('LIFT32_PUSHRET') == '1'
 
 
 def finally_push(prev):
-    """LIFT32_PUSHRET: the instruction before a __finally's `push cont` sets the try level
-    to -1 (an argument push of a code address, cmd's parser tables, has nothing like it)."""
-    return prev is not None and prev.mnemonic == 'mov' and prev.op_str == 'dword ptr [ebp - 4], 0xffffffff'
+    """LIFT32_PUSHRET: the instruction before a __finally's `push cont` sets a try level
+    (-1, or an outer level; an argument push of a code address, cmd's parser tables, has nothing like it)."""
+    return prev is not None and prev.mnemonic == 'mov' and prev.op_str.startswith('dword ptr [ebp - 4], ')
 
 # Lifted only with Lifter(dos=True); see Lifter._lift_dos.
 DOS_OPS = {'int', 'iretd', 'in', 'out', 'insb', 'insw', 'insd', 'outsb', 'outsw', 'outsd',
