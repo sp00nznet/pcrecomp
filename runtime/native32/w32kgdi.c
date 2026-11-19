@@ -114,6 +114,9 @@ uint8_t* native32_gdi_attr(uint32_t g) {
 #define HOST(x) native32_gdi_host((uint32_t)(uintptr_t)(x))
 #define GUEST(x) native32_gdi_handle((uint32_t)(uintptr_t)(x))
 #define AT32(a, o) (*(uint32_t*)((a) + (o)))
+/* a DC_ATTR field by Windows 2000's offset (ntguest.h nt_dca: NT 4.0's are elsewhere) */
+#define DA32(a, o) (*(uint32_t*)((a) + nt_dca(native32_guest_peb, (o))))
+#define DA8(a, o) (*(uint8_t*)((a) + nt_dca(native32_guest_peb, (o))))
 
 /* The guest handle for a host GDI object, entered in the table the first
  * time it is seen. */
@@ -144,37 +147,37 @@ uint32_t native32_gdi_handle(uint32_t h) {
     if (type == 1) {                                                   /* a DC: its attributes, as it is */
         POINT p;
         GetCurrentPositionEx(d, &p);
-        AT32(attr, 0x08) = GUEST(GetCurrentObject(d, OBJ_BRUSH));
-        AT32(attr, 0x0C) = GUEST(GetCurrentObject(d, OBJ_PEN));
-        AT32(attr, 0x10) = AT32(attr, 0x14) = GetBkColor(d);
-        AT32(attr, 0x18) = AT32(attr, 0x1C) = GetTextColor(d);
-        attr[0x38] = (uint8_t)GetROP2(d);
-        attr[0x39] = (uint8_t)GetBkMode(d);
+        DA32(attr, 0x08) = GUEST(GetCurrentObject(d, OBJ_BRUSH));
+        DA32(attr, 0x0C) = GUEST(GetCurrentObject(d, OBJ_PEN));
+        DA32(attr, 0x10) = DA32(attr, 0x14) = GetBkColor(d);
+        DA32(attr, 0x18) = DA32(attr, 0x1C) = GetTextColor(d);
+        DA8(attr, 0x38) = (uint8_t)GetROP2(d);
+        DA8(attr, 0x39) = (uint8_t)GetBkMode(d);
         /* lBkMode, lFillMode, lStretchBltMode: what gdi32's Get* read; its TextOut batch entry
          * takes the background mode from +0x4C (left 0, it batched TRANSPARENT: timedate's
          * calendar drew today's date white on white) */
-        AT32(attr, 0x4C) = (uint32_t)GetBkMode(d);
-        AT32(attr, 0x50) = (uint32_t)GetPolyFillMode(d);
-        AT32(attr, 0x54) = (uint32_t)GetStretchBltMode(d);
-        AT32(attr, 0x3C) = (uint32_t)p.x;
-        AT32(attr, 0x40) = (uint32_t)p.y;
-        AT32(attr, 0x78) = AT32(attr, 0x7C) = GetTextAlign(d);
-        AT32(attr, 0x90) = GUEST(GetCurrentObject(d, OBJ_FONT));
-        AT32(attr, 0x168) = (uint32_t)GetMapMode(d);   /* iMapMode (GetMapMode reads it; RichEdit relaid out on 0) */
+        DA32(attr, 0x4C) = (uint32_t)GetBkMode(d);
+        DA32(attr, 0x50) = (uint32_t)GetPolyFillMode(d);
+        DA32(attr, 0x54) = (uint32_t)GetStretchBltMode(d);
+        DA32(attr, 0x3C) = (uint32_t)p.x;
+        DA32(attr, 0x40) = (uint32_t)p.y;
+        DA32(attr, 0x78) = DA32(attr, 0x7C) = GetTextAlign(d);
+        DA32(attr, 0x90) = GUEST(GetCurrentObject(d, OBJ_FONT));
+        DA32(attr, 0x168) = (uint32_t)GetMapMode(d);   /* iMapMode (GetMapMode reads it; RichEdit relaid out on 0) */
         {   /* window origin +0x174, window extent +0x17C, viewport origin +0x184, viewport extent +0x18C */
             SIZE z;
             GetWindowOrgEx(d, &p);
-            AT32(attr, 0x174) = (uint32_t)p.x, AT32(attr, 0x178) = (uint32_t)p.y;
+            DA32(attr, 0x174) = (uint32_t)p.x, DA32(attr, 0x178) = (uint32_t)p.y;
             GetWindowExtEx(d, &z);
-            AT32(attr, 0x17C) = (uint32_t)z.cx, AT32(attr, 0x180) = (uint32_t)z.cy;
+            DA32(attr, 0x17C) = (uint32_t)z.cx, DA32(attr, 0x180) = (uint32_t)z.cy;
             GetViewportOrgEx(d, &p);
-            AT32(attr, 0x184) = (uint32_t)p.x, AT32(attr, 0x188) = (uint32_t)p.y;
+            DA32(attr, 0x184) = (uint32_t)p.x, DA32(attr, 0x188) = (uint32_t)p.y;
             GetViewportExtEx(d, &z);
-            AT32(attr, 0x18C) = (uint32_t)z.cx, AT32(attr, 0x190) = (uint32_t)z.cy;
+            DA32(attr, 0x18C) = (uint32_t)z.cx, DA32(attr, 0x190) = (uint32_t)z.cy;
         }
         GetBrushOrgEx(d, &p);
-        AT32(attr, 0x1B0) = (uint32_t)p.x;
-        AT32(attr, 0x1B4) = (uint32_t)p.y;
+        DA32(attr, 0x1B0) = (uint32_t)p.x;
+        DA32(attr, 0x1B4) = (uint32_t)p.y;
     }
     return (h & 0xFFFF0000u) | (uint32_t)i;
 }
@@ -192,25 +195,25 @@ static HDC dc(uint32_t g) {
     HDC h = (HDC)(uintptr_t)HOST(g);
     uint8_t* a = native32_gdi_attr(g);
     if (h && a) {
-        uint32_t br = HOST(AT32(a, 0x08)), pen = HOST(AT32(a, 0x0C)), font = HOST(AT32(a, 0x90));
+        uint32_t br = HOST(DA32(a, 0x08)), pen = HOST(DA32(a, 0x0C)), font = HOST(DA32(a, 0x90));
         if (br) SelectObject(h, (HGDIOBJ)(uintptr_t)br);
         if (pen) SelectObject(h, (HGDIOBJ)(uintptr_t)pen);
         if (font) SelectObject(h, (HGDIOBJ)(uintptr_t)font);
-        SetBkColor(h, AT32(a, 0x14));
-        SetTextColor(h, AT32(a, 0x1C));
-        SetROP2(h, a[0x38] ? a[0x38] : R2_COPYPEN);
-        SetBkMode(h, a[0x39] ? a[0x39] : OPAQUE);
-        SetTextAlign(h, AT32(a, 0x7C));
-        MoveToEx(h, (int)AT32(a, 0x3C), (int)AT32(a, 0x40), NULL);
-        SetBrushOrgEx(h, (int)AT32(a, 0x1B0), (int)AT32(a, 0x1B4), NULL);
+        SetBkColor(h, DA32(a, 0x14));
+        SetTextColor(h, DA32(a, 0x1C));
+        SetROP2(h, DA8(a, 0x38) ? DA8(a, 0x38) : R2_COPYPEN);
+        SetBkMode(h, DA8(a, 0x39) ? DA8(a, 0x39) : OPAQUE);
+        SetTextAlign(h, DA32(a, 0x7C));
+        MoveToEx(h, (int)DA32(a, 0x3C), (int)DA32(a, 0x40), NULL);
+        SetBrushOrgEx(h, (int)DA32(a, 0x1B0), (int)DA32(a, 0x1B4), NULL);
         /* origins and extents gdi32 keeps client-side (wordpad's ruler sets
          * the viewport origin); the extents count only in MM_ISOTROPIC/ANISOTROPIC */
-        if (GetMapMode(h) >= MM_ISOTROPIC && (int)AT32(a, 0x17C) && (int)AT32(a, 0x18C)) {
-            SetWindowExtEx(h, (int)AT32(a, 0x17C), (int)AT32(a, 0x180), NULL);
-            SetViewportExtEx(h, (int)AT32(a, 0x18C), (int)AT32(a, 0x190), NULL);
+        if (GetMapMode(h) >= MM_ISOTROPIC && (int)DA32(a, 0x17C) && (int)DA32(a, 0x18C)) {
+            SetWindowExtEx(h, (int)DA32(a, 0x17C), (int)DA32(a, 0x180), NULL);
+            SetViewportExtEx(h, (int)DA32(a, 0x18C), (int)DA32(a, 0x190), NULL);
         }
-        SetWindowOrgEx(h, (int)AT32(a, 0x174), (int)AT32(a, 0x178), NULL);
-        SetViewportOrgEx(h, (int)AT32(a, 0x184), (int)AT32(a, 0x188), NULL);
+        SetWindowOrgEx(h, (int)DA32(a, 0x174), (int)DA32(a, 0x178), NULL);
+        SetViewportOrgEx(h, (int)DA32(a, 0x184), (int)DA32(a, 0x188), NULL);
     }
     return h;
 }
@@ -221,7 +224,7 @@ void* native32_gdi_dc(uint32_t g) { batch(); return dc(g); }
 static void dc_back(uint32_t g) {          /* after a draw that moves the pen */
     uint8_t* a = native32_gdi_attr(g);
     POINT p;
-    if (a && GetCurrentPositionEx((HDC)(uintptr_t)HOST(g), &p)) AT32(a, 0x3C) = (uint32_t)p.x, AT32(a, 0x40) = (uint32_t)p.y;
+    if (a && GetCurrentPositionEx((HDC)(uintptr_t)HOST(g), &p)) DA32(a, 0x3C) = (uint32_t)p.x, DA32(a, 0x40) = (uint32_t)p.y;
 }
 
 /* ---- the TEB batch -------------------------------------------------------- */
@@ -266,13 +269,13 @@ static void batch(void) {
             if (r) DeleteObject(r);
         } else if (cmd == 6) {                                 /* select a font: DC_ATTR's is current */
             uint8_t* a = native32_gdi_attr(hdc);
-            if (a) AT32(a, 0x90) = MEM32(e + 4);
+            if (a) DA32(a, 0x90) = MEM32(e + 4);
             if (getenv("PCRECOMP_TEXTTRACE")) fprintf(stderr, "[gdi] batch font dc %08X font %08X\n", hdc, MEM32(e + 4));
         } else if (cmd == 2) {                                 /* TextOut { fg, bk, bk mode, ?, ?, x, y, options (bit 31: */
             HDC h = dc(hdc);                                   /* no rect), RECT, cp, count, ?, font, align, viewport org, text } */
             uint32_t x = e + nt_batch_textout(native32_guest_peb);   /* (XP: from x on, 8 later) */
             uint32_t f = HOST(MEM32(x + 0x38)), o = MEM32(x + 0x18);
-            if (getenv("PCRECOMP_TEXTTRACE")) fprintf(stderr, "[gdi] text dc %08X font %08X host %08X attrfont %08X n %u\n", hdc, MEM32(x + 0x38), f, native32_gdi_attr(hdc) ? AT32(native32_gdi_attr(hdc), 0x90) : 0, MEM32(x + 0x30));
+            if (getenv("PCRECOMP_TEXTTRACE")) fprintf(stderr, "[gdi] text dc %08X font %08X host %08X attrfont %08X n %u\n", hdc, MEM32(x + 0x38), f, native32_gdi_attr(hdc) ? DA32(native32_gdi_attr(hdc), 0x90) : 0, MEM32(x + 0x30));
             HGDIOBJ old = f ? SelectObject(h, (HGDIOBJ)(uintptr_t)f) : NULL;
             SetTextColor(h, MEM32(e + 4)), SetBkColor(h, MEM32(e + 8)), SetBkMode(h, (int)MEM32(e + 0xC));
             SetTextAlign(h, MEM32(x + 0x3C));
@@ -667,7 +670,7 @@ static uint32_t s_getsetdword(uint32_t* a) {
     if (a[1] == 8) {
         int o = SetMapMode(dc(a[0]), (int)a[2]);
         uint8_t* at = native32_gdi_attr(a[0]);
-        if (at && o) AT32(at, 0x168) = a[2];
+        if (at && o) DA32(at, 0x168) = a[2];
         if (a[3]) MEM32(a[3]) = (uint32_t)o;
         return o != 0;
     }

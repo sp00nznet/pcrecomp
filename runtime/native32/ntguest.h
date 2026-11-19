@@ -65,6 +65,22 @@ static inline uint32_t nt_csr_api(uint32_t peb, uint32_t api) {
 #define NT_GDI_SHARED_SIZE 0x110000
 static inline uint32_t nt_gdi_devcaps(uint32_t peb) { return nt_guest_xp(peb) ? 0x100000 : 0x40000; }
 
+/* DC_ATTR, by Windows 2000's offsets. NT 4.0's (its gdi32's Set/Get* and SelectObject): jROP2 /
+ * jBkMode 0x28/0x29, ptlCurrent 0x2C, lBkMode 0x3C, fill and stretch modes 0x40/0x44, text align
+ * 0x48/0x4C, hlfntNew 0x60, iMapMode 0x138, window/viewport origins and extents from 0x13C,
+ * brush origin 0x170; the brush, pen and colours (0x08..0x1C) as 2000's */
+static inline uint32_t nt_dca(uint32_t peb, uint32_t o) {
+    if (!nt_guest_nt4(peb) || o < 0x20) return o;
+    if (o == 0x38 || o == 0x39) return o - 0x10;
+    if (o >= 0x3C && o < 0x58) return o - 0x10;
+    if (o == 0x78 || o == 0x7C) return o - 0x30;
+    if (o == 0x90) return 0x60;
+    if (o == 0x168) return 0x138;
+    if (o >= 0x174 && o < 0x194) return o - 0x38;
+    if (o >= 0x1B0 && o < 0x1B8) return o - 0x40;
+    return 0x1F0 + (o & 0xF);   /* ponytail: a field not mapped, out of the way (ATTR_SIZE is larger) */
+}
+
 /* ---- USER: XP's layouts as shifts of Windows 2000's ------------------------
  * The win32k layer keeps Windows 2000's offsets (read off its user32) and
  * asks these for the guest's. XP's numbers were read off its own user32
