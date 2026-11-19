@@ -60,6 +60,17 @@ typedef struct {
     uint64_t cf, zf, sf, of, pf, af;
     XMM      xmm[16];
     uint32_t mxcsr;
+#if defined(RECOMP64_SYSTEM)
+    /* Bare-metal state, for a guest that is an operating system (see
+     * lift64_sys.py). fs/gs are guest segment bases, not the host's TEB; IF and
+     * DF are modelled because ring-0 code reads and sets them; x87 is a stack of
+     * doubles as in recomp32_cpu, because that is what HolyC's F64 compiles to. */
+    uint64_t fs_base, gs_base, ifl, df;
+    uint64_t last_ret;       /* the address the last `ret` popped */
+    double   st[8];
+    int      fpu_top;
+    uint32_t fpu_sw, fpu_cw;
+#endif
 } CPU;
 
 /* ---- partial register access ----
@@ -89,22 +100,46 @@ typedef struct {
 #define SET32(r, v)   ((r) = (uint64_t)(uint32_t)(v))      /* zero-extends! */
 #define SET64(r, v)   ((r) = (uint64_t)(v))
 
-/* ---- memory access: a register holds a real 64-bit address ---- */
-static inline uint8_t  rd8 (uint64_t a) { return *(uint8_t  *)(uintptr_t)a; }
-static inline uint16_t rd16(uint64_t a) { return *(uint16_t *)(uintptr_t)a; }
-static inline uint32_t rd32(uint64_t a) { return *(uint32_t *)(uintptr_t)a; }
-static inline uint64_t rd64(uint64_t a) { return *(uint64_t *)(uintptr_t)a; }
-static inline void wr8 (uint64_t a, uint8_t  v) { *(uint8_t  *)(uintptr_t)a = v; }
-static inline void wr16(uint64_t a, uint16_t v) { *(uint16_t *)(uintptr_t)a = v; }
-static inline void wr32(uint64_t a, uint32_t v) { *(uint32_t *)(uintptr_t)a = v; }
-static inline void wr64(uint64_t a, uint64_t v) { *(uint64_t *)(uintptr_t)a = v; }
+/* ---- memory access ----
+ *
+ * Flat by default: a register holds a real 64-bit host address. Built with
+ * RECOMP64_BASED the guest's address space is one host mapping at g_mem_base
+ * (win32hle/README.md, "Guest memory: flat or based"), so a guest address is an
+ * offset into it and nothing the guest computes can reach host memory. That is
+ * how a bare-metal guest with identity-mapped low memory (an OS kernel) runs as
+ * an ordinary process. RECOMP64_MMIO adds one compare per access: an address at
+ * or above g_mmio_lo is handed to the host's device model, which returns the
+ * host location to use (a device register shadow it keeps current).
+ */
+#if defined(RECOMP64_BASED)
+extern uint8_t *g_mem_base;
+#if defined(RECOMP64_MMIO)
+extern uint64_t g_mmio_lo;
+uintptr_t mmio_addr(uint64_t a, int size, int write);
+#define HADDR_RW(a, n, w) ((uint64_t)(a) >= g_mmio_lo ? mmio_addr((a), (n), (w))                                                       : (uintptr_t)(g_mem_base + (uint64_t)(a)))
+#else
+#define HADDR_RW(a, n, w) ((uintptr_t)(g_mem_base + (uint64_t)(a)))
+#endif
+#else
+#define HADDR_RW(a, n, w) ((uintptr_t)(a))
+#endif
+#define HADDR(a) HADDR_RW((a), 1, 0)
+#define HADDRW(a) HADDR_RW((a), 1, 1)
+static inline uint8_t  rd8 (uint64_t a) { return *(uint8_t  *)HADDR_RW(a, 1, 0); }
+static inline uint16_t rd16(uint64_t a) { uint16_t v; memcpy(&v, (void *)HADDR_RW(a, 2, 0), 2); return v; }
+static inline uint32_t rd32(uint64_t a) { uint32_t v; memcpy(&v, (void *)HADDR_RW(a, 4, 0), 4); return v; }
+static inline uint64_t rd64(uint64_t a) { uint64_t v; memcpy(&v, (void *)HADDR_RW(a, 8, 0), 8); return v; }
+static inline void wr8 (uint64_t a, uint8_t  v) { *(uint8_t  *)HADDR_RW(a, 1, 1) = v; }
+static inline void wr16(uint64_t a, uint16_t v) { memcpy((void *)HADDR_RW(a, 2, 1), &v, 2); }
+static inline void wr32(uint64_t a, uint32_t v) { memcpy((void *)HADDR_RW(a, 4, 1), &v, 4); }
+static inline void wr64(uint64_t a, uint64_t v) { memcpy((void *)HADDR_RW(a, 8, 1), &v, 8); }
 
 /* 128-bit move, for movaps/movups/movdqa and friends. memcpy rather than a
  * pointer store: the aligned and unaligned forms differ only in whether the
  * hardware faults, and a lifted build should not fault where the original did
  * not merely because the host allocator moved a buffer. */
-static inline void rd128(uint64_t a, XMM *d) { memcpy(d, (const void *)(uintptr_t)a, 16); }
-static inline void wr128(uint64_t a, const XMM *s) { memcpy((void *)(uintptr_t)a, s, 16); }
+static inline void rd128(uint64_t a, XMM *d) { memcpy(d, (const void *)HADDR(a), 16); }
+static inline void wr128(uint64_t a, const XMM *s) { memcpy((void *)HADDRW(a), s, 16); }
 
 /* ---- gs: the TEB ----
  * The only segment in long mode with a base that addresses anything. Thread
@@ -133,42 +168,42 @@ static inline void wr_gs32(uint64_t off, uint32_t v) {
 /* ---- atomics ---- */
 #if defined(_MSC_VER)
 static inline uint32_t atomic_xadd32(uint64_t a, uint32_t v) {
-    return (uint32_t)_InterlockedExchangeAdd((volatile long *)(uintptr_t)a, (long)v);
+    return (uint32_t)_InterlockedExchangeAdd((volatile long *)HADDRW(a), (long)v);
 }
 static inline uint64_t atomic_xadd64(uint64_t a, uint64_t v) {
-    return (uint64_t)_InterlockedExchangeAdd64((volatile __int64 *)(uintptr_t)a, (__int64)v);
+    return (uint64_t)_InterlockedExchangeAdd64((volatile __int64 *)HADDRW(a), (__int64)v);
 }
 static inline uint32_t atomic_cmpxchg32(uint64_t a, uint32_t cmp, uint32_t nv) {
-    return (uint32_t)_InterlockedCompareExchange((volatile long *)(uintptr_t)a, (long)nv, (long)cmp);
+    return (uint32_t)_InterlockedCompareExchange((volatile long *)HADDRW(a), (long)nv, (long)cmp);
 }
 static inline uint64_t atomic_cmpxchg64(uint64_t a, uint64_t cmp, uint64_t nv) {
-    return (uint64_t)_InterlockedCompareExchange64((volatile __int64 *)(uintptr_t)a,
+    return (uint64_t)_InterlockedCompareExchange64((volatile __int64 *)HADDRW(a),
                                                    (__int64)nv, (__int64)cmp);
 }
 static inline uint32_t atomic_xchg32(uint64_t a, uint32_t v) {
-    return (uint32_t)_InterlockedExchange((volatile long *)(uintptr_t)a, (long)v);
+    return (uint32_t)_InterlockedExchange((volatile long *)HADDRW(a), (long)v);
 }
 static inline uint64_t atomic_xchg64(uint64_t a, uint64_t v) {
-    return (uint64_t)_InterlockedExchange64((volatile __int64 *)(uintptr_t)a, (__int64)v);
+    return (uint64_t)_InterlockedExchange64((volatile __int64 *)HADDRW(a), (__int64)v);
 }
 #else
 static inline uint32_t atomic_xadd32(uint64_t a, uint32_t v) {
-    return __sync_fetch_and_add((volatile uint32_t *)(uintptr_t)a, v);
+    return __sync_fetch_and_add((volatile uint32_t *)HADDRW(a), v);
 }
 static inline uint64_t atomic_xadd64(uint64_t a, uint64_t v) {
-    return __sync_fetch_and_add((volatile uint64_t *)(uintptr_t)a, v);
+    return __sync_fetch_and_add((volatile uint64_t *)HADDRW(a), v);
 }
 static inline uint32_t atomic_cmpxchg32(uint64_t a, uint32_t cmp, uint32_t nv) {
-    return __sync_val_compare_and_swap((volatile uint32_t *)(uintptr_t)a, cmp, nv);
+    return __sync_val_compare_and_swap((volatile uint32_t *)HADDRW(a), cmp, nv);
 }
 static inline uint64_t atomic_cmpxchg64(uint64_t a, uint64_t cmp, uint64_t nv) {
-    return __sync_val_compare_and_swap((volatile uint64_t *)(uintptr_t)a, cmp, nv);
+    return __sync_val_compare_and_swap((volatile uint64_t *)HADDRW(a), cmp, nv);
 }
 static inline uint32_t atomic_xchg32(uint64_t a, uint32_t v) {
-    return __sync_lock_test_and_set((volatile uint32_t *)(uintptr_t)a, v);
+    return __sync_lock_test_and_set((volatile uint32_t *)HADDRW(a), v);
 }
 static inline uint64_t atomic_xchg64(uint64_t a, uint64_t v) {
-    return __sync_lock_test_and_set((volatile uint64_t *)(uintptr_t)a, v);
+    return __sync_lock_test_and_set((volatile uint64_t *)HADDRW(a), v);
 }
 #endif
 
@@ -502,13 +537,13 @@ static inline uint64_t op_bsr(CPU *c, uint64_t old, uint64_t v, int sz) {
  * memcpy throughout: an SSE memory operand is frequently unaligned (movups
  * exists for a reason), and on x64 the compiler emits movups far more often
  * than on x86 because it no longer has the x87 stack to fall back on. */
-static inline float  rdss(uint64_t a) { float  f; memcpy(&f, (const void *)(uintptr_t)a, 4); return f; }
-static inline double rdsd(uint64_t a) { double d; memcpy(&d, (const void *)(uintptr_t)a, 8); return d; }
-static inline XMM    rdxm(uint64_t a) { XMM x;    memcpy(&x, (const void *)(uintptr_t)a, 16); return x; }
+static inline float  rdss(uint64_t a) { float  f; memcpy(&f, (const void *)HADDR(a), 4); return f; }
+static inline double rdsd(uint64_t a) { double d; memcpy(&d, (const void *)HADDR(a), 8); return d; }
+static inline XMM    rdxm(uint64_t a) { XMM x;    memcpy(&x, (const void *)HADDR(a), 16); return x; }
 static inline float  rdf32(uint64_t a) { return rdss(a); }
-static inline void   wrss(uint64_t a, float  v) { memcpy((void *)(uintptr_t)a, &v, 4); }
-static inline void   wrsd(uint64_t a, double v) { memcpy((void *)(uintptr_t)a, &v, 8); }
-static inline void   wrxm(uint64_t a, XMM    v) { memcpy((void *)(uintptr_t)a, &v, 16); }
+static inline void   wrss(uint64_t a, float  v) { memcpy((void *)HADDRW(a), &v, 4); }
+static inline void   wrsd(uint64_t a, double v) { memcpy((void *)HADDRW(a), &v, 8); }
+static inline void   wrxm(uint64_t a, XMM    v) { memcpy((void *)HADDRW(a), &v, 16); }
 
 /* MOVSS/MOVSD from memory zero the rest of the register; the register-to-
  * register forms leave the high lanes alone. Named helpers because getting it
@@ -590,6 +625,99 @@ static inline uint32_t sse_movmskpd(const XMM *x) {
 /* ---- control transfer, provided by the generated dispatch table ---- */
 void dispatch(CPU *c, uint64_t target);
 void dispatch_jmp(CPU *c, uint64_t target);
+
+
+#if defined(RECOMP64_SYSTEM)
+/* ---- bare-metal guests: x87 and the system instructions ----
+ *
+ * x87 is a stack of doubles, the recomp32_cpu model. An x87 register is wider
+ * than a double, which costs nothing for the loads and stores a compiler emits.
+ * The rounding control in the control word IS modelled, because a compiler
+ * that converts F64 to an integer with FISTP sets it to chop first. */
+static inline void   fpush(CPU *c, double v) { c->fpu_top = (c->fpu_top - 1) & 7; c->st[c->fpu_top] = v; }
+static inline double fpop(CPU *c) { double v = c->st[c->fpu_top]; c->fpu_top = (c->fpu_top + 1) & 7; return v; }
+static inline double *fst(CPU *c, int i) { return &c->st[(c->fpu_top + i) & 7]; }
+static inline double rdf64(uint64_t a) { double d; memcpy(&d, (void *)HADDR(a), 8); return d; }
+static inline double rdi16(uint64_t a) { int16_t i; memcpy(&i, (void *)HADDR(a), 2); return (double)i; }
+static inline double rdi32(uint64_t a) { int32_t i; memcpy(&i, (void *)HADDR(a), 4); return (double)i; }
+static inline double rdi64(uint64_t a) { int64_t i; memcpy(&i, (void *)HADDR(a), 8); return (double)i; }
+static inline void   wrf32(uint64_t a, double v) { float f = (float)v; memcpy((void *)HADDRW(a), &f, 4); }
+static inline void   wrf64(uint64_t a, double v) { memcpy((void *)HADDRW(a), &v, 8); }
+/* FIST rounds by the control word's RC field (bits 11:10); FISTTP always chops. */
+static inline double fround(CPU *c, double v) {
+    switch ((c->fpu_cw >> 10) & 3) {
+    case 0: return nearbyint(v);
+    case 1: return floor(v);
+    case 2: return ceil(v);
+    default: return trunc(v);
+    }
+}
+static inline int64_t fto_i(double v, int bits) {
+    double lim = ldexp(1.0, bits - 1);
+    if (!(v >= -lim && v < lim)) return (int64_t)((uint64_t)1 << (bits - 1)) * -1;  /* integer indefinite */
+    return (int64_t)v;
+}
+static inline void wri16(uint64_t a, double v) { int16_t i = (int16_t)fto_i(v, 16); memcpy((void *)HADDRW(a), &i, 2); }
+static inline void wri32(uint64_t a, double v) { int32_t i = (int32_t)fto_i(v, 32); memcpy((void *)HADDRW(a), &i, 4); }
+static inline void wri64(uint64_t a, double v) { int64_t i = fto_i(v, 64); memcpy((void *)HADDRW(a), &i, 8); }
+static inline double rdf80(uint64_t a) {
+    uint8_t b[10]; memcpy(b, (void *)HADDR(a), 10);
+    uint64_t m; memcpy(&m, b, 8);
+    int e = ((b[9] & 0x7F) << 8) | b[8], neg = b[9] >> 7;
+    double v;
+    if (e == 0 && m == 0) v = 0.0;
+    else if (e == 0x7FFF) v = (m << 1) ? NAN : INFINITY;
+    else v = ldexp((double)m, e - 16383 - 63);
+    return neg ? -v : v;
+}
+static inline void wrf80(uint64_t a, double v) {
+    uint8_t b[10] = {0}; int neg = signbit(v) ? 1 : 0; double x = fabs(v);
+    if (x != 0.0) {
+        if (isinf(x)) { b[7] = 0x80; b[8] = 0xFF; b[9] = 0x7F; }
+        else if (isnan(x)) { b[7] = 0xC0; b[8] = 0xFF; b[9] = 0x7F; }
+        else { int e; double f = frexp(x, &e); uint64_t m = (uint64_t)ldexp(f, 64);
+               memcpy(b, &m, 8); e += 16382; b[8] = (uint8_t)e; b[9] = (uint8_t)(e >> 8); }
+    }
+    b[9] |= (uint8_t)(neg << 7);
+    memcpy((void *)HADDRW(a), b, 10);
+}
+static inline void fcompare(CPU *c, double a, double b) {
+    uint32_t sw = c->fpu_sw & ~0x4700u;
+    if (a != a || b != b) sw |= 0x4500u;
+    else if (a < b) sw |= 0x0100u;
+    else if (a == b) sw |= 0x4000u;
+    c->fpu_sw = sw;
+}
+static inline void fcompare_eflags(CPU *c, double a, double b) {
+    c->of = 0; c->sf = 0; c->af = 0;
+    if (a != a || b != b) { c->zf = 1; c->pf = 1; c->cf = 1; }
+    else { c->zf = (a == b); c->pf = 0; c->cf = (a < b); }
+}
+static inline uint16_t fpu_sw_get(CPU *c) { return (uint16_t)((c->fpu_sw & ~0x3800u) | ((c->fpu_top & 7) << 11)); }
+
+/* RFLAGS with the bits a kernel uses: IF (9) and DF (10) on top of the arithmetic set. */
+static inline uint64_t rflags_get(CPU *c) { return (eflags_pack(c) & ~(uint64_t)0x200) | (c->ifl ? 0x200 : 0) | (c->df ? 0x400 : 0); }
+static inline void rflags_set(CPU *c, uint64_t v) { eflags_unpack(c, v); c->ifl = (v >> 9) & 1; c->df = (v >> 10) & 1; }
+
+/* The machine around the CPU. Implemented by the host, which models the
+ * devices (ports, MSRs, descriptor tables, interrupts) in C. Nothing here
+ * executes guest code: an interrupt is delivered by calling the lifted handler
+ * through dispatch(), at the safe points the lifter marks with SYS_POLL. */
+uint64_t sys_in(CPU *c, uint32_t port, int size);
+void     sys_out(CPU *c, uint32_t port, uint64_t v, int size);
+void     sys_op(CPU *c, int op, uint64_t a, uint64_t b);    /* the rest, by SYSOP_ number */
+uint64_t sys_rd(CPU *c, int reg);                           /* cr0..cr8, msr via SYSOP */
+void     sys_hlt(CPU *c);
+void     sys_iret(CPU *c);
+void     sys_int(CPU *c, int vec, uint64_t ret);
+void     sys_irq_poll(CPU *c);
+void     sys_ret_mismatch(CPU *c, uint64_t expected);
+extern volatile int g_irq_pending;
+#define SYS_POLL(c) do { if (g_irq_pending && (c)->ifl) sys_irq_poll(c); } while (0)
+enum { SYSOP_LGDT = 1, SYSOP_LIDT, SYSOP_LTR, SYSOP_WRMSR, SYSOP_RDMSR, SYSOP_MOVCR,
+       SYSOP_INVLPG, SYSOP_WBINVD, SYSOP_FXSAVE, SYSOP_FXRSTOR, SYSOP_RDTSC, SYSOP_SEG,
+       SYSOP_CLFLUSH, SYSOP_SWAPGS, SYSOP_UD2, SYSOP_RDRAND };
+#endif
 
 /* Guest C++ exception handling. Included here, after the CPU typedef, so
  * that every generated translation unit gets the ES3_EH_ENTER macros the
