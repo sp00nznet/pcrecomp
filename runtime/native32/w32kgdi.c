@@ -133,7 +133,8 @@ uint32_t native32_gdi_handle(uint32_t h) {
     g_host[i] = h;
     hput(h, i);
     MEM32(e) = 0x80000000u | (uint32_t)i;                              /* "kernel object": nonzero */
-    MEM32(e + 4) = GetCurrentProcessId() & ~3u;
+    /* (NT 4.0: the owner is a WORD at +6, compared whole with the TEB's pid) */
+    MEM32(e + 4) = nt_guest_nt4(native32_guest_peb) ? (uint32_t)(uint16_t)GetCurrentProcessId() << 16 : GetCurrentProcessId() & ~3u;
     MEM16(e + 8) = (uint16_t)(h >> 16);
     MEM8(e + 10) = (uint8_t)type;
     /* a region's RGNATTR (gdi32 keeps a rectangular region's rectangle in

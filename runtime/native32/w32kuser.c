@@ -60,7 +60,7 @@ static uint8_t* g_desk, *g_deskinfo;
 static uint32_t g_desk_top;
 
 static void thread_setup(void) {
-    uint32_t teb = MEM32(g_fs_base + 0x18), ci = teb + 0x6CC;
+    uint32_t teb = MEM32(g_fs_base + 0x18), ci = teb + nt_teb_ci(native32_guest_peb);
     static uint8_t* threadinfo;
     /* TEB+0x40 Win32ThreadInfo: nonzero is a GUI thread (GetSystemMetrics
      * otherwise asks NtUserGetThreadState to convert it first) */
@@ -655,15 +655,15 @@ static LRESULT wnd_thunk_body(HWND h, UINT m, WPARAM w, LPARAM l) {
     shell_pin(h, m, l);
     uint8_t* pw = native32_user_wnd(h);
     uint32_t pfn = pw ? *(uint32_t*)(pw + WO(0x5C)) : 0, args[4] = { (uint32_t)(uintptr_t)h, m, (uint32_t)w, (uint32_t)l };
-    uint32_t teb, oh, op, rep[3] = { 0, 0, 0 };
+    uint32_t teb, oh = 0, op = 0, rep[3] = { 0, 0, 0 };
     int ansi;
     if (!g_dcm && (g_dcm = find_dcm()) != 0 && getenv("NATIVE32_SYSCALLS"))
         fprintf(stderr, "[user] messages through KiUserCallbackDispatcher, DispatchClientMessage %08X\n", g_dcm);
     if (!pfn || !g_dcm) return DefWindowProcW(h, m, w, l);
     if (native32_cb_in) native32_cb_in(args);   /* (as the bridge would: the WND, GDI handles) */
     ansi = class_ansi(h);
-    teb = MEM32(g_fs_base + 0x18), oh = MEM32(teb + 0x6F4), op = MEM32(teb + 0x6F8);
-    MEM32(teb + 0x6F4) = args[0], MEM32(teb + 0x6F8) = (uint32_t)(uintptr_t)pw;
+    teb = MEM32(g_fs_base + 0x18) + nt_teb_cbwnd(native32_guest_peb);   /* (NT 4.0: none, teb + 0 is left alone) */
+    if (teb != MEM32(g_fs_base + 0x18)) oh = MEM32(teb), op = MEM32(teb + 4), MEM32(teb) = args[0], MEM32(teb + 4) = (uint32_t)(uintptr_t)pw;
     if ((m == WM_CREATE || m == WM_NCCREATE) && l) {
         uint32_t msg[0x18] = { 0 };
         char an[256], ac[256];
@@ -714,7 +714,7 @@ static LRESULT wnd_thunk_body(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (st == 0 && o && olen >= 4) rep[0] = MEM32(o);
         else if (st) fprintf(stderr, "[user] callback for message 0x%X: status %08X\n", m, st);
     }
-    MEM32(teb + 0x6F4) = oh, MEM32(teb + 0x6F8) = op;
+    if (teb != MEM32(g_fs_base + 0x18)) MEM32(teb) = oh, MEM32(teb + 4) = op;
     /* the callback's return flushes the TEB's GDI batch, as win32k's does
      * (calc's owner-drawn buttons: DrawEdge's PatBlts are batched) */
     if (native32_win32k_pre) native32_win32k_pre();
@@ -2167,6 +2167,26 @@ void native32_user_install(void) {
     native32_nt_win32k_override("NtUserCountClipboardFormats", s_nclipfmt);
     native32_nt_win32k_override("NtUserCreateCaret", s_createcaret);
     native32_nt_win32k_override("NtUserCallTwoParam", s_call_twoparam);
+    /* NT 4.0: the calls that return a handle (CreateMenu, ...) by their own services, and a
+     * message's kernel half by one service per argument type (NtUserfnDWORD, NtUserfnINSTRING,
+     * ...), each (hwnd, msg, wParam, lParam, xParam, xpfnProc, bAnsi) like 2000's
+     * NtUserMessageCall. (The hook ones, NtUserfnHk*, take 5 or 6.) */
+    native32_nt_win32k_override_opt("NtUserCallNoParamTranslate", s_call_noparam);
+    native32_nt_win32k_override_opt("NtUserCallOneParamTranslate", s_call_oneparam);
+    {
+        static const char* fn[] = { "COPYDATA", "COPYGLOBALDATA", "DDEINIT", "DWORD", "DWORDOPTINLPMSG",
+            "GETTEXTLENGTHS", "INCNTOUTSTRING", "INCNTOUTSTRINGNULL", "INDEVICECHANGE", "INLPCOMPAREITEMSTRUCT",
+            "INLPCREATESTRUCT", "INLPDELETEITEMSTRUCT", "INLPDRAWITEMSTRUCT", "INLPHELPINFOSTRUCT", "INLPHLPSTRUCT",
+            "INLPWINDOWPOS", "INOUTDRAG", "INOUTLPMEASUREITEMSTRUCT", "INOUTLPPOINT5", "INOUTLPRECT",
+            "INOUTLPSCROLLINFO", "INOUTLPWINDOWPOS", "INOUTNCCALCSIZE", "INOUTNEXTMENU", "INOUTSTYLECHANGE",
+            "INPAINTCLIPBRD", "INSIZECLIPBRD", "INSTRING", "INSTRINGNULL", "OPTOUTLPDWORDOPTOUTLPDWORD",
+            "OUTDWORDINDWORD", "OUTLPRECT", "OUTSTRING", "POPTINLPUINT", "POUTLPINT", "SENTDDEMSG" };
+        char n[64];
+        for (int i = 0; i < (int)(sizeof fn / sizeof fn[0]); i++) {
+            _snprintf(n, sizeof n - 1, "NtUserfn%s", fn[i]), n[sizeof n - 1] = 0;
+            native32_nt_win32k_override_opt(n, s_message_call);
+        }
+    }
     native32_nt_win32k_override("NtUserCreateAcceleratorTable", s_accel);
     native32_nt_win32k_override("NtUserTranslateAccelerator", s_translate_accel);
     native32_nt_win32k_override("NtUserScrollWindowEx", s_scrollwindow);

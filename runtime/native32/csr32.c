@@ -55,6 +55,22 @@ static uint32_t base_static_server_data(void) {
     ustr(d + 0x00, win);
     ustr(d + 0x08, sys);
     ustr(d + 0x10, obj);
+    if (nt_guest_nt4(native32_guest_peb)) {
+        /* NT 4.0 (read off its kernel32): major, minor, build at 0x18, CSDVersion[128] at 0x1E,
+         * SYSTEM_BASIC_INFORMATION 0x120, SYSTEM_TIMEOFDAY_INFORMATION 0x150 (0x20 bytes),
+         * IniFileMapping 0x170, NLS_USER_INFO 0x174 (its UserLocaleId +0x15E0) */
+        uint8_t tod[0x30];
+        *(uint16_t*)(d + 0x18) = (uint16_t)MEM32(native32_guest_peb + 0xA4);
+        *(uint16_t*)(d + 0x1A) = (uint16_t)MEM32(native32_guest_peb + 0xA8);
+        *(uint16_t*)(d + 0x1C) = MEM16(native32_guest_peb + 0xAC);
+        if (MEM16(native32_guest_peb + 0xAE) >> 8)
+            _snwprintf((wchar_t*)(d + 0x1E), 127, L"Service Pack %u", MEM16(native32_guest_peb + 0xAE) >> 8);
+        qsi(0, d + 0x120, 0x2C, NULL);
+        if (!qsi(3, tod, 0x30, NULL)) memcpy(d + 0x150, tod, 0x20);
+        *(uint32_t*)(d + 0x170) = (uint32_t)(uintptr_t)calloc(1, 0x40);
+        MEM32((uint32_t)(uintptr_t)d + 0x174 + 0x15E0) = GetUserDefaultLCID();
+        return (uint32_t)(uintptr_t)d;
+    }
     *(uint16_t*)(d + 0x18) = (uint16_t)MEM32(native32_guest_peb + 0xA4);   /* the PEB's OS version */
     *(uint16_t*)(d + 0x1A) = (uint16_t)MEM32(native32_guest_peb + 0xA8);
     *(uint16_t*)(d + 0x1C) = MEM16(native32_guest_peb + 0xAC);
@@ -99,7 +115,10 @@ static uint32_t client_connect(uint32_t data, uint32_t capture) {
     (void)capture;
     if (getenv("NATIVE32_SYSCALLS"))
         fprintf(stderr, "[csr] client connect, server %u, info %08X len %u\n", index, ci, MEM32(data + 8));
-    if (index == 3 && ci && MEM32(data + 8) >= 0x104) {
+    /* (NT 4.0's USERCONNECT has no dwDispatchCount: SHAREDINFO at +8, 0xFC in all) */
+    int nt4 = nt_guest_nt4(native32_guest_peb);
+    uint32_t si = ci + (nt4 ? 8 : 0xC);
+    if (index == 3 && ci && MEM32(data + 8) >= (nt4 ? 0xFCu : 0x104u)) {
         /* usersrv: USERCONNECT { ulVersion, ulCurrentVersion, dwDispatchCount,
          * SHAREDINFO siClient { psi, aheList, pDispInfo, ulSharedDelta, ... } }.
          * SERVERINFO, the handle table (w32kuser.c keeps both) and the
@@ -115,13 +134,13 @@ static uint32_t client_connect(uint32_t data, uint32_t capture) {
             *(uint32_t*)(psi + nt_si(native32_guest_peb, 0x864)) = 1;                    /* cCaptures: never 0, so GetCapture asks NtUserGetThreadState(2) */
         }
         MEM32(ci + 0x04) = MEM32(ci + 0x00);
-        MEM32(ci + 0x0C) = (uint32_t)(uintptr_t)psi;
-        MEM32(ci + 0x10) = (uint32_t)(uintptr_t)ahe;
-        MEM32(ci + 0x14) = (uint32_t)(uintptr_t)disp;
+        MEM32(si + 0x0) = (uint32_t)(uintptr_t)psi;
+        MEM32(si + 0x4) = (uint32_t)(uintptr_t)ahe;
+        MEM32(si + 0x8) = (uint32_t)(uintptr_t)disp;
         /* ulSharedDelta: user32 subtracts it from every kernel pointer in the
          * shared section (pDispInfo->pMonitorPrimary, ...). The section is
          * ours, so 0; left unset it was the caller's stack (0xCCCC...) */
-        MEM32(ci + 0x18) = 0;
+        if (!nt4) MEM32(si + 0xC) = 0;
         {
             /* SHAREDINFO +0xE8 DefWindowMsgs { maxMsgs, abMsgs }: the messages
              * DefWindowProc hands to win32k. All of them: the host's
@@ -129,7 +148,7 @@ static uint32_t client_connect(uint32_t data, uint32_t capture) {
              * the ones user32 answers itself from the WND: none. */
             static uint8_t all[0x80];
             memset(all, 0xFF, sizeof all);
-            uint32_t dm = ci + 0x0C + nt_shared_defmsgs(native32_guest_peb);   /* (XP: +0x108) */
+            uint32_t dm = si + nt_shared_defmsgs(native32_guest_peb);   /* (XP: +0x108, NT 4.0: +0xE4) */
             MEM32(dm) = 0x3FF;
             MEM32(dm + 4) = (uint32_t)(uintptr_t)all;
             /* (DefWindowSpecMsgs said so; left as the buffer had it, XP's explorer

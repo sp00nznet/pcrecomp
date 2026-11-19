@@ -41,6 +41,11 @@ static inline int nt_guest_xp(uint32_t peb) {
 static inline int nt_guest_nt4(uint32_t peb) {
     return peb && *(const uint16_t*)NTGUEST_VA(peb + 0xAC) < 2000;
 }
+/* CLIENTINFO in the TEB: Win32ClientInfo (+0x6CC) on NT 5, User32Reserved (+0x44) on
+ * NT 4.0, with pDeskInfo and ulClientDelta at the same +0x18 / +0x1C. NT 4.0 has no
+ * CallbackWnd (2000's +0x28): its DispatchClientMessage takes the hwnd from the WND. */
+static inline uint32_t nt_teb_ci(uint32_t peb) { return nt_guest_nt4(peb) ? 0x44 : 0x6CC; }
+static inline uint32_t nt_teb_cbwnd(uint32_t peb) { return nt_guest_nt4(peb) ? 0 : 0x6F4; }
 /* csrss api numbers, the guest's to Windows 2000's ((server << 16) | api;
  * 0xFFFFFFFF: an api Windows 2000 does not have). NT 4.0's csrsrv has
  * CsrNullApiCall at 0, so ClientConnect is 1 (2000: 0), ThreadConnect 2,
@@ -83,15 +88,18 @@ static inline int nt_ncolors(uint32_t peb) { return nt_guest_xp(peb) ? 0x1F : 0x
  * and its TextOut two more dwords before x (everything from x on is 8 later) */
 static inline uint32_t nt_batch_polypatblt(uint32_t peb) { return nt_guest_xp(peb) ? 0x30 : 0x24; }
 static inline uint32_t nt_batch_textout(uint32_t peb) { return nt_guest_xp(peb) ? 8 : 0; }
-/* SHAREDINFO.DefWindowMsgs: after awmControl[0x1D] (XP: [0x1F]) */
-static inline uint32_t nt_shared_defmsgs(uint32_t peb) { return nt_guest_xp(peb) ? 0x108 : 0xE8; }
+/* SHAREDINFO.DefWindowMsgs: after awmControl[0x1D] (XP: [0x1F]; NT 4.0: [0x1B] from +0xC) */
+static inline uint32_t nt_shared_defmsgs(uint32_t peb) { return nt_guest_xp(peb) ? 0x108 : nt_guest_nt4(peb) ? 0xE4 : 0xE8; }
 /* KernelCallbackTable: XP has one more entry at 3 and another before
  * __ClientLoadMenu (2000's 65, XP's 67) */
 static inline uint32_t nt_cb(uint32_t peb, uint32_t i) {
+    /* NT 4.0: __fnDWORD 2, __fnINCNTOUTSTRING 7 as 2000's (the same code); __ClientThreadSetup
+     * is 76 (2000's 74, matched by its body). ponytail: the four the win32k layer calls */
+    if (nt_guest_nt4(peb)) return i == 74 ? 76 : i;
     if (!nt_guest_xp(peb) || i < 3) return i;
     return i < 62 ? i + 1 : i + 2;
 }
-/* NtUserCall* routine indexes, XP's to Windows 2000's: anchors read off the
+/* NtUserCall* routine indexes, XP's (and NT 4.0's) to Windows 2000's: anchors read off the
  * user32 exports that pass each (both builds), the indexes between two
  * anchors with the same shift by that shift; 0xFFFF: no Windows 2000 match */
 static inline uint32_t nt_routine(uint32_t peb, uint32_t x) {
@@ -104,6 +112,22 @@ static inline uint32_t nt_routine(uint32_t peb, uint32_t x) {
         { 0x5E, 0x50 }, { 0x60, 0x53 }, { 0x62, 0x55 }, { 0x63, 0x56 }, { 0x65, 0x57 }, { 0x69, 0x5B }, { 0x6A, 0x5C },
         { 0x6E, 0x5E }, { 0x6F, 0x5F }, { 0x70, 0x60 } };
     int n = (int)(sizeof a / sizeof a[0]);
+    if (nt_guest_nt4(peb)) {
+        /* NT 4.0's apfnSimpleCall is ordered otherwise: no interpolation, each
+         * index read off the user32 export that passes it (both builds; NoParam-
+         * Translate 0xB/0xC are CreateMenu/CreatePopupMenu) */
+        static const uint8_t m[][2] = {
+            { 0x02, 0x05 }, { 0x07, 0x04 }, { 0x08, 0x08 }, { 0x0A, 0x02 }, { 0x0B, 0x00 }, { 0x0C, 0x01 },
+            { 0x0D, 0x19 }, { 0x0F, 0x1C }, { 0x10, 0x1E }, { 0x11, 0x1F }, { 0x12, 0x20 }, { 0x14, 0x26 },
+            { 0x15, 0x29 }, { 0x16, 0x2A }, { 0x17, 0x2B }, { 0x18, 0x2C }, { 0x19, 0x30 }, { 0x1A, 0x2F },
+            { 0x1B, 0x2D }, { 0x1C, 0x2E }, { 0x1F, 0x22 }, { 0x20, 0x24 }, { 0x21, 0x27 }, { 0x25, 0x39 },
+            { 0x26, 0x3B }, { 0x27, 0x3C }, { 0x2A, 0x47 }, { 0x2C, 0x48 }, { 0x31, 0x4D }, { 0x33, 0x50 },
+            { 0x34, 0x3E }, { 0x35, 0x3F }, { 0x36, 0x5B }, { 0x37, 0x5C }, { 0x38, 0x5E }, { 0x39, 0x5F },
+            { 0x3A, 0x60 }, { 0x3D, 0x42 }, { 0x3E, 0x45 }, { 0x44, 0x53 }, { 0x47, 0x55 }, { 0x48, 0x56 },
+            { 0x49, 0x57 } };
+        for (int i = 0; i < (int)(sizeof m / sizeof m[0]); i++) if (m[i][0] == x) return m[i][1];
+        return 0xFFFF;
+    }
     if (!nt_guest_xp(peb)) return x;
     for (int i = 0; i < n; i++) {
         if (a[i][0] == x) return a[i][1];

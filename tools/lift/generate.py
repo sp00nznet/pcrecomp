@@ -404,7 +404,10 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
     if lift32.PUSHRET:
         for k, i in enumerate(instructions):
             nxt_i = instructions[k + 1] if k + 1 < len(instructions) else None
-            if i.mnemonic == 'push' and not (nxt_i is not None and nxt_i.mnemonic == 'jmp'):
+            # (`push L; jmp func` is push_return_label's; `push L; jmp [iat]` is ours: kernel32's
+            # GetStartupInfoA leaves its critical section with `push cont; jmp [RtlLeaveCriticalSection]`)
+            if i.mnemonic == 'push' and not (nxt_i is not None and nxt_i.mnemonic == 'jmp'
+                                             and nxt_i.get_branch_target() is not None):
                 t = i.get_branch_target()
                 if t is not None and t in addrs and t != i.end_address:
                     push_ret.add(t)
@@ -495,7 +498,9 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
         cases = sorted(set(cases) | {f'L_{a:08X}' for a in eh} | {f'L_{a:08X}' for a in aliases})
         for lbl in cases:
             lines.append(f'      case 0x{int(lbl[2:], 16):08X}u: goto {lbl};')
-        lines.append('      default: RECOMP_ITAIL(_itail_tgt); return;')
+        pre = ''.join(f'if (MEM32(esp) == 0x{t:08X}u) {{ esp += 4; RECOMP_ICALL(_itail_tgt); RECOMP_FLAGS_IN(); goto L_{t:08X}; }} '
+                      for t in sorted(push_ret))    # LIFT32_PUSHRET: `push cont; jmp [x]`
+        lines.append(f'      default: {pre}RECOMP_ITAIL(_itail_tgt); return;')
         lines.append('    }')
 
     # A `goto L_x` whose label is outside this body (the disassembly split a

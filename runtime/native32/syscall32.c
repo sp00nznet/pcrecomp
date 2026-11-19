@@ -1099,10 +1099,14 @@ int native32_nt_win32k(const uint32_t* bases, int nbases, const char* names_file
     return stubs;
 }
 
-void native32_nt_win32k_override(const char* name, native32_syscall_fn fn) {
+/* the same for a service only some guests have (NT 4.0's NtUserfn*): 0 if none */
+int native32_nt_win32k_override_opt(const char* name, native32_syscall_fn fn) {
     for (int i = 0; i < W32K_MAX; i++)
-        if (!strcmp(g_w32k[i].name, name)) { g_w32k[i].fn = fn; return; }
-    fprintf(stderr, "[win32k] no service named %s\n", name);
+        if (!strcmp(g_w32k[i].name, name)) { g_w32k[i].fn = fn; return 1; }
+    return 0;
+}
+void native32_nt_win32k_override(const char* name, native32_syscall_fn fn) {
+    if (!native32_nt_win32k_override_opt(name, fn)) fprintf(stderr, "[win32k] no service named %s\n", name);
 }
 
 int native32_guest_loaded;             /* the guest's loader is done (native32_nt_boot) */

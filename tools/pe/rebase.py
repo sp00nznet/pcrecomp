@@ -67,6 +67,16 @@ def rebase(path, base):
     if len(dd) > 11 and dd[11].VirtualAddress:
         off = dd[11].get_file_offset()
         data[off:off + 8] = bytes(8)
+        # ...and each import descriptor's TimeDateStamp (-1: "bound, see the
+        # directory") goes to 0. Windows 2000's loader snaps a -1 descriptor
+        # with no directory; NT 4.0's keeps the IAT as linked (msvcrt called
+        # kernel32 at 0x77F19713, its linked base).
+        if dd[1].VirtualAddress:
+            pe.parse_data_directories([1])
+            for e in getattr(pe, 'DIRECTORY_ENTRY_IMPORT', ()):
+                if e.struct.TimeDateStamp:
+                    o = e.struct.get_file_offset() + 4
+                    data[o:o + 4] = bytes(4)
     return bytes(data), pe.OPTIONAL_HEADER.SizeOfImage, linked
 
 
