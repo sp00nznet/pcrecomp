@@ -693,6 +693,7 @@ static inline void fcompare_eflags(CPU *c, double a, double b) {
     if (a != a || b != b) { c->zf = 1; c->pf = 1; c->cf = 1; }
     else { c->zf = (a == b); c->pf = 0; c->cf = (a < b); }
 }
+static inline double fprem_op(CPU *c, double a, double b) { c->fpu_sw &= ~0x0400u; return fmod(a, b); }  /* C2=0: done */
 static inline uint16_t fpu_sw_get(CPU *c) { return (uint16_t)((c->fpu_sw & ~0x3800u) | ((c->fpu_top & 7) << 11)); }
 
 /* RFLAGS with the bits a kernel uses: IF (9) and DF (10) on top of the arithmetic set. */

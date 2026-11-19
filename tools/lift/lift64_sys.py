@@ -41,8 +41,33 @@ from capstone.x86 import X86_OP_REG, X86_OP_IMM, X86_OP_MEM
 SIZES = {1: '8', 2: '16', 4: '32', 8: '64'}
 
 
+class _Reachable:
+    """Capstone, except that one call to disasm() can be told the exact
+    instruction addresses to decode. Code with data inside it (a switch table
+    between two arms) desyncs a linear sweep; decoding only what discovery
+    reached cannot."""
+    def __init__(self, md):
+        self._md, self.only = md, None
+
+    def disasm(self, code, start):
+        if self.only is not None:
+            only, self.only = self.only, None
+            out = []
+            for a in sorted(only):
+                off = a - start
+                ins = next(self._md.disasm(code[off:off + 16], a), None) if 0 <= off < len(code) else None
+                if ins is not None:
+                    out.append(ins)
+            return out
+        return self._md.disasm(code, start)
+
+    def __getattr__(self, k):
+        return getattr(self._md, k)
+
+
 class SysLifter(Lifter):
     dyn_calls = frozenset()   # call sites whose rel32 the guest patches at run time
+    dyn_all = False           # every rel32 call: code a JIT made, whose imports resolve later
 
     # lift32's x87 translations, reused. They read self.addr_expr, self.wr,
     # self.md, self._st_idx and self._fmem, all of which exist here.
@@ -260,7 +285,7 @@ class SysLifter(Lifter):
                     % (a, SIZES[sz], SIZES[sz], bare, r, n, sz)]
 
         # Safe points for interrupts, and the return-address check.
-        if m == 'call' and ea in self.dyn_calls:
+        if m == 'call' and (ea in self.dyn_calls or (self.dyn_all and ops[0].type == X86_OP_IMM)):
             # A call whose rel32 the guest's own loader patches later (an
             # import resolved when another module loads): read it at run time.
             return ['SYS_POLL(c);',
@@ -281,7 +306,7 @@ class SysLifter(Lifter):
         return Lifter.translate(self, insn, labels)
 
 
-def lift_raw(image, base, funcs, out_path, header='cpu64.h', prefix='', dyn_calls=()):
+def lift_raw(image, base, funcs, out_path, header='cpu64.h', prefix='', dyn_calls=(), dyn_all=False):
     """Lift `funcs` ({va: (size, name)}) out of a raw image loaded at `base`."""
     def read_va(va, n):
         off = va - base
@@ -289,10 +314,14 @@ def lift_raw(image, base, funcs, out_path, header='cpu64.h', prefix='', dyn_call
             raise KeyError('va %#x not in image' % va)
         return image[off:off + n]
     lf = SysLifter(image_size=len(image), read_va=read_va, image_base=base)
+    lf.md = _Reachable(lf.md)
     lf.dyn_calls = frozenset(dyn_calls)
+    lf.dyn_all = dyn_all
     bodies, errs = [], 0
     for va in sorted(funcs):
-        size, name = funcs[va]
+        size, name = funcs[va][:2]
+        if len(funcs[va]) > 2:          # the instructions discovery reached
+            lf.md.only = funcs[va][2]
         try:
             bodies.append(lf.lift_function(read_va(va, size), va))
         except Exception as e:
