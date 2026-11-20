@@ -804,7 +804,11 @@ static uint32_t s_create_window(uint32_t* a) {
             }
     }
     /* 0x80000000 WS_EX_ANSICREATOR: CreateWindowExA's mark for win32k, not the host's */
-    g_create_name = lstr_name(a[2]);
+    /* (its own copy: lstr_name's two buffers turn over before WM_NCCREATE reads it) */
+    static wchar_t name_copy[512];
+    const wchar_t* nm0 = lstr_name(a[2]);
+    if ((uintptr_t)nm0 >= 0x10000) { wcsncpy(name_copy, nm0, 511); name_copy[511] = 0; nm0 = name_copy; }
+    g_create_name = nm0;
     HWND h = CreateWindowExW(a[0] & ~0x80000000u, lstr_name(a[1]), g_create_name, a[3], (int)a[4], (int)a[5], cx, cy,
                              (HWND)(uintptr_t)a[8], (HMENU)(uintptr_t)a[9], (HINSTANCE)(uintptr_t)a[10],
                              (void*)(uintptr_t)a[11]);
@@ -1397,7 +1401,7 @@ static void screen_caption(HWND h) {
         if (ic) DrawIconEx(dc, x, r.top + (ht - 16) / 2, ic, 16, 16, 0, NULL, DI_NORMAL), x += 18;
     }
     wchar_t text[256];
-    int n = GetWindowTextW(h, text, 256);
+    int n = InternalGetWindowText(h, text, 256);   /* (the stored text: WM_GETTEXT through an ANSI guest window procedure gave its bytes as UTF-16) */
     HFONT font = CreateFontW(-11, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, 0, 0, L"Tahoma"), old = (HFONT)SelectObject(dc, font);
     RECT tr = { x, r.top, r.right - 2, r.bottom };
     SetBkMode(dc, TRANSPARENT);
@@ -1463,7 +1467,8 @@ static uint32_t s_init_brushes(uint32_t* a) {
     return 1;
 }
 static uint32_t s_message_call_str(uint32_t* a) {
-    if (a[3]) a[3] = MEM32(a[3] + 8);
+    /* an ANSI text (bAnsi) sent wide (winmine's WM_SETTEXT title): widened, else the bytes as UTF-16 */
+    if (a[3]) a[3] = !a[6] && (MEM32(a[3] + 4) & 0x80000000u) ? (uint32_t)(uintptr_t)lstr_name(a[3]) : MEM32(a[3] + 8);
     return s_message_call(a);
 }
 
