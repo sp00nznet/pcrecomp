@@ -597,6 +597,20 @@ class Lifter:
         if m in ("cwd",):  return ["SET16(c->edx, (R16(c->eax) & 0x8000u) ? 0xFFFFu : 0u);"]
         if m in ("wait","fwait","nop","int3","cld","fnop","hint_nop"): return [f"/* {m} */"]
         if m == "std": return ["/* std (DF=1 unsupported; string ops assume forward) */"]
+        # Carry on its own. Watcom-compiled system code uses CF as a return
+        # channel - `clc; int 0xF2; jae ok` is every QNX 4 kernel call.
+        if m == "clc": return ["c->cf = 0;"]
+        if m == "stc": return ["c->cf = 1;"]
+        if m == "cmc": return ["c->cf ^= 1;"]
+        # PUSHAD stores ESP as it was before the first push; POPAD discards
+        # the saved ESP slot rather than loading it.
+        if m in ("pushal", "pushad"):
+            return ["{ uint32_t _sp = c->esp; push32(c, c->eax); push32(c, c->ecx);"
+                    " push32(c, c->edx); push32(c, c->ebx); push32(c, _sp);"
+                    " push32(c, c->ebp); push32(c, c->esi); push32(c, c->edi); }"]
+        if m in ("popal", "popad"):
+            return ["c->edi = pop32(c); c->esi = pop32(c); c->ebp = pop32(c); c->esp += 4;"
+                    " c->ebx = pop32(c); c->edx = pop32(c); c->ecx = pop32(c); c->eax = pop32(c);"]
         if m == "enter":
             n = ops[0].imm if ops else 0
             return [f"push32(c, c->ebp); c->ebp = c->esp; c->esp -= {n};"]
