@@ -56,8 +56,8 @@ class _Reachable:
             for a in sorted(only):
                 off = a - start
                 ins = next(self._md.disasm(code[off:off + 16], a), None) if 0 <= off < len(code) else None
-                if ins is not None:
-                    out.append(ins)
+                if ins is not None and (not out or out[-1].address + out[-1].size <= a):
+                    out.append(ins)       # never two instructions over the same bytes
             return out
         return self._md.disasm(code, start)
 
@@ -320,7 +320,7 @@ def lift_raw(image, base, funcs, out_path, header='cpu64.h', prefix='', dyn_call
     bodies, errs = [], 0
     for va in sorted(funcs):
         size, name = funcs[va][:2]
-        if len(funcs[va]) > 2:          # the instructions discovery reached
+        if len(funcs[va]) > 2 and funcs[va][2] is not None:   # the instructions discovery reached
             lf.md.only = funcs[va][2]
         try:
             bodies.append(lf.lift_function(read_va(va, size), va))

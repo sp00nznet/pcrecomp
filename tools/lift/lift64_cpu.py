@@ -1355,7 +1355,7 @@ class Lifter:
         if m == 'jmp':
             t = ops[0]
             if t.type == X86_OP_IMM and t.imm in labels:
-                return ['goto L_%012X;' % t.imm]
+                return ['goto L_%012X;' % (t.imm & 0xFFFFFFFFFFFFFFFF)]
             if ea in self.jumptables:
                 tgts = self.jumptables[ea]
                 out = ['{ uint64_t _jt = %s;' % self._jt_load(insn, t)]
@@ -1371,7 +1371,7 @@ class Lifter:
                 out.append('  _ind = _jt; goto _ljump; }')
                 return out
             if t.type == X86_OP_IMM:
-                return ['dispatch(c, 0x%Xull); return;' % t.imm]
+                return ['dispatch(c, 0x%Xull); return;' % (t.imm & 0xFFFFFFFFFFFFFFFF)]
             # An indirect jump. MSVC's x64 switch is
             #     lea r11, [rip+table] / mov eax,[r11+rax*4] / add rax,r11 / jmp rax
             # so the target is computed in a REGISTER and is not a literal
@@ -1417,9 +1417,9 @@ class Lifter:
                 return [_todo(ea, m)]
             t = ops[0]
             if t.type == X86_OP_IMM and t.imm in labels:
-                return ['if (%s) goto L_%012X;' % (cond, t.imm)]
+                return ['if (%s) goto L_%012X;' % (cond, t.imm & 0xFFFFFFFFFFFFFFFF)]
             if t.type == X86_OP_IMM:
-                return ['if (%s) { dispatch(c, 0x%Xull); return; }' % (cond, t.imm)]
+                return ['if (%s) { dispatch(c, 0x%Xull); return; }' % (cond, t.imm & 0xFFFFFFFFFFFFFFFF)]
             return [_todo(ea, 'jcc %s %s' % (m, insn.op_str))]
 
         if m in ('loop', 'loope', 'loopz', 'loopne', 'loopnz'):
@@ -1430,9 +1430,9 @@ class Lifter:
             elif m in ('loopne', 'loopnz'):
                 extra = ' && !c->zf'
             if t.type == X86_OP_IMM and t.imm in labels:
-                return ['c->rcx--; if (c->rcx%s) goto L_%012X;' % (extra, t.imm)]
+                return ['c->rcx--; if (c->rcx%s) goto L_%012X;' % (extra, t.imm & 0xFFFFFFFFFFFFFFFF)]
             return ['c->rcx--; if (c->rcx%s) { dispatch(c, 0x%Xull); return; }'
-                    % (extra, t.imm)]
+                    % (extra, t.imm & 0xFFFFFFFFFFFFFFFF)]
 
         # ---- no-ops and flag fiddling ----
         if m in ('nop', 'int3', 'hint_nop', 'pause', 'wait', 'fwait', 'endbr64'):
