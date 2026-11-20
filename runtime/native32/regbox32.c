@@ -137,6 +137,8 @@ static int os_owned_key(const wchar_t* nt) {
     if (!_wcsnicmp(nt, g_cu_nt, cn) && (!nt[cn] || nt[cn] == L'\\')) {
         for (int i = 0; i < 4; i++)
             if (n = wcslen(cu[i]), !wcsncmp(u + cn, cu[i], n) && (!u[cn + n] || u[cn + n] == L'\\')) return 1;
+        /* NT 4.0's explorer starts what Run names: never the host's (its VMware tray...) */
+        if (nt_guest_nt4(native32_guest_peb) && !wcsncmp(u + cn, L"\\SOFTWARE\\MICROSOFT\\WINDOWS\\CURRENTVERSION\\RUN", 46)) return 1;
         return 0;
     }
     if (!wcsncmp(u, L"\\REGISTRY\\MACHINE\\SYSTEM\\", 25) && (r = wcsstr(u, L"\\CONTROL\\SESSION MANAGER\\ENVIRONMENT")))
@@ -146,6 +148,7 @@ static int os_owned_key(const wchar_t* nt) {
     if (!wcsncmp(r, L"\\WOW6432NODE", 12)) r += 12;
     for (int i = 0; i < 4; i++)
         if (n = wcslen(lm[i]), !wcsncmp(r, lm[i], n) && (!r[n] || r[n] == L'\\')) return 1;
+    if (nt_guest_nt4(native32_guest_peb) && !wcsncmp(r, L"\\MICROSOFT\\WINDOWS\\CURRENTVERSION\\RUN", 37)) return 1;   /* Run, RunOnce, RunServices: never the host's */
     /* XP's COM+ catalog (clbcatq): the host's COM3 names Windows 11's REGDB files, which
      * XP's catalog cannot read; without the key it reads the classes from the registry */
     if (nt_guest_xp(native32_guest_peb) && !wcsncmp(r, L"\\MICROSOFT\\COM3", 15) && (!r[15] || r[15] == L'\\')) return 1;
@@ -181,6 +184,8 @@ static int host_class_key(const wchar_t* nt) {
             }
     }
     if (g_guest_classes < 0 && native32_module("ole32.dll")) g_guest_classes = 1;   /* Windows 2000's own COM, lifted (asked until the guest's modules are mapped) */
+    /* NT 4.0's shell32 reads its classes' InProcServer32 itself (no ole32 lifted): the host's name windows.storage.dll */
+    if (g_guest_classes < 0 && nt_guest_nt4(native32_guest_peb) && native32_module("shell32.dll")) g_guest_classes = 1;
     if (g_guest_classes <= 0) return 0;
     wcsncpy(u, nt, KP - 1), u[KP - 1] = 0, _wcsupr(u);
     if (!wcsstr(u, L"CLASSES\\CLSID\\") && !wcsstr(u, L"CLASSES\\WOW6432NODE\\CLSID\\") && !wcsstr(u, L"CLASSES\\APPID\\") &&

@@ -1122,9 +1122,10 @@ static uint32_t win32k_call(uint32_t svc, uint32_t* args) {
      * the desktop thread could never run the window procedure. The host calls
      * back into a guest window procedure through mach_enter as usual. */
     const char* nm = g_w32k[i].name;
-    /* ponytail: only a send to another thread's window; a send to this
+    /* (NT 4.0 sends through one NtUserfn<kind> service per message shape, not NtUserMessageCall)
+     * ponytail: only a send to another thread's window; a send to this
      * thread's own runs the window procedure right here, under the machine */
-    int blocks = g_w32k[i].fn && ((!strcmp(nm, "NtUserMessageCall") && args[0] &&
+    int blocks = g_w32k[i].fn && (((!strcmp(nm, "NtUserMessageCall") || !strncmp(nm, "NtUserfn", 8)) && args[0] &&
                                    GetWindowThreadProcessId((HWND)(uintptr_t)args[0], NULL) != GetCurrentThreadId()) ||
                                   !strcmp(nm, "NtUserGetMessage") || !strcmp(nm, "NtUserWaitMessage"));
     if (g_trace && blocks)

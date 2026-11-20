@@ -1585,8 +1585,12 @@ static uint32_t cur_new(void) {
  * hotspot (SHORTs), +0x14 hbmMask (the mask, cy doubled when there is no
  * colour), +0x18 hbmColor, +0x30 bpp, +0x34 cx, +0x38 cy * 2 */
 static uint32_t s_set_cursor_data(uint32_t* a) {
-    uint32_t cd = a[3], m = MEM32(cd + 0x14), c = MEM32(cd + 0x18);
-    ICONINFO ii = { MEM16(cd + 8) != 1, (int16_t)MEM16(cd + 0x10), (int16_t)MEM16(cd + 0x12),
+    /* NT 4.0's CURSORDATA: +4 lpName, +8 lpModName, +0xC rt, +0x10 bpp, +0x14 cx, +0x18 cy * 2,
+     * +0x1C/+0x1E the hotspot, +0x20 hbmMask, +0x24 hbmColor */
+    int nt4 = nt_guest_nt4(native32_guest_peb);
+    uint32_t cd = a[3], m = MEM32(cd + (nt4 ? 0x20 : 0x14)), c = MEM32(cd + (nt4 ? 0x24 : 0x18)), rt = MEM16(cd + (nt4 ? 0xC : 8)),
+             hs = nt4 ? 0x1C : 0x10;
+    ICONINFO ii = { rt != 1, (int16_t)MEM16(cd + hs), (int16_t)MEM16(cd + hs + 2),
                     (HBITMAP)(uintptr_t)(native32_gdi_host(m) ? native32_gdi_host(m) : m),
                     (HBITMAP)(uintptr_t)(c && native32_gdi_host(c) ? native32_gdi_host(c) : c) };
     /* Windows 2000's user32 hands a double-height mask (AND mask on top) even
@@ -1614,7 +1618,7 @@ static uint32_t s_set_cursor_data(uint32_t* a) {
                 gc, bc.bmWidth, bc.bmHeight, bc.bmBitsPixel);
     }
     if (getenv("NATIVE32_SYSCALLS"))
-        fprintf(stderr, "[user] SetCursorIconData %08X rt %u mask %08X color %08X (host %08X %08X) -> %p err %lu\n", a[0], MEM16(cd + 8), m, c,
+        fprintf(stderr, "[user] SetCursorIconData %08X rt %u mask %08X color %08X (host %08X %08X) -> %p err %lu\n", a[0], rt, m, c,
                 (uint32_t)(uintptr_t)ii.hbmMask, (uint32_t)(uintptr_t)ii.hbmColor, h, h ? 0 : GetLastError());
     for (int i = 0; i < g_ncur; i++) if (g_cur[i][0] == a[0]) g_cur[i][1] = (uint32_t)(uintptr_t)h;
     return h != NULL;
@@ -1833,6 +1837,8 @@ static uint32_t s_setcapture(uint32_t* a) { return (uint32_t)(uintptr_t)SetCaptu
 
 /* NtUserRegisterWindowMessage(UNICODE_STRING*) */
 static uint32_t s_register_msg(uint32_t* a) { return RegisterWindowMessageW(ustr_name(a[0])); }
+/* NtUserRegisterClipboardFormat(UNICODE_STRING*): NT 4.0's shell32 (CFSTR_SHELLIDLIST...) */
+static uint32_t s_register_cf(uint32_t* a) { return RegisterClipboardFormatW(ustr_name(a[0])); }
 /* NtUserGetAtomName(atom, UNICODE_STRING* name): a name in USER's atom table
  * (window classes, registered messages, clipboard formats; XP's dialog
  * manager asks for its class's), from the host's, which is that table */
@@ -2169,7 +2175,7 @@ void native32_user_install(void) {
         { "NtUserCallHwndParamLock", s_hwnd_param_lock }, { "NtUserCallHwndParam", s_hwnd_param },
         { "NtUserDestroyWindow", s_destroy }, { "NtUserSetWindowFNID", s_set_fnid }, { "NtUserSetFocus", s_setfocus },
         { "NtUserQueryWindow", s_query_window }, { "NtUserFillWindow", s_fill_window }, { "NtUserSetCapture", s_setcapture },
-        { "NtUserWaitMessage", s_waitmessage }, { "NtUserRegisterWindowMessage", s_register_msg }, { "NtUserGetAtomName", s_atom_name }, { "NtUserCallHwndLock", s_hwnd_lock }, { "NtUserSetWindowLong", s_setlong },
+        { "NtUserWaitMessage", s_waitmessage }, { "NtUserRegisterWindowMessage", s_register_msg }, { "NtUserRegisterClipboardFormat", s_register_cf }, { "NtUserGetAtomName", s_atom_name }, { "NtUserCallHwndLock", s_hwnd_lock }, { "NtUserSetWindowLong", s_setlong },
         { "NtUserSetWindowPos", s_setpos }, { "NtUserGetForegroundWindow", s_foreground }, { "NtUserGetSystemMenu", s_sysmenu }, { "NtUserCallNoParam", s_call_noparam }, { "NtUserCallOneParam", s_call_oneparam },
     };
     for (int i = 0; i < (int)(sizeof svc / sizeof svc[0]); i++) native32_nt_win32k_override(svc[i].name, svc[i].fn);
