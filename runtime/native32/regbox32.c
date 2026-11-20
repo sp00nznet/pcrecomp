@@ -149,6 +149,9 @@ static int os_owned_key(const wchar_t* nt) {
     for (int i = 0; i < 4; i++)
         if (n = wcslen(lm[i]), !wcsncmp(r, lm[i], n) && (!r[n] || r[n] == L'\\')) return 1;
     if (nt_guest_nt4(native32_guest_peb) && !wcsncmp(r, L"\\MICROSOFT\\WINDOWS\\CURRENTVERSION\\RUN", 37)) return 1;   /* Run, RunOnce, RunServices: never the host's */
+    /* and NT 4.0's Explorer key whole (its setup hive's): the host's desktop NameSpace (OneDrive...)
+     * names classes NT 4.0 lacks, nameless folders on its desktop */
+    if (nt_guest_nt4(native32_guest_peb) && !wcsncmp(r, L"\\MICROSOFT\\WINDOWS\\CURRENTVERSION\\EXPLORER", 42) && (!r[42] || r[42] == L'\\')) return 1;
     /* XP's COM+ catalog (clbcatq): the host's COM3 names Windows 11's REGDB files, which
      * XP's catalog cannot read; without the key it reads the classes from the registry */
     if (nt_guest_xp(native32_guest_peb) && !wcsncmp(r, L"\\MICROSOFT\\COM3", 15) && (!r[15] || r[15] == L'\\')) return 1;

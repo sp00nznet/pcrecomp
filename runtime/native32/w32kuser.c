@@ -1712,6 +1712,13 @@ static uint32_t s_menu_default(uint32_t* a) {
     return r;
 }
 
+/* NtUserTrackPopupMenuEx(hmenu, flags, x, y, hwnd, TPMPARAMS*): NT 4.0's Start menu (2000's
+ * is a menuband). The point is the guest's screen, the virtual screen's client */
+static uint32_t s_track_popup(uint32_t* a) {
+    POINT p = { (int)a[2], (int)a[3] };
+    if (g_screen) ClientToScreen(g_screen, &p);
+    return (uint32_t)TrackPopupMenuEx((HMENU)(uintptr_t)a[0], a[1], p.x, p.y, (HWND)(uintptr_t)a[4], NULL);
+}
 /* NtUserGetMenuItemRect(hwnd, hmenu, item, RECT*) */
 static uint32_t s_menu_rect(uint32_t* a) {
     return GetMenuItemRect((HWND)(uintptr_t)a[0], (HMENU)(uintptr_t)a[1], a[2], (RECT*)(uintptr_t)a[3]);
@@ -2166,7 +2173,7 @@ void native32_user_install(void) {
         { "NtUserThunkedMenuItemInfo", s_menu_item }, { "NtUserDestroyMenu", s_destroy_menu },
         { "NtUserRemoveMenu", s_remove_menu }, { "NtUserDeleteMenu", s_delete_menu }, { "NtUserSetMenuDefaultItem", s_menu_default },
         { "NtUserCheckMenuItem", s_check_menu }, { "NtUserEnableMenuItem", s_enable_menu },
-        { "NtUserGetMenuItemRect", s_menu_rect }, { "NtUserFindExistingCursorIcon", s_find_icon }, { "NtUserSetCursorIconData", s_set_cursor_data },
+        { "NtUserGetMenuItemRect", s_menu_rect }, { "NtUserTrackPopupMenuEx", s_track_popup }, { "NtUserFindExistingCursorIcon", s_find_icon }, { "NtUserSetCursorIconData", s_set_cursor_data },
         { "NtUserDrawCaptionTemp", s_drawcaptiontemp }, { "NtUserSetWindowsHookEx", s_sethook }, { "NtUserCallNextHookEx", s_nexthook }, { "NtUserUnhookWindowsHookEx", s_unhook },
         { "NtUserDestroyCursor", s_destroy_cursor }, { "NtUserGetIconSize", s_get_icon_size }, { "NtUserGetIconInfo", s_get_icon_info }, { "NtUserDrawIconEx", s_drawiconex }, { "NtUserDeferWindowPos", s_deferpos }, { "NtUserEndDeferWindowPosEx", s_enddeferpos },
         { "NtUserSetProp", s_setprop }, { "NtUserSelectPalette", s_selectpal }, { "NtUserSetParent", s_setparent }, { "NtUserSetScrollInfo", s_setscroll },

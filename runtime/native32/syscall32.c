@@ -1127,7 +1127,7 @@ static uint32_t win32k_call(uint32_t svc, uint32_t* args) {
      * thread's own runs the window procedure right here, under the machine */
     int blocks = g_w32k[i].fn && (((!strcmp(nm, "NtUserMessageCall") || !strncmp(nm, "NtUserfn", 8)) && args[0] &&
                                    GetWindowThreadProcessId((HWND)(uintptr_t)args[0], NULL) != GetCurrentThreadId()) ||
-                                  !strcmp(nm, "NtUserGetMessage") || !strcmp(nm, "NtUserWaitMessage"));
+                                  !strcmp(nm, "NtUserGetMessage") || !strcmp(nm, "NtUserWaitMessage") || !strcmp(nm, "NtUserTrackPopupMenuEx"));
     if (g_trace && blocks)
         fprintf(stderr, "[win32k] t%lu enters %s(%08X %08X), window of t%lu\n", GetCurrentThreadId(), nm, args[0], args[1],
                 args[0] ? GetWindowThreadProcessId((HWND)(uintptr_t)args[0], NULL) : 0);
