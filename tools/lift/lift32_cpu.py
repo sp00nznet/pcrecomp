@@ -711,8 +711,10 @@ class Lifter:
                 return [f"goto L_{t.imm:08X};"]
             if ea in self.jumptables:                       # switch via jump table
                 tgts = self.jumptables[ea]
-                addr = self.addr_expr(insn, t)
-                out = [f"{{ uint32_t _jt = rd32({addr});"]
+                # Through rd(), not a bare rd32: a switch in segmented code reads
+                # its table with a cs: override (Watcom, QNX 4), and rd() is where
+                # overrides are honoured. For a flat image it is the same rd32.
+                out = [f"{{ uint32_t _jt = {self.rd(insn, t)};"]
                 for tv in sorted(set(tgts)):
                     if tv in labels:
                         out.append(f"  if (_jt == GVA(0x{tv:08X})) goto L_{tv:08X};")

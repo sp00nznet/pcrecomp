@@ -24,5 +24,22 @@ def test_pusha_popa():
     assert 'c->esp += 4' in po and 'c->esp = pop32' not in po
     assert po.index('c->edi') < po.index('c->eax')
 
+
+def test_jump_table_honours_segment_override():
+    """A switch in segmented code reads its table through cs:; the table read
+    must go through rd() so a subclass that models segments sees it."""
+    class Seg(L.Lifter):
+        def rd(self, insn, op):
+            if self.seg_name(op) == 'cs':
+                return 'CS_RD(%s)' % self.addr_expr(insn, op)
+            return super().rd(insn, op)
+    lf = Seg('t', 0x1000, lambda a, n: (b'\x10\x00\x00\x00' * 8)[:n])
+    lf.image_lo, lf.image_hi = 0, 0x1000
+    out = lf.lift_function(b'\x2e\xff\x24\x85\x00\x01\x00\x00', 0x10)
+    assert '_jt = CS_RD(' in out
+    flat = L.Lifter('t', 0x1000, lambda a, n: (b'\x10\x00\x00\x00' * 8)[:n])
+    flat.image_lo, flat.image_hi = 0, 0x1000
+    assert '_jt = rd32(' in flat.lift_function(b'\xff\x24\x85\x00\x01\x00\x00', 0x10)
+
 if __name__ == '__main__':
-    test_carry(); test_pusha_popa(); print('ok')
+    test_carry(); test_pusha_popa(); test_jump_table_honours_segment_override(); print('ok')
