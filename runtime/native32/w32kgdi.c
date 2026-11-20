@@ -235,6 +235,8 @@ static void batch(void) {
     if (!used) return;
     for (uint32_t off = 0; off + 4 <= used && off < 0x4D8; ) {
         uint32_t e = tb + 8 + off, len = MEM16(e), cmd = MEM16(e + 2);
+        /* NT 4.0: 6 and 7 delete an object (a brush, a region), 2000's 8; no batched font select */
+        if (nt_guest_nt4(native32_guest_peb) && (cmd == 6 || cmd == 7)) cmd = 8;
         if (cmd == 0) {                                        /* PatBlt { x, y, cx, cy, brush, rop, ... } */
             HDC h = dc(hdc);
             uint32_t br = HOST(MEM32(e + 0x14));
@@ -570,7 +572,8 @@ static uint32_t s_polypolydraw(uint32_t* a) {
 static uint32_t s_dibsection(uint32_t* a) {
     void* bits = NULL;
     HBITMAP b = CreateDIBSection(a[0] ? (HDC)(uintptr_t)HOST(a[0]) : NULL, (BITMAPINFO*)(uintptr_t)a[3], a[4], &bits, NULL, 0);
-    if (a[8]) MEM32(a[8]) = (uint32_t)(uintptr_t)bits;
+    uint32_t pbits = nt_guest_nt4(native32_guest_peb) ? a[7] : a[8];   /* (NT 4.0: 8 arguments, no colorspace) */
+    if (pbits) MEM32(pbits) = (uint32_t)(uintptr_t)bits;
     return GUEST(b);
 }
 /* NtGdiGetDCObject(hdc, type << 16): 5 bitmap, 8 palette, 0xA font, 0x10 brush, 0x30 pen */
