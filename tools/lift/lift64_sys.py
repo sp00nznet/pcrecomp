@@ -114,6 +114,10 @@ class SysLifter(Lifter):
         if e:
             return e
         m = op.mem
+        if self.dyn_imm and m.base == X86_REG_RIP:
+            # A fixed global, reached from wherever this copy is: the next
+            # instruction's address plus a displacement read from the code.
+            return '(0x%Xull + %s)' % (insn.address + insn.size, self._field(insn, insn.disp_offset, 4))
         if self.dyn_imm and insn.disp_size == 4 and m.base != X86_REG_RIP:
             terms = []
             if m.base:
@@ -339,6 +343,15 @@ class SysLifter(Lifter):
         if m in ('ret', 'retn'):
             n = ops[0].imm if ops and ops[0].type == X86_OP_IMM else 0
             return ['c->last_ret = rd64(c->rsp); c->rsp += %d; return;' % (8 + n)]
+        if self.dyn_imm and m.startswith('j') and ops and ops[0].type == X86_OP_IMM \
+                and (ops[0].imm & 0xFFFFFFFFFFFFFFFF) not in labels and insn.imm_size:
+            # Leaves this block (a tail call into other code): relative to wherever this copy is.
+            t = '(0x%Xull + %s)' % (nxt, self._field(insn, insn.imm_offset, insn.imm_size))
+            if m == 'jmp':
+                return ['dispatch(c, %s); return;' % t]
+            cond = self._cond(m)
+            if cond:
+                return ['if (%s) { dispatch(c, %s); return; }' % (cond, t)]
         if (m.startswith('j') or m.startswith('loop')) and ops and ops[0].type == X86_OP_IMM \
                 and ops[0].imm <= ea and ops[0].imm in labels:
             return ['SYS_POLL(c);'] + Lifter.translate(self, insn, labels)
