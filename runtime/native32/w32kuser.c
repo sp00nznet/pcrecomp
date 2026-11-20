@@ -1637,6 +1637,12 @@ static uint32_t s_call_oneparam(uint32_t* a) {
         MEM32(a[0]) = (uint32_t)p.x, MEM32(a[0] + 4) = (uint32_t)p.y;
         return 1;
     }
+    /* NT 4.0's 0x13: user32's handle validation asks the kernel for an object outside this
+     * thread's desktop view (a window of another thread, the Run dialog's): the table's object */
+    if (nt_guest_nt4(native32_guest_peb) && own == 0x13 && native32_user_ahe) {
+        uint32_t e = (uint32_t)(uintptr_t)native32_user_ahe + 12 * (a[0] & 0xFFFF);
+        return MEM32(e) && MEM16(e + 0xA) == (uint16_t)(a[0] >> 16) ? MEM32(e) : 0;
+    }
     a[1] = nt_routine(native32_guest_peb, a[1]);   /* (XP: its routine numbers, as 2000's) */
     if (a[1] == 0x19) return cur_new();
     if (a[1] == 0x18) return 1;   /* AllowSetForegroundWindow(pid): the guest's own, never the host's */
