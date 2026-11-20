@@ -414,6 +414,38 @@ static inline uint64_t op_ror(CPU *c, uint64_t v, uint64_t n, int sz) {
     c->of = (((r >> (w - 1)) ^ (r >> (w - 2))) & 1) ? 1 : 0;
     return r;
 }
+/* RCL/RCR rotate through CF: a (w+1)-bit rotate, one bit at a time. The count
+ * is masked like the shifts, then taken mod w+1 (only matters for 8/16 bits). */
+static inline uint64_t op_rcl(CPU *c, uint64_t v, uint64_t n, int sz) {
+    int w = sz * 8;
+    n &= (sz == 8) ? 63 : 31;
+    n %= (uint64_t)(w + 1);
+    uint64_t m = mask_sz(sz), sb = signbit_sz(sz);
+    v &= m;
+    if (!n) return v;
+    for (uint64_t i = 0; i < n; i++) {
+        uint64_t top = (v & sb) ? 1 : 0;
+        v = ((v << 1) | (c->cf & 1)) & m;
+        c->cf = top;
+    }
+    c->of = (((v & sb) ? 1u : 0u) ^ (uint32_t)c->cf);
+    return v;
+}
+static inline uint64_t op_rcr(CPU *c, uint64_t v, uint64_t n, int sz) {
+    int w = sz * 8;
+    n &= (sz == 8) ? 63 : 31;
+    n %= (uint64_t)(w + 1);
+    uint64_t m = mask_sz(sz), sb = signbit_sz(sz);
+    v &= m;
+    if (!n) return v;
+    c->of = (((v & sb) ? 1u : 0u) ^ (uint32_t)(c->cf & 1));  /* defined for count 1 */
+    for (uint64_t i = 0; i < n; i++) {
+        uint64_t lo = v & 1;
+        v = (v >> 1) | ((c->cf & 1) ? sb : 0);
+        c->cf = lo;
+    }
+    return v;
+}
 static inline uint64_t op_shld(CPU *c, uint64_t d, uint64_t s, uint64_t n, int sz) {
     int w = sz * 8;
     n &= (sz == 8) ? 63 : 31;

@@ -1141,10 +1141,10 @@ class Lifter:
             fn = {'shl': 'op_shl', 'sal': 'op_shl', 'shr': 'op_shr', 'sar': 'op_sar'}[m]
             return [self.dst_write(insn, d, '%s(c, %s, %s, %d)'
                                    % (fn, self._read_dst(insn, d), cnt, d.size))]
-        if m in ('rol', 'ror'):
+        if m in ('rol', 'ror', 'rcl', 'rcr'):
             d = ops[0]
             cnt = self.src(insn, ops[1]) if len(ops) > 1 else '1'
-            fn = 'op_rol' if m == 'rol' else 'op_ror'
+            fn = 'op_' + m
             return [self.dst_write(insn, d, '%s(c, %s, %s, %d)'
                                    % (fn, self._read_dst(insn, d), cnt, d.size))]
         if m in ('shld', 'shrd'):
