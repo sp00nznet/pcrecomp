@@ -201,6 +201,8 @@ extern uint32_t g_gs_base;
  * runtime/dos32 defines them; nothing else references them. Under DOS/4GW es
  * is a real selector (the PSP, the environment), so es: overrides get a base. */
 extern uint32_t g_es_base;
+/* Set by a host whose kernel resumes past the instruction after `int` (Lifter int_skip). */
+RECOMP_WEAK uint32_t g_int_skip;
 #define ES_BASE  g_es_base
 void     recomp_int(int n);
 uint8_t  recomp_in8(uint32_t port);

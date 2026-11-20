@@ -268,7 +268,8 @@ class Lifter:
                  lifted: set = None, precise_sbb: bool = False,
                  patch_sites: set = None, precise_carry: bool = False,
                  reloc=None, dos: bool = False, call_pop: set = None,
-                 computed_ret: bool = False):
+                 computed_ret: bool = False, int_skip: set = (),
+                 call_macros: dict = None):
         """
         iat_map: VA -> (dll, func_name) for import resolution
         func_names: VA -> name for known function names
@@ -307,6 +308,16 @@ class Lifter:
         # needs RECOMP_RETADDR to be a value no such push makes. DOS mode
         # always has it.
         self.computed_ret = computed_ret
+        # A kernel that returns past the instruction after `int` (Seventh
+        # Edition's fork adds 2 to the parent's EIP, skipping the child's
+        # `jmp`): the host sets g_int_skip and control resumes there, when that
+        # address is a block in this body. A set: the addresses of such ints.
+        self.int_skip = set(int_skip)
+        self.int_labels = None     # block starts, set by a driver that lifts linearly
+        # target VA -> macro name: a direct call there lifts as MACRO(sub_X)
+        # instead of RECOMP_CALL(sub_X), for a host that has to wrap the call
+        # in the caller's frame (a guest setjmp needs a host setjmp there).
+        self.call_macros = call_macros or {}
         # Call targets whose first instruction is `pop r32` (see the call case).
         self.call_pop = call_pop or set()
         self._patched_imm = None
@@ -1500,6 +1511,8 @@ class Lifter:
                     dll, fname = self.iat_map[target]
                     lines.append(f"/* call [{dll}]{fname} */")
                     lines.append(f"RECOMP_ICALL(0x{target:08X}u); {comment}")
+                elif target in self.call_macros:
+                    lines.append(f"{self.call_macros[target]}(sub_{target:08X}); {comment}")
                 elif target in self.func_names:
                     lines.append(f"RECOMP_CALL(recomp_{self.func_names[target]}); {comment}")
                 elif self.lifted is not None and target not in self.lifted:
@@ -2032,6 +2045,22 @@ class Lifter:
             # unreachable fallthrough would run the next block's code.
             lines.append(f"/* int3 breakpoint */ return; {comment}")
 
+        elif m in ('das', 'daa'):
+            # Decimal adjust AL after a subtract/add, from the CF and AF the
+            # last arithmetic left (Intel SDM pseudocode). Seventh Edition's
+            # printf makes digits with `cmp $10,al; sbb $0x69,al; das`.
+            sub = m == 'das'
+            op = '-' if sub else '+'
+            lines.append(f"{{ uint32_t _e = recomp_eflags(_flag_k, _flag_a, _flag_b, _cf, _df);"
+                         f" uint32_t _al = LO8(eax), _c = _e & 1u, _nc = 0;"
+                         f" if ((_al & 0xFu) > 9u || (_e & 0x10u)) {{ _nc = _c | ({'_al < 6u' if sub else '_al > 0xF9u'});"
+                         f" _al = (_al {op} 6u) & 0xFFu; _e |= 0x10u; }} else _e &= ~0x10u;"
+                         f" if (LO8(eax) > 0x99u || _c) {{ _al = (_al {op} 0x60u) & 0xFFu; _nc = 1u; }}"
+                         f" SET_LO8(eax, _al);"
+                         f" _flag_a = (_e & 0x10u) | _nc | (_al ? 0u : 0x40u) | (_al & 0x80u) | (recomp_parity8((uint8_t)_al) << 2);"
+                         f" _flag_b = 0; _flag_k = FK_EFLAGS; _cf = _nc; }} {comment}")
+            self._flag_state = None
+
         elif m == 'cdq':
             lines.append(f"edx = ((int32_t)eax < 0) ? 0xFFFFFFFFu : 0; {comment}")
 
@@ -2199,6 +2228,13 @@ class Lifter:
             n = ops[0].imm & 0xFF
             lines.append(f"RECOMP_FLAGS_OUT(); RECOMP_REGS_OUT(); recomp_int({n:#04x});"
                          f" RECOMP_REGS_IN(); RECOMP_FLAGS_IN(); {comment}")
+            skip = insn.address + insn.size + 2
+            labels = self.int_labels if self.int_labels is not None else self._labels
+            if insn.address in self.int_skip:
+                if labels is not None and skip in labels:
+                    lines.append(f"if (g_int_skip) {{ g_int_skip = 0; goto L_{skip:08X}; }}")
+                else:   # no block there in this body: enter it as a function
+                    lines.append(f"if (g_int_skip) {{ g_int_skip = 0; RECOMP_FLAGS_OUT(); RECOMP_ITAIL(0x{skip:08X}u); return; }}")
             self._flag_state = None
         elif m == 'iretd':
             # The host delivers an IRQ by pushing EFLAGS, CS and the dummy
