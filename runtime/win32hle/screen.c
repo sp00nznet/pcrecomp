@@ -234,8 +234,10 @@ static void web_menu(int open) {
  * the display's refreshes. A game making 70 frames a second on a 175 Hz
  * display would otherwise show them for 2 or 3 refreshes in turn, which
  * judders; held to 3 it moves evenly at 58.3. The number is the fewest the
- * game's own time a frame fits in (10% over is let go, as an occasional
- * late frame; gaps of a tenth of a second and more are loads, not frames),
+ * game's own time a frame fits in (60% of a refresh over is let go: those
+ * frames are shown a refresh late now and then, where holding every frame a
+ * refresh longer would halve a 60 Hz display's rate while a game streams its
+ * textures in; gaps of a tenth of a second and more are loads, not frames),
  * taken up at once and down only after a second of fitting, and never more
  * than a twentieth of a second. It is never fewer than keeps the game near 60
  * frames a second (HLE_MAX_FPS): a game of 1999 flips as fast as it can, as
@@ -259,7 +261,7 @@ static void pace(void) {
     if (g_paced_back) {
         double work = (double)(now - g_paced_back) / freq;  /* the game's time since the last frame went out */
         if (work < 0.1) ema = ema > 0 ? 0.9 * ema + 0.1 * work : work;   /* longer: a load, not a frame */
-        int want = (int)ceil(ema / period - 0.1), most = hz / 20 > 1 ? hz / 20 : 1;   /* never under 20 a second */
+        int want = (int)ceil(ema / period - 0.6), most = hz / 20 > 1 ? hz / 20 : 1;   /* never under 20 a second */
         static int max_fps = -1;
         if (max_fps < 0) { const char *e = getenv("HLE_MAX_FPS"); max_fps = e ? atoi(e) : 60; }
         int least = max_fps > 0 ? (int)(hz / (double)max_fps + 0.25) : 1;
