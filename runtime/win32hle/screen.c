@@ -184,9 +184,15 @@ static uint32_t scan_of(SDL_Scancode s) {
     return (unsigned)s < SDL_NUM_SCANCODES ? t[s] : 0;
 }
 
-/* window points -> game pixels, clamped to the picture */
+/* window points -> game pixels, clamped to the picture. The last point
+ * inside the picture is the game's last pixel: the mouse is held to the
+ * points wholly inside it (confine_update, to_points), and unless the
+ * picture is a whole number of pixels a point, that point's pixel maps a
+ * pixel or two short of the right and bottom edges, so a game that scrolls
+ * at its screen's last pixel (Red Alert 2) never scrolled right or down. */
 static void to_game(int x, int y, int *gx, int *gy) {
-    int w = g_src_w, h = g_src_h, bpp, pw, ph, ww, wh;
+    int w = g_src_w, h = g_src_h, bpp, pw = 0, ph = 0, ww = 0, wh = 0;
+    int px = x, py = y;                                 /* in points, as events count */
     if (w <= 0 || h <= 0) hle_dd_mode(&w, &h, &bpp);
     if (g_ren && g_win) {                                /* HiDPI: the renderer counts pixels, events points */
         SDL_GetRendererOutputSize(g_ren, &pw, &ph);
@@ -202,6 +208,10 @@ static void to_game(int x, int y, int *gx, int *gy) {
     if (g_dst.w <= 0 || g_dst.h <= 0) { *gx = x, *gy = y; return; }
     *gx = (int)((long long)(x - g_dst.x) * w / g_dst.w);
     *gy = (int)((long long)(y - g_dst.y) * h / g_dst.h);
+    if (pw > 0 && ph > 0 && ww > 0 && wh > 0) {         /* the picture's last point, as to_points rounds it */
+        if (px >= (int)((long long)(g_dst.x + g_dst.w) * ww / pw) - 1) *gx = w - 1;
+        if (py >= (int)((long long)(g_dst.y + g_dst.h) * wh / ph) - 1) *gy = h - 1;
+    }
     if (*gx < 0) *gx = 0;
     if (*gy < 0) *gy = 0;
     if (*gx >= w) *gx = w - 1;

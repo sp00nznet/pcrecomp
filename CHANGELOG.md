@@ -738,6 +738,12 @@ From #9. Found bringing Nocturne (Terminal Reality, Watcom C/C++32) in game.
 
 ### Fixed
 
+- win32hle screen: the mouse reaches the picture's right and bottom edges.
+  It is held to the points wholly inside the picture, and unless the picture
+  is a whole number of pixels a point (a full-screen window below a MacBook's
+  notch, any window), the last of them mapped a game pixel or two short of
+  the edge: Red Alert 2, which scrolls at its screen's last pixel, scrolled up
+  and left but never right or down. That point is now the last pixel.
 - native32 regbox32: the guest OS's own keys are never read from the host,
   whether or not the box has them: HKCU `...\CurrentVersion\Explorer` and
   `Policies`, `Environment`, `Volatile Environment`; HKLM `Explorer\Shell
