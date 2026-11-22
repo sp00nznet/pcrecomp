@@ -151,7 +151,11 @@ static uint32_t client_connect(uint32_t data, uint32_t capture) {
     (void)capture;
     if (getenv("NATIVE32_SYSCALLS"))
         fprintf(stderr, "[csr] client connect, server %u, info %08X len %u\n", index, ci, MEM32(data + 8));
-    if (index == 3 && ci && MEM32(data + 8) >= 0x104) user_connect(ci);
+    /* (NT 6: USERCONNECT { ulVersion, SHAREDINFO }, 0x11C bytes, as NtUserProcessConnect's) */
+    if (index == 3 && ci && nt_guest_vista(native32_guest_peb)) {
+        uint32_t a[2] = { 0, ci };
+        native32_user_process_connect(a);
+    } else if (index == 3 && ci && MEM32(data + 8) >= 0x104) user_connect(ci);
     if (index == 2 && ci) {
         MEM32(ci + 0x00) = 0x0C0Eu;
         MEM32(ci + 0x04) = (uint32_t)(uintptr_t)CreateEventA(NULL, TRUE, FALSE, NULL);

@@ -1198,7 +1198,14 @@ uint32_t native32_nt_callback(uint32_t api, uint32_t in, uint32_t len, uint32_t*
     uint32_t sp = g_esp;
     g_cb[g_cbn].done = 0;
     g_cbn++;
-    native32_call_guest(kucd, 3, args);
+    if (nt_guest_vista(native32_guest_peb)) {
+        /* NT 6's KiUserCallbackDispatcher ends in NtCallbackReturn(0, 0, result) by its stub,
+         * then RtlRaiseStatus if that returns (it never does on NT): the table's routine
+         * itself, as the dispatcher calls it (PEB KernelCallbackTable[api](in, len)) */
+        uint32_t fn = MEM32(MEM32(native32_guest_peb + 0x2C) + 4 * api);
+        native32_call_guest(fn, 2, args + 1);
+    } else
+        native32_call_guest(kucd, 3, args);
     g_cbn--;
     if (!g_cb[g_cbn].done) g_cb[g_cbn].status = g_eax, g_cb[g_cbn].out = 0, g_cb[g_cbn].outlen = 0;
     g_esp = sp;
