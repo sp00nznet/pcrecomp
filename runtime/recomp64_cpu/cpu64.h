@@ -110,7 +110,19 @@ static inline void wr128(uint64_t a, const XMM *s) { memcpy((void *)(uintptr_t)a
  * The only segment in long mode with a base that addresses anything. Thread
  * information block accesses (stack limits, TLS, the SEH chain) come through
  * it and nothing else does. */
+#if defined(RECOMP_GUEST_GS)
+/* A lifted NT userland (native64) keeps a TEB of its own per guest thread:
+ * gs: is that TEB, never the host's (whose PEB is the host's). */
 #if defined(_MSC_VER)
+extern __declspec(thread) uint64_t g_guest_gs;
+#else
+extern __thread uint64_t g_guest_gs;
+#endif
+static inline uint64_t rd_gs64(uint64_t off) { return *(uint64_t *)(uintptr_t)(g_guest_gs + off); }
+static inline uint32_t rd_gs32(uint64_t off) { return *(uint32_t *)(uintptr_t)(g_guest_gs + off); }
+static inline void wr_gs64(uint64_t off, uint64_t v) { *(uint64_t *)(uintptr_t)(g_guest_gs + off) = v; }
+static inline void wr_gs32(uint64_t off, uint32_t v) { *(uint32_t *)(uintptr_t)(g_guest_gs + off) = v; }
+#elif defined(_MSC_VER)
 static inline uint64_t rd_gs64(uint64_t off) { return __readgsqword((unsigned long)off); }
 static inline uint32_t rd_gs32(uint64_t off) { return __readgsdword((unsigned long)off); }
 static inline void wr_gs64(uint64_t off, uint64_t v) { __writegsqword((unsigned long)off, v); }
@@ -208,6 +220,12 @@ static inline void do_cpuid(CPU *c)
 #ifndef RECOMP_TODO
 #define RECOMP_TODO(va, text) abort()
 #endif
+
+/* The system boundary, provided by a host that lifts an NT userland (native64):
+ * `syscall` (service number in rax, arguments r10, rdx, r8, r9, [rsp+0x28]...)
+ * and `int n` (2Dh debug service, 29h fast fail, 2Ch assertion). */
+void recomp_syscall64(CPU *c);
+void recomp_int64(CPU *c, int vector);
 
 /* ---- absolute image references ----
  * A 64-bit PE is built to relocate and this one has a .reloc, but it asks for
@@ -429,6 +447,37 @@ static inline uint64_t mulu64_128(uint64_t a, uint64_t b, uint64_t *hi) {
     *hi = hh + (lh >> 32) + (hl >> 32) + (mid >> 32);
     return (mid << 32) | (uint32_t)ll;
 #endif
+}
+
+/* div/idiv r/m64: rdx:rax / d. A quotient that does not fit is #DE on the
+ * CPU; here it is truncated (the guest never relies on the fault). */
+static inline void div128u(CPU *c, uint64_t d) {
+#if defined(__SIZEOF_INT128__)
+    unsigned __int128 n = ((unsigned __int128)c->rdx << 64) | c->rax;
+    c->rax = (uint64_t)(n / d); c->rdx = (uint64_t)(n % d);
+#elif defined(_MSC_VER) && defined(_M_X64) && _MSC_VER >= 1920
+    uint64_t r; if (c->rdx >= d) { c->rdx %= d; }  /* keep _udiv128 from faulting */
+    c->rax = _udiv128(c->rdx, c->rax, d, &r); c->rdx = r;
+#else
+    if (!c->rdx) { uint64_t n = c->rax; c->rax = n / d; c->rdx = n % d; return; }
+    { uint64_t q = 0, r = c->rdx % d, lo = c->rax; int i;   /* restoring division, 64 steps */
+      for (i = 63; i >= 0; i--) { uint64_t top = r >> 63; r = (r << 1) | ((lo >> i) & 1);
+          if (top || r >= d) { r -= d; q |= (uint64_t)1 << i; } }
+      c->rax = q; c->rdx = r; }
+#endif
+}
+static inline void div128s(CPU *c, int64_t d) {
+    if ((c->rdx == 0 && (int64_t)c->rax >= 0) || (c->rdx == ~(uint64_t)0 && (int64_t)c->rax < 0)) {
+        int64_t n = (int64_t)c->rax; c->rax = (uint64_t)(n / d); c->rdx = (uint64_t)(n % d); return;
+    }
+    {   /* a true 128-bit numerator: magnitudes, then the signs */
+        int nneg = (int64_t)c->rdx < 0, dneg = d < 0;
+        uint64_t ud = dneg ? (uint64_t)0 - (uint64_t)d : (uint64_t)d;
+        if (nneg) { c->rax = (uint64_t)0 - c->rax; c->rdx = ~c->rdx + (c->rax == 0); }
+        div128u(c, ud);
+        if (nneg != dneg) c->rax = (uint64_t)0 - c->rax;
+        if (nneg) c->rdx = (uint64_t)0 - c->rdx;
+    }
 }
 
 static inline uint64_t muls64_128(int64_t a, int64_t b, uint64_t *hi) {

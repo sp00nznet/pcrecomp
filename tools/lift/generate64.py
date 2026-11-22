@@ -468,6 +468,26 @@ def main():
     # extents, and only the entry that is dispatched to is ever called.
     DISPATCH_RE = re.compile(r'dispatch(?:_jmp)?\(c, 0x([0-9A-Fa-f]+)ull\)')
 
+    _dis = []
+
+    def switch_arms(va, size):
+        """Jump-table targets of every `jmp reg` in [va, va+size) (disasm64's reader)."""
+        if not _dis:
+            sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'disasm'))
+            import disasm64
+            _dis.append(disasm64.Disassembler64(data))
+        d = _dis[0]
+        fn, out = {}, set()
+        try:
+            code = read_va(va, size)
+        except KeyError:
+            return out
+        for ins in d.md.disasm(code, va):
+            fn[ins.address] = ins
+            if ins.mnemonic == 'jmp' and ins.operands and ins.operands[0].type == lift64_cpu.X86_OP_REG:
+                out.update(d.jump_table(fn, ins))
+        return out
+
     def lift_one(va):
         size, name = bounds[va]
         fname = 'L_%012X' % va
@@ -553,6 +573,15 @@ def main():
         # the address is computed with a rip-relative lea rather than stored,
         # .reloc does not either. Filtered to what actually decodes as code,
         # since a lea into .text is just as often a jump table or a literal.
+        # Switch arms of a function whose computed jump left its extent. A
+        # body that ends in the local dispatch's default (a target outside
+        # it) has its jump tables read the way disasm64 reads them; an arm
+        # beyond the extent becomes an entry, so the global dispatcher can
+        # take it. XP x64's compiler scatters one function over many .pdata
+        # chunks, so its switches reach far past the entry's extent.
+        for va in pending:
+            if 'dispatch_jmp(c, _ind)' in bodies[va]:
+                targets.update(switch_arms(va, bounds[va][0]))
         for t in lf.lea_targets:
             if text_lo <= t < text_hi and t not in bounds and plausible_code(read_va, t):
                 targets.add(t)

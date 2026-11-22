@@ -1057,6 +1057,10 @@ class Lifter:
                         % (cond, self.dst_write(insn, d, self.src(insn, sop)))]
 
         # ---- data movement ----
+        if m == 'movnti':          # a non-temporal store is a store (ntdll's memset/memcpy)
+            m = 'mov'
+        if m == 'rdtsc':
+            return ['{ uint64_t _t = __rdtsc(); SET32(c->rax, (uint32_t)_t); SET32(c->rdx, (uint32_t)(_t >> 32)); }']
         if m in ('mov', 'movabs'):
             d, s = two()
             return [self.dst_write(insn, d, self.src_ext(insn, s, d.size))]
@@ -1314,14 +1318,11 @@ class Lifter:
                 # after setting rdx to the sign extension of rax (cqo) or to
                 # zero, so the 64/64 form below is what actually runs. A genuine
                 # 128-bit numerator would need __int128 and is caught, not guessed.
+                # A genuine 128-bit numerator (NT's RtlExtendedLargeIntegerDivide
+                # family) goes through div128u/div128s (cpu64.h).
                 if sg:
-                    return ['{ int64_t _n=(int64_t)c->rax, _d=(int64_t)(%s);' % v,
-                            '  if ((c->rdx != 0) && (c->rdx != ~(uint64_t)0))'
-                            ' RECOMP_TODO(0x%X, "idiv: true 128-bit numerator");' % ea,
-                            '  c->rax=(uint64_t)(_n/_d); c->rdx=(uint64_t)(_n%_d); }']
-                return ['{ uint64_t _n=c->rax, _d=(uint64_t)(%s);' % v,
-                        '  if (c->rdx != 0) RECOMP_TODO(0x%X, "div: true 128-bit numerator");' % ea,
-                        '  c->rax=_n/_d; c->rdx=_n%_d; }']
+                    return ['{ int64_t _d=(int64_t)(%s); div128s(c, _d); }' % v]
+                return ['{ uint64_t _d=(uint64_t)(%s); div128u(c, _d); }' % v]
             if sz == 4:
                 if sg:
                     return ['{ int64_t _n=(int64_t)(((uint64_t)R32(c->rdx)<<32)|R32(c->rax));'
@@ -1451,6 +1452,21 @@ class Lifter:
             return ['do_cpuid(c);']
         if m == 'xlatb':
             return ['SET8L(c->rax, rd8(c->rbx + R8L(c->rax)));']
+        # ---- the system boundary (a lifted NT userland: ntdll's stubs) ----
+        if m == 'syscall':
+            # `mov r10, rcx; mov eax, N; syscall; ret`: the runtime answers
+            # service N (rax) with arguments r10, rdx, r8, r9, [rsp+0x28]...
+            # The CPU clobbers rcx (return rip) and r11 (rflags).
+            return ['recomp_syscall64(c); c->rcx = 0x%Xull; c->r11 = eflags_pack(c);'
+                    % (ea + insn.size)]
+        if m == 'int' and ops and ops[0].type == X86_OP_IMM:
+            # int 2Dh (debug service), int 29h (fast fail), int 2Ch (assertion)
+            return ['recomp_int64(c, 0x%X);' % (ops[0].imm & 0xFF)]
+        if m == 'bswap':
+            r = ops[0]
+            if r.size == 8:
+                return [self.dst_write(insn, r, '_byteswap_uint64(%s)' % self.src(insn, r))]
+            return [self.dst_write(insn, r, '(uint64_t)_byteswap_ulong((uint32_t)(%s))' % self.src(insn, r))]
 
         return [_todo(ea, '%s %s' % (m, insn.op_str))]
 

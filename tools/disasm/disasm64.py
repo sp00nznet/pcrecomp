@@ -259,7 +259,11 @@ class Disassembler64:
         prior = [fn[a] for a in prior]
         target = _canon(jmp.reg_name(jmp.operands[0].reg))
         bases, load = {}, None
-        for ins in prior:                   # imagebase leas, in order
+        # imagebase leas, in order. The base is often taken once at the top of
+        # a long function (XP x64's ntdll: `lea rdx, [rip-...]` hundreds of
+        # bytes before its switches), so every earlier lea counts, not only
+        # the last 16 instructions'.
+        for ins in [fn[a] for a in sorted(a for a in fn if a < jmp.address)]:
             if ins.mnemonic == 'lea' and ins.operands[1].type == X86_OP_MEM:
                 m = ins.operands[1].mem
                 if m.base == X86_REG_RIP and m.index == 0 and \
