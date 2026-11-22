@@ -750,6 +750,9 @@ static BOOL CALLBACK parts_load(PINIT_ONCE o, PVOID a, PVOID *c) {
         HMODULE h = LoadLibraryExA(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
         typedef const recomp_dispatch_entry_t *(*getf)(uint32_t *);
         getf g = h ? (getf)(void *)GetProcAddress(h, "recomp_part_dispatch") : NULL;
+        /* a part not built (a module whose lift is still compiling): loud, and
+         * its functions are not lifted if the guest ever calls one */
+        if (!h && GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) { fprintf(stderr, "[native32] part %s not built: skipped\n", path); continue; }
         if (!g) { fprintf(stderr, "[native32] part %s did not load (error %lu)\n", path, GetLastError()); fflush(stderr); TerminateProcess(GetCurrentProcess(), 3); }
         int k = g_nparts++;
         g_parts[k].t = g(&g_parts[k].n);

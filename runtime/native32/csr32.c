@@ -108,6 +108,13 @@ static void user_connect(uint32_t ci) {
     MEM32(ci + 0x0C) = (uint32_t)(uintptr_t)psi;
     MEM32(ci + 0x10) = (uint32_t)(uintptr_t)ahe;
     MEM32(ci + 0x14) = (uint32_t)(uintptr_t)disp;
+    if (nt_guest_win7(native32_guest_peb)) {
+        /* NT 6.1: SHAREDINFO { psi, aheList, HeEntrySize, pDispInfo, ulSharedDelta, ... },
+         * ValidateHwnd indexes aheList by HeEntrySize */
+        MEM32(ci + 0x14) = 12;
+        MEM32(ci + 0x18) = (uint32_t)(uintptr_t)disp;
+        MEM32(ci + 0x1C) = 0;
+    } else
     /* ulSharedDelta: user32 subtracts it from every kernel pointer in the
      * shared section (pDispInfo->pMonitorPrimary, ...). The section is
      * ours, so 0; left unset it was the caller's stack (0xCCCC...) */
@@ -135,7 +142,7 @@ uint32_t native32_user_process_connect(uint32_t* a) {
     if (!a[1]) return 0xC000000Du;
     c[0] = MEM32(a[1]);
     user_connect((uint32_t)(uintptr_t)c);
-    memcpy((void*)(uintptr_t)(a[1] + 4), c + 3, 0x118);
+    memcpy((void*)(uintptr_t)(a[1] + 4), c + 3, nt_guest_win7(native32_guest_peb) ? 0x11C : 0x118);
     return 0;
 }
 
