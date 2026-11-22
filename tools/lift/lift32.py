@@ -1642,6 +1642,10 @@ class Lifter:
             # the callee's flags (see RECOMP_FLAGS_OUT)
             lines.append("RECOMP_FLAGS_IN();")
             self._flag_state = None
+            # a callee that returned for this frame (generate.frame_escape): this body is done
+            esc = getattr(self, 'escape_check', None)
+            if target and target not in self.iat_map and esc and esc(target):
+                lines.append("{ RECOMP_REGS_OUT(); return; } /* the callee left through this frame's epilogue */")
 
         elif m == 'ret' or m == 'retn':
             # Pop the return address that RECOMP_CALL/ICALL pushed (esp += 4), plus

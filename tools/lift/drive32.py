@@ -39,7 +39,7 @@ import sys
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32
 import pefile
 
-from generate import (EXTENT_REACH, alias_stub, find_splits, true_extent,
+from generate import (EXTENT_REACH, alias_stub, find_splits, frame_escape, true_extent,
                       linear_disassemble_function, lift_function_linear, write_chunk)
 from lift32 import Lifter
 from eh32 import frame as eh_frame
@@ -87,6 +87,8 @@ def lift_image(img, catalog, out, seeds=(), split=400, log=print, precise_carry=
     # precise carry: adc/sbb take their carry from the flag state that set it
     # (64-bit adds and subtracts; ra2's run_lift.py has the history).
     lifter = Lifter(iat_map=iat, lifted=set(byaddr), precise_carry=precise_carry, precise_sbb=precise_carry)
+    _esc = {}
+    lifter.escape_check = lambda va: _esc[va] if va in _esc else _esc.setdefault(va, frame_escape(md, read, va))
 
     shutil.rmtree(out, ignore_errors=True)            # a smaller lift must not leave stale chunks
     os.makedirs(out)

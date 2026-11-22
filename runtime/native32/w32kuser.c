@@ -854,6 +854,11 @@ static uint32_t s_send_notify(uint32_t* a) {
  * returns, not on the caller's next message wait; nothing has minded yet */
 static uint32_t s_send_callback(uint32_t* a) {
     if (!own_window(a[0])) return 1;
+    /* another thread's window: queued, never waited for (it is asynchronous on Windows;
+     * sent, Neptune's shell32 blocked on a thread that waited for the loader lock it held).
+     * ponytail: that path drops the SENDASYNCPROC; queue it back when a caller needs it */
+    if (GetWindowThreadProcessId((HWND)(uintptr_t)a[0], NULL) != GetCurrentThreadId())
+        return SendNotifyMessageW((HWND)(uintptr_t)a[0], a[1], a[2], a[3]);
     uint32_t r = (uint32_t)SendMessageW((HWND)(uintptr_t)a[0], a[1], a[2], a[3]);
     if (a[4]) {
         uint32_t args[4] = { a[0], a[1], a[5], r };

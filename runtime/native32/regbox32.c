@@ -146,11 +146,13 @@ static int os_owned_key(const wchar_t* nt) {
     if (!wcsncmp(r, L"\\WOW6432NODE", 12)) r += 12;
     for (int i = 0; i < 4; i++)
         if (n = wcslen(lm[i]), !wcsncmp(r, lm[i], n) && (!r[n] || r[n] == L'\\')) return 1;
-    /* XP's COM+ catalog (clbcatq): the host's COM3 names Windows 11's REGDB files, which
-     * XP's catalog cannot read; without the key it reads the classes from the registry */
-    if (nt_guest_xp(native32_guest_peb) && !wcsncmp(r, L"\\MICROSOFT\\COM3", 15) && (!r[15] || r[15] == L'\\')) return 1;
+    /* XP's and Neptune's COM+ catalog (clbcatq): the host's COM3 names Windows 11's REGDB
+     * files, which their catalog cannot read (Neptune's faulted); without the key it reads
+     * the classes from the registry */
+    int box_com = nt_guest_xp(native32_guest_peb) || nt_guest_neptune(native32_guest_peb);
+    if (box_com && !wcsncmp(r, L"\\MICROSOFT\\COM3", 15) && (!r[15] || r[15] == L'\\')) return 1;
     /* and the taskbar's default bands (Explorer\Streams\Desktop): Windows 11's streams are not XP's */
-    if (nt_guest_xp(native32_guest_peb) && !wcsncmp(r, L"\\MICROSOFT\\WINDOWS\\CURRENTVERSION\\EXPLORER\\STREAMS", 50)) return 1;
+    if (box_com && !wcsncmp(r, L"\\MICROSOFT\\WINDOWS\\CURRENTVERSION\\EXPLORER\\STREAMS", 50)) return 1;
     return 0;
 }
 static int host_class_key(const wchar_t* nt) {

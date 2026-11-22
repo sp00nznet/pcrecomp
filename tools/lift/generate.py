@@ -230,6 +230,35 @@ FPU_CMP = {'EQ': '==', 'NE': '!=', 'B': '<', 'BE': '<=', 'A': '>', 'AE': '>=',
            'L': '<', 'LE': '<=', 'G': '>', 'GE': '>='}
 
 
+def frame_escape(md, read, va, limit=48):
+    """True when code called at `va` returns for its caller's frame: it never
+    pushes ebp, takes esp back from ebp (`mov esp, [ebp - n]`, `mov esp, ebp`
+    or `leave`) and its `ret` follows `pop ebp`/`leave` directly. MSVC called
+    an __except block's tail that way: Neptune's clbcatq (0x24120272) calls
+    0x241202BB, which ends in its caller's epilogue (`mov esp, [ebp-18h]` ...
+    `pop ebp; ret 8`). Lifted as a call, the callee "returned" and the C went
+    on with the caller's frame already gone (ebp 0, a read of [ebp-10h]).
+    __SEH_epilog (`leave; push ecx; ret`) returns to its caller and is not one.
+    """
+    code = read(va, limit * 15) or b''
+    esp_from_ebp, prev = False, None
+    for i in md.disasm(code, va):
+        m, o = i.mnemonic, i.op_str
+        if m == 'push' and o == 'ebp':
+            return False
+        if m == 'leave' or (m == 'mov' and (o == 'esp, ebp' or o.startswith('esp, dword ptr [ebp'))):
+            esp_from_ebp = True
+        if m in ('ret', 'retn'):
+            return esp_from_ebp and prev is not None and (prev.mnemonic == 'leave' or
+                                                          (prev.mnemonic == 'pop' and prev.op_str == 'ebp'))
+        if m == 'jmp' or m == 'int3':
+            return False
+        prev, limit = i, limit - 1
+        if not limit:
+            return False
+    return False
+
+
 def push_return_label(insn, nxt, leaders, body=()):
     """The label of a `push label; jmp func` pair, or None.
 
@@ -815,6 +844,21 @@ def _selftest():
     """
     md = Cs(CS_ARCH_X86, CS_MODE_32)
     md.detail = True
+
+    # A call into an epilogue returns for its caller (frame_escape):
+    #   mov esp,[ebp-18h] / mov ecx,[ebp-10h] / pop edi / mov esp,ebp / pop ebp / ret 8
+    esc = bytes([0x8B, 0x65, 0xE8, 0x8B, 0x4D, 0xF0, 0x5F, 0x8B, 0xE5, 0x5D, 0xC2, 0x08, 0x00])
+    assert frame_escape(md, lambda va, n: esc[va - 0x1000:va - 0x1000 + n], 0x1000)
+    #   __SEH_epilog: mov ecx,[ebp-10h] / pop ecx / leave / push ecx / ret  -- returns normally
+    sehe = bytes([0x8B, 0x4D, 0xF0, 0x59, 0xC9, 0x51, 0xC3])
+    assert not frame_escape(md, lambda va, n: sehe[va - 0x1000:va - 0x1000 + n], 0x1000)
+    #   push ebp / mov ebp,esp / ... / mov esp,ebp / pop ebp / ret  -- an ordinary function
+    fn = bytes([0x55, 0x8B, 0xEC, 0x8B, 0xE5, 0x5D, 0xC3])
+    assert not frame_escape(md, lambda va, n: fn[va - 0x1000:va - 0x1000 + n], 0x1000)
+    lf = Lifter(iat_map={}, lifted={0x1000, 0x2000})
+    lf.escape_check = lambda va: va == 0x2000
+    call = linear_disassemble_function(md, bytes([0xE8, 0xFB, 0x0F, 0x00, 0x00]), 0x1000, 0x1000, 0x1005)[0][0]   # call 0x2000
+    assert any('return;' in x for x in lf.lift_instruction(call)), lf.lift_instruction(call)
 
     # A loop's target is a block leader, so its goto has a label to land on.
     #   0x1000: inc eax / 0x1001: loop 0x1000 / 0x1003: ret
