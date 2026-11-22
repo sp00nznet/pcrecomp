@@ -781,6 +781,30 @@ static uint32_t s_create_window(uint32_t* a) {
                 break;
             }
     }
+    /* Vista keeps resources in MUI files (en-US\<module>.mui) the host's LoadMenu never
+     * looks in: a top-level window of a guest class with a menu name gets its menu from the
+     * guest user32's LoadMenuW, as win32k's xxxClientLoadMenu would */
+    if (nt_guest_vista(native32_guest_peb) && !a[9] && !(a[3] & WS_CHILD) && a[10]) {
+        WNDCLASSEXW wc = { sizeof wc };
+        uint32_t lm = native32_export(native32_module("user32.dll"), "LoadMenuW");
+        if (lm && guest_class((HINSTANCE)(uintptr_t)a[10], lstr_name(a[1]), &wc) && wc.lpszMenuName) {
+            uint32_t args[2] = { a[10], (uint32_t)(uintptr_t)wc.lpszMenuName }, sp = g_esp, ax = g_eax;
+            native32_call_guest(lm, 2, args);
+            a[9] = g_eax, g_esp = sp, g_eax = ax;
+        }
+    }
+    /* CW_USEDEFAULT for a top-level window on the virtual screen: win32k's cascade
+     * on that screen (26 px steps, 3/4 of it), not the host monitor's (a 1440 px
+     * window on an 800x600 screen). Vista guests only for now. */
+    if (g_screen && nt_guest_vista(native32_guest_peb) && !(a[3] & WS_CHILD) && a[4] == CW_USEDEFAULT) {
+        static int step;
+        RECT sr;
+        /* (with x CW_USEDEFAULT, y is the show command: calc's message window asks SW_HIDE) */
+        if (a[5] == SW_HIDE) a[3] &= ~WS_VISIBLE;
+        GetClientRect(g_screen, &sr);
+        a[4] = a[5] = (uint32_t)(26 * (1 + step++ % 8));
+        if (cx == CW_USEDEFAULT || cx <= 0) cx = sr.right * 3 / 4, cy = sr.bottom * 3 / 4;
+    }
     /* 0x80000000 WS_EX_ANSICREATOR: CreateWindowExA's mark for win32k, not the host's */
     HWND h = CreateWindowExW(a[0] & ~0x80000000u, lstr_name(a[1]), lstr_name(a[2]), a[3], (int)a[4], (int)a[5], cx, cy,
                              (HWND)(uintptr_t)a[8], (HMENU)(uintptr_t)a[9], (HINSTANCE)(uintptr_t)a[10],
