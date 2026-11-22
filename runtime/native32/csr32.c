@@ -87,6 +87,58 @@ void native32_csr_api(uint32_t number, native32_csr_api_fn fn) {
     if ((number >> 16) < 8 && (number & 0xFFFF) < 1024) g_api[number >> 16][number & 0xFFFF] = fn;
 }
 
+/* usersrv's connect, or NT 6's NtUserProcessConnect: the USERCONNECT at ci, in XP's
+ * layout (SHAREDINFO at +0x0C) */
+static void user_connect(uint32_t ci) {
+    /* usersrv: USERCONNECT { ulVersion, ulCurrentVersion, dwDispatchCount,
+     * SHAREDINFO siClient { psi, aheList, pDispInfo, ulSharedDelta, ... } }.
+     * SERVERINFO, the handle table (w32kuser.c keeps both) and the
+     * display info (zeroed). */
+    uint8_t *psi = native32_user_psi, *ahe = native32_user_ahe;
+    uint8_t* disp = native32_user_disp;
+    if (!psi) {
+        psi = native32_user_psi = (uint8_t*)VirtualAlloc(NULL, 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        /* 0x10000 HANDLEENTRYs of 12 bytes: a host HWND's own index fits */
+        ahe = native32_user_ahe = (uint8_t*)VirtualAlloc(NULL, 0xC0000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        disp = native32_user_disp = (uint8_t*)VirtualAlloc(NULL, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        *(uint32_t*)(psi + nt_si(native32_guest_peb, 8)) = 0x10000;   /* cHandleEntries */
+        *(uint32_t*)(psi + nt_si(native32_guest_peb, 0x864)) = 1;                    /* cCaptures: never 0, so GetCapture asks NtUserGetThreadState(2) */
+    }
+    MEM32(ci + 0x04) = MEM32(ci + 0x00);
+    MEM32(ci + 0x0C) = (uint32_t)(uintptr_t)psi;
+    MEM32(ci + 0x10) = (uint32_t)(uintptr_t)ahe;
+    MEM32(ci + 0x14) = (uint32_t)(uintptr_t)disp;
+    /* ulSharedDelta: user32 subtracts it from every kernel pointer in the
+     * shared section (pDispInfo->pMonitorPrimary, ...). The section is
+     * ours, so 0; left unset it was the caller's stack (0xCCCC...) */
+    MEM32(ci + 0x18) = 0;
+    {
+        /* SHAREDINFO +0xE8 DefWindowMsgs { maxMsgs, abMsgs }: the messages
+         * DefWindowProc hands to win32k. All of them: the host's
+         * DefWindowProc answers (w32kuser.c). +0xF0 DefWindowSpecMsgs,
+         * the ones user32 answers itself from the WND: none. */
+        static uint8_t all[0x80];
+        memset(all, 0xFF, sizeof all);
+        uint32_t dm = ci + 0x0C + nt_shared_defmsgs(native32_guest_peb);   /* (XP: +0x108) */
+        MEM32(dm) = 0x3FF;
+        MEM32(dm + 4) = (uint32_t)(uintptr_t)all;
+        /* (DefWindowSpecMsgs said so; left as the buffer had it, XP's explorer
+         * read 0x020A0000 messages from a NULL bitmap) */
+        MEM32(dm + 8) = 0, MEM32(dm + 12) = 0;
+    }
+}
+
+/* NtUserProcessConnect(hProcess, USERCONNECT*), NT 6: { ulVersion, SHAREDINFO } (user32's
+ * UserClientDllInitialize; no usersrv in csrss any more), 0x118 bytes of SHAREDINFO */
+uint32_t native32_user_process_connect(uint32_t* a) {
+    static uint32_t c[0x50];
+    if (!a[1]) return 0xC000000Du;
+    c[0] = MEM32(a[1]);
+    user_connect((uint32_t)(uintptr_t)c);
+    memcpy((void*)(uintptr_t)(a[1] + 4), c + 3, 0x118);
+    return 0;
+}
+
 /* csrsrv 0, ClientConnect { ServerDllIndex; ConnectionInformation*; Length }:
  * ntdll's CsrClientConnectToServer, once per server DLL. consrv (2) fills
  * CONSOLE_INFO at the start of its connect info: the console is the host's,
@@ -99,44 +151,7 @@ static uint32_t client_connect(uint32_t data, uint32_t capture) {
     (void)capture;
     if (getenv("NATIVE32_SYSCALLS"))
         fprintf(stderr, "[csr] client connect, server %u, info %08X len %u\n", index, ci, MEM32(data + 8));
-    if (index == 3 && ci && MEM32(data + 8) >= 0x104) {
-        /* usersrv: USERCONNECT { ulVersion, ulCurrentVersion, dwDispatchCount,
-         * SHAREDINFO siClient { psi, aheList, pDispInfo, ulSharedDelta, ... } }.
-         * SERVERINFO, the handle table (w32kuser.c keeps both) and the
-         * display info (zeroed). */
-        uint8_t *psi = native32_user_psi, *ahe = native32_user_ahe;
-        uint8_t* disp = native32_user_disp;
-        if (!psi) {
-            psi = native32_user_psi = (uint8_t*)VirtualAlloc(NULL, 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-            /* 0x10000 HANDLEENTRYs of 12 bytes: a host HWND's own index fits */
-            ahe = native32_user_ahe = (uint8_t*)VirtualAlloc(NULL, 0xC0000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-            disp = native32_user_disp = (uint8_t*)VirtualAlloc(NULL, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-            *(uint32_t*)(psi + 8) = 0x10000;                  /* cHandleEntries */
-            *(uint32_t*)(psi + nt_si(native32_guest_peb, 0x864)) = 1;                    /* cCaptures: never 0, so GetCapture asks NtUserGetThreadState(2) */
-        }
-        MEM32(ci + 0x04) = MEM32(ci + 0x00);
-        MEM32(ci + 0x0C) = (uint32_t)(uintptr_t)psi;
-        MEM32(ci + 0x10) = (uint32_t)(uintptr_t)ahe;
-        MEM32(ci + 0x14) = (uint32_t)(uintptr_t)disp;
-        /* ulSharedDelta: user32 subtracts it from every kernel pointer in the
-         * shared section (pDispInfo->pMonitorPrimary, ...). The section is
-         * ours, so 0; left unset it was the caller's stack (0xCCCC...) */
-        MEM32(ci + 0x18) = 0;
-        {
-            /* SHAREDINFO +0xE8 DefWindowMsgs { maxMsgs, abMsgs }: the messages
-             * DefWindowProc hands to win32k. All of them: the host's
-             * DefWindowProc answers (w32kuser.c). +0xF0 DefWindowSpecMsgs,
-             * the ones user32 answers itself from the WND: none. */
-            static uint8_t all[0x80];
-            memset(all, 0xFF, sizeof all);
-            uint32_t dm = ci + 0x0C + nt_shared_defmsgs(native32_guest_peb);   /* (XP: +0x108) */
-            MEM32(dm) = 0x3FF;
-            MEM32(dm + 4) = (uint32_t)(uintptr_t)all;
-            /* (DefWindowSpecMsgs said so; left as the buffer had it, XP's explorer
-             * read 0x020A0000 messages from a NULL bitmap) */
-            MEM32(dm + 8) = 0, MEM32(dm + 12) = 0;
-        }
-    }
+    if (index == 3 && ci && MEM32(data + 8) >= 0x104) user_connect(ci);
     if (index == 2 && ci) {
         MEM32(ci + 0x00) = 0x0C0Eu;
         MEM32(ci + 0x04) = (uint32_t)(uintptr_t)CreateEventA(NULL, TRUE, FALSE, NULL);
@@ -605,7 +620,7 @@ static uint32_t theme_request(uint32_t* a) {
 void native32_theme_start(void) {
     static int done;
     wchar_t v[8];
-    if (done || !nt_guest_xp(native32_guest_peb)) return;
+    if (done || !nt_guest_xp(native32_guest_peb) || nt_guest_vista(native32_guest_peb)) return;
     done = 1;
     if (!native32_registry_box_sz(L"Software\\Microsoft\\Windows\\CurrentVersion\\ThemeManager", L"ThemeActive", v, 8) || v[0] != L'1')
         return;
@@ -627,7 +642,8 @@ static uint32_t ovr_connect(uint32_t* a) {
     uint32_t name = a[1];
     int n = name ? MEM16(name) / 2 : 0;
     const wchar_t* s = name ? (const wchar_t*)(uintptr_t)MEM32(name + 4) : L"";
-    if (nt_guest_xp(native32_guest_peb) && n >= 13 && !_wcsnicmp(s + n - 13, L"\\ThemeApiPort", 13)) {
+    /* (XP's protocol: Vista's theme service speaks another, not answered yet: Classic) */
+    if (nt_guest_xp(native32_guest_peb) && !nt_guest_vista(native32_guest_peb) && n >= 13 && !_wcsnicmp(s + n - 13, L"\\ThemeApiPort", 13)) {
         if (!g_theme_port) g_theme_port = CreateEventA(NULL, FALSE, FALSE, NULL);
         MEM32(a[0]) = (uint32_t)(uintptr_t)g_theme_port;
         return 0;

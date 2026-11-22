@@ -495,6 +495,14 @@ static uint32_t ovr_query_process(uint32_t* a) {
         if (a[4]) MEM32(a[4]) = 4;
         return 0;
     }
+    /* ProcessExecuteFlags: Vista's RtlIsValidHandler takes a handler in memory that
+     * is not an executable image only with execution (and dispatch) enabled; the
+     * guest's modules are data to the host */
+    if (a[1] == 0x22 && a[3] >= 4 && nt_guest_vista(native32_guest_peb) && (a[0] == 0xFFFFFFFFu || GetProcessId((HANDLE)(uintptr_t)a[0]) == GetCurrentProcessId())) {
+        MEM32(a[2]) = 0x32;   /* MEM_EXECUTE_OPTION_ENABLE | EXECUTE_DISPATCH_ENABLE | IMAGE_DISPATCH_ENABLE */
+        if (a[4]) MEM32(a[4]) = 4;
+        return 0;
+    }
     uint32_t r = native32_nt_forward("NtQueryInformationProcess", a);
     if (!r && a[1] == 0 && (a[0] == 0xFFFFFFFFu || GetProcessId((HANDLE)(uintptr_t)a[0]) == GetCurrentProcessId()))
         MEM32(a[2] + 4) = native32_guest_peb;
@@ -1104,6 +1112,12 @@ int native32_nt_win32k(const uint32_t* bases, int nbases, const char* names_file
     return stubs;
 }
 
+/* a service of the guest's own win32k table (another build may not have it) */
+int native32_nt_win32k_has(const char* name) {
+    for (int i = 0; i < W32K_MAX; i++)
+        if (!strcmp(g_w32k[i].name, name)) return 1;
+    return 0;
+}
 void native32_nt_win32k_override(const char* name, native32_syscall_fn fn) {
     for (int i = 0; i < W32K_MAX; i++)
         if (!strcmp(g_w32k[i].name, name)) { g_w32k[i].fn = fn; return; }

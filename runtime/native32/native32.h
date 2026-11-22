@@ -336,6 +336,8 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
  * services are logged and return 0; a host answers by name. */
 int native32_nt_win32k(const uint32_t* bases, int nbases, const char* names_file);
 void native32_nt_win32k_override(const char* name, native32_syscall_fn fn);
+int native32_nt_win32k_has(const char* name);
+uint32_t native32_user_process_connect(uint32_t* a);   /* csr32.c: NT 6 */
 /* Called before every win32k service, as win32k flushes GDI's TEB batch on entry. */
 extern void (*native32_win32k_pre)(void);
 /* A user-mode callback, as win32k makes one (KeUserModeCallback): the guest
