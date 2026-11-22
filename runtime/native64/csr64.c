@@ -42,8 +42,7 @@ static uint64_t base_static_server_data(void) {
     wchar_t sys[MAX_PATH], win[MAX_PATH], obj[64];
     DWORD session = 0;
     /* the guest's own directories: its system folder is where its modules are */
-    const wchar_t* dll = (const wchar_t*)(uintptr_t)*(uint64_t*)(uintptr_t)(*(uint64_t*)(peb + 0x20) + 0x58);
-    wcsncpy(sys, dll, MAX_PATH - 1), sys[MAX_PATH - 1] = 0;
+    wcsncpy(sys, native64_sysdir(), MAX_PATH - 1), sys[MAX_PATH - 1] = 0;
     wcscpy(win, sys);
     if (wcsrchr(win, L'\\')) *wcsrchr(win, L'\\') = 0;
     ProcessIdToSessionId(GetCurrentProcessId(), &session);

@@ -506,6 +506,19 @@ def main():
     # dispatch targets get closed over too.
     ptrs = reloc_code_pointers(data, base, secs, reloc_rva, reloc_sz,
                                text_lo, text_hi)
+    if not reloc_rva:
+        # A fixed-base EXE has no .reloc (XP x64's cmd.exe), so its stored code
+        # pointers (cmd's command and callback tables in .data) are found the
+        # other way: every aligned qword of a data section that lands in .text
+        # on something that decodes as code.
+        for (nm, vsa, vs, ra, rs) in secs:
+            if nm in ('.text', '.pdata', '.rsrc', '.reloc'):
+                continue
+            blob = data[ra:ra + min(vs, rs)]
+            for o in range(0, len(blob) - 7, 8):
+                v = struct.unpack_from('<Q', blob, o)[0]
+                if text_lo <= v < text_hi and v not in ptrs and plausible_code(read_va, v):
+                    ptrs.add(v)
     starts = sorted(bounds)
     added_ptr = 0
     for t in sorted(ptrs):

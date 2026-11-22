@@ -51,6 +51,7 @@ int native64_boot(const native64_module_t* mods, int n, const native64_boot_t* b
 
 uint64_t native64_export(uint64_t base, const char* name);
 uint64_t native64_module(const char* file);  /* a lifted module's base, or 0 */
+const wchar_t* native64_sysdir(void);        /* the guest's system folder */
 extern uint64_t native64_peb;
 extern int native64_trace;                        /* NATIVE64_SYSCALLS=1 */
 

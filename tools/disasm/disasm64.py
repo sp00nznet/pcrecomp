@@ -299,10 +299,19 @@ class Disassembler64:
                     bytes_at, idx = self.pe.base + bm.disp, _canon(ins.reg_name(bm.index))
                 break
         bound = None
+        # The index is compared before it is widened: `cmp edx, N; ja; movsxd
+        # rax, edx` (XP x64's cmd.exe), so a copy into the index register
+        # counts as the same index.
+        names = {idx}
         for ins in reversed(prior):         # cmp rI, N ; ja default
+            if ins.mnemonic in ('movsxd', 'mov', 'movzx') and len(ins.operands) == 2 and \
+                    ins.operands[0].type == X86_OP_REG and ins.operands[1].type == X86_OP_REG and \
+                    _canon(ins.reg_name(ins.operands[0].reg)) in names:
+                names.add(_canon(ins.reg_name(ins.operands[1].reg)))
+                continue
             if ins.mnemonic == 'cmp' and ins.operands[0].type == X86_OP_REG and \
                     ins.operands[1].type == X86_OP_IMM and \
-                    _canon(ins.reg_name(ins.operands[0].reg)) == idx:
+                    _canon(ins.reg_name(ins.operands[0].reg)) in names:
                 nxt = fn.get(ins.address + ins.size)
                 if nxt is not None and nxt.mnemonic in ('ja', 'jae'):
                     bound = ins.operands[1].imm + (1 if nxt.mnemonic == 'ja' else 0)

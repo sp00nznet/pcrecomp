@@ -101,9 +101,12 @@ static void guest_stack_dump(CPU* c) {
                     "  r8=%llX r9=%llX r10=%llX r11=%llX r12=%llX r13=%llX r14=%llX r15=%llX\n  callers:",
             c->rax, c->rcx, c->rdx, c->rbx, c->rsp, c->rbp, c->rsi, c->rdi,
             c->r8, c->r9, c->r10, c->r11, c->r12, c->r13, c->r14, c->r15);
+    /* the guest stack runs from rsp to its TEB's StackBase (no probing: the
+     * vectored handler would see IsBadReadPtr's faults first) */
+    uint64_t top = g_guest_gs ? *(uint64_t*)(uintptr_t)(g_guest_gs + 8) : c->rsp + 0x8000;
     for (int i = 0, k = 0; i < 4096 && k < 24; i++) {
         uint64_t p = c->rsp + 8 * i, v, off;
-        if (IsBadReadPtr((void*)(uintptr_t)p, 8)) break;
+        if (p + 8 > top) break;
         v = *(uint64_t*)(uintptr_t)p;
         const char* m = mod_of(v, &off);
         if (*m != '?') fprintf(stderr, " %s+%llX", m, off), k++;
@@ -297,6 +300,8 @@ static LONG CALLBACK fault(EXCEPTION_POINTERS* ep) {
     EXCEPTION_RECORD* r = ep->ExceptionRecord;
     if ((r->ExceptionCode & 0xF0000000u) != 0xC0000000u || !t_cpu) return EXCEPTION_CONTINUE_SEARCH;
     if (r->ExceptionCode == 0xC0000028u || r->ExceptionCode == 0xC0000029u) return EXCEPTION_CONTINUE_SEARCH;  /* unwinds */
+    static volatile LONG once;
+    if (InterlockedExchange(&once, 1)) return EXCEPTION_CONTINUE_SEARCH;   /* a fault while reporting one */
     uint64_t off;
     const char* m = mod_of(t_cpu->rip, &off);
     fprintf(stderr, "\n=== host exception %08lX at %p (address %llX) in lifted %s+%llX (%llX) ===\n",
@@ -310,6 +315,7 @@ static LONG CALLBACK fault(EXCEPTION_POINTERS* ep) {
 
 /* ---- the files box -------------------------------------------------------- */
 static wchar_t g_box[MAX_PATH], g_sys[MAX_PATH];
+const wchar_t* native64_sysdir(void) { return g_sys; }
 
 /* The NT path an OBJECT_ATTRIBUTES names, as a DOS path when it is one. */
 static int oa_path(uint64_t oa, wchar_t* out, int max) {
@@ -510,10 +516,42 @@ static uint64_t ovr_query_thread(uint64_t* a) {
     return r;
 }
 
-/* NtContinue(CONTEXT*, alert): the thread resumes at the context, from the top */
+/* ---- resumable guest frames ------------------------------------------------
+ * A lifted function that has an exception handler opens with ES3_EH_ENTER
+ * (eh64.h): a setjmp landing pad whose resume address goes through the
+ * function's local dispatch. The guest's own exception dispatch (its ntdll's
+ * RtlDispatchException / RtlUnwindEx over the faithful guest stack and the
+ * original .pdata) ends in NtContinue(context); when the context lands in a
+ * live frame's function, at or below that frame's entry rsp, the host
+ * longjmps into the frame and the body resumes at the context's rip. */
+#define EHMAX 512
+static __declspec(thread) struct { es3_ehframe_t* f; uint64_t rsp; } t_eh[EHMAX];
+static __declspec(thread) int t_ehn;
+
+void es3_eh_push(es3_ehframe_t* f, uint64_t func, jmp_buf* jb) {
+    f->jb = jb, f->func = func, f->resume = 0, f->cs_depth = t_ehn, f->prev = NULL;
+    if (t_ehn < EHMAX) t_eh[t_ehn].f = f, t_eh[t_ehn].rsp = t_cpu ? t_cpu->rsp : 0;
+    t_ehn++;
+}
+void es3_eh_pop(es3_ehframe_t* f) { t_ehn = f->cs_depth; }
+
+/* NtContinue(CONTEXT*, alert): the thread resumes at the context: in a live
+ * resumable frame, else from the thread's top */
 static __declspec(thread) uint8_t t_ctx[0x4D0];
+static void load_context(CPU* c, const uint8_t* x);
 static uint64_t ovr_continue(uint64_t* a) {
     memcpy(t_ctx, (void*)(uintptr_t)a[0], sizeof t_ctx);
+    uint64_t rip = *(uint64_t*)(t_ctx + 0xF8), rsp = *(uint64_t*)(t_ctx + 0x98);
+    for (int i = (t_ehn < EHMAX ? t_ehn : EHMAX) - 1; i >= 0; i--) {
+        es3_ehframe_t* f = t_eh[i].f;
+        if (rsp < t_eh[i].rsp && rip >= f->func && rip - f->func < 0x100000) {
+            if (native64_trace) fprintf(stderr, "[native64] resume %llX in the frame of %llX\n", rip, f->func);
+            load_context(t_cpu, t_ctx);
+            t_ehn = i + 1;
+            f->resume = rip;
+            longjmp(*f->jb, 1);
+        }
+    }
     longjmp(*t_top, 1);
 }
 static void load_context(CPU* c, const uint8_t* x) {
@@ -533,14 +571,34 @@ static uint64_t ovr_terminate_process(uint64_t* a) {
     }
     return native64_forward("NtTerminateProcess", a);
 }
+/* NtRaiseException(record, context, first chance): the kernel's exception
+ * dispatch, done the way it does it: the CONTEXT and the EXCEPTION_RECORD
+ * after it on the guest stack below the faulting frame, and the guest's own
+ * KiUserExceptionDispatcher, whose RtlDispatchException walks the guest's
+ * frames with its own unwinder and ends in NtContinue (ovr_continue resumes
+ * a live frame) or raises again as last chance. */
+static __declspec(thread) int t_raise_depth;
 static uint64_t ovr_raise_exception(uint64_t* a) {
     EXCEPTION_RECORD* r = (EXCEPTION_RECORD*)(uintptr_t)a[0];
-    uint64_t off;
+    const uint8_t* ctx = (const uint8_t*)(uintptr_t)a[1];
+    uint64_t off, kiued = native64_export(native64_module("ntdll.dll"), "KiUserExceptionDispatcher");
     const char* m = mod_of((uint64_t)(uintptr_t)r->ExceptionAddress, &off);
-    fprintf(stderr, "\n[native64] guest raises %08lX at %s+%llX (no guest exception dispatch yet)\n", r->ExceptionCode, m, off);
-    guest_stack_dump(t_cpu);
-    fflush(stderr);
-    TerminateProcess(GetCurrentProcess(), 5);
+    if (native64_trace || !a[2] || !kiued || t_raise_depth > 8)
+        fprintf(stderr, "\n[native64] guest raises %08lX at %s+%llX (%s chance)\n", r->ExceptionCode, m, off,
+                a[2] ? "first" : "last");
+    if (!a[2] || !kiued || t_raise_depth > 8) {
+        guest_stack_dump(t_cpu);
+        fflush(stderr);
+        TerminateProcess(GetCurrentProcess(), 5);
+    }
+    CPU* c = t_cpu;
+    uint64_t sp = (*(const uint64_t*)(ctx + 0x98) - 0x100 - 0x4D0 - 0xA0) & ~(uint64_t)15;
+    memcpy((void*)(uintptr_t)sp, ctx, 0x4D0);
+    memcpy((void*)(uintptr_t)(sp + 0x4D0), r, 0x98);
+    c->rsp = sp;
+    t_raise_depth++;
+    dispatch(c, kiued);        /* does not come back: NtContinue or a last-chance raise */
+    t_raise_depth--;
     return 0;
 }
 static uint64_t ovr_create_thread(uint64_t* a) {
@@ -684,9 +742,13 @@ int native64_boot(const native64_module_t* mods, int n, const native64_boot_t* b
     wcsncpy(g_sys, b->sysdir, MAX_PATH - 1);
     wcsncpy(g_box, b->box, MAX_PATH - 1);
     for (int i = 0; i < n && g_nmod < MAXMODS; i++) {
-        _snwprintf(p, MAX_PATH - 1, L"%ls\\%hs", b->sysdir, mods[i].file);
+        /* "stub/shell32.dll": a stand-in module beside sysdir (sysdir\..\stub),
+         * found first on the guest's DllPath; matched by its file name */
+        const char* slash = strrchr(mods[i].file, '/');
+        if (slash) _snwprintf(p, MAX_PATH - 1, L"%ls\\..\\%hs", b->sysdir, mods[i].file);
+        else _snwprintf(p, MAX_PATH - 1, L"%ls\\%hs", b->sysdir, mods[i].file);
         if (!map_image(p, mods[i].base, &g_mod[g_nmod].size)) return 0;
-        strncpy(g_mod[g_nmod].file, mods[i].file, 63);
+        strncpy(g_mod[g_nmod].file, slash ? slash + 1 : mods[i].file, 63);
         g_mod[g_nmod++].base = mods[i].base;
     }
     g_boot.b = b;
@@ -793,7 +855,14 @@ int native64_boot(const native64_module_t* mods, int n, const native64_boot_t* b
     ustr(pp + 0x38, cur, &pool, MAX_PATH * 2);                     /* CurrentDirectory.DosPath */
     *(uint64_t*)(pp + 0x48) = (uint64_t)(uintptr_t)CreateFileW(cur, FILE_TRAVERSE | SYNCHRONIZE,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
-    ustr(pp + 0x50, b->sysdir, &pool, 0);                          /* DllPath */
+    {   /* DllPath: the stand-ins (sysdir\..\stub) first, then the guest's system folder */
+        wchar_t dp[2 * MAX_PATH + 2], stub[MAX_PATH], full[MAX_PATH];
+        _snwprintf(stub, MAX_PATH - 1, L"%ls\\..\\stub", b->sysdir);
+        GetFullPathNameW(stub, MAX_PATH, full, NULL);
+        _snwprintf(dp, 2 * MAX_PATH, L"%ls;%ls", full, b->sysdir);
+        dp[2 * MAX_PATH] = 0;
+        ustr(pp + 0x50, dp, &pool, 0);                             /* DllPath */
+    }
     ustr(pp + 0x60, img, &pool, 0);                                /* ImagePathName */
     ustr(pp + 0x70, b->cmdline, &pool, 0);                         /* CommandLine */
     *(uint64_t*)(pp + 0x80) = (uint64_t)(uintptr_t)make_env();     /* Environment */
