@@ -31,9 +31,31 @@ static inline int ntstub_parse(const uint8_t* b, uint32_t* svc, uint8_t* argc) {
 #else
 #define NTGUEST_VA(va) ((uintptr_t)(uint32_t)(va))
 #endif
-/* NT 5.1 (Windows XP, build 2600) or later, by the guest PEB's build number */
+/* XP's layouts (NT 5.1, build 2600, or later) by the guest's version, not its
+ * build number alone: Windows "Neptune" (NT 5.50, build 5111, 1999) is a later
+ * build of Windows 2000's line, with 2000's kernel, win32k and user32 (its
+ * service tables are 2000's, NtUserCreateWindowEx takes 13; neptune-recomp
+ * docs/survey.md), so 5.50 keeps 2000's whatever its build. A minor version
+ * of 50 or more is that pre-XP line; 5.1 and 5.2 are XP and Server 2003. */
+static inline int nt_ver_xp(uint32_t major, uint32_t minor) {
+    if (major == 5 && minor >= 50) return 0;
+    return major > 5 || (major == 5 && minor >= 1);
+}
+/* the same, by the guest PEB (OSMajorVersion +0xA4, OSMinorVersion +0xA8);
+ * a PEB not filled yet (0.0.0) is not XP */
 static inline int nt_guest_xp(uint32_t peb) {
-    return peb && *(const uint16_t*)NTGUEST_VA(peb + 0xAC) >= 2600;
+    return peb && nt_ver_xp(*(const uint32_t*)NTGUEST_VA(peb + 0xA4), *(const uint32_t*)NTGUEST_VA(peb + 0xA8));
+}
+/* Neptune's 5.50 line: 2000's layouts but for what differs below */
+static inline int nt_guest_neptune(uint32_t peb) {
+    return peb && *(const uint32_t*)NTGUEST_VA(peb + 0xA4) == 5 && *(const uint32_t*)NTGUEST_VA(peb + 0xA8) >= 50;
+}
+
+/* kernel32 reads the user's NLS settings out of BASE_STATIC_SERVER_DATA (csr32.c)
+ * rather than asking basesrv: builds before 2195 (2163) and Neptune, which
+ * branched from 2000 before that change (its kernel32 has no NlsGetUserInfo call) */
+static inline int nt_guest_nls_static(uint32_t peb) {
+    return peb && (*(const uint16_t*)NTGUEST_VA(peb + 0xAC) < 2195 || nt_guest_neptune(peb));
 }
 
 /* GDI's shared memory (Peb->GdiSharedHandleTable): the handle table, then
@@ -53,6 +75,14 @@ static inline uint32_t nt_gdi_devcaps(uint32_t peb) { return nt_guest_xp(peb) ? 
 static inline uint32_t nt_wnd(uint32_t peb, uint32_t o) {
     if (!nt_guest_xp(peb) || o < 0x30) return o;
     return o < 0x98 ? o + 4 : o + 0xC;
+}
+/* CLIENTINFO (TEB+0x6CC), an offset into it: Neptune has 0x10 more bytes after
+ * dwCompatFlags2 (+0x10), so pDeskInfo is +0x28, ulClientDelta +0x2C and
+ * CallbackWnd TEB+0x704 (2000: +0x18, +0x1C, 0x6F4; read off its ValidateHwnd
+ * and DispatchClientMessage). ponytail: shifted to the end of what 2000's user32
+ * reads (+0x74); XP's is 2000's. */
+static inline uint32_t nt_ci(uint32_t peb, uint32_t o) {
+    return nt_guest_neptune(peb) && o >= 0x14 ? o + 0x10 : o;
 }
 /* SERVERINFO: +0xC from the start, +0x20 for atomSysClass, +0x24 from
  * wMaxBtnSize through aiSysMet; argbSystem (+0xB8) then ahbrSystem (+0xC0)
@@ -89,6 +119,9 @@ static inline uint32_t nt_routine(uint32_t peb, uint32_t x) {
         { 0x5E, 0x50 }, { 0x60, 0x53 }, { 0x62, 0x55 }, { 0x63, 0x56 }, { 0x65, 0x57 }, { 0x69, 0x5B }, { 0x6A, 0x5C },
         { 0x6E, 0x5E }, { 0x6F, 0x5F }, { 0x70, 0x60 } };
     int n = (int)(sizeof a / sizeof a[0]);
+    /* Neptune: one routine fewer than 2000 between 0x12 (ClientThreadSetup's, both)
+     * and Neptune's 0x15 (BeginDeferWindowPos's, 2000's 0x16); 0x13/0x14 unmatched */
+    if (nt_guest_neptune(peb)) return x <= 0x12 ? x : x >= 0x15 ? x + 1 : 0xFFFF;
     if (!nt_guest_xp(peb)) return x;
     for (int i = 0; i < n; i++) {
         if (a[i][0] == x) return a[i][1];

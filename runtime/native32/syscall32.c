@@ -1373,7 +1373,7 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
     ntdll_version(ntdll, &major, &minor, &build);
     {   /* XP: a class object registers in process only when it cannot as a local server (native32.c) */
         uint32_t ole = native32_module("ole32.dll");
-        if (ole && build >= 2600) native32_co_register_guard(native32_export(ole, "CoRegisterClassObject"));
+        if (ole && nt_ver_xp(major, minor)) native32_co_register_guard(native32_export(ole, "CoRegisterClassObject"));
     }
     *(uint32_t*)(peb + 0x08) = exe;
     *(uint32_t*)(peb + 0x10) = (uint32_t)(uintptr_t)pp;

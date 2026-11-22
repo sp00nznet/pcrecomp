@@ -47,7 +47,10 @@ static uint32_t call(void* fn, int n, const uint32_t* args, uint32_t* esp_after)
     return g_eax;
 }
 
+#include "ntguest.h"
 int main(void) {
+    /* XP layouts by version: 2000 (5.0.2195) and Neptune (5.50.5111) keep 2000's */
+    CHECK(!nt_ver_xp(5, 0) && !nt_ver_xp(5, 50) && nt_ver_xp(5, 1) && nt_ver_xp(5, 2) && nt_ver_xp(6, 0));
     native32_init();
     mach_enter();                       /* a guest stack and TIB for this thread */
     uint32_t esp0 = g_esp, after, eax = 0;

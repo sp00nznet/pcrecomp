@@ -68,8 +68,9 @@ static uint32_t base_static_server_data(void) {
     *(uint32_t*)(d + 0x180) = (uint32_t)(uintptr_t)calloc(1, 0x40);
     /* Before build 2195 (2163, a release candidate) kernel32 reads the user's
      * NLS settings from an NLS_USER_INFO inside this data, at 0x184;
-     * UserLocaleId is its +0x1860. 2195 asks basesrv instead (api 26). */
-    if (MEM16(native32_guest_peb + 0xAC) < 2195) MEM32((uint32_t)(uintptr_t)d + 0x184 + 0x1860) = GetUserDefaultLCID();
+     * UserLocaleId is its +0x1860. 2195 asks basesrv instead (api 26); Neptune
+     * (5.50.5111) reads it here, as 2163 (ntguest.h). */
+    if (nt_guest_nls_static(native32_guest_peb)) MEM32((uint32_t)(uintptr_t)d + 0x184 + 0x1860) = GetUserDefaultLCID();
     return (uint32_t)(uintptr_t)d;
 }
 
@@ -441,7 +442,7 @@ static uint32_t lpc_connect(uint32_t* a, int secure) {
     /* NlsGetUserInfo is basesrv 26 on NT 5.0 and 30 on NT 5.1 (Windows XP),
      * where 26 is another api: the guest's build (its PEB, set by now) says */
     {
-        uint32_t nls = MEM16(native32_guest_peb + 0xAC) >= 2600 ? 30 : 26;
+        uint32_t nls = nt_guest_xp(native32_guest_peb) ? 30 : 26;
         if (!g_api[1][nls]) native32_csr_api(0x10000 | nls, nls_get_user_info);
         if (nls == 30 && !g_api[1][27]) native32_csr_api(0x1001B, sxs_create_actctx);
     }

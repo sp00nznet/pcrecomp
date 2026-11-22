@@ -27,6 +27,7 @@
 #define WO(o) nt_wnd(native32_guest_peb, (o))
 #define SO(o) nt_si(native32_guest_peb, (o))
 #define CB(i) nt_cb(native32_guest_peb, (i))
+#define CI(o) nt_ci(native32_guest_peb, (o))   /* (Neptune: CLIENTINFO 0x10 longer) */
 
 /* UNICODE_STRING (buffer at +4) / LARGE_STRING (buffer at +8): a name, or an
  * atom in its place */
@@ -73,9 +74,9 @@ static void thread_setup(void) {
         *(uint32_t*)(g_deskinfo + 4) = (uint32_t)(uintptr_t)g_desk + DESK_SIZE;   /* pvDesktopLimit */
         g_desk_top = 0x100;
     }
-    if (MEM32(ci + 0x18) != (uint32_t)(uintptr_t)g_deskinfo) {
-        MEM32(ci + 0x18) = (uint32_t)(uintptr_t)g_deskinfo;
-        MEM32(ci + 0x1C) = 0;                                                   /* ulClientDelta */
+    if (MEM32(ci + CI(0x18)) != (uint32_t)(uintptr_t)g_deskinfo) {
+        MEM32(ci + CI(0x18)) = (uint32_t)(uintptr_t)g_deskinfo;
+        MEM32(ci + CI(0x1C)) = 0;                                                   /* ulClientDelta */
         /* +0x08 dwExpWinVer (GETAPPVER): >= 4.0 gives dialogs DS_3DLOOK and
          * a normal-weight font. ponytail: 5.0 for every program, read the
          * image's subsystem version if a 3.x one ever runs */
@@ -662,8 +663,8 @@ static LRESULT wnd_thunk_body(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (!pfn || !g_dcm) return DefWindowProcW(h, m, w, l);
     if (native32_cb_in) native32_cb_in(args);   /* (as the bridge would: the WND, GDI handles) */
     ansi = class_ansi(h);
-    teb = MEM32(g_fs_base + 0x18), oh = MEM32(teb + 0x6F4), op = MEM32(teb + 0x6F8);
-    MEM32(teb + 0x6F4) = args[0], MEM32(teb + 0x6F8) = (uint32_t)(uintptr_t)pw;
+    teb = MEM32(g_fs_base + 0x18), oh = MEM32(teb + 0x6CC + CI(0x28)), op = MEM32(teb + 0x6CC + CI(0x2C));
+    MEM32(teb + 0x6CC + CI(0x28)) = args[0], MEM32(teb + 0x6CC + CI(0x2C)) = (uint32_t)(uintptr_t)pw;
     if ((m == WM_CREATE || m == WM_NCCREATE) && l) {
         uint32_t msg[0x18] = { 0 };
         char an[256], ac[256];
@@ -714,7 +715,7 @@ static LRESULT wnd_thunk_body(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (st == 0 && o && olen >= 4) rep[0] = MEM32(o);
         else if (st) fprintf(stderr, "[user] callback for message 0x%X: status %08X\n", m, st);
     }
-    MEM32(teb + 0x6F4) = oh, MEM32(teb + 0x6F8) = op;
+    MEM32(teb + 0x6CC + CI(0x28)) = oh, MEM32(teb + 0x6CC + CI(0x2C)) = op;
     /* the callback's return flushes the TEB's GDI batch, as win32k's does
      * (calc's owner-drawn buttons: DrawEdge's PatBlts are batched) */
     if (native32_win32k_pre) native32_win32k_pre();
