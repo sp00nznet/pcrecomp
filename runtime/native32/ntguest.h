@@ -39,6 +39,10 @@ static inline int nt_guest_xp(uint32_t peb) {
 static inline int nt_guest_vista(uint32_t peb) {
     return peb && *(const uint16_t*)NTGUEST_VA(peb + 0xAC) >= 6000;
 }
+/* NT 6.1 (Windows 7 / Thin PC, build 7600): Vista's, except where it says */
+static inline int nt_guest_win7(uint32_t peb) {
+    return peb && *(const uint16_t*)NTGUEST_VA(peb + 0xAC) >= 7600;
+}
 
 /* GDI's shared memory (Peb->GdiSharedHandleTable): the handle table, then
  * the display's DEVCAPS that gdi32's GetDeviceCaps reads. Windows 2000 has

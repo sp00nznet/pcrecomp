@@ -486,6 +486,13 @@ static int fb_install(const wchar_t* image_path, const wchar_t* dll_path, const 
 
 /* NtQueryInformationProcess(ProcessBasicInformation) on this process names
  * the HOST's PEB; the guest wants its own. */
+/* NtSetInformationProcess ProcessConsoleHostProcess (NT 6.1): kernel32 records its
+ * conhost's process id (the host's kernel keeps that only for its own conhost) */
+static uint32_t ovr_set_process(uint32_t* a) {
+    if (a[1] == 0x31 && nt_guest_win7(native32_guest_peb) && (a[0] == 0xFFFFFFFFu || GetProcessId((HANDLE)(uintptr_t)a[0]) == GetCurrentProcessId()))
+        return 0;
+    return native32_nt_forward("NtSetInformationProcess", a);
+}
 static uint32_t ovr_query_process(uint32_t* a) {
     if (fb_on && a[1] == 23 && (a[0] == 0xFFFFFFFFu || GetProcessId((HANDLE)(uintptr_t)a[0]) == GetCurrentProcessId()))
         return fb_devmap(a);                                  /* ProcessDeviceMap */
@@ -500,6 +507,13 @@ static uint32_t ovr_query_process(uint32_t* a) {
      * guest's modules are data to the host */
     if (a[1] == 0x22 && a[3] >= 4 && nt_guest_vista(native32_guest_peb) && (a[0] == 0xFFFFFFFFu || GetProcessId((HANDLE)(uintptr_t)a[0]) == GetCurrentProcessId())) {
         MEM32(a[2]) = 0x32;   /* MEM_EXECUTE_OPTION_ENABLE | EXECUTE_DISPATCH_ENABLE | IMAGE_DISPATCH_ENABLE */
+        if (a[4]) MEM32(a[4]) = 4;
+        return 0;
+    }
+    /* ProcessConsoleHostProcess (NT 6.1): the process's conhost, whose LPC port
+     * kernel32's ConsoleConnect names by it. The guest's conhost is ours (csr32.c). */
+    if (a[1] == 0x31 && a[3] >= 4 && nt_guest_win7(native32_guest_peb) && (a[0] == 0xFFFFFFFFu || GetProcessId((HANDLE)(uintptr_t)a[0]) == GetCurrentProcessId())) {
+        MEM32(a[2]) = GetCurrentProcessId();
         if (a[4]) MEM32(a[4]) = 4;
         return 0;
     }
@@ -569,7 +583,7 @@ static uint32_t ovr_open_section(uint32_t* a) {
  *     host's never runs (the guard: no original Windows 2000 binary is ever
  *     started natively). Process creation is refused the same way. */
 #define MAX_IMAGES 64
-static struct { HANDLE h; uint32_t base, size; uint8_t* snap; int gone; } g_img[MAX_IMAGES];
+static struct { HANDLE h; uint32_t base, size; uint8_t* snap; int gone, views; } g_img[MAX_IMAGES];
 static int g_nimg;
 
 /* A lifted image is never really unmapped (its code is in the host), so a
@@ -869,6 +883,7 @@ static uint32_t ovr_map_view(uint32_t* a) {
     if (!g_img[i].snap) img_writable(i, 0);
     else if (g_img[i].gone) img_writable(i, 1);
     g_img[i].gone = 0;
+    g_img[i].views++;
     MEM32(a[2]) = g_img[i].base;
     MEM32(a[6]) = g_img[i].size;
     return 0;
@@ -883,10 +898,13 @@ static uint32_t ovr_close(uint32_t* a) {
     return native32_nt_forward("NtClose", a);
 }
 
-/* NtUnmapViewOfSection(Process, Base): a guest image or proxy stays mapped. */
+/* NtUnmapViewOfSection(Process, Base): a guest image or proxy stays mapped; its
+ * data is the file's again at the next map once its last view is gone. NT 6.1's
+ * loader maps a DLL it already has a second time (NtAreMappedFilesTheSame, the
+ * ApiSet's kernelbase) and unmaps that view: the loaded one keeps its data. */
 static uint32_t ovr_unmap_view(uint32_t* a) {
     for (int i = 0; i < g_nimg; i++)
-        if (g_img[i].base == a[1]) return g_img[i].gone = 1, 0;
+        if (g_img[i].base == a[1]) return g_img[i].gone = --g_img[i].views <= 0, 0;
     return native32_nt_forward("NtUnmapViewOfSection", a);
 }
 
@@ -1397,6 +1415,7 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
     IMAGE_NT_HEADERS32* ent = (IMAGE_NT_HEADERS32*)(uintptr_t)(exe + MEM32(exe + 0x3C));
     native32_guest_peb = (uint32_t)(uintptr_t)peb;
     native32_nt_override("NtQueryInformationProcess", ovr_query_process);
+    native32_nt_override("NtSetInformationProcess", ovr_set_process);
     native32_nt_override("NtOpenSection", ovr_open_section);
     native32_nt_override("NtCreateSection", ovr_create_section);
     native32_nt_override("NtMapViewOfSection", ovr_map_view);
@@ -1583,6 +1602,23 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
      * rebases their strings: the strings are within it, as the kernel makes them */
     if (build >= 6000) *(uint32_t*)(pp + 0x00) = *(uint32_t*)(pp + 0x04) = (uint32_t)(pool - pp);
 
+    /* NT 6.1: the ApiSet map the kernel puts in every process (PEB +0x38), the
+     * .apiset section of the guest's own apisetschema.dll (version 2: offsets from
+     * its start). The guest's loader resolves api-ms-win-* imports through it. */
+    if (build >= 7600) {
+        uint8_t* f = (uint8_t*)load_file(nls_dir, "apisetschema.dll");
+        if (!f) return 0;
+        IMAGE_NT_HEADERS32* nh = (IMAGE_NT_HEADERS32*)(f + *(uint32_t*)(f + 0x3C));
+        IMAGE_SECTION_HEADER* sh = IMAGE_FIRST_SECTION(nh);
+        for (int i = 0; i < nh->FileHeader.NumberOfSections; i++, sh++)
+            if (!memcmp(sh->Name, ".apiset", 7)) {
+                void* m = VirtualAlloc(NULL, sh->SizeOfRawData, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                memcpy(m, f + sh->PointerToRawData, sh->SizeOfRawData);
+                *(uint32_t*)(peb + 0x38) = (uint32_t)(uintptr_t)m;
+            }
+        VirtualFree(f, 0, MEM_RELEASE);
+        if (!*(uint32_t*)(peb + 0x38)) { fprintf(stderr, "[nt] apisetschema.dll has no .apiset section\n"); return 0; }
+    }
     /* The NLS tables the kernel maps into every process: the guest's own. */
     void* ansi = load_file(nls_dir, "c_1252.nls");
     void* oem = load_file(nls_dir, "c_437.nls");

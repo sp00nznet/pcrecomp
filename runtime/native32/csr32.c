@@ -156,6 +156,14 @@ static uint32_t client_connect(uint32_t data, uint32_t capture) {
         uint32_t a[2] = { 0, ci };
         native32_user_process_connect(a);
     } else if (index == 3 && ci && MEM32(data + 8) >= 0x104) user_connect(ci);
+    if (index == 2 && ci && nt_guest_win7(native32_guest_peb)) {
+        /* NT 6.1's CONSOLE_API_CONNECTINFO (0x21C): { ConsoleHandle, InitEvent, ConsoleApp
+         * (byte), ..., +0x10 title }. No init event: the console is there, kernel32 goes
+         * straight to ConsoleConnect (its conhost's port, below) */
+        MEM32(ci + 0x00) = 0x0C0Eu;
+        MEM32(ci + 0x04) = 0;
+        return 0;
+    }
     if (index == 2 && ci) {
         MEM32(ci + 0x00) = 0x0C0Eu;
         MEM32(ci + 0x04) = (uint32_t)(uintptr_t)CreateEventA(NULL, TRUE, FALSE, NULL);
@@ -451,6 +459,7 @@ uint32_t csr32_shared_section(void) {
     return (uint32_t)(uintptr_t)h;
 }
 static HANDLE g_port;     /* the guest's handle to \Windows\ApiPort: an event of ours */
+static HANDLE g_con_port; /* NT 6.1: its handle to its conhost's port (the same) */
 
 /* NtSecureConnectPort(Port*, Name, Qos, ClientView, Sid, ServerView, MaxLen*, Info, InfoLen*)
  * and NtConnectPort (the same without Sid). The client's port memory view is
@@ -463,6 +472,22 @@ static uint32_t lpc_connect(uint32_t* a, int secure) {
     uint32_t info = a[secure ? 7 : 6];
     int n = name ? MEM16(name) / 2 : 0;
     const wchar_t* s = name ? (const wchar_t*)(uintptr_t)MEM32(name + 4) : L"";
+    int con = nt_guest_win7(native32_guest_peb) && n > 21 && !_wcsnicmp(s, L"\\RPC Control\\console-", 21);
+    if (con) {
+        /* NT 6.1: the process's conhost (\RPC Control\console-<pid>-lpc-handle). The
+         * port memory as for csrss's (no remote delta); requests: con7_request */
+        if (cv && MEM32(cv + 4)) {
+            void* v = MapViewOfFile((HANDLE)(uintptr_t)MEM32(cv + 4), FILE_MAP_ALL_ACCESS, 0, MEM32(cv + 8), MEM32(cv + 12));
+            if (!v) return 0xC0000017u;
+            MEM32(cv + 16) = MEM32(cv + 20) = (uint32_t)(uintptr_t)v;
+            if (sv) MEM32(sv + 4) = MEM32(cv + 12), MEM32(sv + 8) = (uint32_t)(uintptr_t)v;
+        }
+        if (len) MEM32(len) = 0x148;
+        if (!g_con_port) g_con_port = CreateEventA(NULL, FALSE, FALSE, NULL);
+        MEM32(a[0]) = (uint32_t)(uintptr_t)g_con_port;
+        if (getenv("NATIVE32_SYSCALLS")) fprintf(stderr, "[con] connected to %.*ls\n", n, s);
+        return 0;
+    }
     if (n < 8 || _wcsnicmp(s + n - 8, L"\\ApiPort", 8)) {
         /* Any other port is a host service (RPCSS's epmapper, lsass, the
          * services): a guest never talks to one. As if it were not running. */
@@ -660,8 +685,47 @@ static int is_port(uint32_t h) { return g_port && (HANDLE)(uintptr_t)h == g_port
 /* NtRequestWaitReplyPort(Port, Request, Reply): one CSR_API_MSG, a
  * PORT_MESSAGE (0x18) + CaptureBuffer, ApiNumber, ReturnValue (0x20),
  * Reserved, then the api's data (0x28). */
+/* NT 6.1: one request to the process's conhost, a CSR_API_MSG as csrss's
+ * (ApiNumber +0x1C, ReturnValue +0x20, data +0x28) but with conhost's own api
+ * numbers (0x00..0x53, read off 7601's kernel32: each export's sender call).
+ * The console is the host's: kernel32 sends ReadFile/WriteFile on the real std
+ * handles down to NtReadFile/NtWriteFile, so only what it asks of the console
+ * itself is answered; the rest gets an empty (zeroed) reply.
+ * ponytail: the calls cmd needs; more as programs ask (NATIVE32_SYSCALLS names them) */
+static uint32_t con7_request(uint32_t* a) {
+    uint32_t m = a[1], api = MEM32(m + 0x1C), d = m + 0x28, r = 0;
+    uint16_t total = MEM16(m + 2);
+    switch (api) {
+    case 0x53:                                         /* ConsoleConnect */
+        {   /* the start info (captured at the data's first pointer) begins as XP's
+             * CONSOLE_INFO: { ConsoleHandle, InputWaitHandle, StdIn, StdOut, StdErr },
+             * the host console's real std handles */
+            uint32_t ci = MEM32(m + 0x18) ? MEM32(d) : 0;
+            if (!ci) break;
+            MEM32(ci + 0x00) = 0x0C0Eu;
+            MEM32(ci + 0x04) = (uint32_t)(uintptr_t)CreateEventA(NULL, TRUE, FALSE, NULL);
+            MEM32(ci + 0x08) = (uint32_t)(uintptr_t)GetStdHandle(STD_INPUT_HANDLE);
+            MEM32(ci + 0x0C) = (uint32_t)(uintptr_t)GetStdHandle(STD_OUTPUT_HANDLE);
+            MEM32(ci + 0x10) = (uint32_t)(uintptr_t)GetStdHandle(STD_ERROR_HANDLE);
+        }
+        break;
+    case 0x24: r = con_get_title(d - 4, 0); break;     /* GetConsoleTitle { Length, Title, Unicode }: Vista's without the handle */
+    case 0x3C:                                         /* GetConsoleCP { CodePage, Output } */
+        MEM32(d) = MEM8(d + 4) ? GetConsoleOutputCP() : GetConsoleCP();
+        if (!MEM32(d)) MEM32(d) = GetOEMCP();
+        break;
+    default:
+        if (total > 0x28 && total < 0x1000) memset((void*)(uintptr_t)d, 0, total - 0x28);
+        if (getenv("NATIVE32_SYSCALLS")) fprintf(stderr, "[con] api 0x%02X not answered, from sub_%08X\n", api, g_cur_func);
+    }
+    MEM32(m + 0x20) = r;
+    if (a[2] && a[2] != m) memcpy((void*)(uintptr_t)a[2], (void*)(uintptr_t)m, MEM16(m) + 0x18);
+    return 0;
+}
+
 static uint32_t ovr_request_wait_reply(uint32_t* a) {
     if (g_theme_port && (HANDLE)(uintptr_t)a[0] == g_theme_port) return theme_request(a);
+    if (g_con_port && (HANDLE)(uintptr_t)a[0] == g_con_port) return con7_request(a);
     if (!is_port(a[0])) return native32_nt_forward("NtRequestWaitReplyPort", a);
     uint32_t m = a[1], api = MEM32(m + 0x1C), r = 0;
     native32_csr_api_fn fn = (api >> 16) < 8 && (api & 0xFFFF) < 1024 ? g_api[api >> 16][api & 0xFFFF] : NULL;
@@ -707,7 +771,17 @@ static uint32_t ovr_open_mutant(uint32_t* a) {
     return r;
 }
 
+/* NtAlpcConnectPort(Port*, Name, ...): NT 6's ALPC clients (error reporting's
+ * port after a heap failure, RPC's ncalrpc) would reach a host service.
+ * Refused, as LPC is: as if it were not running. */
+static uint32_t ovr_alpc_connect(uint32_t* a) {
+    int n = a[1] ? MEM16(a[1]) / 2 : 0;
+    fprintf(stderr, "[guard] ALPC connect to %.*ls: refused\n", n, a[1] ? (const wchar_t*)(uintptr_t)MEM32(a[1] + 4) : L"");
+    return 0xC0000034u;                                       /* STATUS_OBJECT_NAME_NOT_FOUND */
+}
+
 void csr32_install(void) {
+    native32_nt_override("NtAlpcConnectPort", ovr_alpc_connect);
     native32_nt_override("NtOpenMutant", ovr_open_mutant);
     native32_csr_api(0x00000, client_connect);
     native32_nt_override("NtSecureConnectPort", ovr_secure_connect);
