@@ -556,9 +556,48 @@ static DWORD WINAPI fb_thread(LPVOID unused) {
     return 0;
 }
 /* ponytail: a window only when asked (W16_WINDOW), so check_w16 and plain runs stay headless */
+/* W16_SHOT=T1,T2,... (seconds from the display's Enable): the guest's own
+ * framebuffer, g_fb, written as W16_SHOT_OUT_<T>.bmp (24-bit). The screenshot
+ * comes from inside the guest, not from a host window or the real desktop. */
+static void fb_save(const char *path) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    uint8_t h[54] = { 'B', 'M' };
+    uint32_t row = FB_W * 3, sz = row * FB_H;
+    *(uint32_t *)(h + 2) = 54 + sz; *(uint32_t *)(h + 10) = 54; *(uint32_t *)(h + 14) = 40;
+    *(int32_t *)(h + 18) = FB_W; *(int32_t *)(h + 22) = -FB_H; *(uint16_t *)(h + 26) = 1; *(uint16_t *)(h + 28) = 24;
+    fwrite(h, 1, 54, f);
+    static uint8_t line[FB_W * 3];
+    for (int y = 0; y < FB_H; y++) {
+        for (int x = 0; x < FB_W; x++) {
+            uint16_t p = g_fb[y * FB_W + x];
+            line[x * 3 + 0] = (uint8_t)((p & 0x1F) << 3 | (p & 0x1F) >> 2);
+            line[x * 3 + 1] = (uint8_t)((p >> 5 & 0x3F) << 2 | (p >> 5 & 0x3F) >> 4);
+            line[x * 3 + 2] = (uint8_t)((p >> 11) << 3 | (p >> 11) >> 2);
+        }
+        fwrite(line, 1, sizeof line, f);
+    }
+    fclose(f);
+}
+static DWORD WINAPI shot_thread(LPVOID unused) {
+    (void)unused;
+    DWORD t0 = GetTickCount();
+    const char *out = getenv("W16_SHOT_OUT") ? getenv("W16_SHOT_OUT") : "shot";
+    for (const char *s = getenv("W16_SHOT"); s && *s; ) {
+        double t = atof(s);
+        DWORD at = (DWORD)(t * 1000), now = GetTickCount() - t0;
+        if (at > now) Sleep(at - now);
+        char p[600];
+        snprintf(p, sizeof p, "%s_%g.bmp", out, t);
+        fb_save(p);
+        s = strchr(s, ',') ? strchr(s, ',') + 1 : "";
+    }
+    return 0;
+}
 static void fb_window(void) {
-    static int up;
+    static int up, shots;
     if (!up && getenv("W16_WINDOW")) { up = 1; CloseHandle(CreateThread(NULL, 0, fb_thread, NULL, 0, NULL)); }
+    if (!shots && getenv("W16_SHOT")) { shots = 1; CloseHandle(CreateThread(NULL, 0, shot_thread, NULL, 0, NULL)); }
 }
 
 /* Cursor entries (USER): 101 Inquire(lpCursorInfo) -> its size, {dpXRate, dpYRate} (seg072_3714 wants 4);
@@ -677,9 +716,14 @@ static void sys_fpu_save(CPU *c) { ret_far(c, 4); }
  * SYSTEM.1 InquireSystem(wReq, wDrive) dx:ax; 2 CreateSystemTimer(rate, lpProc) -> 1;
  * 3 KillSystemTimer(h); 4/5 Enable/DisableSystemTimers; 6 GetSystemMSecCount -> dx:ax.
  * Timers run from the tick thread (below); W16_INPUT drives the mouse and keyboard procs. */
+/* The host boots Windows 3.1's USER/GDI (w311host sets it): the driver
+ * interfaces are 3.1's where they differ from Win9x's. */
+int g_drv_win31;
 static void kb_inquire(CPU *c) {
     uint8_t *k = (uint8_t *)farptr(argfar(c, 0));
-    k[0] = 0xFF; k[1] = 0xFE; k[2] = 0xFF; k[3] = 0xFE; put16((char *)k, 4, 0); put16((char *)k, 6, 12);
+    k[0] = 0xFF; k[1] = 0xFE; k[2] = 0xFF; k[3] = 0xFE; put16((char *)k, 4, 0);
+    if (g_drv_win31) { c->ax = 6; ret_far(c, 4); return; }   /* Windows 3.1's KBINFO: no function-key count (USER checks for 6) */
+    put16((char *)k, 6, 12);
     c->ax = 8; ret_far(c, 4);
 }
 static uint32_t g_kb_proc;
@@ -813,6 +857,9 @@ static void sys_inquire(CPU *c) {
     uint16_t req = arg16(c, 1);
     c->ax = 0; c->dx = 0;
     if (req == 0) { c->ax = 1000; c->dx = 0; }    /* timer resolution in microseconds */
+    else if (req == 1 && g_drv_win31) {           /* 3.1: AX = the drive's type, 1 none, 3 fixed (KRNL386 1:9BBF) */
+        c->ax = arg16(c, 0) == 2 ? 3 : 1; c->dx = c->ax;   /* only C: (drive 2) */
+    }
     else if (req == 1) c->dx = 3;                 /* drive type: fixed */
     ret_far(c, 4);
 }
@@ -860,6 +907,15 @@ static void sys_createtimer(CPU *c) {
     uint32_t proc = argfar(c, 0); DWORD rate = arg16(c, 2);
     drv16_tick_sel();
     c->ax = 0;
+    if (proc == 0xFFFFFFFFu) {
+        /* an import the lifter left as FFFF:FFFF: Windows 3.1 USER's
+         * CreateSystemTimer(0, DISPLAY.CheckCursor), whose fixup KRNL386
+         * applies to the segment bytes, not the lifted constant. The cursor
+         * is the host's, so nothing to check: a timer that never fires.
+         * ponytail: only that caller passes one; lift such immediates from the
+         * fixed-up segment if another does. */
+        c->ax = 8; ret_far(c, 6); return;
+    }
     for (int i = 0; i < 8; i++)
         if (!g_tmr[i].proc) { g_tmr[i].rate = rate ? rate : 1; g_tmr[i].next = GetTickCount() + g_tmr[i].rate; g_tmr[i].proc = proc; c->ax = (uint16_t)(i + 1); break; }
     if (getenv("W16_TRACE")) fprintf(stderr, "[drv] SYSTEM.CreateSystemTimer(%u ms, %08X) -> %u\n", (unsigned)rate, proc, c->ax);
@@ -887,6 +943,12 @@ void KEYBOARD_Ord131(CPU *c) { kb_mapvk(c); }
 void KEYBOARD_Ord132(CPU *c) { kb_codepage(c); }
 void KEYBOARD_Ord134(CPU *c) { kb_ansi_to_oem_buf(c); }
 void KEYBOARD_Ord135(CPU *c) { kb_oem_to_ansi_buf(c); }
+/* Windows 3.1's USER imports DISPLAY's cursor entries and SOUND.17 directly */
+void DISPLAY_Ord101(CPU *c) { disp_inquire(c); }
+void DISPLAY_Ord102(CPU *c) { disp_setcursor(c); }
+void DISPLAY_Ord103(CPU *c) { disp_movecursor(c); }
+void DISPLAY_Ord104(CPU *c) { disp_checkcursor(c); }
+void SOUND_Ord17(CPU *c) { c->ax = 0; ret_far(c, 2); }   /* DoBeep: muted */
 
 /* SOUND.DRV (winmine imports 1 OpenSound, 2 CloseSound, 4 SetVoiceNote(4 words), 5 SetVoiceAccent(5 words),
  * 9 StartSound, 10 StopSound): no audio device, so OpenSound answers S_SERDVNA (-1, in use/not there)
@@ -978,7 +1040,30 @@ static drv_t g_drv[] = {
 #define NDRV (int)(sizeof g_drv / sizeof *g_drv)
 
 /* ---- the NE file ---- */
-static uint8_t g_ne[0x1000];
+static uint8_t g_ne[0x40000];
+/* A stand-in's resources: the resource table and data of the real driver it
+ * stands in for (data only, never its code), when the host names one.
+ * Windows 3.1's GDI reads DISPLAY's "oembin" resources (FindResource
+ * "fonts" in its LibEntry) and USER its OEM bitmaps, cursors and icons. */
+static char g_donor[16][MAX_PATH];
+void w16_drv_resources(const char *drv, const char *path) {
+    for (int i = 0; i < (int)(sizeof g_drv / sizeof *g_drv) && i < 16; i++)
+        if (!_stricmp(g_drv[i].name, drv)) snprintf(g_donor[i], MAX_PATH, "%s", path);
+}
+static uint8_t *g_dn; static size_t g_dn_len;
+static int donor_load(int idx) {
+    free(g_dn); g_dn = NULL; g_dn_len = 0;
+    if (idx >= 16 || !g_donor[idx][0]) return 0;
+    FILE *f = fopen(g_donor[idx], "rb");
+    if (!f) { fprintf(stderr, "[drv] no resource donor %s\n", g_donor[idx]); return 0; }
+    fseek(f, 0, SEEK_END); g_dn_len = (size_t)ftell(f); fseek(f, 0, SEEK_SET);
+    g_dn = malloc(g_dn_len);
+    if (fread(g_dn, 1, g_dn_len, f) != g_dn_len) g_dn_len = 0;
+    fclose(f);
+    if (g_dn_len < 0x40 || g_dn[0] != 'M' || g_dn[1] != 'Z') return 0;
+    uint32_t ne = *(uint32_t *)(g_dn + 0x3C);
+    return ne + 0x40 < g_dn_len && g_dn[ne] == 'N' && g_dn[ne + 1] == 'E';
+}
 static size_t ne_build(int idx) {
     const char *name = g_drv[idx].name;
     uint8_t *f = g_ne;
@@ -996,8 +1081,15 @@ static size_t ne_build(int idx) {
     /* segment table */
     *(uint16_t *)(ne + 0x22) = (uint16_t)(p - ne);
     uint8_t *seg = p; p += 8;
-    /* resource table: none (offset = resident names) */
+    /* resource table: the donor's, copied whole (its name strings are
+     * relative to the table), its data placed after the code segment; else none */
     *(uint16_t *)(ne + 0x24) = (uint16_t)(p - ne);
+    uint8_t *rt = NULL;
+    if (donor_load(idx)) {
+        const uint8_t *dne = g_dn + *(uint32_t *)(g_dn + 0x3C);
+        uint16_t a = *(const uint16_t *)(dne + 0x24), b = *(const uint16_t *)(dne + 0x26);
+        if (b > a) { rt = p; memcpy(p, dne + a, b - a); p += b - a; }
+    }
     *(uint16_t *)(ne + 0x26) = (uint16_t)(p - ne);
     size_t n = strlen(name);
     *p++ = (uint8_t)n; memcpy(p, name, n); p += n; *p++ = 0; *p++ = 0;   /* module name, ordinal 0 */
@@ -1033,7 +1125,24 @@ static size_t ne_build(int idx) {
     *(uint16_t *)(seg + 2) = len;
     *(uint16_t *)(seg + 4) = 0x0070;              /* code: moveable, pure, preload */
     *(uint16_t *)(seg + 6) = len;
-    return at + len;
+    size_t end = at + len;
+    if (rt) {   /* each resource's bytes, at the donor's alignment */
+        uint16_t sh = *(uint16_t *)rt;
+        for (uint8_t *t = rt + 2; *(uint16_t *)t; ) {
+            uint16_t cnt = *(uint16_t *)(t + 2);
+            uint8_t *e = t + 8;
+            for (uint16_t k = 0; k < cnt; k++, e += 12) {
+                size_t from = (size_t)*(uint16_t *)e << sh, n = (size_t)*(uint16_t *)(e + 2) << sh;
+                end = (end + ((size_t)1 << sh) - 1) & ~(((size_t)1 << sh) - 1);
+                if (from + n > g_dn_len || end + n > sizeof g_ne) { *(uint16_t *)(e + 2) = 0; continue; }
+                memcpy(f + end, g_dn + from, n);
+                *(uint16_t *)e = (uint16_t)(end >> sh);
+                end += n;
+            }
+            t = e;
+        }
+    }
+    return end;
 }
 
 /* Write each stand-in to <sysdir>\<NAME>.DRV (the guest's own tree). */

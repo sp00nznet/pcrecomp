@@ -1472,6 +1472,9 @@ static void dos_fail(uint16_t err) { SET16(g_eax, err); set_cf(1); g_dos_err = e
 /* The sandbox: guest C:\ is this host directory, and no guest path may
  * leave it (".." is resolved first, then the prefix is checked). */
 static char g_root[MAX_PATH];   /* g_cwd: guest, no drive, no leading '\' */
+/* why host_path failed, as DOS says it: 15 invalid drive (only C: exists; Win 3.1's
+ * KRNL386 probes with a "$:" drive and reads the code), else 3 path not found */
+static int g_path_err = 3;
 static int host_path(uint32_t guest, char* out) {
     char g[MAX_PATH], full[2 * MAX_PATH], *p = g;
     size_t i = 0;
@@ -1482,8 +1485,9 @@ static int host_path(uint32_t guest, char* out) {
     }
     for (; i + 1 < sizeof g && MEM8(guest + i); i++) g[i] = (char)MEM8(guest + i);
     g[i] = 0;
+    g_path_err = 3;
     if (p[0] && p[1] == ':') {
-        if ((p[0] | 0x20) != 'c') return 0;                    /* only C: exists */
+        if ((p[0] | 0x20) != 'c') { g_path_err = 15; return 0; }   /* only C: exists */
         p += 2;
     }
     if (*p == '\\' || *p == '/') _snprintf(full, sizeof full, "%s%s", g_root, p);
@@ -1494,6 +1498,29 @@ static int host_path(uint32_t guest, char* out) {
     size_t n = strlen(g_root);
     if (_strnicmp(out, g_root, n) || (out[n] && out[n] != '\\')) return 0;
     return 1;
+}
+/* A DOS device name (CON, NUL, AUX, PRN, COM1-4, LPT1-3, any directory or
+ * extension): the guest gets the host's NUL device, never the host console
+ * or a port. Win 3.1's KRNL386 opens CON five times at boot (its SFT probe). */
+static int dos_device(uint32_t guest) {
+    char g[16], *b = g;
+    size_t i = 0;
+    for (; i + 1 < sizeof g && MEM8(guest + i); i++) g[i] = (char)MEM8(guest + i);
+    if (MEM8(guest + i)) {   /* longer: only its last component can be a device */
+        uint32_t e = guest + i;
+        while (MEM8(e)) e++;
+        uint32_t st = e;
+        while (st > guest && MEM8(st - 1) != 0x5C && MEM8(st - 1) != ':' && MEM8(st - 1) != '/') st--;
+        if (e - st >= sizeof g) return 0;
+        for (i = 0; st + i < e; i++) g[i] = (char)MEM8(st + i);
+    }
+    g[i] = 0;
+    for (char* q = g; *q; q++) if (*q == 0x5C || *q == ':' || *q == '/') b = q + 1;
+    char* dot = strchr(b, '.');
+    if (dot) *dot = 0;
+    static const char* const dev[] = { "CON", "NUL", "AUX", "PRN", "COM1", "COM2", "COM3", "COM4", "LPT1", "LPT2", "LPT3" };
+    for (int k = 0; k < (int)(sizeof dev / sizeof *dev); k++) if (!_stricmp(b, dev[k])) return 1;
+    return 0;
 }
 static void guest_put(uint32_t va, const char* s, size_t max) {
     size_t i = 0;
@@ -1607,7 +1634,7 @@ static uint32_t vwin32_int21(const uint32_t* a) {
         SET16(g_eax, g_dos_err); SET16(g_ebx, 0x0D01); g_ecx = (g_ecx & 0xFFFF00FFu) | 0x0200; return g_eax;
     case 0x30: SET16(g_eax, 0x0A07); SET16(g_ebx, 0xFF00); return g_eax;   /* DOS 7.10 */
     case 0x41:   /* delete DS:DX (boxed) */
-        if (!host_path(g_edx, path)) { dos_fail(3); return g_eax; }
+        if (!host_path(g_edx, path)) { dos_fail(g_path_err); return g_eax; }
         if (getenv("W16_TRACE")) fprintf(stderr, "[int21] delete %s\n", path);
         if (!DeleteFileA(path)) dos_fail(host_err());
         return g_eax;
@@ -1635,7 +1662,7 @@ static uint32_t vwin32_int21(const uint32_t* a) {
         break;
     case 0x60: {   /* truename DS:SI -> ES:DI (128 bytes), the 8.3 form of 7160 (MSGSRV32's
                     * WinExec of the shell, after 716C did not find it) */
-        if (!host_path(g_esi, path)) { dos_fail(3); return g_eax; }
+        if (!host_path(g_esi, path)) { dos_fail(g_path_err); return g_eax; }
         const char* rel = path + strlen(g_root);
         _snprintf(path2, sizeof path2, "C:\\%s", *rel == '\\' ? rel + 1 : rel);
         path2[127] = 0;
@@ -1644,13 +1671,16 @@ static uint32_t vwin32_int21(const uint32_t* a) {
         return g_eax; }
     case 0x1A: g_dta = g_edx; return g_eax;                    /* set DTA (DS:DX) */
     case 0x2F: g_ebx = g_dta; return g_eax;                    /* get DTA -> ES:BX */
-    case 0x3C: case 0x3D: {   /* create (CX attrs) / open (AL mode): DS:DX name -> AX handle */
-        DWORD acc = ah == 0x3C || (al & 3) == 2 ? GENERIC_READ | GENERIC_WRITE : (al & 3) == 1 ? GENERIC_WRITE : GENERIC_READ;
-        DWORD share = ah == 0x3C ? FILE_SHARE_READ | FILE_SHARE_WRITE : (al & 0x70) == 0x10 ? 0 : (al & 0x70) == 0x20 ? FILE_SHARE_READ
+    case 0x3C: case 0x3D: case 0x5B: {   /* create (CX attrs) / open (AL mode) / create new (5Bh: fails if it exists): DS:DX name -> AX handle */
+        int mk = ah == 0x3C || ah == 0x5B;
+        DWORD acc = mk || (al & 3) == 2 ? GENERIC_READ | GENERIC_WRITE : (al & 3) == 1 ? GENERIC_WRITE : GENERIC_READ;
+        DWORD share = mk ? FILE_SHARE_READ | FILE_SHARE_WRITE : (al & 0x70) == 0x10 ? 0 : (al & 0x70) == 0x20 ? FILE_SHARE_READ
                     : (al & 0x70) == 0x30 ? FILE_SHARE_WRITE : FILE_SHARE_READ | FILE_SHARE_WRITE;
-        if (!host_path(g_edx, path)) { dos_fail(3); return g_eax; }
-        HANDLE fh = CreateFileA(path, acc, share, NULL, ah == 0x3C ? CREATE_ALWAYS : OPEN_EXISTING,
-                                ah == 0x3C && ((uint16_t)g_ecx & 0x27) ? ((uint16_t)g_ecx & 0x27) : FILE_ATTRIBUTE_NORMAL, NULL);
+        int dev = dos_device(g_edx);
+        if (dev) strcpy(path, "NUL");
+        else if (!host_path(g_edx, path)) { dos_fail(g_path_err); return g_eax; }
+        HANDLE fh = CreateFileA(path, acc, share, NULL, mk && !dev ? (ah == 0x5B ? CREATE_NEW : CREATE_ALWAYS) : OPEN_EXISTING,
+                                mk && ((uint16_t)g_ecx & 0x27) ? ((uint16_t)g_ecx & 0x27) : FILE_ATTRIBUTE_NORMAL, NULL);
         if (fh == INVALID_HANDLE_VALUE) { dos_fail(host_err()); return g_eax; }
         int h = new_handle(fh);
         if (h < 0) { dos_fail(4); return g_eax; }
@@ -1660,7 +1690,7 @@ static uint32_t vwin32_int21(const uint32_t* a) {
         WIN32_FIND_DATAA fd;
         int h;
         if (ah == 0x4E) {
-            if (!host_path(g_edx, path)) { dos_fail(3); return g_eax; }
+            if (!host_path(g_edx, path)) { dos_fail(g_path_err); return g_eax; }
             for (h = 0; h < NFINDS && g_find[h]; h++) ;
             if (h == NFINDS) { dos_fail(4); return g_eax; }
             HANDLE f = FindFirstFileA(path, &fd);
@@ -1732,15 +1762,15 @@ static uint32_t vwin32_int21(const uint32_t* a) {
             dos_fail(0x32); return g_eax;
         case 0x3B: {                                           /* LFN chdir */
             DWORD at;
-            if (!host_path(g_edx, path) || (at = GetFileAttributesA(path)) == INVALID_FILE_ATTRIBUTES || !(at & FILE_ATTRIBUTE_DIRECTORY)) { dos_fail(3); return g_eax; }
+            if (!host_path(g_edx, path) || (at = GetFileAttributesA(path)) == INVALID_FILE_ATTRIBUTES || !(at & FILE_ATTRIBUTE_DIRECTORY)) { dos_fail(g_path_err); return g_eax; }
             strcpy(g_cwd, path + strlen(g_root) + (path[strlen(g_root)] == '\\'));
             return g_eax; }
         case 0x39: case 0x3A: case 0x41:                       /* LFN mkdir, rmdir, delete */
-            if (!host_path(g_edx, path)) { dos_fail(3); return g_eax; }
+            if (!host_path(g_edx, path)) { dos_fail(g_path_err); return g_eax; }
             if (!(al == 0x39 ? CreateDirectoryA(path, NULL) : al == 0x3A ? RemoveDirectoryA(path) : DeleteFileA(path))) dos_fail(host_err());
             return g_eax;
         case 0x43:                                             /* LFN attributes: BL 0 get, 1 set */
-            if (!host_path(g_edx, path)) { dos_fail(3); return g_eax; }
+            if (!host_path(g_edx, path)) { dos_fail(g_path_err); return g_eax; }
             if ((uint8_t)g_ebx == 0) {
                 DWORD at = GetFileAttributesA(path);
                 if (at == INVALID_FILE_ATTRIBUTES) dos_fail(host_err()); else SET16(g_ecx, at & 0x3F);
@@ -1749,7 +1779,7 @@ static uint32_t vwin32_int21(const uint32_t* a) {
             if ((uint8_t)g_ebx == 1) { if (!SetFileAttributesA(path, (uint16_t)g_ecx ? (uint16_t)g_ecx : FILE_ATTRIBUTE_NORMAL)) dos_fail(host_err()); return g_eax; }
             break;
         case 0x56:                                             /* LFN rename DS:EDX -> ES:EDI */
-            if (!host_path(g_edx, path) || !host_path(g_edi, path2)) { dos_fail(3); return g_eax; }
+            if (!host_path(g_edx, path) || !host_path(g_edi, path2)) { dos_fail(g_path_err); return g_eax; }
             if (!MoveFileA(path, path2)) dos_fail(host_err());
             return g_eax;
         case 0x6C: {   /* LFN extended open: BX mode, CX attrs, DX action, DS:ESI name -> AX handle, CX action taken */
@@ -1758,7 +1788,7 @@ static uint32_t vwin32_int21(const uint32_t* a) {
             DWORD share = (mode & 0x70) == 0x10 ? 0 : (mode & 0x70) == 0x20 ? FILE_SHARE_READ : (mode & 0x70) == 0x30 ? FILE_SHARE_WRITE : FILE_SHARE_READ | FILE_SHARE_WRITE;
             DWORD disp = (act & 0x10) ? ((act & 3) == 1 ? OPEN_ALWAYS : (act & 3) == 2 ? CREATE_ALWAYS : CREATE_NEW)
                                       : ((act & 3) == 2 ? TRUNCATE_EXISTING : OPEN_EXISTING);
-            if (!host_path(g_esi, path)) { dos_fail(3); return g_eax; }
+            if (!host_path(g_esi, path)) { dos_fail(g_path_err); return g_eax; }
             DWORD pre = GetFileAttributesA(path);
             HANDLE fh = CreateFileA(path, acc, share, NULL, disp, ((uint16_t)g_ecx & 0x27) ? ((uint16_t)g_ecx & 0x27) : FILE_ATTRIBUTE_NORMAL, NULL);
             if (fh == INVALID_HANDLE_VALUE) { dos_fail(host_err()); return g_eax; }
@@ -1771,7 +1801,7 @@ static uint32_t vwin32_int21(const uint32_t* a) {
             WIN32_FIND_DATAA fd;
             int h;
             if (al == 0x4E) {
-                if (!host_path(g_edx, path)) { dos_fail(3); return g_eax; }
+                if (!host_path(g_edx, path)) { dos_fail(g_path_err); return g_eax; }
                 for (h = 0; h < NFINDS && g_find[h]; h++) ;
                 if (h == NFINDS) { dos_fail(4); return g_eax; }
                 HANDLE f = FindFirstFileA(path, &fd);
@@ -1809,7 +1839,7 @@ static uint32_t vwin32_int21(const uint32_t* a) {
             if (h >= 0 && h < NFINDS && g_find[h]) { FindClose(g_find[h]); g_find[h] = NULL; }
             return g_eax; }
         case 0x60: {                                           /* LFN truename: DS:ESI -> ES:EDI */
-            if (!host_path(g_esi, path)) { dos_fail(3); return g_eax; }
+            if (!host_path(g_esi, path)) { dos_fail(g_path_err); return g_eax; }
             const char* rel = path + strlen(g_root);
             _snprintf(path2, sizeof path2, "C:\\%s", *rel == '\\' ? rel + 1 : rel);
             path2[sizeof path2 - 1] = 0;

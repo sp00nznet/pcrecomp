@@ -1105,6 +1105,22 @@ def lift_segment(ne: NEHeader, seg_num: int, func_offset: int = -1, xmod=None):
         if any(i.mnemonic == 'jmp' and i.op1 and i.op1.type == OpType.REG16 and i.op1.reg == i0.op1.reg
                for o, i in _by_off.items() if f.offset < o < f.end):
             lifter.popret_offsets.add(f.offset)
+            continue
+        # or on its straight line past its own end, through the functions it
+        # falls into (KRNL386 3.11 seg1 835E `pop dx; ...` falls into 8364,
+        # whose `jmp dx` the code map made a function of its own: lstrcmpi's
+        # prologue helper, run twice per call without this)
+        o, n = f.offset + i0.length, 0
+        while o in _by_off and n < 64:
+            i = _by_off[o]; n += 1
+            if i.mnemonic == 'jmp':
+                if i.op1 and i.op1.type == OpType.REG16 and i.op1.reg == i0.op1.reg:
+                    lifter.popret_offsets.add(f.offset)
+                break
+            if i.mnemonic in ('ret', 'retf', 'iret', 'call') or (i.op1 is not None and i.op1.type == OpType.REG16
+                                                                 and i.op1.reg == i0.op1.reg and i.mnemonic != 'push'):
+                break
+            o += i.length
 
     # Functions that pop their return address before pushing anything, on
     # their own straight line or a branch into another such function (GDI seg
@@ -1295,9 +1311,14 @@ def lift_segment(ne: NEHeader, seg_num: int, func_offset: int = -1, xmod=None):
         # undeclared real-mode dispatcher.
         def _unreachable(m):
             addr = (int(m.group(1), 16) << 4) | int(m.group(2), 16)
-            return (f'{_unreachable_name()}("{seg.index:03d}", 0x{addr - seg.file_offset:04X});'
-                    f' return; /* unlifted branch target */')
-        code = re.sub(r'recomp_dispatch\(cpu, 0x([0-9A-Fa-f]+), 0x([0-9A-Fa-f]+)\); return;',
+            # the target as the instruction names it (`jb 0xAFC2`, its comment at the
+            # line's end): addr - file_offset is off when lift16's base is not the
+            # segment's file offset (Win 3.11 USER seg 1: 15F32 for AFC2)
+            t = re.search(r'/\* (?:j\w+|loop\w*) 0x([0-9A-Fa-f]+) \*/\s*$', m.group(3))
+            off = int(t.group(1), 16) if t else addr - seg.file_offset
+            return (f'{_unreachable_name()}("{seg.index:03d}", 0x{off:04X});'
+                    f' return; /* unlifted branch target */{m.group(3)}')
+        code = re.sub(r'recomp_dispatch\(cpu, 0x([0-9A-Fa-f]+), 0x([0-9A-Fa-f]+)\); return;(.*)',
                       _unreachable, code)
 
         # A branch into the middle of an instruction has no label to jump to.

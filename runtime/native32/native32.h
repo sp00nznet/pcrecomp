@@ -102,7 +102,7 @@ void native32_init(void);
  * range could not be held; the caller then maps as before.
  * The host's /STACK must be small (256 KB) so the child's first stack fits
  * below base: run the lifted code on a thread with a large stack. */
-int native32_hold_image(const char* path, uint32_t base);
+int native32_hold_image(const char* path, uint32_t base);   /* path NULL: only the hold_range spans */
 /* One more span for that relaunch to reserve before the child's loader runs
  * (call it before native32_hold_image); the child commits it with
  * VirtualAlloc(MEM_COMMIT). Win16 identity mode holds 0x10000-0x10FFFF so

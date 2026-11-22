@@ -387,12 +387,14 @@ int native32_hold_image(const char* path, uint32_t base) {
     }
     IMAGE_DOS_HEADER dos;
     IMAGE_NT_HEADERS32 nt;
-    FILE* f = fopen(path, "rb");
-    int ok = f && fread(&dos, sizeof dos, 1, f) == 1 && fseek(f, dos.e_lfanew, SEEK_SET) == 0 &&
+    /* path NULL: no image, only the native32_hold_range spans (a host with no
+     * guest PE, e.g. Win 3.1's all-16-bit boot) */
+    FILE* f = path ? fopen(path, "rb") : NULL;
+    int ok = !path || f && fread(&dos, sizeof dos, 1, f) == 1 && fseek(f, dos.e_lfanew, SEEK_SET) == 0 &&
              fread(&nt, sizeof nt, 1, f) == 1 && nt.Signature == IMAGE_NT_SIGNATURE;
     if (f) fclose(f);
     if (!ok) return 0;
-    uint32_t span = nt.OptionalHeader.SizeOfImage;
+    uint32_t span = path ? nt.OptionalHeader.SizeOfImage : 0;
 
     STARTUPINFOA si = { sizeof si };
     PROCESS_INFORMATION pi;
@@ -415,7 +417,7 @@ int native32_hold_image(const char* path, uint32_t base) {
             fprintf(stderr, "[native32] cannot start the host again (error %lu)\n", GetLastError());
             return 0;
         }
-        int held = VirtualAllocEx(pi.hProcess, (void*)(uintptr_t)base, span, MEM_RESERVE, PAGE_NOACCESS) != NULL;
+        int held = !span || VirtualAllocEx(pi.hProcess, (void*)(uintptr_t)base, span, MEM_RESERVE, PAGE_NOACCESS) != NULL;
         for (int r = 0; held && r < 8 && g_hold_range[r][1]; r++)
             held = VirtualAllocEx(pi.hProcess, (void*)(uintptr_t)g_hold_range[r][0], g_hold_range[r][1], MEM_RESERVE, PAGE_NOACCESS) != NULL;
         if (held) break;

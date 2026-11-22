@@ -17,6 +17,7 @@
  *
  * Win16 code runs under the Win16Mutex, so one CPU serves every thread;
  * a 16 -> 32 -> 16 nesting saves and restores it around the inner call. */
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -150,13 +151,54 @@ static void w16_bios(void) {
     hi[0xFFFFE] = 0xFC;
 }
 
+/* DOS's own tables, for a caller that reads them (Windows 3.1's KRNL386
+ * BootStrap: int 21h 52h, then it scans memory for the SFT entries of the
+ * five CONs it just opened to learn the entry size, sums the SFT blocks'
+ * counts and links one more block if there are fewer than 127 files).
+ * List of lists at 0060:0000, one SFT block of DOS_NSFT entries at 0070:0000
+ * (DOS 4+ layout: 3Bh-byte entries, the FCB-form name at +20h). Entries 0-2
+ * are CON, AUX, PRN; each open names the next free one, each close frees it. */
+enum { DOS_LOL = 0x600, DOS_SFT = 0x700, DOS_SFTSZ = 0x3B, DOS_NSFT = 40 };
+static uint8_t g_sft_of[256];   /* host handle (low byte) -> SFT entry + 1 */
+static uint8_t *sft_entry(int i) { return g_w16_low + DOS_SFT + 6 + i * DOS_SFTSZ; }
+static void sft_name(int i, const char *path) {
+    uint8_t *e = sft_entry(i) + 0x20;
+    const char *b = path;
+    for (const char *q = path; *q; q++) if (*q == 0x5C || *q == '/' || *q == ':') b = q + 1;
+    memset(e, ' ', 11);
+    for (int k = 0; *b && *b != '.' && k < 8; ) e[k++] = (uint8_t)toupper((unsigned char)*b++);
+    while (*b && *b != '.') b++;
+    if (*b == '.') for (int k = 8, n = 0; *++b && n < 3; n++) e[k++] = (uint8_t)toupper((unsigned char)*b);
+    *(uint16_t *)sft_entry(i) = 1;   /* handle count */
+}
+static void dos_tables(void) {
+    uint8_t *lol = g_w16_low + DOS_LOL, *sft = g_w16_low + DOS_SFT;
+    *(uint16_t *)(lol + 4) = 0; *(uint16_t *)(lol + 6) = DOS_SFT >> 4;   /* first SFT block */
+    *(uint32_t *)sft = 0xFFFFFFFFu;                                       /* the last block */
+    *(uint16_t *)(sft + 4) = DOS_NSFT;
+    sft_name(0, "CON"); sft_name(1, "AUX"); sft_name(2, "PRN");
+}
+static void sft_open(uint16_t h, const char *path) {
+    for (int i = 3; i < DOS_NSFT; i++)
+        if (!*(uint16_t *)sft_entry(i)) {
+            sft_name(i, path); g_sft_of[h & 0xFF] = (uint8_t)(i + 1);
+            if (getenv("W16_TRACE")) fprintf(stderr, "[w16] SFT %d = \"%s\" (handle %u)\n", i, path, h);
+            return;
+        }
+}
+static void sft_close(uint16_t h) {
+    int i = g_sft_of[h & 0xFF] - 1;
+    if (i >= 3) memset(sft_entry(i), 0, DOS_SFTSZ);
+    g_sft_of[h & 0xFF] = 0;
+}
+
 uint32_t w16_real_base(void) {
     /* the launcher holds the range (native32_hold_range) before this
      * process's loader can put its own mappings there */
     if (!g_rm && !VirtualAlloc((void *)0x10000, 0x100000, MEM_COMMIT, PAGE_READWRITE) &&
         !VirtualAlloc((void *)0x10000, 0x100000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))
         w16_stop("real-mode memory at 0x10000 is taken (native32_hold_range not called?)", GetLastError(), 0);
-    if (!g_rm) w16_bios();
+    if (!g_rm) { w16_bios(); dos_tables(); }
     g_rm = 1;
     return 0;
 }
@@ -443,6 +485,10 @@ static void int2f(CPU *c) {
         c->ax = 0; return;
     case 0xFE03:   /* Norton Utilities TSR check (si:di 'CF','NU', CF set; KRNL386 seg001_8436): none, CF stays set */
         return;
+    case 0x1600:   /* enhanced-mode Windows installed? (Win 3.1 KRNL386 BootStrap, after its SFT probe):
+                    * AL 0, none. W16_ENHANCED=1 answers 3.10 (AL 3, AH 0Ah) for a KRNL386 that wants WIN386 */
+        if (getenv("W16_ENHANCED")) c->ax = 0x0A03; else c->al = 0;
+        return;
     case 0x1687:   /* DPMI present: 32-bit clients, 386, v0.90, no private data, entry es:di */
         c->ax = 0; c->bx = 1; c->cl = 3; c->dx = 0x005A; c->si = 0;
         c->es = host_sel(); c->di = H_DPMI_SWITCH; return;
@@ -521,6 +567,7 @@ void dos_int21(CPU *c) {
     }
     case 0x02: fputc(c->dl, stderr); return;                  /* write a character (KRNL386's messages) */
     case 0x47:   /* current directory of drive dl at ds:si, no drive or leading '\': the root */
+        if (c->dl && c->dl != 3) { c->ax = 15; c->flags |= FLAG_CF; return; }   /* only C: (Win 3.1 KRNL386 probes drive F0h, wants "invalid drive") */
         *(char *)(uintptr_t)(recomp_sel_base(c->ds) + c->si) = 0; ok(c); return;
     case 0x50: {   /* set PSP: the parent int 21h 55h copies (KRNL386 seg2 4956 sets it around 55h) */
         void native32_w9x_set_psp(uint16_t sel);
@@ -530,20 +577,25 @@ void dos_int21(CPU *c) {
         if (c->dl == 0xFF) { c->al = 0; c->flags |= FLAG_ZF; }
         ok(c); return;
     case 0x51: case 0x62: c->bx = rm_sel(W16_PSP_PARA); ok(c); return;
+    case 0x52: c->es = rm_sel(DOS_LOL >> 4); c->bx = DOS_LOL & 15; ok(c); return;   /* list of lists */
+    case 0xDC: c->al = 0; return;   /* Novell NetWare connection number (Win 3.1 KRNL386 BootStrap): 0, no NetWare shell */
     }
     uint32_t s[8] = { g_eax, g_ecx, g_edx, g_ebx, g_esp, g_ebp, g_esi, g_edi };
     uint16_t sds = g_seg_ds, ses = g_seg_es;
     uint32_t sdb = g_ds_base, seb = g_es_base;   /* kernel32's handler may load ds/es: the 32-bit caller's come back too */
-    uint32_t in_dx = recomp_sel_base(c->ds) + c->dx, in_si = recomp_sel_base(c->ds) + c->si,
-             in_di = recomp_sel_base(c->es) + c->di, in_bx = c->bx, in_cx = c->cx;
+    uint32_t in_dx = recomp_sel_access_base(c->ds) + c->dx, in_si = recomp_sel_access_base(c->ds) + c->si,
+             in_di = recomp_sel_access_base(c->es) + c->di, in_bx = c->bx, in_cx = c->cx;
     /* cx is a count and dx a value, not ds:dx, for seek (42h cx:dx), ioctl (44h) and file times (57h) */
     /* (and 55h's dx is the new PSP's selector) */
     if (c->ah == 0x42 || c->ah == 0x44 || c->ah == 0x57 || c->ah == 0x55) in_dx = c->dx;
     g_ebx = in_bx; g_ecx = in_cx; g_edx = in_dx; g_esi = in_si; g_edi = in_di;
     if (getenv("W16_TRACE") && (c->ah == 0x3C || c->ah == 0x3D || c->ah == 0x5B || c->ax == 0x716C))
         fprintf(stderr, "[w16] int 21h %04X \"%s\"\n", c->ax, (const char *)(uintptr_t)w16_lin(c->ax == 0x716C ? in_si : in_dx));
+    uint8_t ah = c->ah; uint16_t bx_in = c->bx;
     int cf = native32_w9x_int21(c->ax, in_cx);
     c->ax = (uint16_t)g_eax;
+    if (!cf && (ah == 0x3D || ah == 0x3C || ah == 0x5B)) sft_open(c->ax, (const char *)(uintptr_t)w16_lin(in_dx));
+    if (!cf && ah == 0x3E) sft_close(bx_in);
     if (g_ebx != in_bx) c->bx = (uint16_t)g_ebx;
     if (g_ecx != in_cx) c->cx = (uint16_t)g_ecx;
     if (g_edx != in_dx) c->dx = (uint16_t)g_edx;
@@ -589,8 +641,21 @@ static uint16_t g_alias[8192];
  * When sel is bound to a lifted segment, the read goes to that segment's bytes in the
  * linked image (what a load puts there; relocations are applied), its placeholder SEL(n).
  * ponytail: reads only make sense; KRNL386 still thinks the segment is not loaded. */
+extern uint16_t g_w16_kdgofs;
 static uint32_t w16_np(uint16_t sel) {
     uint16_t n = g_alias[sel >> 3];
+    uint16_t kd = RECOMP_MODULES[0].dgroup;
+    if (!n && (sel | 7) == (uint16_t)(kd << 3 | 7)) {
+        /* KERNEL's own DGROUP by its link-time selector, after BootStrap moved
+         * it (Win 3.11: a fixup KRNL386 applied at run time, baked in as
+         * SEG_n): where its code segment says DGROUP is now, cs:[kdgofs] */
+        uint16_t now = *(uint16_t *)(uintptr_t)w16_lin(recomp_sel_base(g_w16_segsel[1]) + g_w16_kdgofs);
+        if ((now | 7) != (sel | 7) && recomp_sel_base(now)) {
+            g_w16_segsel[kd] = (uint16_t)(now | 7); g_alias[(now | 7) >> 3] = kd;
+            if (getenv("W16_TRACE")) fprintf(stderr, "[w16] KERNEL DGROUP %04X -> %04X\n", sel, now);
+            return recomp_sel_base(now);
+        }
+    }
     if (getenv("W16_TRACE")) fprintf(stderr, "[w16] not-present selector %04X read: segment %u\n", sel, n);
     return n ? recomp_sel_base((uint32_t)n << 3 | 7) : 0;
 }
@@ -601,15 +666,24 @@ static uint32_t w16_np(uint16_t sel) {
  * (NE header in memory: +1C segment count, +22 segment table of 10-byte
  * entries {.., +4 flags (4 = loaded), +8 handle}, +26 resident names with
  * the module name first). Returns sel's segment, or 0. */
+/* KERNEL's THHOOK (export 332) in its DGROUP: pGlobalHeap (the arena's
+ * selector) at +2, SelTableLen +16h, SelTableStart +18h. 121Ch in Win98's
+ * KRNL386; a host booting another KRNL386 sets it from that file's entry
+ * table (Win 3.11's 218h: w311host.c). */
+uint16_t g_w16_thhook = 0x121C;
+/* where KERNEL's code segment 1 keeps its DGROUP selector (`mov ds, cs:[n]`):
+ * 2 in Win98's KRNL386, 30h in Win 3.11's */
+uint16_t g_w16_kdgofs = 2;
 static uint16_t w16_rebind(uint16_t sel, uint16_t want) {
     /* KERNEL's DGROUP: its bound selector, or cs:[2] before the first bind */
     uint16_t kd = RECOMP_MODULES[0].dgroup, dgs = g_w16_segsel[kd];
-    if (dgs == (uint16_t)(kd << 3 | 7)) dgs = *(uint16_t *)(uintptr_t)(recomp_sel_base(g_w16_segsel[1]) + 2);
+    if (dgs == (uint16_t)(kd << 3 | 7)) dgs = *(uint16_t *)(uintptr_t)(recomp_sel_base(g_w16_segsel[1]) + g_w16_kdgofs);
     uint32_t dg = recomp_sel_base(dgs);
     if (!dg) return 0;
-    uint32_t bm = recomp_sel_base(*(uint16_t *)(uintptr_t)(dg + 0x121E));
-    uint16_t len = *(uint16_t *)(uintptr_t)(dg + 0x1232);
-    uint32_t tab = *(uint32_t *)(uintptr_t)(dg + 0x1234), ix = (uint32_t)(sel & ~7) >> 1;
+    uint32_t bm = recomp_sel_base(*(uint16_t *)(uintptr_t)(dg + g_w16_thhook + 2));
+    uint16_t len = *(uint16_t *)(uintptr_t)(dg + g_w16_thhook + 0x16);
+    uint32_t tab = *(uint32_t *)(uintptr_t)(dg + g_w16_thhook + 0x18), ix = (uint32_t)(sel & ~7) >> 1;
+    if (getenv("W16_RBDBG")) fprintf(stderr, "[rb] %04X dgs %04X dg %08X bm %08X len %04X tab %08X ix %04X\n", sel, dgs, dg, bm, len, tab, ix);
     if (!bm || ix >= len) return 0;
     uint32_t a = *(uint32_t *)(uintptr_t)(bm + tab + ix);
     if (!a) return 0;
@@ -649,6 +723,12 @@ static uint16_t w16_rebind(uint16_t sel, uint16_t want) {
  * holds: one KRNL386 loaded a segment into (w16_rebind), or an alias over a
  * segment already in memory (same base). ponytail: a linear scan per first
  * sight, cached. */
+/* addr..addr+n committed (VirtualQuery: IsBadReadPtr's fault would reach a VEH first) */
+static int mapped(uint32_t addr, uint32_t n) {
+    MEMORY_BASIC_INFORMATION mi;
+    return VirtualQuery((const void *)(uintptr_t)addr, &mi, sizeof mi) && mi.State == MEM_COMMIT
+        && (uintptr_t)mi.BaseAddress + mi.RegionSize >= (uintptr_t)addr + n;
+}
 static uint16_t seg_of(uint16_t sel) {
     uint16_t i = (uint16_t)(sel >> 3);
     if (i <= RECOMP_NUM_SEG) return i;
@@ -658,6 +738,29 @@ static uint16_t seg_of(uint16_t sel) {
         for (uint16_t n = 1; n <= RECOMP_NUM_SEG; n++)
             if (recomp_sel_base(g_w16_segsel[n]) == b) { g_alias[i] = n; break; }
         if (!g_alias[i]) w16_rebind(sel, 0);
+        if (!g_alias[i] && b && (native32_w9x_desc(sel)[5] & 0x88) == 0x88) {
+            /* A present code selector no table names yet: a copy of a lifted
+             * segment made before KERNEL's selector table exists (Win 3.11's
+             * BootStrap copies its seg 1 and far-jumps into the copy, 1:ADAA).
+             * Same bytes as the lifted segment's own image: that segment.
+             * ponytail: 256 bytes at 100h, segments over 200h; a closer
+             * compare (relocation sites masked) if two segments ever tie. */
+            uint32_t lim = (uint32_t)native32_w9x_desc(sel)[0] | (uint32_t)native32_w9x_desc(sel)[1] << 8;
+            for (uint16_t n = 1; n <= RECOMP_NUM_SEG && lim > 0x200; n++) {
+                uint16_t s0 = (uint16_t)(n << 3 | 7);
+                uint32_t b0 = recomp_sel_base(s0);
+                const uint8_t *d0 = native32_w9x_desc(s0);
+                if (!b0 || b0 == b || ((uint32_t)d0[0] | (uint32_t)d0[1] << 8) <= 0x200) continue;
+                if (!mapped(w16_lin(b + 0x100), 0x100)) break;   /* a base that is no address */
+                if (!(d0[5] & 0x80) || !mapped(w16_lin(b0 + 0x100), 0x100)) continue;
+                if (!memcmp((const void *)(uintptr_t)w16_lin(b + 0x100), (const void *)(uintptr_t)w16_lin(b0 + 0x100), 0x100)) {
+                    g_alias[i] = n;
+                    g_w16_segsel[n] = (uint16_t)(sel | 7);   /* cs:[n] reads now read the copy, as cs does */
+                    if (getenv("W16_TRACE")) fprintf(stderr, "[w16] code selector %04X (base %08X limit %X): a copy of lifted seg %u\n", sel, b, lim, n);
+                    break;
+                }
+            }
+        }
         if (!g_alias[i]) {
             /* A not-present selector (a load-on-call or discarded segment) has no arena
              * to name its owner: a far call into it is the CPU's #NP, which has KRNL386
@@ -671,9 +774,11 @@ static uint16_t seg_of(uint16_t sel) {
                 if (!rm->dgroup || dg == (uint16_t)(rm->dgroup << 3 | 7)) continue;
                 uint16_t kd = RECOMP_MODULES[0].dgroup;
                 uint32_t kdg = recomp_sel_base(g_w16_segsel[kd]);
-                uint32_t bm = kdg ? recomp_sel_base(*(uint16_t *)(uintptr_t)(kdg + 0x121E)) : 0;
-                uint32_t tab = kdg ? *(uint32_t *)(uintptr_t)(kdg + 0x1234) : 0;
-                uint32_t a = bm ? *(uint32_t *)(uintptr_t)(bm + tab + ((uint32_t)(dg & ~7) >> 1)) : 0;
+                uint32_t bm = kdg ? recomp_sel_base(*(uint16_t *)(uintptr_t)(kdg + g_w16_thhook + 2)) : 0;
+                uint32_t tab = kdg ? *(uint32_t *)(uintptr_t)(kdg + g_w16_thhook + 0x18) : 0;
+                uint16_t len = kdg ? *(uint16_t *)(uintptr_t)(kdg + g_w16_thhook + 0x16) : 0;
+                /* (no table yet during BootStrap: Win 3.11 far-calls before it exists) */
+                uint32_t a = bm && ((uint32_t)(dg & ~7) >> 1) < len ? *(uint32_t *)(uintptr_t)(bm + tab + ((uint32_t)(dg & ~7) >> 1)) : 0;
                 const uint8_t *ne = a ? (const uint8_t *)(uintptr_t)recomp_sel_base(*(uint16_t *)(uintptr_t)(bm + a + 0x12) | 1) : NULL;
                 if (getenv("W16_NPDBG")) {
                     fprintf(stderr, "[np] %04X: %s dg %04X a %08X ne %p", sel, rm->name, dg, a, (const void *)ne);
@@ -1179,13 +1284,21 @@ int w16_enter(uint32_t target) {
  * target, ss:sp a stack), a dummy far return is pushed (the lifted retf
  * just pops it), and *r gets the registers back. For module entry points
  * (LibMain) the host runs before any thunk. */
+/* w16_call's far return is 0:0, written below ss:sp. A host entering code
+ * whose stack sits on data it still reads (Win 3.11's BootStrap: sp = its NE
+ * header, "NE" at ss:[sp]) sets this: the words already there are pushed
+ * back instead, so the bytes stay. Nothing returns to it either way. */
+int g_w16_call_keep;
 int w16_call(CPU *r) {
     if (!g_w16_ready) { cpu_init(&g_w16); g_w16.mem = NULL; g_w16_ready = 1; segsel_init(); }
     CPU saved = g_w16;
     g_w16 = *r; g_w16.mem = NULL;
     if (getenv("W16_FN")) g_fncount = 1;
     if (getenv("W16_WSEL")) { g_watch_ds = 1; g_wsel = (uint16_t)strtoul(getenv("W16_WSEL"), 0, 16); }   /* a descriptor watch (recomp_fn_hit) */
-    push16(&g_w16, 0); push16(&g_w16, 0);
+    if (g_w16_call_keep) {
+        uint16_t hi = mem_read16(&g_w16, g_w16.ss, (uint16_t)(g_w16.sp - 2)), lo = mem_read16(&g_w16, g_w16.ss, (uint16_t)(g_w16.sp - 4));
+        push16(&g_w16, hi); push16(&g_w16, lo);
+    } else { push16(&g_w16, 0); push16(&g_w16, 0); }
     int okc = w16_entry(&g_w16, seg_of(r->cs), r->ip);
     *r = g_w16;
     g_w16 = saved;
