@@ -1578,12 +1578,30 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
                                         L"LOGONSERVER=\\\\PCRECOMP", L"SESSIONNAME=Console" };
         static const wchar_t* idn[] = { L"USERNAME=", L"USERDOMAIN", L"COMPUTERNAME=", L"LOGONSERVER=", L"SESSIONNAME=",
                                         L"CLIENTNAME=", L"USERDNSDOMAIN=" };
+        /* Not the host's environment: only the names a Windows process has (the
+         * runner points the paths into the box), never the host's tokens and keys.
+         * A guest's child keeps its launcher's guest block whole (ge). More names:
+         * PCRECOMP_GUEST_SET=NAME=VAL;NAME=VAL, appended below. */
+        static const wchar_t* keep[] = { L"SystemRoot=", L"windir=", L"SystemDrive=", L"ComSpec=", L"PATHEXT=",
+            L"TEMP=", L"TMP=", L"USERPROFILE=", L"ALLUSERSPROFILE=", L"APPDATA=", L"LOCALAPPDATA=", L"HOMEDRIVE=",
+            L"HOMEPATH=", L"ProgramFiles=", L"CommonProgramFiles=", L"ProgramData=", L"PUBLIC=", L"OS=", L"PROMPT=",
+            L"NUMBER_OF_PROCESSORS=", L"PROCESSOR_ARCHITECTURE=", L"PROCESSOR_IDENTIFIER=", L"PROCESSOR_LEVEL=",
+            L"PROCESSOR_REVISION=" };
         for (wchar_t* s = e; *s; s += wcslen(s) + 1) {
-            int id = native32_host_identity_in(s, wcslen(s));
+            int id = native32_host_identity_in(s, wcslen(s)), ok = ge != NULL;
+            for (int i = 0; !ok && i < (int)(sizeof keep / sizeof keep[0]); i++) ok = !_wcsnicmp(s, keep[i], wcslen(keep[i]));
+            id |= !ok;
             for (int i = 0; i < (int)(sizeof idn / sizeof idn[0]); i++) id |= !_wcsnicmp(s, idn[i], wcslen(idn[i]));
             if (!id && _wcsnicmp(s, L"Path=", 5) && _wcsnicmp(s, L"PCRECOMP_GUEST_", 15)) { wcscpy(copy + o, s); if (fb_on && !ge) fb_guest_path(copy + o); o += wcslen(copy + o) + 1; }
         }
         for (int i = 0; i < (int)(sizeof idv / sizeof idv[0]); i++) wcscpy(copy + o, idv[i]), o += wcslen(idv[i]) + 1;
+        if (!ge) {
+            wchar_t gs[1024];
+            DWORD k = GetEnvironmentVariableW(L"PCRECOMP_GUEST_SET", gs, 1024);
+            if (k && k < 1024)   /* the block's slack: MAX_PATH + 200 past the host's size, which still holds the var */
+                for (wchar_t *c, *t = wcstok(gs, L";", &c); t; t = wcstok(NULL, L";", &c))
+                    if (wcschr(t, L'=') > t) wcscpy(copy + o, t), o += wcslen(t) + 1;
+        }
         wcscpy(copy + o, L"Path="), wcscpy(copy + o + 5, dll_path), o += 5 + dl;
         /* PCRECOMP_GUEST_PATH: more guest directories for a program search (cmd's
          * `find` and `more`: the box's C:\WINNT\system32, where a runner puts names) */
