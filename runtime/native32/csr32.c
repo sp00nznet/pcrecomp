@@ -164,6 +164,27 @@ static uint32_t nls_get_user_info(uint32_t data, uint32_t capture) {
     return 0;
 }
 
+/* consrv GetConsoleTitle, NT 6 (api 0x20226): { ConsoleHandle, TitleLength (in: the
+ * buffer's bytes; out: the title's), Title (captured), Unicode, Original }. The
+ * host console's title (an empty reply zeroed the Title pointer, which kernel32
+ * then copies from). */
+static uint32_t con_get_title(uint32_t data, uint32_t capture) {
+    uint32_t buf = MEM32(data + 8), n = MEM32(data + 4);
+    wchar_t t[1024] = L"";
+    (void)capture;
+    GetConsoleTitleW(t, 1023);
+    if (!buf || !n) return 0xC000000Du;
+    if (MEM8(data + 0x0C)) {
+        uint32_t k = (uint32_t)wcslen(t) * 2;
+        if (k + 2 > n) k = n - 2 & ~1u;
+        memcpy((void*)(uintptr_t)buf, t, k), MEM16(buf + k) = 0, MEM32(data + 4) = k;
+    } else {
+        int k = WideCharToMultiByte(CP_OEMCP, 0, t, -1, (char*)(uintptr_t)buf, (int)n, NULL, NULL);
+        MEM32(data + 4) = k > 0 ? (uint32_t)k - 1 : 0;
+    }
+    return 0;
+}
+
 /* ---- SxS: activation contexts (XP) ----------------------------------------
  * XP's csrss builds an activation context from a manifest: basesrv 27,
  * BaseSrvSxsCreateActivationContext, and the process default one at process
@@ -402,6 +423,14 @@ static uint32_t sxs_create_actctx(uint32_t data, uint32_t capture) {
 }
 
 /* ---- the port ------------------------------------------------------------ */
+static HANDLE g_shared_sec;   /* NT 6: csrss's read-only shared section */
+/* NtOpenSection(\Sessions\N\Windows\SharedSection): a handle to it (syscall32.c) */
+uint32_t csr32_shared_section(void) {
+    HANDLE h = NULL;
+    if (!g_shared_sec) g_shared_sec = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, 0x10000, NULL);
+    DuplicateHandle(GetCurrentProcess(), g_shared_sec, GetCurrentProcess(), &h, 0, FALSE, DUPLICATE_SAME_ACCESS);
+    return (uint32_t)(uintptr_t)h;
+}
 static HANDLE g_port;     /* the guest's handle to \Windows\ApiPort: an event of ours */
 
 /* NtSecureConnectPort(Port*, Name, Qos, ClientView, Sid, ServerView, MaxLen*, Info, InfoLen*)
@@ -427,7 +456,27 @@ static uint32_t lpc_connect(uint32_t* a, int secure) {
         MEM32(cv + 16) = MEM32(cv + 20) = (uint32_t)(uintptr_t)v;
         if (sv) MEM32(sv + 4) = MEM32(cv + 12), MEM32(sv + 8) = (uint32_t)(uintptr_t)v;
     }
-    if (info) {
+    if (info && MEM16(native32_guest_peb + 0xAC) >= 6000) {
+        /* NT 6: CSR_API_CONNECTINFO { ObjectDirectory, SharedSectionBase,
+         * SharedStaticServerData, SharedSectionHeap, ..., +0x1C ServerProcessId };
+         * ntdll maps \Sessions\N\Windows\SharedSection itself at the base
+         * (csr32_shared_section), so the base is a free address the section fits */
+        static uint32_t base;
+        if (!g_shared_sec) g_shared_sec = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, 0x10000, NULL);
+        if (!base) {
+            uint8_t* v = (uint8_t*)MapViewOfFile(g_shared_sec, FILE_MAP_ALL_ACCESS, 0, 0, 0);
+            if (!v) return 0xC0000017u;
+            ((uint32_t*)(v + 0x100))[1] = base_static_server_data();   /* the static server data array */
+            UnmapViewOfFile(v);
+            v = (uint8_t*)VirtualAlloc(NULL, 0x10000, MEM_RESERVE, PAGE_NOACCESS);   /* a free 64 KB */
+            base = (uint32_t)(uintptr_t)v;
+            VirtualFree(v, 0, MEM_RELEASE);
+        }
+        MEM32(info + 0x04) = base;
+        MEM32(info + 0x08) = base + 0x100;
+        MEM32(info + 0x0C) = base + 0x1000;
+        MEM32(info + 0x1C) = GetCurrentProcessId();
+    } else if (info) {
         static uint32_t srv[16];
         static uint8_t* shared;
         if (!shared) shared = (uint8_t*)VirtualAlloc(NULL, 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -444,6 +493,7 @@ static uint32_t lpc_connect(uint32_t* a, int secure) {
         uint32_t nls = MEM16(native32_guest_peb + 0xAC) >= 2600 ? 30 : 26;
         if (!g_api[1][nls]) native32_csr_api(0x10000 | nls, nls_get_user_info);
         if (nls == 30 && !g_api[1][27]) native32_csr_api(0x1001B, sxs_create_actctx);
+        if (MEM16(native32_guest_peb + 0xAC) >= 6000) native32_csr_api(0x20226, con_get_title);
     }
     if (!g_port) g_port = CreateEventA(NULL, FALSE, FALSE, NULL);
     MEM32(a[0]) = (uint32_t)(uintptr_t)g_port;
