@@ -57,6 +57,12 @@ extern int native64_trace;                        /* NATIVE64_SYSCALLS=1 */
 /* Run guest code at va on this thread's CPU with up to 4 arguments. */
 uint64_t native64_call(uint64_t va, int n, const uint64_t* args);
 
+/* win32k: names for the guest's service numbers ("0xNNNN Name" lines; 0 if
+ * the file is missing), and a handler by name. */
+int native64_win32k_names(const char* file);
+void native64_w32k(const char* name, native64_syscall_fn fn);
+
 /* csr64.c: \Windows\ApiPort answered here */
 void csr64_install(void);
+void w32k64_install(void);   /* w32k64.c: the first win32k services */
 #endif

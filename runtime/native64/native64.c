@@ -144,6 +144,18 @@ void dispatch(CPU* c, uint64_t va) {
 }
 void dispatch_jmp(CPU* c, uint64_t va) { dispatch(c, va); }
 
+/* An instruction the lifter left as RECOMP_TODO was reached. */
+void recomp_todo64(void* cv, uint64_t va, const char* text) {
+    CPU* c = (CPU*)cv;
+    uint64_t off;
+    const char* m = mod_of(va, &off);
+    fprintf(stderr, "\n[native64] not lifted: %s at %s+%llX (%llX)\n", text, m, (unsigned long long)off, (unsigned long long)va);
+    guest_stack_dump(c);
+    ring_dump("todo");
+    fflush(stderr);
+    TerminateProcess(GetCurrentProcess(), 6);
+}
+
 uint64_t native64_call(uint64_t va, int n, const uint64_t* a) {
     CPU* c = t_cpu;
     uint64_t sp = c->rsp;
@@ -209,7 +221,6 @@ static int read_services(uint64_t ntdll) {
 }
 
 static uint64_t win32k_call(CPU* c, uint32_t svc, uint64_t* a);
-static uint64_t (*g_w32k)(uint32_t svc, uint64_t* a);   /* stage 3 */
 
 void recomp_syscall64(CPU* c) {
     uint32_t n = (uint32_t)c->rax;
@@ -234,10 +245,37 @@ void recomp_syscall64(CPU* c) {
     c->rax = (uint32_t)r;
 }
 
+/* win32k: the guest's numbers named from a "0xNNNN Name" file (j00ru's
+ * table for the guest's build), answered by name (native64_w32k). A service
+ * with no handler is logged once and answers 0. */
+#define NW32K 0x400
+static struct { char name[48]; native64_syscall_fn fn; int seen; } g_w32kt[NW32K];
+
+int native64_win32k_names(const char* file) {
+    FILE* f = fopen(file, "r");
+    char line[128], nm[64];
+    unsigned k, n = 0;
+    if (!f) return 0;
+    while (fgets(line, sizeof line, f))
+        if (sscanf(line, "%x %63s", &k, nm) == 2 && k >= 0x1000 && k < 0x1000 + NW32K)
+            strncpy(g_w32kt[k - 0x1000].name, nm, 47), n++;
+    fclose(f);
+    return (int)n;
+}
+void native64_w32k(const char* name, native64_syscall_fn fn) {
+    for (int i = 0; i < NW32K; i++) if (!strcmp(g_w32kt[i].name, name)) g_w32kt[i].fn = fn;
+}
+
 static uint64_t win32k_call(CPU* c, uint32_t svc, uint64_t* a) {
-    if (g_w32k) return g_w32k(svc, a);
-    fprintf(stderr, "[win32k] service %X (rip %llX): no win32k layer\n", svc, c->rip);
-    return ST_INVALID_SERVICE;
+    unsigned i = svc - 0x1000;
+    if (i >= NW32K) return ST_INVALID_SERVICE;
+    uint64_t r = g_w32kt[i].fn ? g_w32kt[i].fn(a) : 0;
+    if (native64_trace || (!g_w32kt[i].fn && !g_w32kt[i].seen))
+        fprintf(stderr, "[win32k] %-32s(%llX %llX %llX %llX %llX %llX) -> %llX%s  (rip %llX)\n",
+                g_w32kt[i].name[0] ? g_w32kt[i].name : "?", a[0], a[1], a[2], a[3], a[4], a[5], r,
+                g_w32kt[i].fn ? "" : "  NOT ANSWERED", c->rip);
+    g_w32kt[i].seen = 1;
+    return r;
 }
 
 void recomp_int64(CPU* c, int v) {
@@ -700,6 +738,7 @@ int native64_boot(const native64_module_t* mods, int n, const native64_boot_t* b
     native64_override("NtQueryDebugFilterState", ovr_debug_filter);
     native64_override("NtRegisterThreadTerminatePort", ovr_terminate_port);
     csr64_install();
+    w32k64_install();
 
     /* PEB (x64 NT 5.2): the fields the kernel fills. */
     uint8_t* peb = (uint8_t*)VirtualAlloc(NULL, 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -737,16 +776,17 @@ int native64_boot(const native64_module_t* mods, int n, const native64_boot_t* b
     *(uint64_t*)(peb + 0xA8) = (uint64_t)(uintptr_t)oem;
     *(uint64_t*)(peb + 0xB0) = (uint64_t)(uintptr_t)casetab;
 
-    /* RTL_USER_PROCESS_PARAMETERS (x64), normalized. No console of the
-     * guest's own: ConsoleHandle is CONSOLE_DETACHED_PROCESS (-1) and the
-     * standard handles are the host's, which the host kernel writes. */
+    /* RTL_USER_PROCESS_PARAMETERS (x64), normalized. The standard handles
+     * are the host's, which the host kernel reads and writes. */
     wchar_t cur[MAX_PATH], img[MAX_PATH];
     _snwprintf(cur, MAX_PATH - 1, L"%ls\\", b->box);
     _snwprintf(img, MAX_PATH - 1, L"%ls\\%ls", b->sysdir, b->image);
     *(uint32_t*)(pp + 0x00) = 0x1000;
     *(uint32_t*)(pp + 0x04) = 0x3F0;
     *(uint32_t*)(pp + 0x08) = 1;                                   /* RTL_USER_PROC_PARAMS_NORMALIZED */
-    *(uint64_t*)(pp + 0x10) = (uint64_t)-1;                        /* ConsoleHandle */
+    /* ConsoleHandle: a console program attaches to the host's console
+     * through csr64's consrv (its handle 0x4E363460); a GUI one has none */
+    *(uint64_t*)(pp + 0x10) = ent->OptionalHeader.Subsystem == 3 ? 0x4E363460u : 0;
     *(uint64_t*)(pp + 0x20) = (uint64_t)(uintptr_t)GetStdHandle(STD_INPUT_HANDLE);
     *(uint64_t*)(pp + 0x28) = (uint64_t)(uintptr_t)GetStdHandle(STD_OUTPUT_HANDLE);
     *(uint64_t*)(pp + 0x30) = (uint64_t)(uintptr_t)GetStdHandle(STD_ERROR_HANDLE);

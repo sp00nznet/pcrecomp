@@ -1027,6 +1027,23 @@ class Lifter:
 
         # x87 and MMX are not modelled - see the module docstring. Caught here
         # so they cannot fall through into a same-named integer handler.
+        # The x87 *control* state is still read and written on x64: a CRT's
+        # setjmp saves the control word (msvcrt: fnstcw [rcx+5Ch]) and
+        # _control87 sets it. With no x87 stack it stays the default 0x27F.
+        # fxsave/fxrstor: RtlCaptureContext and RtlRestoreContext keep the
+        # SSE state (MxCsr, xmm0-15) in the CONTEXT's FltSave area.
+        if m in ('fxsave', 'fxsave64') and ops and ops[0].type == X86_OP_MEM:
+            return ['fxsave_cpu(c, %s);' % self.addr_expr(insn, ops[0])]
+        if m in ('fxrstor', 'fxrstor64') and ops and ops[0].type == X86_OP_MEM:
+            return ['fxrstor_cpu(c, %s);' % self.addr_expr(insn, ops[0])]
+        if m in ('fnstcw', 'fstcw') and ops and ops[0].type == X86_OP_MEM:
+            return ['wr16(%s, 0x27F);' % self.addr_expr(insn, ops[0])]
+        if m in ('fldcw', 'fnclex', 'fclex', 'fninit', 'finit'):
+            return ['/* %s: no x87 state */' % m]
+        if m == 'fnstsw' and ops:
+            if ops[0].type == X86_OP_MEM:
+                return ['wr16(%s, 0);' % self.addr_expr(insn, ops[0])]
+            return ['SET16(c->rax, 0);']
         if m[0] == 'f' and m not in ('fs',):
             return [_todo(ea, '%s %s (x87 not modelled)' % (m, insn.op_str))]
 
@@ -1063,6 +1080,13 @@ class Lifter:
             return ['{ uint64_t _t = __rdtsc(); SET32(c->rax, (uint32_t)_t); SET32(c->rdx, (uint32_t)(_t >> 32)); }']
         if m in ('mov', 'movabs'):
             d, s = two()
+            # A selector read (RtlCaptureContext saves all six): long mode's
+            # user selectors are fixed, so they are constants.
+            if s.type == X86_OP_REG and insn.reg_name(s.reg) in SEG:
+                sel = {'cs': 0x33, 'fs': 0x53}.get(insn.reg_name(s.reg), 0x2B)
+                return [self.dst_write(insn, d, '0x%Xull' % sel)]
+            if d.type == X86_OP_REG and insn.reg_name(d.reg) in SEG:
+                return ['/* mov %s: selectors are fixed */' % insn.op_str]
             return [self.dst_write(insn, d, self.src_ext(insn, s, d.size))]
         if m == 'lea':
             d, s = two()

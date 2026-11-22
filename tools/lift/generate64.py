@@ -230,7 +230,7 @@ def plausible_code(read_va, va):
         from capstone import Cs, CS_ARCH_X86, CS_MODE_64
         _CODE_MD = Cs(CS_ARCH_X86, CS_MODE_64)
     try:
-        code = read_va(va, 16)
+        code = read_va(va, 48)   # three 7-byte leas do not fit in 16 (XP x64 cmd.exe)
     except Exception:
         return False
     n = 0
@@ -588,7 +588,10 @@ def main():
         lf.lea_targets.clear()
 
         known = set(bounds)
-        starts = sorted(known)
+        # The round's own new entries bound each other too: an arm's extent
+        # stops at the next arm. Against the old starts only, 200 arms of one
+        # XP x64 switch each lifted the same 64 KB (cmd.exe: 480 MB of C).
+        starts = sorted(known | {t for t in targets if text_lo <= t < text_hi})
         new = []
         for t in sorted(targets):
             if t in known or not (text_lo <= t < text_hi):

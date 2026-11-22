@@ -217,6 +217,11 @@ static inline void do_cpuid(CPU *c)
     SET32(c->rdx, (uint32_t)r[3]);
 }
 
+#if !defined(RECOMP_TODO) && defined(RECOMP_GUEST_GS)
+/* native64 names the instruction and the guest's callers, then ends */
+void recomp_todo64(void *c, uint64_t va, const char *text);
+#define RECOMP_TODO(va, text) recomp_todo64(c, (va), (text))
+#endif
 #ifndef RECOMP_TODO
 #define RECOMP_TODO(va, text) abort()
 #endif
@@ -447,6 +452,20 @@ static inline uint64_t mulu64_128(uint64_t a, uint64_t b, uint64_t *hi) {
     *hi = hh + (lh >> 32) + (hl >> 32) + (mid >> 32);
     return (mid << 32) | (uint32_t)ll;
 #endif
+}
+
+/* fxsave/fxrstor's 512-byte area: FCW +0, MXCSR +0x18, MXCSR_MASK +0x1C,
+ * xmm0-15 at +0xA0. No x87 stack is modelled, so its part is the reset state. */
+static inline void fxsave_cpu(CPU *c, uint64_t a) {
+    memset((void *)(uintptr_t)a, 0, 0xA0);
+    wr16(a, 0x27F);
+    wr32(a + 0x18, c->mxcsr);
+    wr32(a + 0x1C, 0xFFFF);
+    memcpy((void *)(uintptr_t)(a + 0xA0), c->xmm, sizeof c->xmm);
+}
+static inline void fxrstor_cpu(CPU *c, uint64_t a) {
+    c->mxcsr = rd32(a + 0x18);
+    memcpy(c->xmm, (const void *)(uintptr_t)(a + 0xA0), sizeof c->xmm);
 }
 
 /* div/idiv r/m64: rdx:rax / d. A quotient that does not fit is #DE on the
