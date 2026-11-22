@@ -1024,7 +1024,10 @@ static void dib_bitmapbits(CPU *c) {
     c->ax = (uint16_t)done; c->dx = (uint16_t)(done >> 16);
     ret_far(c, 16);
 }
-#define DISPLAY_FNS [1] = disp_bitblt, [8] = disp_output, [9] = disp_pixel, [2] = disp_colorinfo, [3] = disp_control, [4] = disp_disable, [5] = disp_enable, [10] = disp_realize, [14] = disp_exttextout, [15] = disp_charwidth, [19] = disp_dibbits, [21] = disp_dibtodev
+/* DISPLAY.17 FastBorder(lpRect, wBorderWidth, wBorderDepth, dwRop, lpDstDev, lpPBrush, lpDrawMode, lpClipRect):
+ * 0, not done here (Win 3.1 GDI then draws the border with PatBlt) */
+static void disp_fastborder(CPU *c) { c->ax = 0; ret_far(c, 28); }
+#define DISPLAY_FNS [17] = disp_fastborder, [1] = disp_bitblt, [8] = disp_output, [9] = disp_pixel, [2] = disp_colorinfo, [3] = disp_control, [4] = disp_disable, [5] = disp_enable, [10] = disp_realize, [14] = disp_exttextout, [15] = disp_charwidth, [19] = disp_dibbits, [21] = disp_dibtodev
 static drv_t g_drv[] = {
     { "SYSTEM",   { [1] = sys_inquire, [2] = sys_createtimer, [3] = sys_killtimer, [4] = sys_timers, [5] = sys_timers, [6] = sys_msec, [7] = sys_fpu_size, [8] = sys_fpu_save, [9] = sys_fpu_save } },
     { "KEYBOARD", { [5] = kb_ansi_to_oem, [6] = kb_oem_to_ansi, [1] = kb_inquire, [2] = kb_enable, [3] = drv_disable, [7] = kb_setspeed, [4] = kb_toascii, [131] = kb_mapvk, [132] = kb_codepage, [134] = kb_ansi_to_oem_buf, [135] = kb_oem_to_ansi_buf, [136] = kb_sysreq } },

@@ -1471,6 +1471,7 @@ static void dos_fail(uint16_t err) { SET16(g_eax, err); set_cf(1); g_dos_err = e
 
 /* The sandbox: guest C:\ is this host directory, and no guest path may
  * leave it (".." is resolved first, then the prefix is checked). */
+const char* native32_w9x_cwd(void) { return g_cwd; }   /* identity.c's int 21h 47h */
 static char g_root[MAX_PATH];   /* g_cwd: guest, no drive, no leading '\' */
 /* why host_path failed, as DOS says it: 15 invalid drive (only C: exists; Win 3.1's
  * KRNL386 probes with a "$:" drive and reads the code), else 3 path not found */
@@ -1752,6 +1753,11 @@ static uint32_t vwin32_int21(const uint32_t* a) {
             if (!SetFileTime(fh, al == 7 ? &ft : NULL, al == 4 ? &ft : NULL, NULL)) dos_fail(host_err());
             return g_eax; }
         break; }
+    case 0x3B: {                                               /* chdir DS:DX (Win 3.1 KRNL386 at task start) */
+        DWORD at;
+        if (!host_path(g_edx, path) || (at = GetFileAttributesA(path)) == INVALID_FILE_ATTRIBUTES || !(at & FILE_ATTRIBUTE_DIRECTORY)) { dos_fail(g_path_err); return g_eax; }
+        strcpy(g_cwd, path + strlen(g_root) + (path[strlen(g_root)] == '\\'));
+        return g_eax; }
     case 0x71:
         switch (al) {
         case 0x47:                                             /* LFN cwd: DL drive (0 = current), DS:ESI */

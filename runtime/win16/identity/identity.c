@@ -568,7 +568,8 @@ void dos_int21(CPU *c) {
     case 0x02: fputc(c->dl, stderr); return;                  /* write a character (KRNL386's messages) */
     case 0x47:   /* current directory of drive dl at ds:si, no drive or leading '\': the root */
         if (c->dl && c->dl != 3) { c->ax = 15; c->flags |= FLAG_CF; return; }   /* only C: (Win 3.1 KRNL386 probes drive F0h, wants "invalid drive") */
-        *(char *)(uintptr_t)(recomp_sel_base(c->ds) + c->si) = 0; ok(c); return;
+        { const char *native32_w9x_cwd(void); strncpy((char *)(uintptr_t)(recomp_sel_access_base(c->ds) + c->si), native32_w9x_cwd(), 64); }
+        ok(c); return;
     case 0x50: {   /* set PSP: the parent int 21h 55h copies (KRNL386 seg2 4956 sets it around 55h) */
         void native32_w9x_set_psp(uint16_t sel);
         native32_w9x_set_psp(c->bx); ok(c); return;
@@ -613,6 +614,7 @@ void int_handler(CPU *cpu, int vec) {
     if (vec == 0x12) { cpu->ax = 640; return; }      /* BIOS base memory, KB */
     if (vec == 0x10) return;   /* BIOS video (KRNL386's fatal exit sets mode 3 before its message): no screen */
     if (vec == 0x41) return;   /* kernel debugger (WDEB386) calls: none present, ax stays (not F386h) */
+    if (vec == 0x28) return;   /* DOS idle (Win 3.1 USER's idle loop, seg1 33FA): nothing to hand the time to */
     w16_stop("int, ax", (unsigned)vec << 8 | (cpu->ax >> 8), cpu->ax);
 }
 void bios_int10(CPU *cpu) { int_handler(cpu, 0x10); }
