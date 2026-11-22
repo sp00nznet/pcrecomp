@@ -58,6 +58,9 @@ extern int native64_trace;                        /* NATIVE64_SYSCALLS=1 */
 /* Run guest code at va on this thread's CPU with up to 4 arguments. */
 uint64_t native64_call(uint64_t va, int n, const uint64_t* args);
 
+/* Answer a guest function (its entry va) with a host one, in the lifted model. */
+void native64_replace(uint64_t va, void (*fn)(CPU*));
+
 /* win32k: names for the guest's service numbers ("0xNNNN Name" lines; 0 if
  * the file is missing), and a handler by name. */
 int native64_win32k_names(const char* file);

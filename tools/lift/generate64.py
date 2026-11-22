@@ -629,6 +629,24 @@ def main():
         print('[*] catalog closed after %d rounds, %d entries added (%d total)'
               % (rounds, added_total, len(bounds)))
 
+    # setjmp's callers get a landing pad too. A guest longjmp unwinds with
+    # the guest's RtlUnwindEx and ends in a context whose rip is the return
+    # from setjmp, in the middle of the caller's body; the runtime can resume
+    # there only through a live ES3_EH_ENTER frame (native64.c ovr_continue).
+    # The callers are found by what they call: the IAT slot of _setjmp /
+    # _setjmpex, or a one-jump thunk to it (XP x64's cmd.exe calls a thunk).
+    sj_slots = {s for s, (dll, nm) in iat.items() if nm.lower() in ('_setjmp', '_setjmpex', 'setjmp')}
+    if sj_slots:
+        refs = ['rd64(GVA(0x%X))' % s for s in sj_slots]
+        thunks = {va for va, b in bodies.items() if bounds[va][0] <= 8 and any(r in b for r in refs)}
+        calls = refs + ['dispatch(c, 0x%Xull)' % t for t in thunks]
+        callers = {va for va, b in bodies.items() if va not in thunks and any(r in b for r in calls)}
+        if callers:
+            lf.eh_funcs = frozenset(set(lf.eh_funcs) | callers)
+            for va in callers:
+                bodies[va] = lift_one(va)
+            print('[*] setjmp: %d callers given a landing pad' % len(callers))
+
     entries = []
     chunk = []
     file_idx = 0

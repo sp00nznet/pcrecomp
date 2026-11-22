@@ -128,9 +128,25 @@ static void ring_dump(const char* why) {
     fprintf(stderr, "\n");
 }
 
+/* Guest functions answered by the host (native64_replace): the kernel's half
+ * of a few ntdll routines, e.g. RtlRestoreContext, which ends in iretq. */
+#define NREPL 16
+static struct { uint64_t va; void (*fn)(CPU*); } g_repl[NREPL];
+static int g_nrepl;
+static uint64_t g_repl_lo = ~(uint64_t)0, g_repl_hi;
+void native64_replace(uint64_t va, void (*fn)(CPU*)) {
+    if (!va || g_nrepl >= NREPL) return;
+    g_repl[g_nrepl].va = va, g_repl[g_nrepl++].fn = fn;
+    if (va < g_repl_lo) g_repl_lo = va;
+    if (va > g_repl_hi) g_repl_hi = va;
+}
+
 void dispatch(CPU* c, uint64_t va) {
-    void (*fn)(CPU*) = find(va);
+    void (*fn)(CPU*);
     t_ring[t_ringn++ % RING] = va;
+    if (va >= g_repl_lo && va <= g_repl_hi)
+        for (int i = 0; i < g_nrepl; i++) if (g_repl[i].va == va) { g_repl[i].fn(c); return; }
+    fn = find(va);
     if (fn) { fn(c); return; }
     uint64_t off;
     const char* m = mod_of(va, &off);
@@ -539,8 +555,32 @@ void es3_eh_pop(es3_ehframe_t* f) { t_ehn = f->cs_depth; }
  * resumable frame, else from the thread's top */
 static __declspec(thread) uint8_t t_ctx[0x4D0];
 static void load_context(CPU* c, const uint8_t* x);
+static void resume_context(void);
 static uint64_t ovr_continue(uint64_t* a) {
     memcpy(t_ctx, (void*)(uintptr_t)a[0], sizeof t_ctx);
+    resume_context();
+    return 0;
+}
+
+/* RtlRestoreContext(CONTEXT*, EXCEPTION_RECORD*): a longjmp's unwind (record
+ * STATUS_LONGJUMP, its _JUMP_BUFFER in ExceptionInformation[0]) takes the
+ * callee-saved registers, rsp and rip from the buffer; then as NtContinue. */
+static void rtl_restore_context(CPU* c) {
+    memcpy(t_ctx, (void*)(uintptr_t)c->rcx, sizeof t_ctx);
+    EXCEPTION_RECORD* r = (EXCEPTION_RECORD*)(uintptr_t)c->rdx;
+    if (r && r->ExceptionCode == 0x80000026u && r->NumberParameters >= 1) {
+        const uint8_t* jb = (const uint8_t*)(uintptr_t)r->ExceptionInformation[0];
+        static const int from[] = { 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38, 0x40, 0x48, 0x50 };
+        static const int to[] = { 0x90, 0x98, 0xA0, 0xA8, 0xB0, 0xD8, 0xE0, 0xE8, 0xF0, 0xF8 };   /* Rbx Rsp Rbp Rsi Rdi R12-R15 Rip */
+        for (int i = 0; i < 10; i++) *(uint64_t*)(t_ctx + to[i]) = *(const uint64_t*)(jb + from[i]);
+        memcpy(t_ctx + 0x1A0 + 6 * 16, jb + 0x60, 10 * 16);   /* Xmm6-15 */
+    } else if (r && r->ExceptionCode == 0x80000029u) {
+        fprintf(stderr, "[native64] RtlRestoreContext: unwind consolidation (C++ catch) is not done\n");
+    }
+    resume_context();
+}
+
+static void resume_context(void) {
     uint64_t rip = *(uint64_t*)(t_ctx + 0xF8), rsp = *(uint64_t*)(t_ctx + 0x98);
     for (int i = (t_ehn < EHMAX ? t_ehn : EHMAX) - 1; i >= 0; i--) {
         es3_ehframe_t* f = t_eh[i].f;
@@ -781,6 +821,7 @@ int native64_boot(const native64_module_t* mods, int n, const native64_boot_t* b
     native64_override("NtQueryInformationProcess", ovr_query_process);
     native64_override("NtQueryInformationThread", ovr_query_thread);
     native64_override("NtContinue", ovr_continue);
+    native64_replace(native64_export(g_boot.ntdll, "RtlRestoreContext"), rtl_restore_context);
     native64_override("NtTerminateProcess", ovr_terminate_process);
     native64_override("NtRaiseException", ovr_raise_exception);
     native64_override("NtCreateThread", ovr_create_thread);
