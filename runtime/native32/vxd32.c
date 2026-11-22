@@ -1672,6 +1672,15 @@ static uint32_t vwin32_int21(const uint32_t* a) {
         return g_eax; }
     case 0x1A: g_dta = g_edx; return g_eax;                    /* set DTA (DS:DX) */
     case 0x2F: g_ebx = g_dta; return g_eax;                    /* get DTA -> ES:BX */
+    case 0x43:                                                 /* attributes DS:DX: AL 0 get -> CX, 1 set CX */
+        if (!host_path(g_edx, path)) { dos_fail(g_path_err); return g_eax; }
+        if (al == 0) {
+            DWORD at = GetFileAttributesA(path);
+            if (at == INVALID_FILE_ATTRIBUTES) dos_fail(host_err()); else SET16(g_ecx, at & 0x3F);
+            return g_eax;
+        }
+        if (al == 1) { if (!SetFileAttributesA(path, (uint16_t)g_ecx & 0x27 ? (uint16_t)g_ecx & 0x27 : FILE_ATTRIBUTE_NORMAL)) dos_fail(host_err()); return g_eax; }
+        break;
     case 0x3C: case 0x3D: case 0x5B: {   /* create (CX attrs) / open (AL mode) / create new (5Bh: fails if it exists): DS:DX name -> AX handle */
         int mk = ah == 0x3C || ah == 0x5B;
         DWORD acc = mk || (al & 3) == 2 ? GENERIC_READ | GENERIC_WRITE : (al & 3) == 1 ? GENERIC_WRITE : GENERIC_READ;

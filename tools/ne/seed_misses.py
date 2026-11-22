@@ -33,6 +33,8 @@ MISS_RE = re.compile(r'(?:dispatch_)?(?:far|near) MISS seg=(\d+) off=([0-9A-Fa-f
 # Win16 identity mode (runtime/win16/identity): "[w16] unlifted target SSSS:OOOO"
 # and "[w16] near call miss SSSS:OOOO", the global segment in hex
 W16_RE = re.compile(r'\[w16\] (?:unlifted target|near call miss) ([0-9A-Fa-f]{4}):([0-9A-Fa-f]{4})')
+# "[w16] far call miss SEL:OOOO" through a segment's own identity selector (n << 3 | 7)
+W16_FAR_RE = re.compile(r'\[w16\] far call miss ([0-9A-Fa-f]{4}):([0-9A-Fa-f]{4})')
 
 
 def main():
@@ -53,7 +55,8 @@ def main():
         seeds = json.load(open(args.seeds, encoding='utf-8'))
     text = open(args.log, encoding='utf-8', errors='replace').read()
     added = 0
-    found = {(int(a), int(b, 16)) for a, b in MISS_RE.findall(text)} | {(int(a, 16), int(b, 16)) for a, b in W16_RE.findall(text)}
+    found = {(int(a), int(b, 16)) for a, b in MISS_RE.findall(text)} | {(int(a, 16), int(b, 16)) for a, b in W16_RE.findall(text)} \
+        | {(int(a, 16) >> 3, int(b, 16)) for a, b in W16_FAR_RE.findall(text) if int(a, 16) & 7 == 7}
     for seg, off in sorted(found):
         mod = next(((m, seg - lo) for lo, hi, m in ranges if lo < seg <= hi), None)
         if mod is None:
