@@ -158,8 +158,8 @@ class NELifter(Lifter):
                     # Cross-module call into another lifted module (e.g. CATZDLL):
                     # resolve the ordinal to that module's export entry -> function.
                     xm = self.xmod.get(mod.upper())
-                    if xm is not None and r.ordinal in xm:
-                        s, o = xm[r.ordinal]
+                    if xm is not None and _xk(r) in xm:
+                        s, o = xm[_xk(r)]
                         return f'seg{s:03d}_{o:04X}'
                     imp = get_import(mod, r.ordinal, r.name)
                     return imp.name
@@ -195,8 +195,8 @@ class NELifter(Lifter):
             return r.target_off & 0xFFFF
         mod = module_name(self.ne, r.module_idx)
         xm = self.xmod.get(mod.upper())
-        if xm and r.ordinal in xm:
-            return xm[r.ordinal][1] & 0xFFFF
+        if xm and _xk(r) in xm:
+            return xm[_xk(r)][1] & 0xFFFF
         return None
 
     def _resolve_mem_disp(self, inst, m, op1, op2):
@@ -610,8 +610,8 @@ class NELifter(Lifter):
                     elif tt in (1, 2):     # cross-module selector (e.g. CATZDLL)
                         mod = module_name(self.ne, r.module_idx)
                         xm = self.xmod.get(mod.upper())
-                        if xm and r.ordinal in xm:
-                            self._emit(_put(f'SEG_{xm[r.ordinal][0]}'),
+                        if xm and _xk(r) in xm:
+                            self._emit(_put(f'SEG_{xm[_xk(r)][0]}'),
                                        f'{orig} -- selector for {mod}.{r.ordinal}')
                             return
                 elif r.src_type == 5:      # OFFSET16 (offset of a symbol)
@@ -663,8 +663,8 @@ class NELifter(Lifter):
                     elif tt in (1, 2):
                         mod = module_name(self.ne, r.module_idx)
                         xm = self.xmod.get(mod.upper())
-                        if xm and r.ordinal in xm:
-                            self._emit(_put(f'0x{xm[r.ordinal][1] & 0xFFFF:04X}'),
+                        if xm and _xk(r) in xm:
+                            self._emit(_put(f'0x{xm[_xk(r)][1] & 0xFFFF:04X}'),
                                        f'{orig} -- offset of {mod}.{r.ordinal}')
                             return
 
@@ -1064,6 +1064,13 @@ class NELifter(Lifter):
             return f'fpu_write_i16(cpu, {seg}, {off}, {value});'
 
 
+def _xk(r):
+    """The key of an import in a lifted module's exports: its name when imported by
+    name (then r.ordinal is only an offset into the importer's name table), else its
+    ordinal (PBRUSH.EXE imports PBRUSH.DLL's VBITBLT by name)."""
+    return r.name.upper() if getattr(r, 'name', '') else r.ordinal
+
+
 def lift_segment(ne: NEHeader, seg_num: int, func_offset: int = -1, xmod=None):
     """Lift functions from a segment to C code. `xmod` (optional) maps a module
     name to {ordinal: (seg, off)} for cross-module call resolution (host->DLL)."""
@@ -1096,7 +1103,8 @@ def lift_segment(ne: NEHeader, seg_num: int, func_offset: int = -1, xmod=None):
     lifter.seg_func_offsets = {f.offset for f in functions}
     from ne_decode import collect_entry_table_targets, collect_internal_code_targets
     _known_entries = (collect_entry_table_targets(ne).get(seg.index, set())
-                      | collect_internal_code_targets(ne).get(seg.index, set()))
+                      | collect_internal_code_targets(ne).get(seg.index, set())
+                      | getattr(ne, '_seed_offs', {}).get(seg.index - getattr(ne, 'seg_base', 0), set()))
     # Functions whose first instruction pops the return address into a register
     # that the function later jumps through (see the near-call case).
     lifter.popret_offsets = set()

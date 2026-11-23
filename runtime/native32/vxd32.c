@@ -1634,6 +1634,22 @@ static uint32_t vwin32_int21(const uint32_t* a) {
     case 0x59:                                                 /* extended error: AX code, BH class, BL action, CH locus */
         SET16(g_eax, g_dos_err); SET16(g_ebx, 0x0D01); g_ecx = (g_ecx & 0xFFFF00FFu) | 0x0200; return g_eax;
     case 0x30: SET16(g_eax, 0x0A07); SET16(g_ebx, 0xFF00); return g_eax;   /* DOS 7.10 */
+    case 0x56: { /* rename DS:DX to ES:DI, both boxed (PBRUSH's temp file) */
+        uint32_t b = g_ds_base; int ok;
+        if (!host_path(g_edx, path)) { dos_fail(g_path_err); return g_eax; }
+        g_ds_base = g_es_base; ok = host_path(g_edi, path2); g_ds_base = b;
+        if (!ok) { dos_fail(g_path_err); return g_eax; }
+        if (!MoveFileA(path, path2)) dos_fail(host_err());
+        return g_eax; }
+    case 0x36: { /* free space of drive DL (0 current, 3 C:; others AX = FFFF): 32 KB clusters (WINFILE) */
+        uint8_t d = (uint8_t)g_edx; ULARGE_INTEGER fr, tot;
+        if (d != 0 && d != 3) { SET16(g_eax, 0xFFFF); return g_eax; }
+        if (!GetDiskFreeSpaceExA(g_root, &fr, &tot, NULL)) fr.QuadPart = tot.QuadPart = 0;
+        fr.QuadPart >>= 15; tot.QuadPart >>= 15;
+        SET16(g_eax, 64); SET16(g_ecx, 512);
+        SET16(g_ebx, fr.QuadPart > 0xFFFE ? 0xFFFE : (uint16_t)fr.QuadPart);
+        SET16(g_edx, tot.QuadPart > 0xFFFE ? 0xFFFE : (uint16_t)tot.QuadPart);
+        return g_eax; }
     case 0x41:   /* delete DS:DX (boxed) */
         if (!host_path(g_edx, path)) { dos_fail(g_path_err); return g_eax; }
         if (getenv("W16_TRACE")) fprintf(stderr, "[int21] delete %s\n", path);
@@ -1747,6 +1763,9 @@ static uint32_t vwin32_int21(const uint32_t* a) {
             if (d != 0 && d != 3) { dos_fail(15); return g_eax; }   /* only C: exists */
             if (al == 0x08) SET16(g_eax, 1); else SET16(g_edx, 0);  /* fixed, local */
             return g_eax;
+        }
+        if (al == 0x0D || al == 0x0E || al == 0x0F) {          /* generic block IOCTL / logical drive map (WINFILE's drive probe) */
+            dos_fail(al == 0x0D ? 1 : 15); return g_eax;       /* no device parameters to give; 0E/0F: no such drive map */
         }
         break;
     case 0x57: { HANDLE fh = dos_handle((uint16_t)g_ebx); FILETIME ft, l; WORD d, t;

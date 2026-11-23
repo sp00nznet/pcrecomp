@@ -66,8 +66,10 @@ def exports(ne):
     uses for calls. Keeping only code entries left CATZ.WAD pushing the
     loader's 0xFFFF:0000 placeholders instead of CATZDLL's data -- it booted,
     then idled in its message loop with the pet never loaded."""
-    return {e.ordinal: (e.segment, e.offset) for e in ne.entries
-            if 1 <= e.segment < 0xFE and ne.seg(e.segment) is not None}
+    x = {e.ordinal: (e.segment, e.offset) for e in ne.entries
+         if 1 <= e.segment < 0xFE and ne.seg(e.segment) is not None}
+    x.update({e.name.upper(): x[e.ordinal] for e in ne.entries if e.name and e.ordinal in x})   # imports by name
+    return x
 
 
 def main():
@@ -130,6 +132,9 @@ def main():
             data = ne._ida_data = ne_codemap.build(ne, local)
             print(f'  {stem}: native code map, {sum(len(v["functions"]) for v in data.values())} '
                   f'functions, {sum(len(v["heads"]) for v in data.values())} heads')
+        # the seeds by local segment, for ne_lift: a seeded entry hidden in a skip idiom
+        # is one more entry known to be entered (USER 2:0B57 under SetWindowWord's 0B56)
+        ne._seed_offs = {int(sg): {int(o, 16) for o in offs} for sg, offs in seeds.get(name, {}).items()}
         for seg, offs in seeds.get(name, {}).items():
             fn = data.setdefault(seg, {}).setdefault('functions', [])
             fn.extend(int(o, 16) for o in offs)

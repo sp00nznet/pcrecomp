@@ -29,6 +29,7 @@
 
 int recomp_dispatch_lookup(CPU *cpu, uint16_t seg, uint16_t off);
 uint8_t *native32_w9x_desc(uint16_t sel);
+static uint16_t seg_of(uint16_t sel);
 
 /* the trace ring main.c keeps; only written here */
 const char *g_fn_ring[RECOMP_FN_RING_SIZE];
@@ -486,6 +487,8 @@ static void int2f(CPU *c) {
                     * (the input and timer threads get in) */
         { extern int g_drv_win31; void native32_w9x_yield(void); if (g_drv_win31) native32_w9x_yield(); }
         return;
+    case 0x1500:   /* MSCDEX installation check (WINFILE): bx = 0, no CD-ROM drives */
+        c->bx = 0; return;
     case 0x4A32:   /* IO.SYS service bl (USER seg072_3742: bl=5, result unread); ponytail: a no-op, ax unchanged */
         return;
     case 0x168D:  /* es:di into the table KRNL386 hands VWIN32 0Ch (seg001_6B2A, unchecked): kernel32
@@ -624,6 +627,7 @@ void int_handler(CPU *cpu, int vec) {
     if (vec == 0x11) { cpu->ax = 0x0022; return; }   /* BIOS equipment: FPU, 80x25 colour, no floppies */
     if (vec == 0x12) { cpu->ax = 640; return; }      /* BIOS base memory, KB */
     if (vec == 0x10) return;   /* BIOS video (KRNL386's fatal exit sets mode 3 before its message): no screen */
+    if (vec == 0x25 || vec == 0x26) { cpu->ax = 0x8002; cpu->flags |= FLAG_CF; return; }   /* absolute disk read/write (WINFILE): refused, drive not ready */
     if (vec == 0x41) return;   /* kernel debugger (WDEB386) calls: none present, ax stays (not F386h) */
     if (vec == 0x28) { void native32_w9x_yield(void); native32_w9x_yield(); return; }   /* DOS idle (Win 3.1 USER's idle loop, seg1 33FA): the machine to the input/timer threads */
     w16_stop("int, ax", (unsigned)vec << 8 | (cpu->ax >> 8), cpu->ax);
@@ -965,6 +969,10 @@ void dispatch_far(CPU *cpu, uint16_t sel, uint16_t off) {
             fprintf(stderr, "[w16] %04X:%04X (base %08X):", sel, off, b);
             for (int i = 0; i < 24; i++) fprintf(stderr, " %02X", ((uint8_t *)(uintptr_t)(b + off))[i]);
             fputc('\n', stderr);
+        }
+        {   /* a segment KRNL386 loaded (not its identity selector): name it for seed_misses.py */
+            uint16_t sn = seg_of(sel);
+            if (sn) fprintf(stderr, "[w16] unlifted target %04X:%04X (far call into segment %u)\n", sn, off, sn);
         }
         w16_stop("far call miss", sel, off);
     }
