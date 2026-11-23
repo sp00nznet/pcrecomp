@@ -22,7 +22,7 @@ void w16_drv_stop(const char *what, unsigned a, unsigned b);
 #define NORD       410      /* ordinals 1..NORD exported (KEYBOARD goes to 136, DIBENG to 408) */
 
 typedef void (*drv_fn)(CPU *c);
-typedef struct { const char *name; drv_fn fn[NORD + 1]; } drv_t;
+typedef struct { const char *name; drv_fn fn[NORD + 1]; unsigned base; } drv_t;   /* fn[n] is ordinal base + n */
 
 static uint16_t arg16(CPU *c, int i) { return mem_read16(c, c->ss, (uint16_t)(c->sp + 4 + 2 * i)); }
 static void ret_far(CPU *c, int argbytes) { c->ret_ip = mem_read16(c, c->ss, c->sp); c->sp = (uint16_t)(c->sp + 4 + argbytes); }   /* ret_ip: what a far return pops (w16_retf_call) */
@@ -1033,6 +1033,128 @@ static void disp_fastborder(CPU *c) { c->ax = 0; ret_far(c, 28); }
 static void disp_enumdfonts(CPU *c) { c->ax = 1; c->dx = 0; ret_far(c, 16); }
 /* DISPLAY.7 EnumObj(lpDestDev, style, lpCallback, lpClientData): no pens or brushes listed, 1 (PBRUSH) */
 static void disp_enumobj(CPU *c) { c->ax = 1; c->dx = 0; ret_far(c, 14); }
+
+/* ---- WING.DLL (WinG 1.0, a redistributable, not part of Windows 3.1) ----
+ * Its four entries Dogz and Oddballz import, on Windows 3.1's own lifted GDI and
+ * KERNEL, called through their exports: a WinG DC is a memory DC, a WinG bitmap's
+ * bits are GlobalAlloc'd guest memory (huge, tiled), and a blit is
+ * SetDIBitsToDevice / StretchDIBits from those bits.
+ * A blit reads the bits of the bitmap selected into the source DC.
+ * ponytail: GDI drawing into a WinG DC does not reach the bits; 64 bitmaps, never
+ * freed (no DeleteObject hook). */
+#include "mem_layout.h"
+extern uint16_t g_w16_segsel[];
+int w16_call(CPU *r);
+/* far address of MODULE's export ORD, read from the module's NE file in the guest tree */
+static uint32_t w16_export(const char *mod, unsigned ord) {
+    for (int m = 0; m < RECOMP_NUM_MODULES; m++) {
+        if (_stricmp(RECOMP_MODULES[m].name, mod)) continue;
+        char p[MAX_PATH], root[MAX_PATH] = ".";   /* the host sets it with SetEnvironmentVariable: not in getenv's copy */
+        GetEnvironmentVariableA("NATIVE32_W9X_ROOT", root, sizeof root);
+        snprintf(p, sizeof p, "%s\\WINDOWS\\SYSTEM\\%s", root, RECOMP_MODULES[m].file);
+        FILE *f = fopen(p, "rb"); if (!f) { fprintf(stderr, "[wing] no %s\n", p); return 0; }
+        uint8_t h[0x40]; uint32_t ne = 0;
+        fseek(f, 0x3C, SEEK_SET); fread(&ne, 4, 1, f); fseek(f, ne, SEEK_SET); fread(h, 1, sizeof h, f);
+        uint16_t el = *(uint16_t *)(h + 6); uint8_t *t = malloc(el);
+        fseek(f, ne + *(uint16_t *)(h + 4), SEEK_SET); fread(t, 1, el, f); fclose(f);
+        uint32_t r = 0; unsigned o = 1;
+        for (unsigned i = 0; i + 2 <= el && t[i] && !r; ) {
+            unsigned cnt = t[i], ty = t[i + 1]; i += 2;
+            if (!ty) { o += cnt; continue; }
+            for (unsigned k = 0; k < cnt; k++, o++, i += ty == 0xFF ? 6 : 3)
+                if (o == ord) { unsigned sg = ty == 0xFF ? t[i + 3] : ty; uint16_t off = *(uint16_t *)(t + i + (ty == 0xFF ? 4 : 1));
+                                r = (uint32_t)g_w16_segsel[RECOMP_MODULES[m].first_seg + sg - 1] << 16 | off; break; }
+        }
+        free(t);
+        if (!r) fprintf(stderr, "[wing] %s has no export %u\n", p, ord);
+        return r;
+    }
+    return 0;
+}
+/* call FN (pascal) with N words, pushed in the order given, on the caller's stack below its frame -> dx:ax */
+static uint32_t w16_farcall_n(CPU *c, uint32_t fn, int n, const uint16_t *w) {
+    CPU r = *c;
+    r.sp = (uint16_t)(c->sp - 0x40);
+    for (int i = 0; i < n; i++) push16(&r, w[i]);
+    r.cs = (uint16_t)(fn >> 16); r.ip = (uint16_t)fn;
+    if (!fn || !w16_call(&r)) { fprintf(stderr, "[wing] call %08X failed\n", fn); return 0; }
+    return (uint32_t)r.dx << 16 | r.ax;
+}
+#define GCALL(mod, ord, ...) w16_farcall_n(c, w16_export(mod, ord), (int)(sizeof((uint16_t[]){ __VA_ARGS__ }) / 2), (uint16_t[]){ __VA_ARGS__ })
+static struct { uint16_t hdc, hbm; uint32_t bits, bi, tmp, tbi; } g_wing[64];
+static uint16_t g_wing_probe;   /* a 1x1 bitmap to learn which bitmap a DC holds */
+static void *gptr(uint32_t p) { return farptr(p); }
+static uint32_t galloc(CPU *c, uint32_t n) {   /* KERNEL.15 GlobalAlloc(GMEM_FIXED|GMEM_ZEROINIT), .18 GlobalLock */
+    uint16_t h = (uint16_t)GCALL("KERNEL", 15, 0x0042, (uint16_t)(n >> 16), (uint16_t)n);
+    return h ? GCALL("KERNEL", 18, h) : 0;
+}
+static void wing_createdc(CPU *c) { c->ax = (uint16_t)GCALL("GDI", 52, 0); c->dx = 0; ret_far(c, 0); }   /* CreateCompatibleDC(NULL) */
+/* WinGRecommendDIBFormat(lpbmi): 8 bpp, bottom-up (Windows 3.1's GDI blits those; WinG apps take either) */
+static void wing_recommend(CPU *c) {
+    uint8_t *b = gptr(argfar(c, 0));
+    memset(b, 0, 40); *(uint32_t *)b = 40; *(int32_t *)(b + 4) = 1; *(int32_t *)(b + 8) = 1; *(uint16_t *)(b + 12) = 1; *(uint16_t *)(b + 14) = 8;
+    c->ax = 1; c->dx = 0; ret_far(c, 4);
+}
+/* WinGCreateBitmap(hdc, lpbmi, lplpBits) */
+static void wing_createbitmap(CPU *c) {
+    uint32_t pp = argfar(c, 0), lpbi = argfar(c, 2); uint16_t hdc = arg16(c, 4);
+    const uint8_t *bi = gptr(lpbi);
+    int32_t w = *(const int32_t *)(bi + 4), h = *(const int32_t *)(bi + 8); uint16_t bpp = *(const uint16_t *)(bi + 14);
+    uint32_t ah = (uint32_t)(h < 0 ? -h : h), size = (uint32_t)(((w * bpp + 31) / 32) * 4) * ah;
+    int i = 0; while (i < 63 && g_wing[i].hbm) i++;
+    g_wing[i].hdc = hdc; g_wing[i].tmp = g_wing[i].tbi = 0;
+    g_wing[i].bits = galloc(c, size);
+    g_wing[i].bi = galloc(c, 40 + 1024);
+    memcpy(gptr(g_wing[i].bi), bi, bpp <= 8 ? 40 + 4u * (1u << bpp) : 40);
+    *(uint32_t *)gptr(g_wing[i].bi) = 40;
+    g_wing[i].hbm = (uint16_t)GCALL("GDI", 48, (uint16_t)w, (uint16_t)ah, 1, 1, 0, 0);   /* CreateBitmap(w, h, 1, 1, NULL): a handle to select */
+    if (pp) *(uint32_t *)gptr(pp) = g_wing[i].bits;
+    if (getenv("W16_TRACE") || h < 0) fprintf(stderr, "[wing] CreateBitmap(%04X) %dx%d %u bpp -> %04X bits %08X%s\n", hdc, w, h, bpp, g_wing[i].hbm, g_wing[i].bits, h < 0 ? " (top-down: not blitted right yet)" : "");
+    c->ax = g_wing[i].hbm; c->dx = 0; ret_far(c, 10);
+}
+/* WinGStretchBlt(hdcDst, xd, yd, wd, hd, hdcSrc, xs, ys, ws, hs) */
+static void wing_stretchblt(CPU *c) {
+    uint16_t hs = arg16(c, 0), ws = arg16(c, 1), ys = arg16(c, 2), xs = arg16(c, 3), src = arg16(c, 4);
+    uint16_t hd = arg16(c, 5), wd = arg16(c, 6), yd = arg16(c, 7), xd = arg16(c, 8), dst = arg16(c, 9);
+    /* the bitmap selected into the source DC (SelectObject 45 returns it; then put it back) */
+    if (!g_wing_probe) g_wing_probe = (uint16_t)GCALL("GDI", 48, 1, 1, 1, 1, 0, 0);
+    uint16_t cur = (uint16_t)GCALL("GDI", 45, src, g_wing_probe);
+    GCALL("GDI", 45, src, cur);
+    int i = 0; while (i < 64 && (!g_wing[i].hbm || g_wing[i].hbm != cur)) i++;
+    c->ax = 0;
+    if (i < 64 && g_wing[i].bits) {
+        /* Windows 3.1's GDI hands the display driver the DC's clip, not the blit's rectangle,
+         * and the driver draws the whole DIB: so the source rectangle is copied out (bottom-up)
+         * into a DIB of its own size and that is blitted whole. ponytail: 8 bpp and up */
+        const uint8_t *bi = gptr(g_wing[i].bi);
+        int32_t W = *(const int32_t *)(bi + 4), H = *(const int32_t *)(bi + 8), AH = H < 0 ? -H : H;
+        int bpp = *(const uint16_t *)(bi + 14), px = bpp / 8, sstride = ((W * bpp + 31) / 32) * 4, dstride = ((ws * bpp + 31) / 32) * 4;
+        if (!g_wing[i].tmp) { g_wing[i].tmp = galloc(c, (uint32_t)sstride * (uint32_t)AH); g_wing[i].tbi = galloc(c, 40 + 1024); }
+        uint8_t *t = gptr(g_wing[i].tmp), *tb = gptr(g_wing[i].tbi);
+        const uint8_t *sb = gptr(g_wing[i].bits);
+        memcpy(tb, bi, 40 + 1024);
+        *(int32_t *)(tb + 4) = ws; *(int32_t *)(tb + 8) = hs; *(uint32_t *)(tb + 20) = 0;
+        if ((uint32_t)dstride * hs > (uint32_t)sstride * (uint32_t)AH) { c->dx = 0; ret_far(c, 20); return; }   /* ponytail: no larger than the bitmap */
+        int sx = (int16_t)xs, sy0 = (int16_t)ys, c0 = sx < 0 ? -sx : 0, c1 = ws < W - sx ? ws : W - sx;
+        memset(t, 0, (size_t)dstride * hs);
+        for (int r = 0; r < hs && px && c1 > c0; r++) {   /* the rectangle's row r (from its top), clipped to the bitmap */
+            int sy = sy0 + r; if (sy < 0 || sy >= AH) continue;
+            const uint8_t *srow = sb + (size_t)(H < 0 ? sy : AH - 1 - sy) * sstride;
+            memcpy(t + (size_t)(hs - 1 - r) * dstride + (size_t)c0 * px, srow + (size_t)(sx + c0) * px, (size_t)(c1 - c0) * px);
+        }
+        uint32_t tp = g_wing[i].tmp, tbp = g_wing[i].tbi;
+        if (ws == wd && hs == hd)   /* SetDIBitsToDevice(hdc, x, y, w, h, 0, 0, start 0, scans h, bits, bi, DIB_RGB_COLORS) */
+            c->ax = (uint16_t)GCALL("GDI", 443, dst, xd, yd, wd, hd, 0, 0, 0, hs, (uint16_t)(tp >> 16), (uint16_t)tp, (uint16_t)(tbp >> 16), (uint16_t)tbp, 0);
+        else                        /* StretchDIBits(..., SRCCOPY) */
+            c->ax = (uint16_t)GCALL("GDI", 439, dst, xd, yd, wd, hd, 0, 0, ws, hs, (uint16_t)(tp >> 16), (uint16_t)tp, (uint16_t)(tbp >> 16), (uint16_t)tbp, 0, 0x00CC, 0x0020);
+    }
+    c->dx = 0; ret_far(c, 20);
+}
+/* the apps' own import calls (lifted as direct calls, WING is not lifted) */
+void WING_Ord1001(CPU *c) { wing_createdc(c); }
+void WING_Ord1002(CPU *c) { wing_recommend(c); }
+void WING_Ord1003(CPU *c) { wing_createbitmap(c); }
+void WING_Ord1009(CPU *c) { wing_stretchblt(c); }
 #define DISPLAY_FNS [17] = disp_fastborder, [6] = disp_enumdfonts, [7] = disp_enumobj, [1] = disp_bitblt, [8] = disp_output, [9] = disp_pixel, [2] = disp_colorinfo, [3] = disp_control, [4] = disp_disable, [5] = disp_enable, [10] = disp_realize, [14] = disp_exttextout, [15] = disp_charwidth, [19] = disp_dibbits, [21] = disp_dibtodev
 static drv_t g_drv[] = {
     { "SYSTEM",   { [1] = sys_inquire, [2] = sys_createtimer, [3] = sys_killtimer, [4] = sys_timers, [5] = sys_timers, [6] = sys_msec, [7] = sys_fpu_size, [8] = sys_fpu_save, [9] = sys_fpu_save } },
@@ -1044,6 +1166,7 @@ static drv_t g_drv[] = {
     /* GDI.EXE's DIB sections: the DIB engine's entries are the display driver's ordinals,
      * drawing into a DIBENGINE surface (surf_of) */
     { "DIBENG",   { DISPLAY_FNS, [30] = dib_bitmapbits, [300] = dib_createpdevice } },
+    { "WING",     { [1] = wing_createdc, [2] = wing_recommend, [3] = wing_createbitmap, [9] = wing_stretchblt }, 1000 },
     { "SOUND",    { [1] = snd_open, [2] = snd_zero, [4] = snd_note, [5] = snd_accent, [9] = snd_zero, [10] = snd_zero } },
 };
 #define NDRV (int)(sizeof g_drv / sizeof *g_drv)
@@ -1109,6 +1232,7 @@ static size_t ne_build(int idx) {
     /* entry table: one bundle of NORD fixed entries in segment 1, exported */
     *(uint16_t *)(ne + 0x04) = (uint16_t)(p - ne);
     uint8_t *et = p;
+    for (unsigned b = g_drv[idx].base; b; ) { unsigned k = b < 255 ? b : 255; *p++ = (uint8_t)k; *p++ = 0; b -= k; }   /* unused ordinals before base + 1 */
     for (int i = 0; i < NORD; ) {   /* bundles of at most 255 */
         int k = NORD - i < 255 ? NORD - i : 255;
         *p++ = (uint8_t)k; *p++ = 1;
@@ -1159,7 +1283,7 @@ void w16_drv_write(const char *sysdir) {
     snprintf(g_fontdir, sizeof g_fontdir, "%s", sysdir);
     for (int i = 0; i < NDRV; i++) {
         char path[512];
-        snprintf(path, sizeof path, "%s\\%s.%s", sysdir, g_drv[i].name, strcmp(g_drv[i].name, "DIBENG") ? "DRV" : "DLL");
+        snprintf(path, sizeof path, "%s\\%s.%s", sysdir, g_drv[i].name, strcmp(g_drv[i].name, "DIBENG") && strcmp(g_drv[i].name, "WING") ? "DRV" : "DLL");
         size_t n = ne_build(i);
         FILE *f = fopen(path, "wb");
         if (!f) { fprintf(stderr, "[drv] cannot write %s\n", path); continue; }

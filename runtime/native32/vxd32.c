@@ -1483,6 +1483,7 @@ static int host_path(uint32_t guest, char* out) {
         const char* r = getenv("NATIVE32_W9X_ROOT");
         GetFullPathNameA(r ? r : "root", MAX_PATH, g_root, NULL);
         CreateDirectoryA(g_root, NULL);
+        if (!g_cwd[0] && getenv("NATIVE32_W9X_CWD")) _snprintf(g_cwd, MAX_PATH - 1, "%s", getenv("NATIVE32_W9X_CWD"));   /* the shell's working directory (no drive, no leading backslash) */
     }
     for (; i + 1 < sizeof g && MEM8(guest + i); i++) g[i] = (char)MEM8(guest + i);
     g[i] = 0;

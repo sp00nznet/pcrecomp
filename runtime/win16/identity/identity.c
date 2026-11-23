@@ -291,6 +291,15 @@ static void dpmi(CPU *c) {
         /* 2F/160B, identify TSRs (USER seg72 20E7): nothing real-mode is
          * loaded, so no one fills in es:di and the block comes back as sent */
         if (c->bl == 0x2F && rax == 0x160B) { ok(c); return; }
+        /* 21/6900, get media ID into real-mode ds:dx (Dogz's THINK.DLL): the boxed C: has
+         * serial 1995-0001, label NO NAME, FAT16; CF clear in the block's flags (+20h) */
+        if (c->bl == 0x21 && rax == 0x6900) {
+            uint8_t *b = (uint8_t *)(uintptr_t)(w16_real_base() + *(const uint16_t *)(rb + 0x24) * 16u + *(const uint16_t *)(rb + 0x14));
+            memset(b, 0, 0x19); *(uint32_t *)(b + 2) = 0x19950001u;
+            memcpy(b + 6, "NO NAME    FAT16   ", 19);
+            *(uint16_t *)(rb + 0x20) &= (uint16_t)~1;
+            ok(c); return;
+        }
         w16_stop("int 31h 0300: real-mode int, vec:ax", c->bl, rax);
     }
     }
@@ -652,6 +661,7 @@ static void segsel_init(void) {   /* once per process: g_w16_ready is per thread
 }
 
 static uint16_t g_alias[8192];
+static uint8_t g_rbsel[8192];   /* bound by w16_rebind: a module instance's own selector */
 /* A lifted memory access through a not-present selector (vxd32 recomp_sel_access_base):
  * KRNL386 marks a discarded or load-on-call segment so, and the CPU's #NP would have it
  * loaded. USER's GetCodeInfo probes a Win16 app's code segment that way (SOL seg 10).
@@ -691,6 +701,18 @@ uint16_t g_w16_thhook = 0x121C;
 /* where KERNEL's code segment 1 keeps its DGROUP selector (`mov ds, cs:[n]`):
  * 2 in Win98's KRNL386, 30h in Win 3.11's */
 uint16_t g_w16_kdgofs = 2;
+/* the module (its NE selector) that owns sel, from KERNEL's selector table: 0 if none */
+static uint16_t sel_owner(uint16_t sel) {
+    uint16_t kd = RECOMP_MODULES[0].dgroup, dgs = g_w16_segsel[kd];
+    uint32_t dg = recomp_sel_base(dgs);
+    if (!dg) return 0;
+    uint32_t bm = recomp_sel_base(*(uint16_t *)(uintptr_t)(dg + g_w16_thhook + 2));
+    uint16_t len = *(uint16_t *)(uintptr_t)(dg + g_w16_thhook + 0x16);
+    uint32_t tab = *(uint32_t *)(uintptr_t)(dg + g_w16_thhook + 0x18), ix = (uint32_t)(sel & ~7) >> 1;
+    if (!bm || ix >= len) return 0;
+    uint32_t a = *(uint32_t *)(uintptr_t)(bm + tab + ix);
+    return a ? *(uint16_t *)(uintptr_t)(bm + a + 0x12) : 0;
+}
 static uint16_t w16_rebind(uint16_t sel, uint16_t want) {
     /* KERNEL's DGROUP: its bound selector, or cs:[2] before the first bind */
     uint16_t kd = RECOMP_MODULES[0].dgroup, dgs = g_w16_segsel[kd];
@@ -729,7 +751,7 @@ static uint16_t w16_rebind(uint16_t sel, uint16_t want) {
             if (!h || ((ns | 7) != (sel | 7) && n != rm->dgroup && n != want && (fl & 5) != 5)) continue;
             if (g_w16_segsel[n] != ns && getenv("W16_TRACE"))
                 fprintf(stderr, "[w16] %s seg %u (lifted %u): selector %04X -> %04X\n", rm->name, s + 1, n, g_w16_segsel[n], ns);
-            g_w16_segsel[n] = ns; g_alias[ns >> 3] = n;
+            g_w16_segsel[n] = ns; g_alias[ns >> 3] = n; g_rbsel[ns >> 3] = 1;
             if (n != rm->dgroup || (ns | 7) == (sel | 7)) hit = n;
         }
     }
@@ -749,6 +771,12 @@ static int mapped(uint32_t addr, uint32_t n) {
 static uint16_t seg_of(uint16_t sel) {
     uint16_t i = (uint16_t)(sel >> 3);
     if (i <= RECOMP_NUM_SEG) return i;
+    /* Two loaded modules with one lifted copy (Oddballz's eggs: fourteen DLLs, one module
+     * name, the same code): entering one after the other was bound points the lifted
+     * segments' SEG_n (its DGROUP constant) back at this instance */
+    if (g_alias[i] && g_rbsel[i] && g_w16_segsel[g_alias[i]] != (uint16_t)(sel | 7)
+        && sel_owner(sel) != sel_owner(g_w16_segsel[g_alias[i]])
+        && !w16_rebind(sel, 0)) g_alias[i] = g_rbsel[i] = 0;   /* another instance; or a freed selector KERNEL gave to a module not lifted (a driver) */
     if (!g_alias[i]) {
         uint32_t b = recomp_sel_base(sel);
         if (native32_w9x_desc(sel)[5] & 0x80)   /* a not-present one's base is no address (GDI 071F's reads 01000000) */
@@ -834,6 +862,7 @@ int w16_ss_big(uint16_t ss) { return (ss & 4) && (native32_w9x_desc(ss)[6] & 0x4
 typedef struct w16_ff { struct w16_ff *up; uint16_t ss, sp; } w16_ff;
 static __declspec(thread) w16_ff *g_ff, *g_ff_to;
 static __declspec(thread) uint32_t g_retf_at;   /* where the last plain retf went (dispatch_far) */
+static __declspec(thread) uint32_t g_retf_sp;   /* ss:sp after the last lifted retf (w16_farcall) */
 /* 16->32 calls in flight whose 32-bit side comes back by a far jump into
  * 16-bit code (w16_retf's generated stubs, w16_retf32's 16:16 returns):
  * w16_enter longjmps here when its target is the pending return. */
@@ -1045,7 +1074,11 @@ void w16_farcall(CPU *c, void (*f)(CPU *)) {
     g_ff = &fr;
     __try {
         f(c);
-        while (seg && c->ss == fr.ss && c->sp < fr.sp) {
+        /* not when the callee's own retf ended it below the frame: Borland's struct-by-value
+         * helper (pop bx; pop es; sub sp, cx; push es; push bx; ...; retf, Dogz 1:5B9A)
+         * returns cx bytes lower on purpose */
+        int byretf = g_retf_sp == ((uint32_t)c->ss << 16 | c->sp);
+        while (seg && !byretf && c->ss == fr.ss && c->sp < fr.sp) {
             if (getenv("W16_TRACE")) fprintf(stderr, "[w16] near ret into %u:%04X under a far call (sp %04X < %04X)\n", seg, c->ret_ip, c->sp, fr.sp);
             if (!recomp_dispatch_lookup(c, seg, c->ret_ip)) w16_stop("near ret under a far call into, seg:off", seg, c->ret_ip);
         }
@@ -1195,7 +1228,7 @@ static int w16_retf_jmp(CPU *c) {
 }
 int w16_retf(CPU *c) {
     uint32_t at = mem_read32(c, c->ss, c->sp);
-    g_retf_at = at;
+    g_retf_at = at; g_retf_sp = (uint32_t)c->ss << 16 | (uint16_t)(c->sp + 4);
     int recomp_lar32(uint16_t sel, uint32_t *rights);
     uint32_t r;   /* only a present code selector of the guest's (a C return names a placeholder) */
     if (!(at >> 16 & 4) || !recomp_lar32((uint16_t)(at >> 16), &r) || (r & 0x8800) != 0x8800 || !recomp_sel_base(at >> 16)) return w16_retf_jmp(c);
@@ -1364,7 +1397,11 @@ int w16_call(CPU *r) {
         uint16_t hi = mem_read16(&g_w16, g_w16.ss, (uint16_t)(g_w16.sp - 2)), lo = mem_read16(&g_w16, g_w16.ss, (uint16_t)(g_w16.sp - 4));
         push16(&g_w16, hi); push16(&g_w16, lo);
     } else { push16(&g_w16, 0); push16(&g_w16, 0); }
+    /* a host call made from inside lifted code (drv16's WinG calling GDI) leaves the
+     * caller's last-retf state as it found it (dispatch_far's ret-jump reads it) */
+    uint32_t rat = g_retf_at, rsp = g_retf_sp; uint16_t cseg = g_w16_callseg;
     int okc = w16_entry(&g_w16, seg_of(r->cs), r->ip);
+    g_retf_at = rat; g_retf_sp = rsp; g_w16_callseg = cseg;
     *r = g_w16;
     g_w16 = saved;
     return okc;
