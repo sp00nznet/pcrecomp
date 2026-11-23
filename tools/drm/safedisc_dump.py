@@ -1,16 +1,21 @@
 """
-Memory Dumper for X-Wing Alliance.
+Run-and-dump memory dumper for the Steam X-Wing Alliance build.
 
-The Steam distribution of XWA has SafeDisc v1 encryption on the .text section.
-The code is decrypted at runtime by the .bind section's entry point stub.
-This tool launches the game, waits for decryption, and dumps the decrypted
-.text section from process memory.
+NOTE ON NAMING: despite the filename, this is NOT a SafeDisc tool. The Steam
+distribution of XWA is wrapped in **SteamStub** (its `.text` is decrypted at
+runtime by a `.bind` section entry stub), not the SafeDisc 1 disc protection.
+This tool launches the game and dumps the decrypted `.text` from the live
+process -- a run-and-dump that requires running the original executable.
+
+For SafeDisc 1.x titles (FS2000, Crimson Skies, the retail XWA disc pressing,
+etc.) use the headless `drm/safedisc1.py` emulation path instead (see
+`docs/safedisc1.md`); it needs no disc, no driver and launches nothing.
 
 Usage:
-    python tools/dump_memory.py "path/to/xwingalliance.exe" [output.bin]
+    python tools/drm/safedisc_dump.py "path/to/xwingalliance.exe" [output.bin]
 
-The output is a patched copy of the original PE with the .text section replaced
-by decrypted code from memory.
+The output is a patched copy of the original PE with the `.text` section
+replaced by decrypted code from memory.
 """
 
 import sys
