@@ -71,6 +71,7 @@ void native64_w32k(const char* name, native64_syscall_fn fn);
 
 /* csr64.c: \Windows\ApiPort answered here */
 void csr64_install(void);
+void csr64_user_connect(uint8_t* sharedinfo);   /* SHAREDINFO for user32 (usersrv or NtUserProcessConnect) */
 void* csr64_shared_section(void);   /* NT 6: \Sessions\N\Windows\SharedSection */
 void csr64_profile(void);   /* win.ini reads: the default (after the modules are mapped) */
 void w32k64_install(void);

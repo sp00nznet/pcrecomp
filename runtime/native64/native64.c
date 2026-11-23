@@ -523,7 +523,6 @@ static uint64_t ovr_open_section(uint64_t* a) {
 static uint64_t ovr_terminate_port(uint64_t* a) { (void)a; return ST_SUCCESS; }
 
 /* ---- the process and its threads ----------------------------------------- */
-static uint64_t g_teb0;
 static int is_self(uint64_t h) { return h == (uint64_t)-1 || (h && GetProcessId((HANDLE)(uintptr_t)h) == GetCurrentProcessId()); }
 static int is_self_thread(uint64_t h) { return h == (uint64_t)-2 || (h && GetThreadId((HANDLE)(uintptr_t)h) == GetCurrentThreadId()); }
 
@@ -804,23 +803,15 @@ static void run_thread_top(CPU* c, uint64_t entry, const uint8_t* ctx) {
 
 static struct { const native64_boot_t* b; uint64_t exe, ntdll; int status; } g_boot;
 
-static DWORD WINAPI boot_thread(LPVOID unused) {
-    (void)unused;
-    static CPU cpu;
-    CPU* c = &cpu;
-    uint64_t top;
+/* A guest thread on this host thread: its own TEB and guest stack, then
+ * LdrInitializeThunk(Context: rcx and rsp+8, SystemArgument1 = ntdll's base)
+ * with the thread's initial CONTEXT as the kernel queues it (rip, rcx, rdx);
+ * it ends in NtContinue(Context). */
+static void guest_thread(CPU* c, uint64_t rip, uint64_t rcx, uint64_t rdx, uint64_t teb, uint64_t top) {
     t_cpu = c;
-    g_guest_gs = g_teb0 = new_teb(&top);
-    /* LdrInitializeThunk(Context: rsp+8, SystemArgument1 = ntdll's base): the
-     * thread's initial CONTEXT, as the kernel queues it; it ends in
-     * NtContinue(Context) to kernel32's BaseProcessStart(entry). */
-    uint64_t k32 = native64_module("kernel32.dll");
-    /* NT 6: no BaseProcessStart; the thread starts in ntdll's RtlUserThreadStart(entry, PEB),
-     * which calls kernel32's BaseThreadInitThunk; LdrInitializeThunk(Context, ntdll) the same */
-    uint64_t start = NATIVE64_NT6 ? native64_export(g_boot.ntdll, "RtlUserThreadStart")
-                                  : k32 ? native64_export(k32, "BaseProcessStart") : 0;
-    IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(uintptr_t)(g_boot.exe + *(uint32_t*)(uintptr_t)(g_boot.exe + 0x3C));
-    uint64_t entry = g_boot.exe + nt->OptionalHeader.AddressOfEntryPoint;
+    if (!teb) teb = new_teb(&top);
+    *(uint64_t*)(uintptr_t)(teb + 0x48) = GetCurrentThreadId();   /* ClientId.UniqueThread: this one */
+    g_guest_gs = teb;
     uint64_t sp = (top - 0x100) & ~(uint64_t)15;
     sp -= 0x4D0;                          /* CONTEXT, 16-aligned */
     uint8_t* ctx = (uint8_t*)(uintptr_t)sp;
@@ -828,15 +819,67 @@ static DWORD WINAPI boot_thread(LPVOID unused) {
     *(uint32_t*)(ctx + 0x30) = 0x10000B;  /* CONTEXT_FULL (AMD64) */
     *(uint32_t*)(ctx + 0x34) = 0x1F80;    /* MxCsr */
     *(uint32_t*)(ctx + 0x44) = 0x200;     /* EFlags: IF */
-    *(uint64_t*)(ctx + 0x80) = entry;     /* Rcx: BaseProcessStart's argument */
-    if (NATIVE64_NT6) *(uint64_t*)(ctx + 0x88) = native64_peb;   /* Rdx: RtlUserThreadStart's second */
+    *(uint64_t*)(ctx + 0x80) = rcx;
+    *(uint64_t*)(ctx + 0x88) = rdx;
     *(uint64_t*)(ctx + 0x98) = (top - 0x28) & ~(uint64_t)15 | 8;   /* Rsp, as after a call */
-    *(uint64_t*)(ctx + 0xF8) = start;     /* Rip */
+    *(uint64_t*)(ctx + 0xF8) = rip;
     c->rsp = sp - 8;
     c->rcx = sp, c->rdx = g_boot.ntdll, c->r8 = 0;
     *(uint64_t*)(uintptr_t)c->rsp = 0;
     run_thread_top(c, native64_export(g_boot.ntdll, "LdrInitializeThunk"), ctx);
+}
+
+static DWORD WINAPI boot_thread(LPVOID unused) {
+    (void)unused;
+    static CPU cpu;
+    /* XP x64: kernel32's BaseProcessStart(entry). NT 6: no BaseProcessStart; the
+     * thread starts in ntdll's RtlUserThreadStart(entry, PEB), which calls
+     * kernel32's BaseThreadInitThunk */
+    uint64_t k32 = native64_module("kernel32.dll");
+    uint64_t start = NATIVE64_NT6 ? native64_export(g_boot.ntdll, "RtlUserThreadStart")
+                                  : k32 ? native64_export(k32, "BaseProcessStart") : 0;
+    IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(uintptr_t)(g_boot.exe + *(uint32_t*)(uintptr_t)(g_boot.exe + 0x3C));
+    guest_thread(&cpu, start, g_boot.exe + nt->OptionalHeader.AddressOfEntryPoint, NATIVE64_NT6 ? native64_peb : 0, 0, 0);
     return 0;
+}
+
+/* NT 6: NtCreateThreadEx(h*, access, oa, process, start, arg, flags (1: suspended),
+ * zerobits, stack, maxstack, PS_ATTRIBUTE_LIST*): a host thread running a guest
+ * thread that starts in RtlUserThreadStart(start, arg); its handle is the host's
+ * (waits, resume and exit codes are the host kernel's). The attribute list's
+ * ClientId (0x10003) and TebAddress (0x10004) are filled. ponytail: the host layers (w32k64's tables)
+ * still assume one GUI thread; a worker that only computes (calc's) is fine */
+typedef struct { uint64_t start, arg, teb, top; } newthread_t;
+static DWORD WINAPI new_thread(LPVOID p) {
+    newthread_t t = *(newthread_t*)p;
+    CPU* c = (CPU*)calloc(1, sizeof(CPU));
+    free(p);
+    guest_thread(c, native64_export(g_boot.ntdll, "RtlUserThreadStart"), t.start, t.arg, t.teb, t.top);
+    return 0;
+}
+static uint64_t ovr_create_thread_ex(uint64_t* a) {
+    if (!is_self(a[3])) return ST_ACCESS_DENIED;
+    newthread_t* t = (newthread_t*)malloc(sizeof *t);
+    DWORD tid = 0;
+    t->start = a[4], t->arg = a[5];
+    t->teb = new_teb(&t->top);   /* now: the caller asks for its address (PsAttributeTebAddress) */
+    uint64_t teb = t->teb;   /* (t is the new thread's once it runs) */
+    HANDLE h = CreateThread(NULL, 256u << 20, new_thread, t, STACK_SIZE_PARAM_IS_A_RESERVATION | ((a[6] & 1) ? CREATE_SUSPENDED : 0), &tid);
+    if (!h) { free(t); return 0xC0000017u; }
+    *(uint64_t*)(uintptr_t)a[0] = (uint64_t)(uintptr_t)h;
+    if (a[10]) {
+        uint64_t n = (*(uint64_t*)(uintptr_t)a[10] - 8) / 32;
+        for (uint64_t i = 0; i < n; i++) {
+            uint64_t* at = (uint64_t*)(uintptr_t)(a[10] + 8 + 32 * i);
+            if ((at[0] & 0xFFFF) == 3 && at[1] >= 16 && at[2]) {   /* PsAttributeClientId */
+                ((uint64_t*)(uintptr_t)at[2])[0] = GetCurrentProcessId();
+                ((uint64_t*)(uintptr_t)at[2])[1] = tid;
+            }
+            if ((at[0] & 0xFFFF) == 4 && at[1] >= 8 && at[2]) *(uint64_t*)(uintptr_t)at[2] = teb;   /* PsAttributeTebAddress */
+        }
+    }
+    if (native64_trace) fprintf(stderr, "[native64] guest thread %lu at %llX(%llX)\n", tid, a[4], a[5]);
+    return ST_SUCCESS;
 }
 
 int native64_boot(const native64_module_t* mods, int n, const native64_boot_t* b) {
@@ -892,6 +935,8 @@ int native64_boot(const native64_module_t* mods, int n, const native64_boot_t* b
     native64_override("NtCreateThread", ovr_create_thread);
     native64_override("NtCreateProcess", ovr_no_process);
     native64_override("NtCreateProcessEx", ovr_no_process);
+    native64_override("NtCreateUserProcess", ovr_no_process);   /* NT 6 */
+    native64_override("NtCreateThreadEx", NATIVE64_NT6 ? ovr_create_thread_ex : ovr_create_thread);
     native64_override("NtSetSystemTime", ovr_denied);
     native64_override("NtShutdownSystem", ovr_denied);
     native64_override("NtSetSystemPowerState", ovr_denied);

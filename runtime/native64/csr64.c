@@ -71,6 +71,22 @@ static void user_shared(void) {
     native64_user_disp = (uint8_t*)VirtualAlloc(NULL, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 }
 
+/* SHAREDINFO { psi, aheList, pDispInfo, ulSharedDelta, awmControl, ...,
+ * DefWindowMsgs (+0x210) { maxMsgs, abMsgs* } }: win32k's SERVERINFO, handle
+ * table and display info (native64_user_*); the "desktop heap" is ours (delta 0);
+ * DefWindowProc hands every message to win32k (the host's DefWindowProc answers) */
+void csr64_user_connect(uint8_t* si) {
+    static uint8_t all[0x80];
+    user_shared();
+    *(uint64_t*)(si + 0x00) = (uint64_t)(uintptr_t)native64_user_psi;
+    *(uint64_t*)(si + 0x08) = (uint64_t)(uintptr_t)native64_user_ahe;
+    *(uint64_t*)(si + 0x10) = (uint64_t)(uintptr_t)native64_user_disp;
+    *(uint64_t*)(si + 0x18) = 0;
+    memset(all, 0xFF, sizeof all);
+    *(uint32_t*)(si + 0x210) = 0x3FF;
+    *(uint64_t*)(si + 0x218) = (uint64_t)(uintptr_t)all;
+}
+
 static uint64_t g_static[16];   /* SharedStaticServerData: one pointer per server DLL */
 
 /* NT 6: ntdll opens \Sessions\N\Windows\SharedSection and maps it itself at
@@ -172,18 +188,7 @@ static uint64_t ovr_request(uint64_t* a) {
              * win32k's SERVERINFO, handle table and display info (native64_user_*) */
             uint8_t* ci = (uint8_t*)(uintptr_t)*(uint64_t*)(d + 8);
             *(uint32_t*)(ci + 4) = *(uint32_t*)ci;
-            *(uint64_t*)(ci + 0x10) = (uint64_t)(uintptr_t)native64_user_psi;
-            *(uint64_t*)(ci + 0x18) = (uint64_t)(uintptr_t)native64_user_ahe;
-            *(uint64_t*)(ci + 0x20) = (uint64_t)(uintptr_t)native64_user_disp;
-            *(uint64_t*)(ci + 0x28) = 0;   /* ulSharedDelta: the "desktop heap" is ours */
-            /* +0x210 DefWindowMsgs { maxMsgs, abMsgs* }: the messages DefWindowProc
-             * hands to win32k (all of them: the host's DefWindowProc answers) */
-            {
-                static uint8_t all[0x80];
-                memset(all, 0xFF, sizeof all);
-                *(uint32_t*)(ci + 0x10 + 0x210) = 0x3FF;
-                *(uint64_t*)(ci + 0x10 + 0x218) = (uint64_t)(uintptr_t)all;
-            }
+            csr64_user_connect(ci + (NATIVE64_NT6 ? 8 : 0x10));   /* NT 6 x64: { ulVersion, ?, SHAREDINFO +8 } */
         }
         break;
     case 0x1001E: {    /* basesrv NlsGetUserInfo { NLS_USER_INFO*; Length +8 }: UserLocaleId +0x1860 */

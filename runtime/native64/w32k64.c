@@ -70,15 +70,42 @@ extern uint8_t* native64_user_psi, *native64_user_ahe, *native64_user_disp;
 #define WND_PCLS    0x98
 #define WND_UPDATE  0xA0
 #define WND_MENU    0xC0
-#define WND_NAME    0xD0
-#define WND_CBEXTRA 0xE0
-#define WND_EXTRA   0x108
 /* SERVERINFO: +0x8 cHandleEntries, +0x738 aiSysMet, +0x91C argbSystem[31],
  * +0x998 ahbrSystem[31], +0xAC4/+0xAC8 cxSysFontChar/cySysFontChar */
-#define SI_METRICS 0x738
-#define SI_COLORS  0x91C
-#define SI_BRUSHES 0x998
-#define SI_CXSYSFONT 0xAC4
+/* Vista x64 (NT 6.0, read off its user32: InternalGetWindowText, GetWindowLongPtr,
+ * RealGetSystemMetrics, GetSysColor(Brush), GetDialogBaseUnits, IsHelpParent):
+ * WND strName 0xD8, cbwndExtra 0xE8, extra bytes 0x128; SERVERINFO aiSysMet
+ * 0x758, atomSysClass 0x354, argbSystem 0xABC, ahbrSystem 0xB38, cxSysFontChar
+ * 0xC6C. Set by w32k64_install from the guest's build. */
+static uint32_t WND_NAME = 0xD0, WND_CBEXTRA = 0xE0, WND_EXTRA = 0x108;
+static uint32_t SI_METRICS = 0x738, SI_COLORS = 0x91C, SI_BRUSHES = 0x998, SI_CXSYSFONT = 0xAC4, SI_ATOMSYSCLASS = 0x334;
+
+/* FNIDs are XP x64's here; Vista's are one higher from FNID_MDICLIENT on
+ * (0x2A9; one more constant before it, as on Vista x86) */
+static uint32_t fnid_in(uint32_t f) { return NATIVE64_NT6 && f >= 0x2AA && f < 0x2C2 ? f - 1 : f; }
+static uint32_t fnid_out(uint32_t f) { return NATIVE64_NT6 && f >= 0x2A9 && f < 0x2C1 ? f + 1 : f; }
+
+/* NtUserCall* routine numbers (SFI_*) are XP x64's here; a Vista guest's are
+ * mapped to them first. Read off both user32s by export (vista64-recomp's
+ * tools/sfimap.py: CreatePopupMenu, MessageBeep, UpdateWindow, ...); the ones
+ * no export carries are between two that do, at the same distance. */
+static const uint8_t g_sfi_vista[][2] = {   /* { XP x64, Vista x64 } */
+    { 0x00, 0x00 }, { 0x01, 0x01 }, { 0x04, 0x02 }, { 0x05, 0x05 }, { 0x02, 0x06 }, { 0x08, 0x09 }, { 0x09, 0x0A },
+    { 0x0D, 0x10 }, { 0x18, 0x1B }, { 0x1C, 0x20 },
+    { 0x1E, 0x21 }, { 0x1F, 0x23 }, { 0x20, 0x24 }, { 0x21, 0x25 }, { 0x25, 0x28 }, { 0x26, 0x29 }, { 0x28, 0x2A },
+    { 0x2A, 0x2C }, { 0x2B, 0x2D }, { 0x2C, 0x2E }, { 0x2E, 0x2F }, { 0x2F, 0x30 }, { 0x31, 0x32 }, { 0x33, 0x34 },
+    { 0x35, 0x35 }, { 0x39, 0x3A }, { 0x3A, 0x3C }, { 0x3B, 0x3D }, { 0x3C, 0x3E }, { 0x3E, 0x3F }, { 0x3F, 0x40 },
+    { 0x40, 0x42 }, { 0x41, 0x43 }, { 0x42, 0x44 },
+    { 0x45, 0x46 }, { 0x47, 0x48 }, { 0x48, 0x49 }, { 0x4A, 0x4B }, { 0x4B, 0x4C }, { 0x4D, 0x4E }, { 0x4E, 0x4F },
+    { 0x4F, 0x50 }, { 0x51, 0x52 }, { 0x52, 0x53 }, { 0x54, 0x55 }, { 0x55, 0x56 }, { 0x5B, 0x5C }, { 0x5E, 0x5F },
+    { 0x60, 0x61 }, { 0x62, 0x63 }, { 0x63, 0x64 }, { 0x65, 0x66 },
+    { 0x69, 0x6D }, { 0x6E, 0x72 }, { 0x6F, 0x73 }, { 0x70, 0x75 } };
+static uint64_t sfi(uint64_t x) {
+    if (!NATIVE64_NT6) return x;
+    for (size_t i = 0; i < sizeof g_sfi_vista / sizeof g_sfi_vista[0]; i++)
+        if (g_sfi_vista[i][1] == x) return g_sfi_vista[i][0];
+    return 0x1000 + x;   /* not mapped: no case matches, "not answered" names it */
+}
 /* KernelCallbackTable (PEB+0x58) */
 #define CB_DWORD       2     /* __fnDWORD { pwnd, msg, w, l, xParam, xpfn } (no capture header) */
 #define CB_THREADSETUP 76    /* __ClientThreadSetup */
@@ -277,7 +304,7 @@ static void thread_setup(void) {
         Q(g_deskwnd, 0) = (uint64_t)(uintptr_t)GetDesktopWindow();
         Q(g_deskwnd, 0x20) = (uint64_t)(uintptr_t)g_deskwnd;
         D(g_deskwnd, WND_STYLE) = WS_VISIBLE | WS_POPUP | WS_CLIPCHILDREN;
-        W(g_deskwnd, WND_FNID) = 0x29D;
+        W(g_deskwnd, WND_FNID) = (uint16_t)fnid_out(0x29D);
         Q(g_deskwnd, WND_PCLS) = (uint64_t)(uintptr_t)g_cls;
         Q(g_deskinfo, 0x10) = (uint64_t)(uintptr_t)g_deskwnd;
     }
@@ -392,7 +419,7 @@ static void server_info(void) {
         static const wchar_t* sc[] = { L"Button", L"Edit", L"Static", L"ListBox", L"ScrollBar", L"ComboBox", L"MDIClient", L"ComboLBox" };
         for (int i = 0; i < 8; i++) {
             WNDCLASSEXW wc = { sizeof wc };
-            W(si, 0x334 + 2 * i) = (uint16_t)GetClassInfoExW(NULL, sc[i], &wc);
+            W(si, SI_ATOMSYSCLASS + 2 * i) = (uint16_t)GetClassInfoExW(NULL, sc[i], &wc);
         }
     }
     {   /* DISPLAYINFO: +0x50 cMonitors, +0x58 pMonitorPrimary, +0x60 pMonitorFirst; MONITOR:
@@ -559,11 +586,12 @@ static uint64_t s_message_call(uint64_t* a) {
     UINT m = (UINT)a[1];
     WPARAM w = (WPARAM)a[2];
     if (w && (m == WM_ERASEBKGND || m == WM_PRINTCLIENT || (m >= WM_CTLCOLORMSGBOX && m <= WM_CTLCOLORSTATIC))) gdi_flush();
-    uint32_t fnid = (uint32_t)a[5];
+    uint32_t fnid = fnid_in((uint32_t)a[5]);
     LRESULT r;
-    if (TRACE) fprintf(stderr, "[user] MessageCall %p %04X fnid %X\n", (void*)h, m, fnid);
-    if (fnid == 0x29E) r = a[6] ? DefWindowProcA(h, m, w, (LPARAM)a[3]) : DefWindowProcW(h, m, w, (LPARAM)a[3]);
-    else if (fnid == 0x2B0 || fnid == 0x2AE || fnid == 0x2B1) r = a[6] ? SendMessageA(h, m, w, (LPARAM)a[3]) : SendMessageW(h, m, w, (LPARAM)a[3]);
+    int ansi = (uint32_t)a[6] != 0;   /* a BOOL: the high half is not the caller's (Vista x64's user32 leaves it) */
+    if (TRACE) fprintf(stderr, "[user] MessageCall %p %04X fnid %X%s\n", (void*)h, m, fnid, ansi ? " (ANSI)" : "");
+    if (fnid == 0x29E) r = ansi ? DefWindowProcA(h, m, w, (LPARAM)a[3]) : DefWindowProcW(h, m, w, (LPARAM)a[3]);
+    else if (fnid == 0x2B0 || fnid == 0x2AE || fnid == 0x2B1) r = ansi ? SendMessageA(h, m, w, (LPARAM)a[3]) : SendMessageW(h, m, w, (LPARAM)a[3]);
     else {
         static int said[0x400];
         if (fnid < 0x400 ? !said[fnid]++ : 1) fprintf(stderr, "[user] NtUserMessageCall fnid 0x%X (msg 0x%X) as SendMessage\n", fnid, m);
@@ -652,7 +680,7 @@ static uint64_t s_find_icon(uint64_t* a) {
 
 /* the SFI_ routine numbers are XP x64's (read off user32's callers) */
 static uint64_t s_call_noparam(uint64_t* a) {
-    switch (a[0]) {
+    switch (sfi(a[0])) {
     case 0: return MENU(CreateMenu());
     case 1: return MENU(CreatePopupMenu());
     case 5: return DestroyCaret();
@@ -664,7 +692,7 @@ static uint64_t s_call_noparam(uint64_t* a) {
     return 0;
 }
 static uint64_t s_call_oneparam(uint64_t* a) {
-    switch (a[1]) {
+    switch (sfi(a[1])) {
     case 0x20: case 0x2E: return 1;   /* (Lock)SetForegroundWindow permissions: the guest's own */
     case 0x1E: return (uint64_t)(uintptr_t)BeginDeferWindowPos((int)a[0]);
     case 0x26: {
@@ -685,7 +713,7 @@ static uint64_t s_call_oneparam(uint64_t* a) {
     return 0;
 }
 static uint64_t s_call_twoparam(uint64_t* a) {
-    switch (a[2]) {
+    switch (sfi(a[2])) {
     case 0x6E: return SetCaretPos((int)a[0], (int)a[1]);
     }
     fprintf(stderr, "[user] NtUserCallTwoParam(%llX, %llX, 0x%llX) not answered\n", a[0], a[1], a[2]);
@@ -701,7 +729,7 @@ static uint64_t s_call_hwndopt(uint64_t* a) {
 }
 static uint64_t s_call_hwndlock(uint64_t* a) {
     HWND h = HW(a[0]);
-    switch (a[1]) {
+    switch (sfi(a[1])) {
     case 0x55: return DrawMenuBar(h);
     case 0x5B: return SetForegroundWindow(h);
     case 0x5E: return UpdateWindow(h);
@@ -711,7 +739,8 @@ static uint64_t s_call_hwndlock(uint64_t* a) {
 }
 static uint64_t s_call_hwndparam(uint64_t* a) {
     uint8_t* w = user_wnd(HW(a[0]));
-    switch (a[2]) {
+    uint64_t k = sfi(a[2]);
+    switch (k) {
     case 0x4F:      /* SetDialogPointer: the DIALOG at the extra bytes' +8, state bit "a dialog" */
         if (!w) return 0;
         Q(w, WND_EXTRA + 8) = a[1];
@@ -720,7 +749,7 @@ static uint64_t s_call_hwndparam(uint64_t* a) {
     case 0x4D:      /* ClearWindowState / SetWindowState: (byte from +0x28) << 8 | mask */
     case 0x52:
         if (!w || (a[1] >> 8) >= 8) return 0;
-        if (a[2] == 0x52) B(w, 0x28 + (a[1] >> 8)) |= (uint8_t)a[1];
+        if (k == 0x52) B(w, 0x28 + (a[1] >> 8)) |= (uint8_t)a[1];
         else B(w, 0x28 + (a[1] >> 8)) &= (uint8_t)~a[1];
         return 1;
     case 0x4E: return KillTimer(HW(a[0]), (UINT_PTR)a[1]);
@@ -731,7 +760,7 @@ static uint64_t s_call_hwndparam(uint64_t* a) {
 }
 static uint64_t s_call_hwndparamlock(uint64_t* a) {
     HWND h = HW(a[0]);
-    switch (a[2]) {
+    switch (sfi(a[2])) {
     case 0x60: return EnableWindow(h, (BOOL)a[1]);
     case 0x62: return ShowOwnedPopups(h, (BOOL)a[1]);
     case 0x65: return ValidateRgn(h, (HRGN)HH(a[1]));
@@ -1177,6 +1206,13 @@ static void write_bmp(HWND h, const char* path) {
     PatBlt(m, 0, 0, w, ht, WHITENESS);
     BOOL ok = PrintWindow(h, m, 0);
     fprintf(stderr, "[shot] PrintWindow %d\n", ok);
+    if (TRACE)   /* each child's text: what the picture should show */
+        for (HWND c = GetWindow(h, GW_CHILD); c; c = GetWindow(c, GW_HWNDNEXT)) {
+            wchar_t t[128] = L"";
+            RECT r;
+            GetWindowTextW(c, t, 127), GetWindowRect(c, &r);
+            if (t[0]) fprintf(stderr, "[shot]  %p (%ld,%ld %ldx%ld) \"%ls\"\n", (void*)c, r.left, r.top, r.right - r.left, r.bottom - r.top, t);
+        }
     GdiFlush();
     FILE* f = fopen(path, "wb");
     if (f) {
@@ -1311,7 +1347,20 @@ static const svc_t g_gdi[] = {
     { "NtGdiSetBitmapAttributes", g_bitmap_attrs }, { "NtGdiGetDCforBitmap", g_dcforbitmap }, { "NtGdiExtCreatePen", g_extcreatepen },
 };
 static void pre(const char* name) { if (!strncmp(name, "NtUser", 6)) user_pre(); gdi_flush(); }
+/* NT 6: NtUserProcessConnect(hProcess, USERCONNECT* { ulVersion, ulCurrentVersion,
+ * SHAREDINFO (+8) }) replaces usersrv's csrss connect (csr64.c fills both) */
+static uint64_t s_process_connect(uint64_t* a) {
+    if (!a[1]) return 0xC000000Du;
+    csr64_user_connect((uint8_t*)(uintptr_t)a[1] + 8);
+    return 0;
+}
+
 void w32k64_install(void) {
+    if (NATIVE64_NT6) {
+        WND_NAME = 0xD8, WND_CBEXTRA = 0xE8, WND_EXTRA = 0x128;
+        SI_METRICS = 0x758, SI_COLORS = 0xABC, SI_BRUSHES = 0xB38, SI_CXSYSFONT = 0xC6C, SI_ATOMSYSCLASS = 0x354;
+        native64_w32k("NtUserProcessConnect", s_process_connect);
+    }
     native64_override("NtCallbackReturn", ovr_callback_return);
     for (size_t i = 0; i < sizeof g_user / sizeof g_user[0]; i++) native64_w32k(g_user[i].name, g_user[i].fn);
     for (size_t i = 0; i < sizeof g_gdi / sizeof g_gdi[0]; i++) native64_w32k(g_gdi[i].name, g_gdi[i].fn);
