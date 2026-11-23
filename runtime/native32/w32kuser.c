@@ -602,7 +602,7 @@ static uint32_t find_dcm(void) {
     if (!u) return 0;
     da = native32_export(u, "DefDlgProcA"), dw = native32_export(u, "DefDlgProcW");
     uint32_t size = MEM32(u + MEM32(u + 0x3C) + 0x50);
-    uint32_t k = nt_guest_xp(native32_guest_peb) ? 0x28 : 0x24;   /* (XP: pfnGhostWndProc before it) */
+    uint32_t k = nt_guest_vista(native32_guest_peb) ? 0x2C : nt_guest_xp(native32_guest_peb) ? 0x28 : 0x24;   /* (XP: pfnGhostWndProc before it; Vista one more) */
     for (uint32_t o = 0x1000; o + 0x2C < size; o += 4)
         if (MEM32(u + o) == dw)
             for (uint32_t p = 0x1000; p + 0x2C < size; p += 4)
@@ -780,6 +780,30 @@ static uint32_t s_create_window(uint32_t* a) {
                 a[10] = (uint32_t)(uintptr_t)g_cls[i].inst;
                 break;
             }
+    }
+    /* Vista keeps resources in MUI files (en-US\<module>.mui) the host's LoadMenu never
+     * looks in: a top-level window of a guest class with a menu name gets its menu from the
+     * guest user32's LoadMenuW, as win32k's xxxClientLoadMenu would */
+    if (nt_guest_vista(native32_guest_peb) && !a[9] && !(a[3] & WS_CHILD) && a[10]) {
+        WNDCLASSEXW wc = { sizeof wc };
+        uint32_t lm = native32_export(native32_module("user32.dll"), "LoadMenuW");
+        if (lm && guest_class((HINSTANCE)(uintptr_t)a[10], lstr_name(a[1]), &wc) && wc.lpszMenuName) {
+            uint32_t args[2] = { a[10], (uint32_t)(uintptr_t)wc.lpszMenuName }, sp = g_esp, ax = g_eax;
+            native32_call_guest(lm, 2, args);
+            a[9] = g_eax, g_esp = sp, g_eax = ax;
+        }
+    }
+    /* CW_USEDEFAULT for a top-level window on the virtual screen: win32k's cascade
+     * on that screen (26 px steps, 3/4 of it), not the host monitor's (a 1440 px
+     * window on an 800x600 screen). Vista guests only for now. */
+    if (g_screen && nt_guest_vista(native32_guest_peb) && !(a[3] & WS_CHILD) && a[4] == CW_USEDEFAULT) {
+        static int step;
+        RECT sr;
+        /* (with x CW_USEDEFAULT, y is the show command: calc's message window asks SW_HIDE) */
+        if (a[5] == SW_HIDE) a[3] &= ~WS_VISIBLE;
+        GetClientRect(g_screen, &sr);
+        a[4] = a[5] = (uint32_t)(26 * (1 + step++ % 8));
+        if (cx == CW_USEDEFAULT || cx <= 0) cx = sr.right * 3 / 4, cy = sr.bottom * 3 / 4;
     }
     /* 0x80000000 WS_EX_ANSICREATOR: CreateWindowExA's mark for win32k, not the host's */
     HWND h = CreateWindowExW(a[0] & ~0x80000000u, lstr_name(a[1]), lstr_name(a[2]), a[3], (int)a[4], (int)a[5], cx, cy,
@@ -2017,6 +2041,7 @@ static uint32_t s_enddeferpos(uint32_t* a) { return EndDeferWindowPos((HDWP)(uin
  * (the guest's GetProp, which reads the WND's list, is answered by the host's
  * GetProp in the program's host) */
 static uint32_t s_setprop(uint32_t* a) { return SetPropW((HWND)(uintptr_t)a[0], MAKEINTATOM(a[1]), (HANDLE)(uintptr_t)a[2]); }
+static uint32_t s_getprop(uint32_t* a) { return (uint32_t)(uintptr_t)GetPropW((HWND)(uintptr_t)a[0], MAKEINTATOM(a[1])); }
 static uint32_t s_removeprop(uint32_t* a) { return (uint32_t)(uintptr_t)RemovePropW((HWND)(uintptr_t)a[0], MAKEINTATOM(a[1])); }
 /* NtUserSelectPalette(hdc, hpal, bForceBackground) */
 static uint32_t s_selectpal(uint32_t* a) {
@@ -2122,6 +2147,15 @@ void native32_user_install(void) {
     g_prev_cb_in = native32_cb_in;
     native32_cb_in = cb_in;
     native32_nt_win32k_override("NtUserCreateWindowEx", s_create_window);
+    {   /* NT 6's: user32 connects to win32k itself, NtUserGetClassInfo is
+         * ...Ex (the same arguments), and GetProp asks win32k (2000/XP: client-side) */
+        static const struct { const char* name; native32_syscall_fn fn; } v6[] = {
+            { "NtUserProcessConnect", native32_user_process_connect }, { "NtUserGetClassInfoEx", s_classinfo },
+            { "NtUserGetProp", s_getprop } };
+        for (int i = 0; i < (int)(sizeof v6 / sizeof v6[0]); i++)
+            if (native32_nt_win32k_has(v6[i].name) && native32_nt_win32k_has("NtUserGetWindowMinimizeRect"))   /* (a Vista table) */
+                native32_nt_win32k_override(v6[i].name, v6[i].fn);
+    }
     native32_nt_win32k_override("NtUserGetDC", s_getdc);
     native32_nt_win32k_override("NtUserGetDCEx", s_getdcex);
     native32_nt_win32k_override("NtUserGetWindowDC", s_getwindowdc);

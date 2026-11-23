@@ -495,6 +495,14 @@ static uint32_t ovr_query_process(uint32_t* a) {
         if (a[4]) MEM32(a[4]) = 4;
         return 0;
     }
+    /* ProcessExecuteFlags: Vista's RtlIsValidHandler takes a handler in memory that
+     * is not an executable image only with execution (and dispatch) enabled; the
+     * guest's modules are data to the host */
+    if (a[1] == 0x22 && a[3] >= 4 && nt_guest_vista(native32_guest_peb) && (a[0] == 0xFFFFFFFFu || GetProcessId((HANDLE)(uintptr_t)a[0]) == GetCurrentProcessId())) {
+        MEM32(a[2]) = 0x32;   /* MEM_EXECUTE_OPTION_ENABLE | EXECUTE_DISPATCH_ENABLE | IMAGE_DISPATCH_ENABLE */
+        if (a[4]) MEM32(a[4]) = 4;
+        return 0;
+    }
     uint32_t r = native32_nt_forward("NtQueryInformationProcess", a);
     if (!r && a[1] == 0 && (a[0] == 0xFFFFFFFFu || GetProcessId((HANDLE)(uintptr_t)a[0]) == GetCurrentProcessId()))
         MEM32(a[2] + 4) = native32_guest_peb;
@@ -536,6 +544,11 @@ static uint32_t ovr_open_section(uint32_t* a) {
             MEM32(a[0]) = (uint32_t)(uintptr_t)s;
             return 0;
         }
+    if (n > 22 && !_wcsnicmp(name + n - 22, L"\\Windows\\SharedSection", 22)) {   /* NT 6's csrss section */
+        uint32_t csr32_shared_section(void);
+        MEM32(a[0]) = csr32_shared_section();
+        return MEM32(a[0]) ? 0 : 0xC0000017u;
+    }
     uint32_t r = native32_nt_forward("NtOpenSection", a);
     if (r) fprintf(stderr, "[syscall] NtOpenSection %.*ls -> %08X\n", n, name, r);
     return r;
@@ -1099,6 +1112,12 @@ int native32_nt_win32k(const uint32_t* bases, int nbases, const char* names_file
     return stubs;
 }
 
+/* a service of the guest's own win32k table (another build may not have it) */
+int native32_nt_win32k_has(const char* name) {
+    for (int i = 0; i < W32K_MAX; i++)
+        if (!strcmp(g_w32k[i].name, name)) return 1;
+    return 0;
+}
 void native32_nt_win32k_override(const char* name, native32_syscall_fn fn) {
     for (int i = 0; i < W32K_MAX; i++)
         if (!strcmp(g_w32k[i].name, name)) { g_w32k[i].fn = fn; return; }
@@ -1179,7 +1198,14 @@ uint32_t native32_nt_callback(uint32_t api, uint32_t in, uint32_t len, uint32_t*
     uint32_t sp = g_esp;
     g_cb[g_cbn].done = 0;
     g_cbn++;
-    native32_call_guest(kucd, 3, args);
+    if (nt_guest_vista(native32_guest_peb)) {
+        /* NT 6's KiUserCallbackDispatcher ends in NtCallbackReturn(0, 0, result) by its stub,
+         * then RtlRaiseStatus if that returns (it never does on NT): the table's routine
+         * itself, as the dispatcher calls it (PEB KernelCallbackTable[api](in, len)) */
+        uint32_t fn = MEM32(MEM32(native32_guest_peb + 0x2C) + 4 * api);
+        native32_call_guest(fn, 2, args + 1);
+    } else
+        native32_call_guest(kucd, 3, args);
     g_cbn--;
     if (!g_cb[g_cbn].done) g_cb[g_cbn].status = g_eax, g_cb[g_cbn].out = 0, g_cb[g_cbn].outlen = 0;
     g_esp = sp;
@@ -1292,6 +1318,54 @@ void csr32_install(void);   /* csr32.c */
 uint32_t csr32_sxs_blob(const char* manifest, size_t len);   /* csr32.c */
 uint32_t csr32_sxs_default(void);
 
+/* ---- NT 6 NLS: the guest's own locale.nls and code pages, not the host's --
+ * Vista's kernel32 maps locale.nls by NtInitializeNlsFiles(&base, &lcid,
+ * &casing size) and each code page by NtGetNlsSectionPtr(11, cp, 0, &base,
+ * &size). The host's would hand Windows 11's files (another format). */
+static char g_nls_dir[MAX_PATH];
+static void* load_file(const char* dir, const char* name);
+static uint32_t file_size_of(const char* dir, const char* name) {
+    char p[MAX_PATH];
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    _snprintf(p, MAX_PATH - 1, "%s\\%s", dir, name), p[MAX_PATH - 1] = 0;
+    return GetFileAttributesExA(p, GetFileExInfoStandard, &fa) ? fa.nFileSizeLow : 0;
+}
+/* NtQueryVirtualMemory MemoryRegionInformation (3): NT 6.0's is 0x10 bytes
+ * { AllocationBase, AllocationProtect, RegionType, RegionSize }, the host's
+ * longer one starts the same (the MUI loader checks its view with it) */
+static uint32_t ovr_query_vm(uint32_t* a) {
+    if (a[2] == 3 && a[4] < 0x30) {
+        uint32_t b[16] = { 0 }, t[6] = { a[0], a[1], 3, (uint32_t)(uintptr_t)b, sizeof b, 0 };
+        uint32_t r = native32_nt_forward("NtQueryVirtualMemory", t);
+        if (r) return r;
+        if (a[4] < 0x10) return 0xC0000004u;
+        memcpy((void*)(uintptr_t)a[3], b, a[4]);
+        if (a[5]) MEM32(a[5]) = a[4];
+        return 0;
+    }
+    return native32_nt_forward("NtQueryVirtualMemory", a);
+}
+static uint32_t ovr_init_nls(uint32_t* a) {
+    static void* loc;
+    if (!loc) loc = load_file(g_nls_dir, "locale.nls");
+    if (!loc) return 0xC0000034u;
+    if (a[0]) MEM32(a[0]) = (uint32_t)(uintptr_t)loc;
+    if (a[1]) MEM32(a[1]) = GetUserDefaultLCID();
+    if (a[2]) MEM32(a[2]) = file_size_of(g_nls_dir, "l_intl.nls"), MEM32(a[2] + 4) = 0;
+    return 0;
+}
+static uint32_t ovr_nls_section(uint32_t* a) {
+    char name[64];
+    void* p;
+    if (a[0] == 11) _snprintf(name, sizeof name, "c_%u.nls", a[1]);
+    else if (a[0] == 12) _snprintf(name, sizeof name, "normnfc.nls");   /* ponytail: one form */
+    else { fprintf(stderr, "[nt] NtGetNlsSectionPtr type %u id %u: none\n", a[0], a[1]); return 0xC0000034u; }
+    if (!(p = load_file(g_nls_dir, name))) return 0xC0000034u;
+    MEM32(a[3]) = (uint32_t)(uintptr_t)p;
+    if (a[4]) MEM32(a[4]) = file_size_of(g_nls_dir, name);
+    return 0;
+}
+
 /* An image's resource (type, id), or 0: the first language */
 static uint32_t pe_resource(uint32_t base, uint32_t type, uint32_t id, uint32_t* size) {
     IMAGE_NT_HEADERS32* nt = (IMAGE_NT_HEADERS32*)(uintptr_t)(base + MEM32(base + 0x3C));
@@ -1371,6 +1445,12 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
     /* PEB: the fields the kernel sets (NT 5 offsets). Ldr, the heap, the
      * locks and the TLS bitmap are the guest ntdll's to make. */
     ntdll_version(ntdll, &major, &minor, &build);
+    if (build >= 6000) {
+        strncpy(g_nls_dir, nls_dir, MAX_PATH - 1);
+        native32_nt_override("NtInitializeNlsFiles", ovr_init_nls);
+        native32_nt_override("NtGetNlsSectionPtr", ovr_nls_section);
+        native32_nt_override("NtQueryVirtualMemory", ovr_query_vm);
+    }
     {   /* XP: a class object registers in process only when it cannot as a local server (native32.c) */
         uint32_t ole = native32_module("ole32.dll");
         if (ole && build >= 2600) native32_co_register_guard(native32_export(ole, "CoRegisterClassObject"));
@@ -1511,11 +1591,15 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
         copy[o] = 0;
         if (ge) free(ge); else FreeEnvironmentStringsW(e);
         *(uint32_t*)(pp + 0x48) = (uint32_t)(uintptr_t)copy;
+        if (build >= 6000) *(uint32_t*)(pp + 0x290) = (uint32_t)(o + 1) * 2;   /* NT 6: EnvironmentSize */
     }
     ustr(pp + 0x70, image_path, &pool);                               /* WindowTitle */
     ustr(pp + 0x78, L"WinSta0\\Default", &pool);                      /* DesktopInfo */
     ustr(pp + 0x80, L"", &pool);
     ustr(pp + 0x88, L"", &pool);
+    /* NT 6's loader copies the parameters (Length bytes from pp, RtlpInitParameterBlock) and
+     * rebases their strings: the strings are within it, as the kernel makes them */
+    if (build >= 6000) *(uint32_t*)(pp + 0x00) = *(uint32_t*)(pp + 0x04) = (uint32_t)(pool - pp);
 
     /* The NLS tables the kernel maps into every process: the guest's own. */
     void* ansi = load_file(nls_dir, "c_1252.nls");
@@ -1536,9 +1620,20 @@ int native32_nt_boot(uint32_t ntdll, uint32_t exe, const wchar_t* image_path, co
     ctx[0] = 0x10007;                                                 /* CONTEXT_FULL */
     ctx[0xB0 / 4] = exe + ent->OptionalHeader.AddressOfEntryPoint;    /* Eax: the image's entry */
     ctx[0xB8 / 4] = exe + ent->OptionalHeader.AddressOfEntryPoint;    /* Eip */
+    if (build >= 6000) {
+        /* NT 6: LdrInitializeThunk(Context, NtdllBase) calls LdrpInitialize(Context,
+         * NtdllBase), then NtContinue(Context) to RtlUserThreadStart. That last step
+         * is the host's (the entry point is called by the host after us): the
+         * call at +0xB, LdrpInitialize, is entered instead, with the context first. */
+        const uint8_t* t = (const uint8_t*)(uintptr_t)thunk;
+        if (t[0xB] != 0xE8) { fprintf(stderr, "[nt] LdrInitializeThunk: not NT 6.0's shape\n"); return 0; }
+        thunk = thunk + 0x10 + *(const int32_t*)(t + 0xC);
+        args[0] = (uint32_t)(uintptr_t)ctx, args[1] = ntdll;
+        ctx[0xA4 / 4] = (uint32_t)(uintptr_t)peb;                     /* Ebx: the PEB (RtlUserThreadStart's second) */
+    }
     mach_enter();
     uint32_t sp = g_esp;
-    native32_call_guest(thunk, (int)(sizeof args / 4), args);
+    native32_call_guest(thunk, build >= 6000 ? 2 : (int)(sizeof args / 4), args);
     g_esp = sp;
     mach_leave();
     native32_guest_loaded = 1;
