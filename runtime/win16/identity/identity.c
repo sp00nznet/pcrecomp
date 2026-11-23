@@ -28,6 +28,7 @@
 #define W16_PSP_PARA 0x1000   /* where the host puts KRNL386's PSP (w16test.c) */
 
 int recomp_dispatch_lookup(CPU *cpu, uint16_t seg, uint16_t off);
+uint8_t *native32_w9x_desc(uint16_t sel);
 
 /* the trace ring main.c keeps; only written here */
 const char *g_fn_ring[RECOMP_FN_RING_SIZE];
@@ -57,8 +58,15 @@ void recomp_fn_hit(const char *n) {   /* g_fncount: W16_FN=1 (with fs when it ch
         static const char *wa = (const char *)-1;
         if (wa == (const char *)-1) wa = getenv("W16_ARGS");
         if (wa && strstr(wa, n)) {
-            fprintf(stderr, "ARGS %s thread %lu (ax %04X bx %04X cx %04X dx %04X si %04X di %04X):", n, GetCurrentThreadId(), g_w16.ax, g_w16.bx, g_w16.cx, g_w16.dx, g_w16.si, g_w16.di);
+            fprintf(stderr, "ARGS %s thread %lu (ax %04X bx %04X cx %04X dx %04X si %04X di %04X ds %04X bp %04X sp %04X) ret %04X:%04X:", n, GetCurrentThreadId(), g_w16.ax, g_w16.bx, g_w16.cx, g_w16.dx, g_w16.si, g_w16.di, g_w16.ds, g_w16.bp, g_w16.sp, mem_read16(&g_w16, g_w16.ss, (uint16_t)(g_w16.sp + 2)), mem_read16(&g_w16, g_w16.ss, g_w16.sp));
             for (int i = 0; i < 16; i++) fprintf(stderr, " %04X", mem_read16(&g_w16, g_w16.ss, (uint16_t)(g_w16.sp + 4 + 2 * i)));
+            for (int i = 0; i < 4; i += 2) {   /* the first two dword args as strings, when they are LDT selectors */
+                uint16_t o = mem_read16(&g_w16, g_w16.ss, (uint16_t)(g_w16.sp + 4 + 2 * i)), sg = mem_read16(&g_w16, g_w16.ss, (uint16_t)(g_w16.sp + 6 + 2 * i));
+                if ((sg & 7) != 7 || !(native32_w9x_desc(sg)[5] & 0x80)) continue;
+                fprintf(stderr, " \"");
+                for (int k = 0; k < 48; k++) { uint8_t ch = mem_read8(&g_w16, sg, (uint16_t)(o + k)); if (!ch) break; fputc(ch >= 32 && ch < 127 ? ch : '.', stderr); }
+                fprintf(stderr, "\"");
+            }
             fprintf(stderr, "\n");
         }
         static const char *wb = (const char *)-1;   /* W16_BP=fn@-70: 16 words at ss:bp-70h there (a frame's buffer) */
@@ -1295,7 +1303,7 @@ int w16_call(CPU *r) {
     if (!g_w16_ready) { cpu_init(&g_w16); g_w16.mem = NULL; g_w16_ready = 1; segsel_init(); }
     CPU saved = g_w16;
     g_w16 = *r; g_w16.mem = NULL;
-    if (getenv("W16_FN")) g_fncount = 1;
+    if (getenv("W16_FN") || getenv("W16_ARGS") || getenv("W16_BP")) g_fncount = 1;
     if (getenv("W16_WSEL")) { g_watch_ds = 1; g_wsel = (uint16_t)strtoul(getenv("W16_WSEL"), 0, 16); }   /* a descriptor watch (recomp_fn_hit) */
     if (g_w16_call_keep) {
         uint16_t hi = mem_read16(&g_w16, g_w16.ss, (uint16_t)(g_w16.sp - 2)), lo = mem_read16(&g_w16, g_w16.ss, (uint16_t)(g_w16.sp - 4));

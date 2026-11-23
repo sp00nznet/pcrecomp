@@ -437,6 +437,9 @@ class NELifter(Lifter):
                 tn = re.match(r'seg(\d+)_', func_name)
                 if _IDENTITY and tn and int(tn.group(1)) != self.seg.index:
                     self._emit(f'W16_SEGIN({int(tn.group(1))});', 'target segment bound')
+                elif _IDENTITY and tn:   # own segment: still say which, for a near ret into a pushed
+                    # continuation (USER 1:196A pushes 198B, 19C3 `ret`s into it: GetWindowText)
+                    self._emit(f'g_w16_callseg = {int(tn.group(1))};', 'the call segment')
                 # identity: through w16_farcall, so a far return that skips its C
                 # caller (identity.c w16_unwind) can land back here
                 self._emit(f'{{ void {func_name}(CPU *); w16_farcall(cpu, {func_name}); }}' if _IDENTITY else f'{func_name}(cpu);', orig)
@@ -1277,8 +1280,14 @@ def lift_segment(ne: NEHeader, seg_num: int, func_offset: int = -1, xmod=None):
             # and only the classic skip idiom: a 3-byte `mov r16, imm16` /
             # `cmp ax, imm16` / `test ax, imm16` whose immediate is the entry's
             # code (padding before a prologue straddles entries too, never runs)
-            if (i is not None and e + i.length > func.end and func.end in _known_entries
-                    and i.length == 3 and seg.data[e] in (0x3D, 0xA9, *range(0xB8, 0xC0))):
+            # A chain of them counts too: USER seg 2 0B27 `mov cl,1` / 0B29
+            # `test ax,85B1` / 0B2C `test ax,81B1` hides 0B2A and 0B2D, and 0B2D
+            # is only a near jump's target (GetWindowWord ran GetClassWord's cl=81).
+            skip = (0x3D, 0xA9, *range(0xB8, 0xC0))
+            lo_ = last.offset - seg.file_offset
+            chained = last.length == 3 and seg.data[lo_] in skip
+            if (i is not None and e + i.length > func.end and (func.end in _known_entries or chained)
+                    and i.length == 3 and seg.data[e] in skip):
                 ext, ok = [], False
                 while len(ext) < 512 and 0 <= e < len(seg.data):
                     dec.pos = e
