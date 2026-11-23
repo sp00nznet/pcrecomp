@@ -1623,6 +1623,10 @@ class Lifter:
                                f'/* secondary entry @ +0x{entry_addr:X} */')
 
         for inst in instructions:
+            # F2 (repnz) on movs/stos/lods/ins/outs repeats exactly like F3: the
+            # CPU ignores ZF for them (MSC 5.1's strcpy is `repnz movsw`).
+            if inst.prefix == 'repnz' and inst.mnemonic in ('movsb','movsw','movsd','stosb','stosw','stosd','outsb','outsw','insb','insw'):
+                inst.prefix = 'rep'
             if inst.prefix == 'rep' and inst.mnemonic in ('movsb','movsw','movsd','stosb','stosw','stosd','outsb','outsw','insb','insw'):
                 self._emit_label(inst.address)
                 _rc = 'cpu->ecx' if getattr(inst, 'addr32', False) else 'cpu->cx'   # 67h: rep counts ecx

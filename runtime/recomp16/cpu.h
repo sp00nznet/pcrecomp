@@ -82,6 +82,7 @@ typedef struct CPU {
 
     /* Halt flag (set by HLT or INT 20h / program exit) */
     int halted;
+    uint16_t ret_ip;   /* the offset an iret popped (lift16 iret_frame) */
 
 } CPU;
 
