@@ -936,8 +936,11 @@ static time_t start_time;
  * that wait "2 hundredths" with int 21h 2Ch really waited a whole tick:
  * Theme Park's ride films are timed this way, and ran nearly three times too
  * fast with an exact clock. */
+/* DOS32_EPOCH=<unix seconds> pins the start time: a test run then sees the
+ * same date and time, and a program that seeds its random numbers from the
+ * clock (UFO's copy-protection page) makes the same choices every run. */
 static int guest_clock(struct tm* t) {   /* returns hundredths of a second */
-    if (!start_time) start_time = time(NULL);
+    if (!start_time) { const char* e = getenv("DOS32_EPOCH"); start_time = e && *e ? (time_t)strtoll(e, NULL, 10) : time(NULL); }
     const double tick = 65536.0 / 1193182.0;
     double g = floor(gtime() / tick) * tick;
     time_t s = start_time + (time_t)g;
@@ -945,6 +948,8 @@ static int guest_clock(struct tm* t) {   /* returns hundredths of a second */
     if (l) *t = *l; else memset(t, 0, sizeof *t);
     return (int)((g - (double)(long long)g) * 100);
 }
+
+double dos32_kbhit_idle;
 
 /* ---- int 21h ------------------------------------------------------------ */
 static void int21(regs_t* r) {
@@ -957,7 +962,11 @@ static void int21(regs_t* r) {
         SET8L(r->eax, kbbuf[kb_r] & 0xFF); kb_r = (kb_r + 1) & 63;
         break; }
     case 0x09: { uint32_t p = dsdx(r); while (R8(p) != '$') putchar(R8(p++)); break; }
-    case 0x0B: SET8L(r->eax, kb_r != kb_w ? 0xFF : 0); break;
+    case 0x0B:   /* a program that polls the keyboard between steps (UFO's
+                  * Geoscape) ran at the speed of the CPU: dos32_kbhit_idle
+                  * gives each poll the time it took on a period machine */
+        if (dos32_kbhit_idle > 0) dos32_idle(dos32_kbhit_idle);
+        SET8L(r->eax, kb_r != kb_w ? 0xFF : 0); break;
     case 0x0E: SET8L(r->eax, 26); break;
     case 0x19: SET8L(r->eax, 2); break;                     /* C: */
     case 0x1A: dta = dsdx(r); break;
@@ -970,6 +979,7 @@ static void int21(regs_t* r) {
     case 0x2C: { struct tm t; int cs = guest_clock(&t);
         SET8H(r->ecx, t.tm_hour); SET8L(r->ecx, t.tm_min); SET8H(r->edx, t.tm_sec);
         SET8L(r->edx, cs); break; }
+    case 0x2B: case 0x2D: SET8L(r->eax, 0); break;     /* set date/time: accepted, the guest clock runs on */
     case 0x30: SET16(r->eax, 0x0006); r->ebx &= 0xFFFF0000u; r->ecx &= 0xFFFF0000u; break;  /* DOS 6.0 */
     case 0x33: SET8L(r->edx, 0); break;
     case 0x36: SET16(r->eax, 64); SET16(r->ebx, 0x7FFF); SET16(r->ecx, 512); SET16(r->edx, 0xFFFF); break;
@@ -1443,7 +1453,18 @@ static void run_int(int n, regs_t* r) {
     case 0x31: int31(r); break;
     case 0x33: int33(r); break;
     case 0x2F: int2f(r); break;
-    case 0x1A: if (AH(r) == 0) { uint32_t t = R32(0x46C); SET16(r->ecx, t >> 16); SET16(r->edx, t); SET8L(r->eax, 0); } break;
+    case 0x1A:
+        if (AH(r) == 0) { uint32_t t = R32(0x46C); SET16(r->ecx, t >> 16); SET16(r->edx, t); SET8L(r->eax, 0); }
+        else if (AH(r) == 2 || AH(r) == 4) {   /* the CMOS clock, in BCD: UFO waits for its second to
+                                                * turn over to set the DOS time back at exit */
+            struct tm t; guest_clock(&t);
+#define BCD(v) (uint8_t)(((v) / 10 % 10) << 4 | (v) % 10)
+            if (AH(r) == 2) { SET8H(r->ecx, BCD(t.tm_hour)); SET8L(r->ecx, BCD(t.tm_min)); SET8H(r->edx, BCD(t.tm_sec)); SET8L(r->edx, 0); }
+            else { SET8H(r->ecx, BCD((t.tm_year + 1900) / 100)); SET8L(r->ecx, BCD(t.tm_year)); SET8H(r->edx, BCD(t.tm_mon + 1)); SET8L(r->edx, BCD(t.tm_mday)); }
+#undef BCD
+            r->flags &= ~CF;
+        }
+        break;
     case 0x11: SET16(r->eax, 0x4026); break;
     case 0x12: SET16(r->eax, 640); break;
     case 0x15: r->flags |= CF; SET8H(r->eax, 0x86); break;
