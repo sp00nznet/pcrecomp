@@ -126,6 +126,13 @@ extern void (*dos32_on_poll)(void);
  * registers are as they were after. */
 uint32_t dos32_call(uint32_t va, int n, const uint32_t* args);
 
+/* int 21h 4Bh: the program runs another (a DOS path and its command tail,
+ * e.g. "C:\COMMAND.COM", "/c intro"). The host runs it and returns its exit
+ * code, or -1 for "not found". NULL: every exec fails. */
+extern int (*dos32_on_exec)(const char* path, const char* tail);
+
+void dos32_vga_dump(void);   /* debug: the VGA state on stdout */
+
 /* Called on the guest thread at every retrace the program waits for:
  * frame capture for --record, scripted input. May be NULL. */
 extern void (*dos32_on_retrace)(void);
