@@ -68,5 +68,7 @@ void native64_w32k(const char* name, native64_syscall_fn fn);
 
 /* csr64.c: \Windows\ApiPort answered here */
 void csr64_install(void);
-void w32k64_install(void);   /* w32k64.c: the first win32k services */
+void csr64_profile(void);   /* win.ini reads: the default (after the modules are mapped) */
+void w32k64_install(void);
+extern void (*native64_win32k_pre)(const char* name);   /* before each win32k service */   /* w32k64.c: the first win32k services */
 #endif

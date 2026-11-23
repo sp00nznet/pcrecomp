@@ -144,6 +144,14 @@ static uint64_t ovr_request(uint64_t* a) {
             *(uint64_t*)(ci + 0x18) = (uint64_t)(uintptr_t)native64_user_ahe;
             *(uint64_t*)(ci + 0x20) = (uint64_t)(uintptr_t)native64_user_disp;
             *(uint64_t*)(ci + 0x28) = 0;   /* ulSharedDelta: the "desktop heap" is ours */
+            /* +0x210 DefWindowMsgs { maxMsgs, abMsgs* }: the messages DefWindowProc
+             * hands to win32k (all of them: the host's DefWindowProc answers) */
+            {
+                static uint8_t all[0x80];
+                memset(all, 0xFF, sizeof all);
+                *(uint32_t*)(ci + 0x10 + 0x210) = 0x3FF;
+                *(uint64_t*)(ci + 0x10 + 0x218) = (uint64_t)(uintptr_t)all;
+            }
         }
         break;
     case 0x1001E: {    /* basesrv NlsGetUserInfo { NLS_USER_INFO*; Length +8 }: UserLocaleId +0x1860 */
@@ -188,6 +196,38 @@ static uint64_t ovr_request(uint64_t* a) {
     *(uint32_t*)(m + 0x34) = st;
     if (a[2] && a[2] != a[1]) memcpy((void*)(uintptr_t)a[2], m, 0x28 + (*(uint16_t*)m & 0xFFFF));
     return 0;
+}
+
+/* win.ini (GetProfileString/Int): csrss's IniFileMapping sends these to the
+ * registry; here every key is absent and the caller's default is the answer
+ * (calc's [intl] reads). ponytail: no win.ini values until the registry box
+ * carries them */
+static void ret64(CPU* c) { c->rip = *(uint64_t*)(uintptr_t)c->rsp; c->rsp += 8; }
+static void rep_profstr_w(CPU* c) {
+    const wchar_t* d = c->r8 ? (const wchar_t*)(uintptr_t)c->r8 : L"";
+    wchar_t* o = (wchar_t*)(uintptr_t)c->r9;
+    uint32_t n = *(uint32_t*)(uintptr_t)(c->rsp + 0x28), k = 0;
+    if (o && n) { for (; d[k] && k + 1 < n; k++) o[k] = d[k]; o[k] = 0; }
+    c->rax = k;
+    ret64(c);
+}
+static void rep_profstr_a(CPU* c) {
+    const char* d = c->r8 ? (const char*)(uintptr_t)c->r8 : "";
+    char* o = (char*)(uintptr_t)c->r9;
+    uint32_t n = *(uint32_t*)(uintptr_t)(c->rsp + 0x28), k = 0;
+    if (o && n) { for (; d[k] && k + 1 < n; k++) o[k] = d[k]; o[k] = 0; }
+    c->rax = k;
+    ret64(c);
+}
+static void rep_profint(CPU* c) { c->rax = (uint32_t)c->r8; ret64(c); }
+
+void csr64_profile(void) {
+    uint64_t k = native64_module("kernel32.dll");
+    if (!k) return;
+    native64_replace(native64_export(k, "GetProfileStringW"), rep_profstr_w);
+    native64_replace(native64_export(k, "GetProfileStringA"), rep_profstr_a);
+    native64_replace(native64_export(k, "GetProfileIntW"), rep_profint);
+    native64_replace(native64_export(k, "GetProfileIntA"), rep_profint);
 }
 
 void csr64_install(void) {

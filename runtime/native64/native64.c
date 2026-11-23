@@ -285,14 +285,16 @@ void native64_w32k(const char* name, native64_syscall_fn fn) {
     for (int i = 0; i < NW32K; i++) if (!strcmp(g_w32kt[i].name, name)) g_w32kt[i].fn = fn;
 }
 
+void (*native64_win32k_pre)(const char* name);
 static uint64_t win32k_call(CPU* c, uint32_t svc, uint64_t* a) {
     unsigned i = svc - 0x1000;
     if (i >= NW32K) return ST_INVALID_SERVICE;
+    if (native64_win32k_pre) native64_win32k_pre(g_w32kt[i].name);
     uint64_t r = g_w32kt[i].fn ? g_w32kt[i].fn(a) : 0;
     if (native64_trace || (!g_w32kt[i].fn && !g_w32kt[i].seen))
         fprintf(stderr, "[win32k] %-32s(%llX %llX %llX %llX %llX %llX) -> %llX%s  (rip %llX)\n",
                 g_w32kt[i].name[0] ? g_w32kt[i].name : "?", a[0], a[1], a[2], a[3], a[4], a[5], r,
-                g_w32kt[i].fn ? "" : "  NOT ANSWERED", c->rip);
+                g_w32kt[i].fn ? "" : "  NOT ANSWERED", *(uint64_t*)(uintptr_t)c->rsp);
     g_w32kt[i].seen = 1;
     return r;
 }
@@ -841,6 +843,7 @@ int native64_boot(const native64_module_t* mods, int n, const native64_boot_t* b
     native64_override("NtQueryDebugFilterState", ovr_debug_filter);
     native64_override("NtRegisterThreadTerminatePort", ovr_terminate_port);
     csr64_install();
+    csr64_profile();
     w32k64_install();
 
     /* PEB (x64 NT 5.2): the fields the kernel fills. */
