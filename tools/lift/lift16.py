@@ -217,6 +217,9 @@ class Lifter:
         # relocations applied already and must leave this alone.
         self.reloc_words = reloc_words or set()
         self.load_seg = load_seg
+        # INT numbers lowered to int_handler() (through the vector table)
+        # instead of the direct dos_int21/bios_int10/bios_int16/mouse_int33
+        self.vectored_ints = set()
 
     def _emit(self, code: str, comment: str = ''):
         """Emit a line of C code with optional comment."""
@@ -1061,6 +1064,12 @@ class Lifter:
                            f'overlay far call return addr')
                 self._emit(f'{func_name}(cpu);',
                            f'INT 3Fh -> OVL {ovl_num:02X}:{ovl_off:04X}')
+            elif int_num in self.vectored_ints:
+                # A program that hooks this vector (its own INT 9 keyboard
+                # buffer behind INT 16h) must reach its handler: go through
+                # the IVT, which the runtime points at its built-in BIOS
+                # until the program changes it.
+                self._emit(f'int_handler(cpu, 0x{int_num:02X});', orig)
             elif int_num == 0x21:
                 self._emit(f'dos_int21(cpu);', orig)
             elif int_num == 0x10:
