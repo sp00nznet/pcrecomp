@@ -147,22 +147,31 @@ class Tracer:
             dll = imp.dll.decode().lower()
             for i in imp.imports:
                 self.w32(i.address, self.thunk(dll, i.name.decode() if i.name else i.ordinal))
+        self._seh_ret_thunk = self.thunk('__seh', 'ret')
         uc.hook_add(UC_HOOK_CODE, self._api, begin=THUNKS, end=THUNKS + 0xFFFFF)
         uc.hook_add(UC_HOOK_MEM_UNMAPPED, self._unmapped)
         uc.hook_add(UC_HOOK_INTR, self._intr)
 
     def _intr(self, uc, intno, _):
-        # SafeDisc sprinkles int1/int3/icebp through the shell: on a clean machine
-        # the fault is delivered to its own SEH handler, which resumes after the
-        # instruction; a debugger would consume it instead (that is the check). We
-        # are the "no debugger" case, so dispatch to the registered handler (or, if
-        # it just resumes, step past the trap).
+        # Software traps, with NT's user-mode semantics. Unicorn calls this with
+        # EIP already *past* the instruction. On a clean NT box:
+        #   CC / CD 03  -> STATUS_BREAKPOINT (0x80000003), Eip backed up by 1
+        #   CD nn (other, e.g. CD 01) -> the IDT gate is DPL 0, so #GP ->
+        #                 STATUS_ACCESS_VIOLATION (0xC0000005) at the instruction
+        # and the fault goes to the thread's SEH chain. SafeDisc relies on this:
+        # its `int 1` check records the exception code in an __except filter and
+        # penalises the decryption key unless it saw 0xC0000005 (a debugger would
+        # swallow the trap instead). Simply stepping past -- what this used to do --
+        # is the *debugger* behaviour and corrupted every page after the first.
         eip = uc.reg_read(UC_X86_REG_EIP)
-        op = uc.mem_read(eip, 1)[0]
-        n = 1 if op in (0xCC, 0xF1, 0xCE, 0xF4) else 2 if op == 0xCD else 0
         self.intr_count = getattr(self, 'intr_count', 0) + 1
-        self._seh(uc, {0xCC: 0x80000003, 0xF1: 0x80000004}.get(op, 0x80000004),
-                  eip, eip + n)
+        prev = bytes(uc.mem_read(eip - 2, 2))
+        if intno == 3:
+            start = eip - 1 if prev[1] == 0xCC else eip - 2
+            self._seh(uc, 0x80000003, start, eip - 1)
+        else:
+            start = eip - 2 if prev[0] == 0xCD else eip
+            self._seh(uc, 0xC0000005, start, start, params=(0, 0xFFFFFFFF))
 
     @staticmethod
     def _gdt(base, limit, flags=0x40):
@@ -207,6 +216,9 @@ class Tracer:
     # ---- API dispatch
     def _api(self, uc, addr, size, _):
         dll, name = self.thunks[addr]
+        if dll == '__seh':
+            self._seh_ret(uc)
+            return
         esp = uc.reg_read(UC_X86_REG_ESP)
         ret = self.r32(esp)
         a = lambda n: self.r32(esp + 4 + 4 * n)  # noqa: E731
@@ -229,11 +241,64 @@ class Tracer:
         uc.reg_write(UC_X86_REG_EIP, ret)
         uc.reg_write(UC_X86_REG_ESP, esp + 4 + 4 * argc)
 
-    def _seh(self, uc, code, fault_eip, resume_eip):
-        # ponytail: resume past the trap. SafeDisc's int1/int3 handler, in the
-        # no-debugger case, continues after the instruction. If a title needs the
-        # handler's context edits, dispatch the fs:[0] chain here instead.
-        uc.reg_write(UC_X86_REG_EIP, resume_eip)
+    # x86 CONTEXT field offsets (winnt.h) for the registers SEH handlers touch.
+    _CTX = (('Edi', 0x9C, UC_X86_REG_EDI), ('Esi', 0xA0, UC_X86_REG_ESI),
+            ('Ebx', 0xA4, UC_X86_REG_EBX), ('Edx', 0xA8, UC_X86_REG_EDX),
+            ('Ecx', 0xAC, UC_X86_REG_ECX), ('Eax', 0xB0, UC_X86_REG_EAX),
+            ('Ebp', 0xB4, UC_X86_REG_EBP), ('Eip', 0xB8, UC_X86_REG_EIP),
+            ('EFlags', 0xC0, UC_X86_REG_EFLAGS), ('Esp', 0xC4, UC_X86_REG_ESP))
+
+    def _seh(self, uc, code, fault_eip, ctx_eip, params=()):
+        """Raise `code` at `fault_eip` the way KiUserExceptionDispatcher does:
+        build an EXCEPTION_RECORD and a CONTEXT (Eip = `ctx_eip`) below the stack,
+        then call each fs:[0] handler(rec, frame, ctx, dispatcher) in turn; the
+        return comes back through the '__seh!ret' thunk (`_seh_ret`)."""
+        esp = uc.reg_read(UC_X86_REG_ESP)
+        base = (esp - 0x800) & ~0xF
+        rec, ctx = base + 0x10, base + 0x80
+        uc.mem_write(rec, bytes(1) * 0x50)
+        uc.mem_write(rec, struct.pack('<IIIII', code, 0, 0, fault_eip, len(params)))
+        for i, v in enumerate(params):
+            self.w32(rec + 0x14 + 4 * i, v)
+        uc.mem_write(ctx, bytes(1) * 0x2CC)
+        self.w32(ctx, 0x1003F)                       # CONTEXT_ALL
+        for _, off, reg in self._CTX:
+            self.w32(ctx + off, uc.reg_read(reg))
+        self.w32(ctx + 0xB8, ctx_eip)
+        self.w32(ctx + 0xBC, 0x1B); self.w32(ctx + 0xC8, 0x23)
+        self.w32(ctx + 0x8C, 0); self.w32(ctx + 0x90, 0x3B)
+        self._seh_state = {'rec': rec, 'ctx': ctx, 'base': base,
+                           'frame': self.r32(TEB), 'depth': 0}
+        self._seh_call(uc)
+
+    def _seh_call(self, uc):
+        st = self._seh_state
+        frame = st['frame']
+        if frame in (0, 0xFFFFFFFF) or st['depth'] > 64:
+            self.stop_reason = 'unhandled exception 0x%08X at 0x%08X' % (
+                self.r32(st['rec']), self.r32(st['rec'] + 12))
+            uc.emu_stop()
+            return
+        st['depth'] += 1
+        sp = st['base'] - 0x14
+        uc.mem_write(sp, struct.pack('<5I', self._seh_ret_thunk, st['rec'], frame,
+                                     st['ctx'], st['base']))
+        uc.reg_write(UC_X86_REG_ESP, sp)
+        uc.reg_write(UC_X86_REG_EIP, self.r32(frame + 4))
+
+    def _seh_ret(self, uc):
+        # A handler returned: 0 = ExceptionContinueExecution (resume from the
+        # possibly-edited CONTEXT), 1 = ExceptionContinueSearch (next frame).
+        # An __except handler (_except_handler3) never returns here; it unwinds
+        # with RtlUnwind and jumps into the __except block itself.
+        st = self._seh_state
+        disp = uc.reg_read(UC_X86_REG_EAX)
+        if disp == 0:
+            for _, off, reg in self._CTX:
+                uc.reg_write(reg, self.r32(st['ctx'] + off))
+            return
+        st['frame'] = self.r32(st['frame'])
+        self._seh_call(uc)
 
     def _unmapped(self, uc, access, addr, size, value, _):
         self.stop_reason = 'unmapped %s at 0x%08X from eip 0x%08X' % (
@@ -581,7 +646,15 @@ class Tracer:
     def api_FlushFileBuffers(self, a):
         return 1, 1
     def api_RtlUnwind(self, a):
-        return 4, 0
+        # (TargetFrame, TargetIp, ExceptionRecord, ReturnValue). _global_unwind2
+        # passes the address right after its call as TargetIp, so a normal return
+        # is the same as jumping there; unlink every frame above the target.
+        # ponytail: frames above the target are dropped without calling their
+        # unwind handlers -- SafeDisc's checks raise in the top frame. Call them
+        # (EXCEPTION_UNWINDING) if a title nests __try blocks across the raise.
+        if a(0):
+            self.w32(TEB, a(0))
+        return 4, a(3)
     def api_UnhandledExceptionFilter(self, a):
         return 1, 0
     def api_SetUnhandledExceptionFilter(self, a):

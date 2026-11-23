@@ -155,7 +155,40 @@ Also required a fix: `wsprintfA` was stubbed as a no-op, so the shell built an
 **empty** `\\.\Secdrv` device name (it formats `"\\.\%s"`). `safedisc1.py` now
 implements a minimal `wsprintfA`, and the device name resolves.
 
-#### Where it actually diverges
+#### SOLVED (2026-11-23): the software-interrupt SEH handling
+
+`.txt` now reconstructs **byte-for-byte for all 13 pages** against `shell.bin`
+(`work/safedisc1/cmp_pages.py`: `0/800` mismatching blocks, emulator entropy `7.01`
+== oracle). Root cause, found by lifting the stage-1/stage-2 maths out and solving
+for the correct per-page `K` (path 2): **`K` is decremented by penalty constants
+that the SafeDisc anti-debug checks add when a software interrupt is *not* seen as
+an unhandled NT exception.** The shell sprinkles `int 1` / `int 3` / `int nn`;
+on a clean box the `int 1` reaches the thread's SEH via `KiUserExceptionDispatcher`
+with `STATUS_SINGLE_STEP`/`STATUS_ACCESS_VIOLATION`, the `__except` filter records
+the code, and because it is the *unhandled/clean* path the key is left intact. A
+debugger would swallow the trap — that is the check. The old `_intr` just advanced
+`EIP` past the instruction (the debugger behaviour), so each check fired its
+penalty: `0x426d85` adds `+0x400`/chunk, `0x42b42c` adds `+0xF71`, `0x425d0c` adds
+`+0x4F3`, etc., which shifted `K` and corrupted every page after the cleartext
+bootstrap.
+
+The fix (in `safedisc1.py`) implements real user-mode exception dispatch: `_intr`
+raises `STATUS_BREAKPOINT` for `int 3` and `STATUS_ACCESS_VIOLATION` for the
+DPL-0 `int nn` gate (with `EIP` backed up to the faulting instruction), and `_seh`
+walks the `fs:[0]` handler chain — building an `EXCEPTION_RECORD` + `CONTEXT`,
+calling each `handler(rec, frame, ctx, dispatcher)`, honouring
+`ExceptionContinueExecution` (resume from the possibly-edited `CONTEXT`) vs
+`ExceptionContinueSearch` (next frame), with `RtlUnwind` relinking `fs:[0]` so an
+`__except` block resumes correctly. This was an **emulator-harness** bug (our
+`int`/SEH model), not a Unicorn core bug and not a pcrecomp lifter bug.
+
+With the maths lifted out (`work/safedisc1/*`, kept out of the repo), stage 1 is an
+**XTEA** decrypt (`0x4263c8` loop, 32 rounds, `delta=0x9E3779B9` at `0x42F00C`, the
+16-byte key `00 01 … 0F` at `0x435A60`) over 8-byte blocks, and stage 2 is the
+`foldbyte(K)`/`.txt2`-mask XOR above. Both are now reproduced exactly in Python,
+which is how the penalty-shifted `K` was pinned.
+
+#### How it diverged, before the fix (kept for reference)
 
 With the primitive confirmed, the divergence was localised:
 
