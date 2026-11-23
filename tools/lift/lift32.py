@@ -153,6 +153,9 @@ SETCC_MAP = {f'set{k[1:]}': v for k, v in COND_MAP.items()}
 
 # CMOVcc follows same pattern
 CMOVCC_MAP = {f'cmov{k[1:]}': v for k, v in COND_MAP.items()}
+# The x87 conditional moves and the jcc whose condition each one takes.
+FCMOV_JCC = {'fcmovb': 'jb', 'fcmovnb': 'jae', 'fcmove': 'je', 'fcmovne': 'jne',
+             'fcmovbe': 'jbe', 'fcmovnbe': 'ja', 'fcmovu': 'jp', 'fcmovnu': 'jnp'}
 
 
 _SEG_REGS = (X86_REG_CS, X86_REG_DS, X86_REG_ES, X86_REG_FS, X86_REG_GS, X86_REG_SS)
@@ -1904,6 +1907,15 @@ class Lifter:
                 lines.append(f"fp_xch({i}); {comment}")
             else:
                 lines.append(f"fp_xch(1); {comment}")
+
+        # fcmovcc st(0), st(i): copy st(i) to st(0) on an EFLAGS condition,
+        # nothing pushed or popped. It reads the flags as the matching jcc
+        # does, almost always straight after fucomip. Serious Sam HD's
+        # float min/max/clamp is nothing but `fucomip; fcmovnb`: 6,088
+        # unlifted sites in SamHD.exe and 6,215 in SamHD_TSE.exe.
+        elif m in FCMOV_JCC:
+            i = ops[-1].reg - X86_REG_ST0 if ops else 1
+            lines.append(f"if ({self._make_condition(FCMOV_JCC[m])}) _st[0] = _st[{i}]; {comment}")
 
         # FPU stack-pointer ops. In our fixed-window stack (st[0] is always top),
         # `fincstp; ffree st(7)` is the standard "pop without storing" idiom, so we
