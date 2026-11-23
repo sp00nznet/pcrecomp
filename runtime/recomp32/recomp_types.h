@@ -1222,6 +1222,9 @@ static inline void fp_bcd_st(uint8_t* p, int64_t v) {
  * unimplemented SIMD sites against a handful of x87 ones). */
 RECOMP_WEAK uint32_t g_cpuid_edx1 RECOMP_WEAK_INIT(0xFFFFFFFFu), g_cpuid_ecx1 RECOMP_WEAK_INIT(0xFFFFFFFFu);
 RECOMP_WEAK uint32_t g_cpuid_edx_ext RECOMP_WEAK_INIT(0xFFFFFFFFu);
+/* Leaf 7 subleaf 0 ebx: AVX2, BMI, SHA (bit 29) and friends. MSVC 14 CRTs and
+ * crypto code dispatch on these too (Sven Co-op: sha256rnds2, vpxor paths). */
+RECOMP_WEAK uint32_t g_cpuid_ebx7 RECOMP_WEAK_INIT(0xFFFFFFFFu);
 /* Nonzero replaces leaf 1's family/model/stepping (eax). Some libraries pick
  * SIMD paths by family alone (Crypto++ on family 0xF), past the feature bits. */
 RECOMP_WEAK uint32_t g_cpuid_signature RECOMP_WEAK_INIT(0);
@@ -1234,6 +1237,7 @@ static inline void CPUID_impl(uint32_t eax_val, uint32_t ebx_val, uint32_t ecx_v
     if (eax_val == 1) { g_edx &= g_cpuid_edx1; g_ecx &= g_cpuid_ecx1;
                         if (g_cpuid_signature) g_eax = g_cpuid_signature; }
     if (eax_val == 0x80000001u) g_edx &= g_cpuid_edx_ext;
+    if (eax_val == 7) g_ebx &= g_cpuid_ebx7;
     (void)ebx_val; (void)edx_val;
 #else
     (void)eax_val; (void)ebx_val; (void)ecx_val; (void)edx_val;
