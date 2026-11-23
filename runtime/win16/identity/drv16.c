@@ -535,7 +535,10 @@ static void disp_pixel(CPU *c) {
     c->ax = v; c->dx = 0; ret_far(c, 16);
 }
 
-/* ---- the host window: g_fb shown 1:1, repainted on a timer; no input yet ---- */
+static volatile LONG g_mv_xy, g_mv_pending;   /* the latest move, and whether live_thread has it queued */
+static DWORD g_live_tid;
+static DWORD WINAPI live_thread(LPVOID);
+/* ---- the host window: g_fb shown 1:1, repainted on a timer; its mouse and keys go to the guest ---- */
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_TIMER) { InvalidateRect(h, NULL, FALSE); return 0; }
     if (m == WM_PAINT || m == WM_PRINTCLIENT) {
@@ -545,11 +548,31 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (m == WM_PAINT) EndPaint(h, &ps);
         return 0;
     }
-    if (m == WM_CLOSE) return 0;   /* the guest owns its lifetime */
+    if (m == WM_CLOSE) ExitProcess(0);   /* closing the window ends the session */
+    if (m == WM_MOUSEMOVE) {
+        InterlockedExchange(&g_mv_xy, (LONG)l);
+        if (!InterlockedExchange(&g_mv_pending, 1)) PostThreadMessageA(g_live_tid, WM_MOUSEMOVE, 0, 0);
+        return 0;
+    }
+    int bit = m == WM_LBUTTONDOWN ? 2 : m == WM_LBUTTONUP ? 4 : m == WM_RBUTTONDOWN ? 8 : m == WM_RBUTTONUP ? 0x10 : 0;
+    if (bit) {   /* the client is 1:1 with the guest screen, so client coords are guest coords */
+        if (bit & 0xA) SetFocus(h), SetCapture(h); else ReleaseCapture();
+        int x = (short)LOWORD(l), y = (short)HIWORD(l);
+        x = x < 0 ? 0 : x >= FB_W ? FB_W - 1 : x; y = y < 0 ? 0 : y >= FB_H ? FB_H - 1 : y;
+        PostThreadMessageA(g_live_tid, WM_APP, bit, MAKELPARAM(x, y));
+        return 0;
+    }
+    if (m == WM_KEYDOWN || m == WM_KEYUP || m == WM_SYSKEYDOWN || m == WM_SYSKEYUP) {
+        int up = m == WM_KEYUP || m == WM_SYSKEYUP;
+        PostThreadMessageA(g_live_tid, WM_APP + 1, (w & 0xFF) | (up ? 0x8000 : 0), (l >> 16) & 0xFF);
+        if (w == VK_F4 && m == WM_SYSKEYDOWN) return DefWindowProcA(h, m, w, l);   /* Alt+F4 still closes */
+        return 0;
+    }
     return DefWindowProcA(h, m, w, l);
 }
 static DWORD WINAPI fb_thread(LPVOID unused) {
     (void)unused;
+    CloseHandle(CreateThread(NULL, 0, live_thread, NULL, 0, &g_live_tid));
     WNDCLASSA wc = { 0 };
     wc.lpfnWndProc = fb_wndproc; wc.hInstance = GetModuleHandleA(NULL); wc.lpszClassName = "pcrecomp_w16_display";
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
@@ -757,10 +780,53 @@ int w16_call(CPU *r);
 void mach_enter(void);
 void mach_leave(void);
 uint16_t native32_w9x_alloc_sel(uint32_t base, uint32_t limit);
+/* a private 16-bit stack for a host thread that calls into the guest */
+static uint16_t host_stack(void) {
+    return native32_w9x_alloc_sel((uint32_t)(uintptr_t)VirtualAlloc(NULL, 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE), 0x1FFF);
+}
+/* one event into USER's MOUSE.Enable proc: ax status (8000h absolute|1 moved|2/4 left down/up|8/10h right), at guest pixel x,y */
+static void ms_event(uint16_t ss, uint16_t ax, int x, int y) {
+    if (!g_ms_proc) return;
+    mach_enter();
+    CPU r; cpu_init(&r);
+    r.ax = ax; r.bx = (uint16_t)(x * 0xFFFF / (FB_W - 1)); r.cx = (uint16_t)(y * 0xFFFF / (FB_H - 1)); r.dx = 2;
+    r.cs = (uint16_t)(g_ms_proc >> 16); r.ip = (uint16_t)g_ms_proc; r.ss = r.ds = r.es = ss; r.sp = 0x1FF0;
+    if (!w16_call(&r)) fprintf(stderr, "[drv] mouse proc %04X:%04X is no lifted function\n", r.cs, r.ip);
+    mach_leave();
+}
+/* one event into KEYBOARD.Enable's proc: al vk, ah 80h on release; bl scan */
+static void kb_event(uint16_t ss, uint16_t ax, uint16_t scan) {
+    if (!g_kb_proc) return;
+    mach_enter();
+    CPU r; cpu_init(&r);
+    r.ax = ax; r.bx = scan;
+    r.cs = (uint16_t)(g_kb_proc >> 16); r.ip = (uint16_t)g_kb_proc; r.ss = r.ds = r.es = ss; r.sp = 0x1FF0;
+    if (!w16_call(&r)) fprintf(stderr, "[drv] keyboard proc %04X:%04X is no lifted function\n", r.cs, r.ip);
+    mach_leave();
+}
+/* the host window's input: its wndproc posts here and this thread calls the guest, so the window
+ * keeps pumping and painting while USER runs; mouse moves coalesce to the latest position */
+static DWORD WINAPI live_thread(LPVOID unused) {
+    (void)unused;
+    uint16_t ss = host_stack();
+    MSG m;
+    while (GetMessageA(&m, NULL, 0, 0) > 0) {
+        int x = (short)LOWORD(m.lParam), y = (short)HIWORD(m.lParam);
+        if (m.message == WM_MOUSEMOVE) {
+            InterlockedExchange(&g_mv_pending, 0);
+            LONG xy = g_mv_xy;
+            ms_event(ss, 0x8001, (short)LOWORD(xy), (short)HIWORD(xy));
+        } else if (m.message == WM_APP) {   /* a button: move there first, USER takes a press with the move bit where the cursor was */
+            ms_event(ss, 0x8001, x, y);
+            ms_event(ss, (uint16_t)(0x8000 | m.wParam), x, y);
+        } else if (m.message == WM_APP + 1) kb_event(ss, (uint16_t)m.wParam, (uint16_t)m.lParam);
+    }
+    return 0;
+}
 static DWORD WINAPI input_thread(LPVOID unused) {
     (void)unused;
     DWORD t0 = GetTickCount();
-    uint16_t ss = native32_w9x_alloc_sel((uint32_t)(uintptr_t)VirtualAlloc(NULL, 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE), 0x1FFF);
+    uint16_t ss = host_stack();
     for (const char *s = getenv("W16_INPUT"); s && *s; s = strchr(s, ';') ? strchr(s, ';') + 1 : "") {
         int x, y; double t; char k;
         extern int g_fncount;
@@ -781,13 +847,8 @@ static DWORD WINAPI input_thread(LPVOID unused) {
                 ev[n++] = (uint16_t)vk; ev[n++] = (uint16_t)(vk | 0x8000);
                 if (shift) ev[n++] = VK_SHIFT | 0x8000;
                 for (int i = 0; i < n && g_kb_proc; i++) {
-                    mach_enter();
-                    CPU r; cpu_init(&r);
-                    r.ax = ev[i]; r.bx = (uint16_t)MapVirtualKeyA(ev[i] & 0xFF, 0);   /* al vk, ah 80h on release; bl scan */
-                    r.cs = (uint16_t)(g_kb_proc >> 16); r.ip = (uint16_t)g_kb_proc; r.ss = r.ds = r.es = ss; r.sp = 0x1FF0;
-                    fprintf(stderr, "[drv] key event %04X (%c) to %04X:%04X\n", r.ax, k, r.cs, r.ip);
-                    if (!w16_call(&r)) fprintf(stderr, "[drv] keyboard proc %04X:%04X is no lifted function\n", r.cs, r.ip);
-                    mach_leave();
+                    fprintf(stderr, "[drv] key event %04X (%c)\n", ev[i], k);
+                    kb_event(ss, ev[i], (uint16_t)MapVirtualKeyA(ev[i] & 0xFF, 0));
                     Sleep(60);
                 }
             }
@@ -823,14 +884,9 @@ static DWORD WINAPI input_thread(LPVOID unused) {
         for (int i = 0; i < (drag ? 11 : 3); i++) {
             int last = i == (drag ? 10 : 2), step = drag && i >= 2 && !last ? i - 1 : last ? 8 : 0;
             int px = x + (x2 - x) * step / 8, py = y + (y2 - y) * step / 8;
-            mach_enter();
-            CPU r; cpu_init(&r);
-            r.ax = i == 0 ? 0x8001 : i == 1 ? 0x8002 : last ? 0x8004 : 0x8001;
-            r.bx = (uint16_t)(px * 0xFFFF / (FB_W - 1)); r.cx = (uint16_t)(py * 0xFFFF / (FB_H - 1)); r.dx = 2;
-            r.cs = (uint16_t)(g_ms_proc >> 16); r.ip = (uint16_t)g_ms_proc; r.ss = r.ds = r.es = ss; r.sp = 0x1FF0;
-            fprintf(stderr, "[drv] mouse event %04X at %d,%d to %04X:%04X\n", r.ax, px, py, r.cs, r.ip);
-            if (!w16_call(&r)) fprintf(stderr, "[drv] mouse proc %04X:%04X is no lifted function\n", r.cs, r.ip);
-            mach_leave();
+            uint16_t ax = i == 0 ? 0x8001 : i == 1 ? 0x8002 : last ? 0x8004 : 0x8001;
+            fprintf(stderr, "[drv] mouse event %04X at %d,%d\n", ax, px, py);
+            ms_event(ss, ax, px, py);
             Sleep(60);
         }
     }
