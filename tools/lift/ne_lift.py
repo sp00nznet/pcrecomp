@@ -1306,6 +1306,23 @@ def lift_segment(ne: NEHeader, seg_num: int, func_offset: int = -1, xmod=None):
             func.label, func_insts, seg.file_offset + func.offset, func.is_far, entry_addr=entry)
         # Inject an entry-trace marker (compiles to nothing without -DELFISH_TRACE_FN)
         code = code.replace('{\n', '{\n    TRACE_FN("%s");\n' % func.label, 1)
+        # `mov ss, r; mov sp, r`: a stack switch, which may be KRNL386's task switch
+        # (Win 3.1 Reschedule 1:81AA loads the next task's ss:sp from its TDB). The
+        # runtime (identity.c w16_stack_switch) gives each task's stack its own host
+        # fiber, so the C frames of the task switched away from stay until it runs again.
+        if _IDENTITY:
+            for k in range(len(func_insts) - 1):
+                a, b = func_insts[k], func_insts[k + 1]
+                if (a.mnemonic == 'mov' and a.op1 and a.op1.type == OpType.SREG and a.op1.reg == 2
+                        and a.op2 and a.op2.type == OpType.REG16 and b.mnemonic == 'mov' and b.op1
+                        and b.op1.type == OpType.REG16 and b.op1.reg == 4 and b.op2 and b.op2.type == OpType.REG16):
+                    nxt_off = b.offset - seg.file_offset + b.length
+                    pat = (r'(    cpu->ss = \(uint16_t\)\(cpu->' + repr(a.op2) + r'\);[^\n]*\n)'
+                           r'(    cpu->sp = [^\n]*/\* ' + re.escape(repr(b)) + r' \*/\n)')
+                    m = re.search(pat, code)
+                    if m:
+                        code = (code[:m.start()] + '    { uint16_t _oss = cpu->ss;\n' + m.group(1) + m.group(2)
+                                + f'    w16_stack_switch(cpu, _oss, {seg.index}, 0x{nxt_off:04X}); }}\n' + code[m.end():])
 
         # Drop lift16's own fall-through line. It resolves the next address as a
         # real-mode seg:off pair (`recomp_dispatch(cpu, addr>>4, addr&0xF)`),

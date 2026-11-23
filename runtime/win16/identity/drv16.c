@@ -68,6 +68,7 @@ static void kb_sysreq(CPU *c) { c->ax = 0; ret_far(c, 2); }
  * Entries are the Win 3.1 DDK display ordinals, named from GDI.EXE's call
  * sites as each is reached. ponytail: 800x600x16 (5-6-5), no palette (RC_PALETTE
  * off, so no SetPalette/translate traffic); a host window shows g_fb later. */
+int g_drv_win31;   /* the host boots Windows 3.1's USER/GDI (w311host sets it) */
 #define FB_W 800
 #define FB_H 600
 static uint16_t g_fb[FB_W * FB_H];
@@ -88,7 +89,9 @@ static void disp_enable(CPU *c) {
         put16(dev, 0x08, FB_W); put16(dev, 0x0A, FB_H);
         put16(dev, 0x0C, 16); put16(dev, 0x0E, 1);          /* bits/pixel, planes */
         put16(dev, 0x10, -1); put16(dev, 0x12, 100);         /* brushes, pens */
-        put16(dev, 0x16, 0); put16(dev, 0x18, -1);           /* device fonts, colors (more than 256) */
+        /* device fonts; colors: Win9x reads -1 as more than 256, Win 3.1 apps compare it signed
+         * (winmine: <= 2 picks its black-and-white bitmaps), so 3.1 hears 32767 */
+        put16(dev, 0x16, 0); put16(dev, 0x18, g_drv_win31 ? 0x7FFF : -1);
         put16(dev, 0x1A, PDEV_SIZE);
         put16(dev, 0x1C, 0);           /* dpCurves: GDI draws them */
         put16(dev, 0x1E, 0x0002);      /* dpLines: LC_POLYLINE */
@@ -467,7 +470,7 @@ static void disp_bitblt(CPU *c) {
         surf_put(&d, px, py, rop3(code, for_surf(&d, pv), sv, surf_get(&d, px, py)));
     }
     free(tmp);
-    if (getenv("W16_TRACE")) fprintf(stderr, "[drv] DISPLAY.BitBlt %d,%d %dx%d rop %02X pat %04X src %s %s\n", dx, dy, w, h, code, brush_at(br, dx, dy), hs ? "yes" : "no",
+    if (getenv("W16_TRACE")) fprintf(stderr, "[drv] DISPLAY.BitBlt %d,%d %dx%d rop %02X pat %04X src %s(%dx%d/%d @%d,%d) %s\n", dx, dy, w, h, code, brush_at(br, dx, dy), hs ? "yes" : "no", hs ? s.w : 0, hs ? s.h : 0, hs ? s.bpp : 0, sx, sy,
                                          d.bits == (uint8_t *)g_fb ? "screen" : d.bpp == 1 ? "mono" : "bitmap");
     c->ax = 1; ret_far(c, 32);
 }
@@ -718,7 +721,6 @@ static void sys_fpu_save(CPU *c) { ret_far(c, 4); }
  * Timers run from the tick thread (below); W16_INPUT drives the mouse and keyboard procs. */
 /* The host boots Windows 3.1's USER/GDI (w311host sets it): the driver
  * interfaces are 3.1's where they differ from Win9x's. */
-int g_drv_win31;
 static void kb_inquire(CPU *c) {
     uint8_t *k = (uint8_t *)farptr(argfar(c, 0));
     k[0] = 0xFF; k[1] = 0xFE; k[2] = 0xFF; k[3] = 0xFE; put16((char *)k, 4, 0);

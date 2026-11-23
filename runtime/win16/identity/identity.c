@@ -481,7 +481,10 @@ static void int2f(CPU *c) {
     case 0x4A16: case 0x4A17: case 0x4A18:   /* IO.SYS boot log open/write/close (KRNL386 seg002_4B5C): no BOOTLOG.TXT, ax unchanged */
         return;
     case 0x1689:   /* Windows idle (KRNL386's idle path seg001_6095, bx = 0 or -1): a hint to the
-                    * VMM to release the time slice; VWIN32 11 right after does the blocking. No-op */
+                    * VMM to release the time slice; VWIN32 11 right after does the blocking. No-op there.
+                    * Windows 3.1 has no VWIN32: its scheduler spins here, so the machine is handed over
+                    * (the input and timer threads get in) */
+        { extern int g_drv_win31; void native32_w9x_yield(void); if (g_drv_win31) native32_w9x_yield(); }
         return;
     case 0x4A32:   /* IO.SYS service bl (USER seg072_3742: bl=5, result unread); ponytail: a no-op, ax unchanged */
         return;
@@ -622,7 +625,7 @@ void int_handler(CPU *cpu, int vec) {
     if (vec == 0x12) { cpu->ax = 640; return; }      /* BIOS base memory, KB */
     if (vec == 0x10) return;   /* BIOS video (KRNL386's fatal exit sets mode 3 before its message): no screen */
     if (vec == 0x41) return;   /* kernel debugger (WDEB386) calls: none present, ax stays (not F386h) */
-    if (vec == 0x28) return;   /* DOS idle (Win 3.1 USER's idle loop, seg1 33FA): nothing to hand the time to */
+    if (vec == 0x28) { void native32_w9x_yield(void); native32_w9x_yield(); return; }   /* DOS idle (Win 3.1 USER's idle loop, seg1 33FA): the machine to the input/timer threads */
     w16_stop("int, ax", (unsigned)vec << 8 | (cpu->ax >> 8), cpu->ax);
 }
 void bios_int10(CPU *cpu) { int_handler(cpu, 0x10); }
@@ -1056,6 +1059,50 @@ static int w16_entry(CPU *c, uint16_t seg, uint16_t off) {
     }
     g_ff = up;
     return ok;
+}
+
+/* Windows 3.1's task switch: Reschedule (KRNL386 1:81A3) saves the running task's ss:sp in
+ * its TDB, loads the next one's (ds = that TDB, 'TD' at FAh) and pops into it. Lifted, each
+ * task's 16-bit stack has C frames under it, so each task runs on its own host fiber: the one
+ * switched away from parks (under its TDB) until a switch names it again; a task never run
+ * yet gets a new fiber that goes on from the instruction after the switch (ne_lift emits the
+ * call after every `mov ss, r; mov sp, r`). Win98's tasks are threads: g_drv_win31 only.
+ * ponytail: 64 tasks, one host thread (the machine's), fibers of finished tasks never freed. */
+static struct { uint16_t tdb; void *fib; w16_ff *ff; } g_tfib[64];
+static uint16_t g_cur_tdb;
+typedef struct { CPU *c; uint16_t seg, off; } w16_tstart;
+static void CALLBACK w16_task_fiber(void *p) {
+    w16_tstart st = *(w16_tstart *)p;
+    free(p);
+    g_ff = NULL;
+    w16_entry(st.c, st.seg, st.off);   /* Reschedule's tail: pops and a plain retf into the task */
+    dispatch_far(st.c, mem_read16(st.c, st.c->ss, (uint16_t)(st.c->sp - 2)), st.c->ret_ip);
+    w16_stop("a task's fiber came back from its start, seg:off", st.seg, st.off);
+}
+void w16_stack_switch(CPU *c, uint16_t oss, uint16_t seg, uint16_t off) {
+    extern int g_drv_win31;
+    uint16_t tdb = c->ds;
+    if (!g_drv_win31 || oss == c->ss || tdb == g_cur_tdb) return;
+    if (mem_read16(c, tdb, 0xFA) != 0x4454 || mem_read16(c, tdb, 4) != c->ss || mem_read16(c, tdb, 2) != c->sp) return;
+    if (!IsThreadAFiber()) ConvertThreadToFiber(NULL);
+    int i, me = -1, to = -1;
+    for (i = 0; i < 64; i++) {
+        if (g_tfib[i].fib && g_tfib[i].tdb == tdb) to = i;
+        if (!g_tfib[i].fib && me < 0) me = i;
+    }
+    if (me < 0) w16_stop("more than 64 task fibers, tdb", tdb, 0);
+    g_tfib[me].tdb = g_cur_tdb; g_tfib[me].fib = GetCurrentFiber(); g_tfib[me].ff = g_ff;
+    if (getenv("W16_TRACE")) fprintf(stderr, "[w16] task switch %04X -> %04X (%s fiber) ss:sp %04X:%04X\n", g_cur_tdb, tdb, to >= 0 ? "its" : "a new", c->ss, c->sp);
+    g_cur_tdb = tdb;
+    void *f;
+    if (to >= 0) { f = g_tfib[to].fib; g_ff = g_tfib[to].ff; g_tfib[to].fib = NULL; }
+    else {
+        w16_tstart *st = malloc(sizeof *st);
+        st->c = c; st->seg = seg; st->off = off;
+        f = CreateFiberEx(0x10000, 16u << 20, FIBER_FLAG_FLOAT_SWITCH, w16_task_fiber, st);
+        if (!f) w16_stop("CreateFiberEx failed, tdb", tdb, 0);
+    }
+    SwitchToFiber(f);   /* back here when a switch names this task again; the switcher left c as it should be */
 }
 void w16_unwind(CPU *c) {
     w16_ff *t = NULL;
