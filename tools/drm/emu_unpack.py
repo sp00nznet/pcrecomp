@@ -23,6 +23,7 @@ normal PE that pe_analyze and the lifters read like any other.
 
     py -3 tools/drm/emu_unpack.py packed.exe unpacked.exe
     py -3 tools/drm/emu_unpack.py packed.exe unpacked.exe --stub-low 0x1100000
+    py -3 tools/drm/emu_unpack.py MW2WIN.EXE out.exe --stop-at 0x401A00   # Shrinker
 
 The stub must stay inside the API set below. An unknown call stops the run and
 names the import, which is the next line to add to APIS.
@@ -58,7 +59,9 @@ def align(v, a=PAGE):
 
 
 class Unpacker:
-    def __init__(self, path, stub_low=None):
+    def __init__(self, path, stub_low=None, stop_at=None):
+        self.path = path
+        self.stop_at = stop_at
         self.pe = pefile.PE(path)
         oh = self.pe.OPTIONAL_HEADER
         self.base, self.size = oh.ImageBase, align(oh.SizeOfImage)
@@ -99,6 +102,15 @@ class Unpacker:
                 self._write32(i.address, self._thunk(dll, i.name.decode() if i.name else i.ordinal))
         uc.hook_add(UC_HOOK_CODE, self._api, begin=THUNKS, end=THUNKS + 0xFFFFF)
         uc.hook_add(UC_HOOK_MEM_FETCH_PROT, self._fetch_prot)
+        if self.stop_at:
+            # A stub that decompresses over its own section (Shrinker) can't be
+            # fenced off by page protection: the OEP is the first instruction
+            # run at or above stop_at, the top of the stub's own code.
+            uc.hook_add(UC_HOOK_CODE, self._stop_hook, begin=self.stop_at, end=self.base + self.size)
+
+    def _stop_hook(self, uc, addr, size, _):
+        self.oep = addr
+        uc.emu_stop()
 
     @staticmethod
     def _gdt_entry(base, limit, flags=0x40):
@@ -184,7 +196,8 @@ class Unpacker:
             stub_page = start & ~(PAGE - 1)
         low = self.stub_low or stub_page
         text = self.base + PAGE
-        self.uc.mem_protect(text, low - text, UC_PROT_READ | UC_PROT_WRITE)
+        if not self.stop_at and low > text:
+            self.uc.mem_protect(text, low - text, UC_PROT_READ | UC_PROT_WRITE)
         try:
             self.uc.emu_start(start, 0xFFFFFFFF)
         except UcError as e:
@@ -321,6 +334,26 @@ class Unpacker:
         return runs
 
 
+def _map_self(u, a):
+    # MapViewOfFile on the handle CreateFileA gave for the module's own file.
+    data = open(u.path, 'rb').read()
+    v = u.virtual_alloc(0, len(data))
+    u.uc.mem_write(v, data)
+    return v
+
+
+def _module_file_name(u, a):
+    name = u.path.encode('latin-1')[:max(a(2) - 1, 0)]
+    u.uc.mem_write(a(1), name + b'\0')
+    return len(name)
+
+
+def _global_alloc(u, a):
+    v = u.virtual_alloc(0, a(1))
+    u.uc.mem_write(v, b'\0' * a(1)) if a(0) & 0x40 else None   # GMEM_ZEROINIT
+    return v
+
+
 def _load_library(u, a):
     return u._module(u._cstr(a(0)))
 
@@ -335,6 +368,16 @@ APIS = {
     'VirtualProtect': (4, lambda u, a: (u._write32(a(3), 0x40) if a(3) else None) or 1),
     'FlushInstructionCache': (3, lambda u, a: 1),
     'FreeLibrary': (1, lambda u, a: 1),
+    # Shrinker (Blink Inc, Lee Hasiuk; 1990s Activision titles) reads its own
+    # file through a mapping and decompresses from it.
+    'GetModuleFileNameA': (3, _module_file_name),
+    'CreateFileA': (7, lambda u, a: 0x1234),
+    'CreateFileMappingA': (6, lambda u, a: 0x1238),
+    'MapViewOfFile': (5, _map_self),
+    'UnmapViewOfFile': (1, lambda u, a: 1),
+    'CloseHandle': (1, lambda u, a: 1),
+    'GlobalAlloc': (2, _global_alloc),
+    'GlobalFree': (1, lambda u, a: 0),
     # Steam2 (2004-2008) DRM wrapper: a PECompact loader plugin that asks
     # steam.dll whether the app is owned before it jumps to the OEP. cdecl.
     # Answer "started, subscribed, not pending" -- no Steam is involved.
@@ -379,8 +422,11 @@ def main():
     ap.add_argument('--stub-low', type=lambda s: int(s, 0),
                     help='lowest address of the stub; fetches below it are the OEP '
                          '(default: the stub entry\'s page)')
+    ap.add_argument('--stop-at', type=lambda s: int(s, 0),
+                    help='end of a stub that decompresses over its own section (Shrinker): '
+                         'the first instruction run at or above it is the OEP')
     args = ap.parse_args()
-    u = Unpacker(args.packed, args.stub_low)
+    u = Unpacker(args.packed, args.stub_low, args.stop_at)
     oep = u.run()
     runs = u.write(args.out)
     n = sum(len(v) for v in runs.values())
