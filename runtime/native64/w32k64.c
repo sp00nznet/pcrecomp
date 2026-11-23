@@ -20,8 +20,8 @@
  * host's high word, the type, this process) with no translation either way.
  * A DC's entry carries a DC_ATTR in XP x64's layout (gdi32 writes colours,
  * modes and selected objects there in user mode); before a draw it is
- * applied to the host DC. gdi32's TEB batch is kept off (a DC_ATTR flag
- * gdi32 tests before it queues); the PatBlt entries that still come are run.
+ * applied to the host DC. gdi32's TEB batch (PatBlt, font selects) runs at
+ * each service and callback return.
  *
  * The guest's screen is its own: XP64_SHOT/XP64_KEYS (w32k64_script) type
  * into the guest's window and write its picture from inside the process.
@@ -111,7 +111,7 @@ static uint64_t callback(int api, void* msg, uint32_t len) {
  * GDICELL (24 bytes): +0 pKernelAddress (nonzero), +8 pid (low bit ignored),
  * +0xC the handle's high word, +0xE type (1 DC, 4 region, 5 bitmap, 8
  * palette, 0xA font, 0x10 brush, 0x30 pen), +0x10 pUser (a DC's DC_ATTR).
- * DC_ATTR: +0x08 ulDirty (bit 14: gdi32 queues nothing for this DC), +0x10
+ * DC_ATTR: +0x08 ulDirty (bit 14: a DIB-section DC), +0x10
  * hbrush, +0x18 hpen, +0x20/+0x24 background colour, +0x28/+0x2C text
  * colour, +0x48 ROP2, +0x49 bk mode, +0x4C current position, +0x5C lBkMode,
  * +0x98/+0x9C text align, +0xB0 font, +0x134 map mode, +0x140 window org,
@@ -146,7 +146,7 @@ static uint64_t G(HANDLE hv);
 static void attr_from_dc(uint8_t* at, HDC d) {
     POINT p;
     memset(at, 0, ATTR_SIZE);
-    D(at, DA_DIRTY) = 0x4000;
+    D(at, DA_DIRTY) = 0;
     Q(at, DA_BRUSH) = G(GetCurrentObject(d, OBJ_BRUSH));
     Q(at, DA_PEN) = G(GetCurrentObject(d, OBJ_PEN));
     Q(at, DA_FONT) = G(GetCurrentObject(d, OBJ_FONT));
@@ -238,6 +238,9 @@ static void gdi_flush(void) {
             HGDIOBJ old = Q(e, 0x18) ? SelectObject(h, HH(Q(e, 0x18))) : NULL;
             PatBlt(h, (int)D(e, 4), (int)D(e, 8), (int)D(e, 0xC), (int)D(e, 0x10), D(e, 0x20));
             if (old) SelectObject(h, old);
+        } else if (cmd == 6) {          /* select a font { font at +8 }: DC_ATTR's is current */
+            uint8_t* at = gattr(hdc);
+            if (at) Q(at, DA_FONT) = Q(e, 8);
         } else fprintf(stderr, "[gdi] batch command %u (%u bytes) dropped\n", cmd, len);
         if (len < 4) break;
         off += (len + 7) & ~7u;
@@ -614,6 +617,7 @@ static uint64_t s_enable_menu(uint64_t* a) { return (uint64_t)(int64_t)EnableMen
 static uint64_t s_remove_menu(uint64_t* a) { return RemoveMenu((HMENU)(uintptr_t)a[0], (UINT)a[1], (UINT)a[2]); }
 static uint64_t s_delete_menu(uint64_t* a) { return DeleteMenu((HMENU)(uintptr_t)a[0], (UINT)a[1], (UINT)a[2]); }
 static uint64_t s_menu_default(uint64_t* a) { return SetMenuDefaultItem((HMENU)(uintptr_t)a[0], (UINT)a[1], (UINT)a[2]); }
+static uint64_t s_menu_rect(uint64_t* a) { return GetMenuItemRect(HW(a[0]), (HMENU)(uintptr_t)a[1], (UINT)a[2], (RECT*)(uintptr_t)a[3]); }
 static uint64_t s_getsysmenu(uint64_t* a) { return MENU(GetSystemMenu(HW(a[0]), (BOOL)a[1])); }
 
 /* NtUserFindExistingCursorIcon(UNICODE_STRING* module, UNICODE_STRING* resource,
@@ -756,7 +760,31 @@ static uint64_t s_getdcex(uint64_t* a) { return gdi_enter(GetDCEx(HW(a[0]), (HRG
 static uint64_t s_invalidate(uint64_t* a) { return InvalidateRect(HW(a[0]), (RECT*)(uintptr_t)a[1], (BOOL)a[2]); }
 static uint64_t s_redraw(uint64_t* a) { return RedrawWindow(HW(a[0]), (RECT*)(uintptr_t)a[1], (HRGN)HH(a[2]), (UINT)a[3]); }
 static uint64_t s_getupdaterect(uint64_t* a) { return GetUpdateRect(HW(a[0]), (RECT*)(uintptr_t)a[1], (BOOL)a[2]); }
-static uint64_t s_move(uint64_t* a) { return MoveWindow(HW(a[0]), (int)a[1], (int)a[2], (int)a[3], (int)a[4], (BOOL)a[5]); }
+/* A top-level frame: the guest sizes it with its own borders (one border per
+ * WS_EX_WINDOWEDGE side and a caption, GetWindowBorders); the host's is
+ * thicker (padded borders), so the difference goes on each side and the
+ * client area is what the guest meant (winmine sizes itself from its board) */
+static int frame_pad_top;            /* the caption's share, after frame_pad */
+static int frame_pad(HWND h) {
+    frame_pad_top = 0;
+    uint32_t style = (uint32_t)GetWindowLongW(h, GWL_STYLE), ex = (uint32_t)GetWindowLongW(h, GWL_EXSTYLE);
+    RECT r = { 0, 0, 0, 0 };
+    if ((style & WS_CHILD) || (style & WS_CAPTION) != WS_CAPTION) return 0;
+    int b = (ex & WS_EX_WINDOWEDGE) ? 2 : (ex & WS_EX_STATICEDGE) ? 1 : 0;
+    b++;
+    if (style & WS_THICKFRAME) { UINT g = 1; SystemParametersInfoW(SPI_GETBORDER, 0, &g, 0); b += (int)g; }
+    if (ex & WS_EX_CLIENTEDGE) b += 2;
+    b *= GetSystemMetrics(SM_CXBORDER);
+    AdjustWindowRectEx(&r, style, FALSE, ex);
+    int top = -r.top - b - GetSystemMetrics(SM_CYCAPTION), p = -r.left > b ? -r.left - b : 0;
+    frame_pad_top = top > p ? top - p : 0;
+    return p;
+}
+static uint64_t s_move(uint64_t* a) {
+    int p = frame_pad(HW(a[0]));
+    return MoveWindow(HW(a[0]), (int)a[1], (int)a[2], (int)a[3] + 2 * p, (int)a[4] + 2 * p + frame_pad_top, (BOOL)a[5]);
+}
+/* ponytail: SetWindowPos keeps the guest's size (calc resizes from its own GetWindowRect: a pad there grew it each time) */
 static uint64_t s_setpos(uint64_t* a) { return SetWindowPos(HW(a[0]), HW(a[1]), (int)a[2], (int)a[3], (int)a[4], (int)a[5], (UINT)a[6]); }
 static uint64_t s_destroy(uint64_t* a) { return DestroyWindow(HW(a[0])); }
 static uint64_t s_setfocus(uint64_t* a) { return (uint64_t)(uintptr_t)SetFocus(HW(a[0])); }
@@ -971,7 +999,23 @@ static uint64_t g_rgnbox(uint64_t* a) { return (uint64_t)GetRgnBox((HRGN)HH(a[0]
 static uint64_t g_savedc(uint64_t* a) { return (uint64_t)SaveDC(dc(a[0])); }
 static uint64_t g_restoredc(uint64_t* a) { return RestoreDC(dc(a[0]), (int)a[1]); }
 static uint64_t g_bitmap(uint64_t* a) { return G(CreateBitmap((int)a[0], (int)a[1], (UINT)a[2], (UINT)a[3], (void*)(uintptr_t)a[4])); }
-static uint64_t g_getobject(uint64_t* a) { return (uint64_t)GetObjectW(HH(a[0]), (int)a[1], (void*)(uintptr_t)a[2]); }
+/* NtGdiExtGetObjectW(h, count, buffer). A window DC's bitmap (the screen's
+ * surface) has no BITMAP on the host; XP answered the screen's size and depth
+ * (winmine reads its colour depth so) */
+static uint64_t g_getobject(uint64_t* a) {
+    int r = GetObjectW(HH(a[0]), (int)a[1], (void*)(uintptr_t)a[2]);
+    if (!r && ((a[0] >> 16) & 0x1F) == 5 && a[2] && a[1] >= sizeof(BITMAP)) {
+        BITMAP* b = (BITMAP*)(uintptr_t)a[2];
+        HDC s = GetDC(NULL);
+        memset(b, 0, sizeof *b);
+        b->bmWidth = GetDeviceCaps(s, HORZRES), b->bmHeight = GetDeviceCaps(s, VERTRES);
+        b->bmPlanes = 1, b->bmBitsPixel = (WORD)GetDeviceCaps(s, BITSPIXEL);
+        b->bmWidthBytes = ((b->bmWidth * b->bmBitsPixel + 15) / 16) * 2;
+        ReleaseDC(NULL, s);
+        r = sizeof(BITMAP);
+    }
+    return (uint64_t)r;
+}
 static uint64_t g_font(uint64_t* a) { return G(CreateFontIndirectW((LOGFONTW*)(uintptr_t)a[0])); }
 static uint64_t g_textout(uint64_t* a) {
     return ExtTextOutW(dc(a[0]), (int)a[1], (int)a[2], (UINT)a[3], (RECT*)(uintptr_t)a[4], (LPCWSTR)(uintptr_t)a[5], (UINT)a[6], (const INT*)(uintptr_t)a[7]);
@@ -1238,7 +1282,7 @@ static const svc_t g_user[] = {
     { "NtUserBuildHwndList", s_hwndlist }, { "NtUserModifyUserStartupInfoFlags", s_one }, { "NtUserNotifyProcessCreate", s_one },
     { "NtUserSetThreadState", s_zero }, { "NtUserThunkedMenuItemInfo", s_menu_item }, { "NtUserDestroyMenu", s_destroy_menu },
     { "NtUserCheckMenuItem", s_check_menu }, { "NtUserEnableMenuItem", s_enable_menu }, { "NtUserRemoveMenu", s_remove_menu },
-    { "NtUserDeleteMenu", s_delete_menu }, { "NtUserSetMenuDefaultItem", s_menu_default }, { "NtUserGetSystemMenu", s_getsysmenu }, { "NtUserUpdateInputContext", s_zero }, { "NtUserGetImeInfoEx", s_zero },
+    { "NtUserDeleteMenu", s_delete_menu }, { "NtUserSetMenuDefaultItem", s_menu_default }, { "NtUserGetSystemMenu", s_getsysmenu }, { "NtUserGetMenuItemRect", s_menu_rect }, { "NtUserUpdateInputContext", s_zero }, { "NtUserGetImeInfoEx", s_zero },
 };
 static const svc_t g_gdi[] = {
     { "NtGdiInit", g_init }, { "NtGdiGetStockObject", g_stock }, { "NtGdiCreateCompatibleDC", g_compat_dc },

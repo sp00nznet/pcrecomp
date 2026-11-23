@@ -221,6 +221,12 @@ static void rep_profstr_a(CPU* c) {
 }
 static void rep_profint(CPU* c) { c->rax = (uint32_t)c->r8; ret64(c); }
 
+/* OutputDebugString raises DBG_PRINTEXCEPTION_C and resumes in its own
+ * __except, which needs a debugger-less unwind back into kernel32; the text
+ * goes to the log instead (winmine prints a line at start) */
+static void rep_debugstr_a(CPU* c) { if (native64_trace && c->rcx) fprintf(stderr, "[debug] %s", (const char*)(uintptr_t)c->rcx); ret64(c); }
+static void rep_debugstr_w(CPU* c) { if (native64_trace && c->rcx) fprintf(stderr, "[debug] %ls", (const wchar_t*)(uintptr_t)c->rcx); ret64(c); }
+
 void csr64_profile(void) {
     uint64_t k = native64_module("kernel32.dll");
     if (!k) return;
@@ -228,6 +234,8 @@ void csr64_profile(void) {
     native64_replace(native64_export(k, "GetProfileStringA"), rep_profstr_a);
     native64_replace(native64_export(k, "GetProfileIntW"), rep_profint);
     native64_replace(native64_export(k, "GetProfileIntA"), rep_profint);
+    native64_replace(native64_export(k, "OutputDebugStringA"), rep_debugstr_a);
+    native64_replace(native64_export(k, "OutputDebugStringW"), rep_debugstr_w);
 }
 
 void csr64_install(void) {
