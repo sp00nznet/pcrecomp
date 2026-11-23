@@ -1389,6 +1389,34 @@ static inline recomp_func_t recomp_resolve(uint32_t va) {
     g_cur_func = _caller;  /* the callee RECOMP_ENTER clobbered it */ \
 } while(0)
 
+/* RECOMP_CALL_K(func, k): a direct call to a callee that keeps the
+ * callee-saved registers in k (1 ebx, 2 esi, 4 edi, 8 ebp; generate.py
+ * LIFT32_ABI proves it). Those are not reloaded: the caller's locals still
+ * hold them. RECOMP_ABI_CHECK reloads them anyway and reports a callee that
+ * broke the claim (recomp_abi_violation, native32.c). */
+#if defined(RECOMP_LOCAL_REGS) && !defined(RECOMP_ABI_CHECK)
+#define RECOMP_REGS_IN_K(k) (l_eax = g_eax, l_ecx = g_ecx, l_edx = g_edx, l_esp = g_esp, \
+    ((k) & 1 ? 0 : (l_ebx = g_ebx)), ((k) & 2 ? 0 : (l_esi = g_esi)), \
+    ((k) & 4 ? 0 : (l_edi = g_edi)), ((k) & 8 ? 0 : (l_ebp = g_ebp)))
+#elif defined(RECOMP_LOCAL_REGS)
+void recomp_abi_violation(uint32_t caller, uint32_t mask);
+#define RECOMP_REGS_IN_K(k) do { uint32_t _bad = \
+    (((k) & 1) && g_ebx != l_ebx) | (((k) & 2) && g_esi != l_esi) << 1 | \
+    (((k) & 4) && g_edi != l_edi) << 2 | (((k) & 8) && g_ebp != l_ebp) << 3; \
+    if (_bad) recomp_abi_violation(_caller, _bad); RECOMP_REGS_IN(); } while (0)
+#else
+#define RECOMP_REGS_IN_K(k) ((void)0)
+#endif
+#define RECOMP_CALL_K(func, k) do { \
+    uint32_t _caller = g_cur_func; \
+    PUSH32(esp, RECOMP_RETADDR); \
+    RECOMP_FLAGS_OUT(); \
+    RECOMP_REGS_OUT(); \
+    func(); \
+    RECOMP_REGS_IN_K(k); \
+    g_cur_func = _caller; \
+} while(0)
+
 /* An indirect call or jump to an address that is no function entry may be a
  * guest exception handler continuing inside a body further up the host stack
  * (RECOMP_EH_FRAME). The hook longjmps there if a frame owns both the address

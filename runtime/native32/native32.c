@@ -2281,3 +2281,18 @@ void native32_mute_winmm(void) {
     if ((va = native32_export(w, "waveOutOpen"))) native32_replace(va, mm_nodrv6);
     if ((va = native32_export(w, "waveInOpen"))) native32_replace(va, mm_nodrv6);
 }
+
+#ifdef RECOMP_ABI_CHECK
+/* RECOMP_CALL_K's claim broke: the callee changed a register the lift's
+ * LIFT32_ABI plan says it keeps (recomp_types.h). Reported once a caller. */
+void recomp_abi_violation(uint32_t caller, uint32_t mask)
+{
+    static uint32_t seen[256];
+    uint32_t h = (caller * 2654435761u) >> 24;
+    if (seen[h] == caller) return;
+    seen[h] = caller;
+    fprintf(stderr, "[abi] 0x%08X: a callee changed %s%s%s%s\n", caller,
+            mask & 1 ? "ebx " : "", mask & 2 ? "esi " : "", mask & 4 ? "edi " : "", mask & 8 ? "ebp" : "");
+    fflush(stderr);
+}
+#endif
