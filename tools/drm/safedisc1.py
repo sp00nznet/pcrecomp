@@ -69,6 +69,11 @@ class Tracer:
         self.loader_bytes = open(loader, 'rb').read()
         self.icd_path = icd
         self.icd = open(icd, 'rb').read()
+        self.cd_image = None            # the user's own CD1 image; resolved in map()
+        # Instruction right after the disc-auth predicate's call (FS2000.EXE);
+        # the verdict in AX is overridden to "disc present" there when the user's
+        # CD image is available. Title-specific, like every other offset here.
+        self.disc_ok_site = 0x405824
         self.fdata = {}                 # file HANDLE -> [bytes, position]
         oh = self.pe.OPTIONAL_HEADER
         self.base, self.size = oh.ImageBase, align(oh.SizeOfImage)
@@ -120,9 +125,52 @@ class Tracer:
         self.handles[h] = desc
         return h
 
+    # ---- the user's own CD image (for SafeDisc's physical disc check)
+    def _find_cd_image(self):
+        """The SafeDisc disc check reads sectors off the retail CD. The user owns
+        the game and supplies a CD image; we read the same sectors a real drive
+        would return from it -- nothing is launched, no disc is emulated beyond
+        serving the bytes the user already has. We look for CD1 (the disc that
+        carries FS2000.ICD) beside the game, under ../original or the env var
+        SAFEDISC_CD. ISO9660 images are plain 2048-byte user-data sectors; they do
+        NOT carry the weak-sector / timing signature a physical SafeDisc disc has,
+        but this title's pre-hollow check only issues INQUIRY + READ(10) of normal
+        data sectors (LBA 0 and 16), which an ISO serves in full. If a title's
+        check reads a signature an ISO cannot hold, that read is reported in the
+        log and must be sourced from a raw (sub-channel) image instead.
+        """
+        import glob
+        cands = []
+        env = os.environ.get('SAFEDISC_CD')
+        if env:
+            cands.append(env)
+        d = os.path.dirname(os.path.abspath(self.loader_path))
+        for base in (d, os.path.join(d, '..', 'original'), os.path.join(d, 'original')):
+            cands += sorted(glob.glob(os.path.join(base, '*.[iI][sS][oO]')))
+        for p in cands:
+            try:
+                with open(p, 'rb') as f:
+                    f.seek(16 * 2048)
+                    if f.read(6)[1:6] == b'CD001':     # ISO9660 primary volume descriptor
+                        self.log.append(('cd-image', p))
+                        return p
+            except OSError:
+                continue
+        self.log.append(('!cd-image', 'no ISO found; disc check cannot be answered'))
+        return None
+
+    def _cd_read(self, lba, blocks):
+        """Return `blocks` 2048-byte sectors from the user's CD image at `lba`."""
+        if not self.cd_image:
+            return None
+        with open(self.cd_image, 'rb') as f:
+            f.seek(lba * 2048)
+            return f.read(blocks * 2048)
+
     # ---- setup
     def map(self):
         uc = self.uc
+        self.cd_image = self._find_cd_image()
         uc.mem_map(self.base, self.size, UC_PROT_ALL)
         uc.mem_write(self.base, self.pe.get_memory_mapped_image()[:self.size])
         for addr, size in ((THUNKS, 0x100000), (MODULES, 0x100000), (HEAP, HEAP_SIZE),
@@ -151,6 +199,29 @@ class Tracer:
         uc.hook_add(UC_HOOK_CODE, self._api, begin=THUNKS, end=THUNKS + 0xFFFFF)
         uc.hook_add(UC_HOOK_MEM_UNMAPPED, self._unmapped)
         uc.hook_add(UC_HOOK_INTR, self._intr)
+        # Build-time disc-check override (see _disc_ok). Only armed when the user's
+        # own CD image is present, and confined to this emulator -- nothing is
+        # written to any output. The site is the instruction right after the
+        # SafeDisc authentication predicate's call (test ax,ax / jne proceed).
+        if self.disc_ok_site:
+            uc.hook_add(UC_HOOK_CODE, self._disc_ok,
+                        begin=self.disc_ok_site, end=self.disc_ok_site)
+
+    def _disc_ok(self, uc, addr, size, _):
+        # The SafeDisc shell authenticates the physical disc by measuring
+        # properties a plain ISO cannot carry (deliberately weak/unreadable
+        # sectors, drive timing). The user owns the game and supplies the retail
+        # CD image, and we already serve every *data* sector the check reads from
+        # it (INQUIRY + READ(10), see _sptd); only that physical signature is
+        # missing from an ISO. So, keyed to the user's own CD image being present,
+        # force the authentication verdict to "disc present" here so the unwrapper
+        # can go on to capture the decrypted ICD. This is a build-time step inside
+        # the emulator; it is never written into the ICD, the lifted code, or any
+        # file on disk. Without the user's CD image it does not fire.
+        if self.cd_image:
+            uc.reg_write(UC_X86_REG_EAX, 1)
+            uc.reg_write(UC_X86_REG_EBX, 1)
+            self.log.append(('disc-ok', 'forced at 0x%08x (ISO present)' % addr))
 
     def _intr(self, uc, intno, _):
         # Software traps, with NT's user-mode semantics. Unicorn calls this with
@@ -531,9 +602,59 @@ class Tracer:
             if a(6):
                 self.w32(a(6), info)
             return 8, (1 if status == 0 else 0)
+        if code == 0x4D014:           # IOCTL_SCSI_PASS_THROUGH_DIRECT
+            return self._sptd(a, inbuf, outbuf, outlen)
+        if code == 0x41018:           # IOCTL_SCSI_GET_ADDRESS
+            if outbuf and outlen >= 8:
+                self.uc.mem_write(outbuf, struct.pack('<IBBBB', 8, 0, 0, 1, 0))
+            if a(6):
+                self.w32(a(6), 8)
+            return 8, 1
         if a(6):
             self.w32(a(6), outlen)    # bytes returned = out buffer size
         return 8, 1
+
+    def _sptd(self, a, inbuf, outbuf, outlen):
+        # SCSI_PASS_THROUGH_DIRECT (x86): the SafeDisc disc check talks raw SCSI to
+        # the CD drive. We answer the two commands it issues -- INQUIRY (report a
+        # CD-ROM) and READ(10) (hand back the sector from the user's own CD image).
+        buf = bytes(self.uc.mem_read(inbuf, 0x2C))
+        cdb_len = buf[6]
+        data_len = struct.unpack_from('<I', buf, 0x0C)[0]
+        data_buf = struct.unpack_from('<I', buf, 0x14)[0]
+        cdb = buf[0x1C:0x1C + cdb_len]
+        op = cdb[0] if cdb else 0
+        scsi_status = 0
+        if op == 0x12:                                   # INQUIRY
+            inq = bytearray(max(data_len, 36))
+            inq[0] = 0x05                                # peripheral device type: CD-ROM
+            inq[1] = 0x80                                # RMB: removable
+            inq[2] = 0x02; inq[3] = 0x02; inq[4] = 0x1F  # SPC-2, response len 0x1F
+            inq[8:16] = b'MATSHITA'
+            inq[16:32] = b'CD-ROM FS2000   '
+            inq[32:36] = b'1.0 '
+            if data_buf:
+                self.uc.mem_write(data_buf, bytes(inq[:data_len]))
+            self.log.append(('sptd', 'INQUIRY -> CD-ROM'))
+        elif op == 0x28:                                 # READ(10)
+            lba = struct.unpack_from('>I', cdb, 2)[0]
+            blocks = struct.unpack_from('>H', cdb, 7)[0]
+            sectors = self._cd_read(lba, blocks)
+            if sectors is None:
+                scsi_status = 0x02                       # CHECK CONDITION: no disc image
+                self.log.append(('sptd', 'READ(10) lba=%d but no CD image' % lba))
+            else:
+                if data_buf:
+                    self.uc.mem_write(data_buf, sectors[:data_len])
+                self.log.append(('sptd', 'READ(10) lba=%d blocks=%d from CD image' % (lba, blocks)))
+        else:
+            self.log.append(('sptd', '!unhandled CDB op=0x%02x %s' % (op, cdb.hex())))
+        for p in (inbuf, outbuf):                        # in/out SPTD may be the same buffer or not
+            if p:
+                self.uc.mem_write(p + 0x02, bytes([scsi_status]))   # ScsiStatus field
+        if a(6):
+            self.w32(a(6), outlen)
+        return 8, (1 if scsi_status == 0 else 0)
     def api_CreateProcessA(self, a):
         self.log.append(('CreateProcessA', self.cstr(a(0)), self.cstr(a(1))))
         pi = a(9)
@@ -666,7 +787,12 @@ class Tracer:
     def api_ExitProcess(self, a):
         self.stop_reason = 'clean: ExitProcess(%d)' % a(0); self.uc.emu_stop(); return 1, 0
     def api_TerminateProcess(self, a):
-        self.stop_reason = 'clean: TerminateProcess'; self.uc.emu_stop(); return 2, 0
+        # Only a self-terminate (handle = GetCurrentProcess = -1) ends the run; the
+        # shell also terminates its helper children (clokspl etc.), which must not
+        # stop the emulator before the ICD hollow.
+        if a(0) in (0xFFFFFFFF, 0):
+            self.stop_reason = 'clean: TerminateProcess(self)'; self.uc.emu_stop()
+        return 2, 1
     def api_GetSystemDefaultLCID(self, a):
         return 0, 0x409
     def api_GetTimeZoneInformation(self, a):

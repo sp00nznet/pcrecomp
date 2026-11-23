@@ -50,14 +50,16 @@ Driven from `GAME.EXE`'s clean entry point under Unicorn, the loader:
 7. **Driver authentication.** `DeviceIoControl(\\.\Secdrv, 0xEF002407,
    in=1300, out=1552)` — a challenge/response with secdrv. The loader retries
    256 times and then traps if the 1552-byte response is wrong.
-8. Only once authentication passes: it decrypts the ICD and **process-hollows**
-   it into a child — `CreateProcess` (suspended), `WriteProcessMemory` the
-   decrypted sections, `SetThreadContext` with `Eip` = the ICD's real OEP,
-   `ResumeThread`.
+8. Reconstructs its own obfuscated `.txt` (the per-page cipher below), then does
+   the **physical disc check**, then launches the game via a child process + an
+   injected bootstrap stub that hands off to `DPLAYERX.DLL` to decrypt and run the
+   ICD. The precise, measured flow is in "After reconstruction: the disc check" and
+   "The launch chain / hollow" below. (An earlier draft guessed a direct
+   `WriteProcessMemory` of decrypted sections into a hollowed child; the real
+   mechanism delegates the ICD decryption to `DPLAYERX.DLL!Ox77F052CC`.)
 
-The decryption is **gated on step 7**: with the secdrv response stubbed, step 8
-never happens (no `CreateProcess`, no `WriteProcessMemory`). So the decryption
-key is derived from the secdrv response, and there is no shortcut around it.
+Decryption is **gated on step 7** (secdrv) and these later checks; with the secdrv
+response stubbed, nothing past it happens.
 
 ## The emulator
 
@@ -188,6 +190,72 @@ With the maths lifted out (`work/safedisc1/*`, kept out of the repo), stage 1 is
 `foldbyte(K)`/`.txt2`-mask XOR above. Both are now reproduced exactly in Python,
 which is how the penalty-shifted `K` was pinned.
 
+### After reconstruction: the disc check (2026-11-23)
+
+With `.txt` correct, the shell runs its real code and performs SafeDisc's physical
+disc authentication, then (previously) aborted with *"Please insert the correct
+CD-ROM"*. Measured, the check issues raw SCSI through `IOCTL_SCSI_PASS_THROUGH_DIRECT`
+(`0x4D014`) on `\\.\A:`…`\\.\Z:`:
+
+- `INQUIRY` (CDB `0x12`) on each drive, to find a CD-ROM.
+- `READ(10)` (CDB `0x28`) of **LBA 0, 16 and 21** — the ISO9660 boot area, primary
+  volume descriptor and root directory — all normal 2048-byte data sectors.
+
+The user owns the game and supplies the retail CD as an ISO (`FS2KCD1.ISO`, volume
+label `FS2KCD1`). `safedisc1.py` now backs the check from that image: `_find_cd_image`
+locates the user's ISO (beside the game, under `../original`, or `$SAFEDISC_CD`), the
+`INQUIRY` is answered as a CD-ROM, and each `READ(10)` returns the real sector from
+the ISO (`_cd_read`). **Nothing is emulated beyond serving the bytes the user already
+has**; no disc is launched.
+
+A plain ISO carries every *data* sector the check reads, but **not** the physical
+SafeDisc signature (deliberately weak / unreadable sectors and drive-timing), which
+no ISO9660 image can hold. So the final authentication verdict — the obfuscated
+predicate `0x40BF1E(2)`, whose result `test ax,ax / jne` at `0x405824` gates the
+error dialog — is overridden to "disc present" at that one consumer site, **only when
+the user's own CD image is present** (`_disc_ok`). This is a build-time step inside
+the unwrapper's emulator, keyed to the user's files; it is never written into the
+ICD, the lifted code, or any file. Without the ISO it does not fire and the check
+runs as-is. If a future title's check reads a signature an ISO cannot carry, `_sptd`
+logs the unhandled CDB; such a title needs a raw (sub-channel) image instead.
+
+### The launch chain / hollow (2026-11-23)
+
+Past the disc check the shell launches the game. Measured order:
+
+1. `CreateProcess("clokspl.exe 00000409", CREATE_NO_WINDOW)` — the C-DILLA splash,
+   fire-and-forget (the loader also `TerminateProcess`es its helper children, which
+   must not stop the emulator — only a self-terminate ends the run).
+2. `CreateProcess(FS2000.EXE, cmdline "FS2000.ICD", CREATE_SUSPENDED)` — a child
+   **loader instance with the ICD as its argument**.
+3. `WriteProcessMemory` of a **0xB5-byte bootstrap stub** to `0x7FFFFF2F`,
+   `SetThreadContext` with `Eip = 0x7FFFFF67` (inside the stub), `ResumeThread`.
+
+The stub is self-contained: a header of three resolved kernel32 thunks
+(`LoadLibraryA`, `GetProcAddress`, `FreeLibrary`) and the strings `"dplayerx"` and
+`"Ox77F052CC"`, then code that does
+`h = LoadLibraryA("dplayerx"); p = GetProcAddress(h, "Ox77F052CC"); p(...); FreeLibrary(h)`.
+
+So **the ICD is decrypted and run by `DPLAYERX.DLL!Ox77F052CC` in the child**, not by
+a `WriteProcessMemory` of decrypted sections from the parent (the doc's earlier
+process-hollow guess). And `DPLAYERX.DLL` is **itself a SafeDisc shell**: its `.txt`
+(RVA `0xE000`, entropy ~7.98) is encrypted and the export `Ox77F052CC` sits at RVA
+`0x1000` inside that encrypted `.txt`, so dplayerx self-reconstructs with the *same*
+cipher before it can decrypt the ICD.
+
+#### The remaining step
+
+To capture the decrypted ICD, emulate the **child stage**: map `FS2000.EXE`, install
+the captured stub at `0x7FFFFF2F`, start at `0x7FFFFF67`; service `LoadLibraryA
+("dplayerx")` by mapping `DPLAYERX.DLL` and running its `.txt` reconstruction (reuse
+the stage-1/2 decryptor already implemented — it is the same SafeDisc cipher) and its
+`DllMain`, then run `Ox77F052CC`, which maps `FS2000.ICD`, decrypts its `.text`
+(stripped `kernel32`/`user32` imports resolved by dplayerx) over the child's
+`0x400000`, and jumps to the ICD OEP. Capture the `0x400000` image and the OEP at that
+jump, recover the imports from dplayerx's resolution, and emit the clean PE
+(`emu_unpack.py` `find_iat`/`layout`/`write`). This reuses existing machinery but is a
+second shell to drive; it is the open item before the ICD can be lifted.
+
 #### How it diverged, before the fix (kept for reference)
 
 With the primitive confirmed, the divergence was localised:
@@ -239,52 +307,13 @@ buffers and whole-page outputs:
   `0x435A70`. So stage 1 is a keyed block transform whose state is this table plus the
   surrounding `.data`; the exact round function is still to be reversed.
 
-Why this is a **hard wall** for black-box work, with the evidence:
-
-- Stage 1 runs for **every** page including page 0 (in the loop-window *before*
-  page 0's stage-2 pass), and page 0's `P` is both produced by stage 1 and consumed
-  by stage 2 to give the byte-perfect page 0. **So stage 1 demonstrably works on
-  page 0.**
-- Its S-box state therefore evolves correctly through page 0 and should enter page 1
-  correct; its raw `.txt` input for page 1 is correct in the image; secdrv and custom
-  data are ruled out. Every input stage 1 has on page 1 is one we can show is correct,
-  yet its output `P` is wrong from byte 0.
-- When a fully deterministic computation with all-correct inputs produces a correct
-  result on page 0 and a wrong one on page 1, the remaining cause is that the
-  **emulator executes some instruction on page 1's data path differently from a real
-  CPU** — a Unicorn semantics edge (an obfuscated `aad`/`aam`/BCD, a flag or
-  segment or `rep` corner), or S-box state silently clobbered between pages. The only
-  oracle available headless is the final `shell.bin`, which cannot by itself localise
-  a single wrong instruction deep inside 512 blocks of obfuscated stage-1 code.
-
-Two ways past the wall, for whoever picks it up:
-
-1. **Reverse stage 1 fully** (the per-block round function at/above
-   `0x426490`) into a standalone reference, run it over page 1's known-correct inputs,
-   and compare to the emulator's per-instruction state to find the first divergence.
-2. **A known-good x86 reference** to diff instruction semantics against the emulator
-   on the stage-1 path. We cannot run the original natively (project rule), but the
-   decrypt routines can be executed in isolation under a second, independent x86
-   engine (or a Unicorn vs. a software x86 model) on the captured input buffers —
-   neither runs the game — and the first instruction whose two engines disagree is
-   the bug.
-
-Fixing stage 1 makes `P` correct, stage 2 is already proven, and the shell runs to
-completion and decrypts the ICD (secdrv is already answered headless).
-
-### Then
-
-1. **Finish the page decryptor** so `.txt` reconstructs to real code; the shell
-   then runs its own reconstruction to completion.
-2. **Model the child.** `CreateProcess(ICD)` initialises a second memory image
-   from the ICD's file layout; `WriteProcessMemory`/`ReadProcessMemory`/
-   `VirtualProtect` act on it (the `0x66` path already targets it);
-   `GetThreadContext`/`SetThreadContext` carry the OEP. After `ResumeThread` the
-   child image holds the decrypted program.
-3. **Rebuild the PE.** Reuse `emu_unpack.py`'s `find_iat`/`layout`/`write`: the
-   stripped imports come back as the runs of thunk addresses the decrypted code
-   calls through, and a fresh import directory is appended. Output is an ordinary
-   PE that `pe_analyze` and the lifters read like any other.
+At the time this looked like a possible Unicorn instruction-semantics edge, because
+stage 1 works on page 0 yet produces wrong `P` on page 1 with seemingly-correct
+inputs. That hypothesis was **wrong**: the lift-to-Python diff (path 2) showed the
+stage-1 XTEA and stage-2 fold are exact, and the real cause was the shared key `K`
+being shifted by anti-debug penalties that only fire when software interrupts are
+mis-handled — the SEH fix above. Unicorn and the pcrecomp lifter were fine. Kept
+here only to show how the diagnosis narrowed.
 
 ## Which SafeDisc 1 titles this covers
 
