@@ -78,6 +78,9 @@ void dos32_mouse_move(double dx, double dy, int buttons);
  * retrace; the platform layer may set it to throttle or to speed up. */
 extern double dos32_speed;        /* 1.0 = the PIT runs at its real rate */
 extern volatile int dos32_quit;   /* set to ask the program to stop */
+/* Seconds each keyboard poll (int 21h AH=0Bh) takes; 0 (default) = none.
+ * Paces a program whose loop runs as fast as the CPU between polls. */
+extern double dos32_kbhit_idle;
 
 /* Wait `seconds` of real time on the guest thread, still delivering timer,
  * keyboard and mouse interrupts: how a host paces a program that ran flat
