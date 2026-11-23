@@ -14,13 +14,17 @@ place (pointer at [ebp+0x14]) and `mask` is a second byte stream (pointer at
 the data (0x426d85) shares the same K accumulator, so K is *stateful across
 passes and pages* -- it is not reseeded from the page index.
 
-This module is the reference for that primitive and a self-test against the
-real decrypted shell. It is NOT the whole unwrapper: cipher[] and mask[] are
-themselves produced by earlier reconstruction steps inside the shell, and those
-feeders -- not this primitive -- are where the headless emulator currently
-diverges (see docs/safedisc1.md "The frontier"). Having the primitive pinned
-down means a divergence can be localised to a wrong cipher/mask/K input rather
-than to the arithmetic.
+This is **stage 2** of a two-stage per-page scheme. `mask` is the mapped `.txt2`
+section (cleartext, one page per `.txt` page) and is correct by construction;
+`cipher` is the `P` intermediate produced by **stage 1** -- an RC4-keyed 8-byte
+block transform (helper tail `0x426490`, S-box at `0x435A60`, 512 blocks/page).
+
+This module is the reference for the stage-2 primitive and a self-test against
+the real decrypted shell. It is NOT the whole unwrapper. Page 0 reconstructs
+byte-for-byte; pages 0x402000+ do not, and the divergence is isolated to stage 1
+producing a wrong `P` for page 1 while `mask` and the stage-2 `K` carry are
+proven correct (see docs/safedisc1.md "Narrowed to stage 1"). Having stage 2
+pinned down is what let the bug be localised to stage 1 rather than the XOR math.
 """
 
 

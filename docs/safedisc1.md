@@ -171,20 +171,72 @@ With the primitive confirmed, the divergence was localised:
   withdrawn). So the key/mask are **not** fed by secdrv or custom data; they are
   built from the mapped image and the shell's own `.data` by earlier reconstruction
   steps that run inside the emulator.
-- Therefore the remaining bug is **not a missing external input**. It is that one
-  of the feeder steps (the pass that fills `cipher`/`mask`, or the handling that
-  carries `K` between pages) executes differently in the emulator than on the real
-  CPU — a mis-emulated obfuscated instruction, a stale buffer left by an API stub,
-  or an SEH/`int` path taken wrongly — since page 0 proves the emulator *can*
-  reconstruct a page correctly when its feeders happen to be right.
+- Therefore the remaining bug is **not a missing external input**; everything is
+  internal and deterministic.
 
-Next concrete step: differential-trace the two reconstruction passes (`0x426728`
-and `0x426d85`) and the `K` carry between pages; the only observable oracle is the
-final `shell.bin`, so bisect by snapshotting the `cipher`/`mask` buffers at the
-start of page 1's loop and working *backwards* to the first feeder read whose value
-cannot be reconciled with the `shell.bin`-implied `cipher`/`mask`. That read is the
-mis-emulated step. (secdrv is already answered headless; once the shell runs to
-completion it decrypts the ICD.)
+#### Narrowed to stage 1 (2026-11-22, backward-bisect)
+
+The reconstruction is **two stages** per `.txt` page, confirmed by capturing full
+buffers and whole-page outputs:
+
+- **Stage 2** is the byte loop above (`out = in ^ foldbyte(K) ^ mask[i]`). Its three
+  inputs are now each pinned:
+  - `mask` is the mapped **`.txt2`** section, one page per `.txt` page (page 0's
+    mask = `.txt2` VA `0x423000`, page 1 = `0x424000`, …). `.txt2` is cleartext in
+    the file and loads straight into the image, so the mask is **correct by
+    construction**.
+  - `K` carries between pages. **Page 0 reconstructs all 4096 bytes correctly**
+    (verified against `shell.bin`, not just the first 16), so every `K` update
+    through page 0 is correct and the value entering page 1 (`0xEF189825`) is
+    correct.
+  - `cipher` is the `P` intermediate (stack buffer `0x5F1FDDFC`), *not* the raw
+    `.txt`. It is produced by stage 1.
+- So for page 1, stage 2's only wrong input is **`P` (the stage-1 output)**. Direct
+  check at byte 0: oracle wants `0x30`; with the correct `K` (`foldbyte=0x4A`) and
+  correct mask (`0xA2`), `P[0]` would have to be `0x30^0x4A^0xA2 = 0xD8`, but the
+  emulator's `P[0]` is `0x27`. Page 1's output is wrong **from byte 0**, which (since
+  `K` is still correct at byte 0) can only be a wrong `cipher`/`P` byte.
+- **Stage 1** fills `P` from the raw mapped `.txt` ciphertext (`0x402000…`, correct
+  in the image) and transforms it in **8-byte blocks** — a helper whose tail at
+  `0x426490..0x4264A7` stores two dwords (`[ebp-8]`,`[ebp-0xC]`) per call and is
+  called **512 times per page** (512×8 = 4096). Its arguments are
+  `(P_dest, 0x435A60, 0x400000, 0x70000024)`. **`0x435A60` is an RC4-style S-box**:
+  256 bytes, identity-initialised (`00 01 02 03 …`), read ~65536 times during a page,
+  and it sits `0x10` below the stage-2 accumulator `K` at `0x435A70`. So stage 1 is a
+  keyed stream/block transform whose key state is this evolving S-box.
+
+Why this is a **hard wall** for black-box work, with the evidence:
+
+- Stage 1 runs for **every** page including page 0 (in the loop-window *before*
+  page 0's stage-2 pass), and page 0's `P` is both produced by stage 1 and consumed
+  by stage 2 to give the byte-perfect page 0. **So stage 1 demonstrably works on
+  page 0.**
+- Its S-box state therefore evolves correctly through page 0 and should enter page 1
+  correct; its raw `.txt` input for page 1 is correct in the image; secdrv and custom
+  data are ruled out. Every input stage 1 has on page 1 is one we can show is correct,
+  yet its output `P` is wrong from byte 0.
+- When a fully deterministic computation with all-correct inputs produces a correct
+  result on page 0 and a wrong one on page 1, the remaining cause is that the
+  **emulator executes some instruction on page 1's data path differently from a real
+  CPU** — a Unicorn semantics edge (an obfuscated `aad`/`aam`/BCD, a flag or
+  segment or `rep` corner), or S-box state silently clobbered between pages. The only
+  oracle available headless is the final `shell.bin`, which cannot by itself localise
+  a single wrong instruction deep inside 512×(RC4 schedule) of obfuscated code.
+
+Two ways past the wall, for whoever picks it up:
+
+1. **Reverse stage 1 fully** (RC4 KSA + PRGA + the per-block round at/above
+   `0x426490`) into a standalone reference, run it over page 1's known-correct inputs,
+   and compare to the emulator's per-instruction state to find the first divergence.
+2. **A known-good x86 reference** to diff instruction semantics against the emulator
+   on the stage-1 path. We cannot run the original natively (project rule), but the
+   decrypt routines can be executed in isolation under a second, independent x86
+   engine (or a Unicorn vs. a software x86 model) on the captured input buffers —
+   neither runs the game — and the first instruction whose two engines disagree is
+   the bug.
+
+Fixing stage 1 makes `P` correct, stage 2 is already proven, and the shell runs to
+completion and decrypts the ICD (secdrv is already answered headless).
 
 ### Then
 
