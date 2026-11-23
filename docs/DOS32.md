@@ -150,6 +150,16 @@ timeout in frames and paces nothing, so natively its name prompt timed out in
 a fraction of a second. The host has to choose where to pace; Theme Park does it
 on its per-frame input poll.
 
+- `DOS32_EPOCH=<unix seconds>` (environment) pins the start time the DOS
+  clock counts from, so a program that seeds its random numbers from the clock
+  makes the same choices every run (UFO's manual-check page).
+- `dos32_kbhit_idle`: seconds each keyboard poll (int 21h `0Bh`) takes. UFO's
+  Geoscape steps game time between polls and nothing else; without it a day
+  went by in seconds.
+- The CMOS clock (int 1Ah `02h`/`04h`, BCD) reads the same guest clock; DOS
+  set date/time (int 21h `2Bh`/`2Dh`) is accepted and ignored. UFO waits for
+  the CMOS second to turn over at exit.
+
 ## Save states
 
 `dos32_state_save(path, where)` writes the whole machine to a file, and
