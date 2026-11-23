@@ -150,7 +150,15 @@ class Unpacker:
         uc.reg_write(UC_X86_REG_EIP, self._read32(esp))
 
     def _fetch_prot(self, uc, access, addr, size, value, _):
-        self.oep = addr
+        # The TAC wrapper (GTA2) writes a lone `ret` into the image and calls
+        # it, to check it can, then puts the byte back: that is a probe, not
+        # the OEP. run() steps over it and carries on.
+        op = bytes(uc.mem_read(addr, 3))
+        self.probe = op[0] == 0xC3 or op[0] == 0xC2
+        if self.probe:
+            self.probe_pop = 0 if op[0] == 0xC3 else struct.unpack('<H', op[1:3])[0]
+        else:
+            self.oep = addr
         uc.emu_stop()
         return False
 
@@ -185,12 +193,19 @@ class Unpacker:
         low = self.stub_low or stub_page
         text = self.base + PAGE
         self.uc.mem_protect(text, low - text, UC_PROT_READ | UC_PROT_WRITE)
-        try:
-            self.uc.emu_start(start, 0xFFFFFFFF)
-        except UcError as e:
-            if self.oep is None:
-                eip = self.uc.reg_read(UC_X86_REG_EIP)
-                raise SystemExit(f'stub faulted at 0x{eip:08X}: {e}')
+        while True:
+            self.probe = False
+            try:
+                self.uc.emu_start(start, 0xFFFFFFFF)
+            except UcError as e:
+                if self.oep is None and not self.probe:
+                    eip = self.uc.reg_read(UC_X86_REG_EIP)
+                    raise SystemExit(f'stub faulted at 0x{eip:08X}: {e}')
+            if not self.probe:
+                break
+            esp = self.uc.reg_read(UC_X86_REG_ESP)          # do the probe's ret
+            start = struct.unpack('<I', bytes(self.uc.mem_read(esp, 4)))[0]
+            self.uc.reg_write(UC_X86_REG_ESP, esp + 4 + self.probe_pop)
         if self.oep is None:
             raise SystemExit(f'stopped before the OEP: {self.stopped or "stub returned"}')
         return self.oep
