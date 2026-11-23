@@ -3,9 +3,13 @@
 This is the mechanism of SafeDisc 1.x copy protection as measured on Microsoft
 Flight Simulator 2000 (`FS2000.EXE` + `FS2000.ICD`, SafeDisc `BoG_ *90.0`,
 secdrv.sys dated 1999), and how `tools/drm/safedisc1.py` unwraps it without a
-disc, a driver, or launching anything. It is the reference for finishing that
-tool, and it applies to every SafeDisc 1 title (Crimson Skies, X-Wing Alliance,
-the many others on the usual-suspects list), because the pieces are shared.
+disc, a driver, or launching anything. **Status: work in progress** — the loader
+runs headless through the anti-debug gauntlet, the secdrv challenge and into the
+`.txt` reconstruction, but the per-page reconstruction does not yet match the
+oracle (see "Where it actually diverges"), so no decrypted ICD is produced yet.
+It is the reference for finishing that tool, and it applies to every SafeDisc 1
+title (Crimson Skies, X-Wing Alliance, the many others on the usual-suspects
+list — see "Which SafeDisc 1 titles this covers"), because the pieces are shared.
 
 The goal is a decrypted, importable PE for the lifter — not a working disc
 check. We measure the game; we do not help anyone skip buying it.
@@ -128,21 +132,59 @@ Measured against that oracle (`work/safedisc1/cmp_pages.py`):
   the per-page decryptor emits **garbage** for the rest.
 - The cipher is **not** a simple keystream: `file_txt XOR shell_txt` is ~7.95
   (high) per page, so it is a real stream/block cipher, not a repeating XOR.
-- The key comes from the **"custom data"** block at file offset `0x44200`, which
-  begins with the ASCII `"custom data"` stored **reversed** (`61 74 61 64 20 6d 6f
-  74 73 75 63`), then a small header (`…01 00 00 00 09 04 00 00 68 00 …`).
-- The decryptor *code* runs correctly in the emulator (it is the same shell code);
-  it produces garbage because its **key input is wrong**. So the fix is not to
-  re-implement the cipher but to find what input the real decryptor consumes that
-  the emulator feeds wrong — the `"custom data"` bytes delivered by the file model,
-  the secdrv response, or a runtime value — by tracing the decryptor's reads in the
-  emulator and matching them to the state that yields `shell.bin`.
 
-Next concrete step: hook the emulator around the per-page decrypt routine (reached
-just before the dispatcher `0x415d10` / patch engine `0x415a80`; the copy-in is the
-`rep movsd` at `0x415AC8`), log its inputs for the first page that diverges from the
-oracle, and correct the emulator's delivery of that input. Then the shell runs to
-completion, and — with secdrv already answered headless — it decrypts the ICD.
+#### The per-page decrypt primitive, pinned down (2026-11-22)
+
+The inner decrypt loop was traced byte-by-byte (`FS2000.EXE` `0x426728..0x4267eb`,
+reached from the patch engine `0x415a80`). It is, per byte `i`:
+
+    out[i] = cipher[i] ^ foldbyte(K) ^ mask[i]
+    K      = (K + out[i]) & 0xFFFFFFFF
+
+with `foldbyte(K) = (K ^ (K>>8) ^ (K>>16) ^ (K>>24)) & 0xFF`, `K` a 32-bit
+running accumulator held at `[0x435A70]`, `cipher` the page transformed in place
+(ptr `[ebp+0x14]`) and `mask` a second byte stream (ptr `[ebp+0x1c]`); both
+pointers advance one byte per step. A **second pass** (`0x426d85`) shares the same
+`K`, so `K` is stateful across passes *and* pages — not reseeded per page.
+`tools/drm/safedisc1_cipher.py` is this primitive plus a self-test: it reproduces
+the first bytes of `shell.bin` page 0 exactly from the captured `cipher`/`mask`/`K=0`
+inputs, so the **arithmetic is confirmed correct**. (The `rep movsd` at `0x415AC8`
+is only the copy-in of the finished page.)
+
+Also required a fix: `wsprintfA` was stubbed as a no-op, so the shell built an
+**empty** `\\.\Secdrv` device name (it formats `"\\.\%s"`). `safedisc1.py` now
+implements a minimal `wsprintfA`, and the device name resolves.
+
+#### Where it actually diverges
+
+With the primitive confirmed, the divergence was localised:
+
+- Page 0 (`0x401000`) is the already-cleartext **bootstrap** and reconstructs
+  byte-for-byte; it is a passthrough, so it never exercised the real cipher. Pages
+  `0x402000`+ are genuinely encrypted and the emulator produces garbage for them.
+  Only **5 pages** are copied before the shell faults on executing a junk page.
+- **The decrypt inputs are entirely internal and deterministic.** Perturbing the
+  secdrv IOCTL response (`0xEF002407`) and perturbing the `"custom data"` block
+  (`0x44200`) each leave the page-1 decrypted output **bit-identical** (measured by
+  comparing the `esi` source at the copy, not the pre-copy destination — the earlier
+  "key comes from custom data" note was based on a read *before* the copy and is
+  withdrawn). So the key/mask are **not** fed by secdrv or custom data; they are
+  built from the mapped image and the shell's own `.data` by earlier reconstruction
+  steps that run inside the emulator.
+- Therefore the remaining bug is **not a missing external input**. It is that one
+  of the feeder steps (the pass that fills `cipher`/`mask`, or the handling that
+  carries `K` between pages) executes differently in the emulator than on the real
+  CPU — a mis-emulated obfuscated instruction, a stale buffer left by an API stub,
+  or an SEH/`int` path taken wrongly — since page 0 proves the emulator *can*
+  reconstruct a page correctly when its feeders happen to be right.
+
+Next concrete step: differential-trace the two reconstruction passes (`0x426728`
+and `0x426d85`) and the `K` carry between pages; the only observable oracle is the
+final `shell.bin`, so bisect by snapshotting the `cipher`/`mask` buffers at the
+start of page 1's loop and working *backwards* to the first feeder read whose value
+cannot be reconciled with the `shell.bin`-implied `cipher`/`mask`. That read is the
+mis-emulated step. (secdrv is already answered headless; once the shell runs to
+completion it decrypts the ICD.)
 
 ### Then
 
@@ -157,6 +199,28 @@ completion, and — with secdrv already answered headless — it decrypts the IC
    stripped imports come back as the runs of thunk addresses the decrypted code
    calls through, and a fresh import directory is appended. Output is an ordinary
    PE that `pe_analyze` and the lifters read like any other.
+
+## Which SafeDisc 1 titles this covers
+
+The loader, `secdrv.sys` (byte-identical across the family), the anti-debug
+gauntlet and this per-page cipher primitive are shared across SafeDisc 1.x
+(`BoG_ *90.0`-era, secdrv dated 1998–1999). Once the headless unwrapper finishes
+one title it should cover the others unchanged apart from per-title offsets. The
+usual-suspects list this unblocks — all `GAME.EXE` + `GAME.ICD` pairs with a
+`secdrv.sys`:
+
+- **Microsoft Flight Simulator 2000** (this reference; also `FSEDIT.EXE`/`FSEDIT.ICD`
+  in the same install).
+- **Crimson Skies** (Microsoft/Zipper, 2000).
+- **X-Wing Alliance** retail SafeDisc pressing (the Steam build is SteamStub, handled
+  elsewhere) and other LucasArts SafeDisc 1 discs.
+- Other Microsoft-published SafeDisc 1 titles of the era (e.g. Motocross Madness 2,
+  Midtown Madness) and the broad SafeDisc 1 catalogue — any title whose ICD carries
+  the same `BoG_` marker and ships the 1999 `secdrv.sys`.
+
+Confirm a candidate by checking the ICD's `.text` entropy (~7.99, stripped
+kernel32/user32 imports) and that `secdrv.sys` matches the known hash before
+pointing the unwrapper at it.
 
 ## Verifying
 

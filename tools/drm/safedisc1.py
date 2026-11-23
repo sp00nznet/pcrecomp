@@ -539,7 +539,28 @@ class Tracer:
         self.log.append(('MessageBoxA', self.cstr(a(1)), self.cstr(a(2))))
         self.stop_reason = 'MessageBox: %r' % self.cstr(a(1)); self.uc.emu_stop(); return 4, 1
     def api_wsprintfA(self, a):
-        return 0, 0           # cdecl, variadic -- leave stack to caller
+        # cdecl, variadic -- leave stack to caller. The shell builds the Secdrv device name
+        # with it, so it must really format (a no-op left the device name empty).
+        # ponytail: %s %c %d %u %x/%X with flags/width only; add more if a title needs it.
+        import re
+        fmt, k = self.cstr(a(1)), [2]
+        def arg():
+            v = a(k[0]); k[0] += 1; return v
+        def sub(m):
+            flags, width, conv = m.group(1), m.group(2), m.group(3)
+            if conv == '%':
+                return '%'
+            v = arg()
+            if conv == 's':
+                v = self.cstr(v) or ''
+            elif conv == 'c':
+                v = chr(v & 0xFF)
+            elif conv == 'd':
+                v = v - (1 << 32) if v & 0x80000000 else v
+            return ('%' + flags + width + {'u': 'd'}.get(conv, conv)) % v
+        out = re.sub(r'%([-0#]*)(\d*)l?([%scduxX])', sub, fmt).encode('latin-1', 'replace')
+        self.uc.mem_write(a(0), out + bytes(1))
+        return 0, len(out)
     def api_GetKeyboardType(self, a):
         return 1, 4
     def api_GetDesktopWindow(self, a):
