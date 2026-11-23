@@ -65,6 +65,10 @@ class Volume:
         # Volume header follows the common header; the file-index range sits at
         # +8/+12 within it (after data_offset and its high dword).
         self.first_file_index, self.last_file_index = struct.unpack_from('<II', head, 20 + 8)
+        # Then where the boundary files sit in this volume: the first file's
+        # tail (offset, expanded, compressed) and the last file's head.
+        (self.first_file_offset, _, self.first_file_comp,
+         self.last_file_offset, _, self.last_file_comp) = struct.unpack_from('<6I', head, 20 + 16)
 
     def __repr__(self):
         return '%s [%d..%d]' % (os.path.basename(self.path),
@@ -420,6 +424,8 @@ class ISCabinet:
                 if fd.is_compressed:
                     # Extract from cab file
                     try:
+                        if fd.is_split:
+                            cab, fd = self._join_split(handles, fd)
                         self._extract_compressed(cab, fd, out_path)
                         extracted += 1
                         self._print_progress(fd.index, total, rel_path, "extracted")
@@ -495,6 +501,24 @@ class ISCabinet:
         print(f"  Extracted: {extracted}/{total}")
         if errors:
             print(f"  Errors: {errors}")
+
+    def _join_split(self, handles, fd):
+        """A file that spans two volumes: its head is the last file of one
+        volume and its tail the first file of the next. Reading all of it from
+        one volume read the next file's bytes as its own (GTA1's Track8.wav came
+        out headerless, with Track9's RIFF header inside it)."""
+        import copy, io
+        head = next(v for v in self.volumes if v.last_file_index == fd.index and v.last_file_comp)
+        tail = next(v for v in self.volumes if v.first_file_index == fd.index and v.first_file_comp)
+        parts = []
+        for v, off, n in ((head, head.last_file_offset, head.last_file_comp),
+                          (tail, tail.first_file_offset, tail.first_file_comp)):
+            h = _volume_handle(handles, v.path)
+            h.seek(off)
+            parts.append(h.read(n))
+        joined = copy.copy(fd)
+        joined.data_offset = 0
+        return io.BytesIO(b''.join(parts)), joined
 
     def _extract_compressed(self, cab_file, fd, out_path):
         """
