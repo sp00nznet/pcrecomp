@@ -73,6 +73,31 @@ static void user_shared(void) {
 
 static uint64_t g_static[16];   /* SharedStaticServerData: one pointer per server DLL */
 
+/* NT 6: ntdll opens \Sessions\N\Windows\SharedSection and maps it itself at
+ * the connect info's SharedSectionBase; the static server data array lives in
+ * it (+0x100), the heap after (+0x1000). */
+static HANDLE g_shared_sec;
+static uint64_t g_shared_base;
+void* csr64_shared_section(void) {
+    HANDLE h = NULL;
+    if (!g_shared_sec) g_shared_sec = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, 0x10000, NULL);
+    DuplicateHandle(GetCurrentProcess(), g_shared_sec, GetCurrentProcess(), &h, 0, FALSE, DUPLICATE_SAME_ACCESS);
+    return h;
+}
+static int nt6_shared(void) {
+    if (g_shared_base) return 1;
+    if (!g_shared_sec) g_shared_sec = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, 0x10000, NULL);
+    uint8_t* v = (uint8_t*)MapViewOfFile(g_shared_sec, FILE_MAP_ALL_ACCESS, 0, 0, 0);
+    if (!v) return 0;
+    ((uint64_t*)(v + 0x100))[1] = base_static_server_data();
+    UnmapViewOfFile(v);
+    /* Vista x64's ntdll frees the kernel's reserve at 0x7EFE0000 (the section's size) and maps
+     * the section there: the reserve is made here */
+    g_shared_base = 0x7EFE0000;
+    if (!VirtualAlloc((void*)(uintptr_t)g_shared_base, 0x10000, MEM_RESERVE, PAGE_NOACCESS)) return 0;
+    return 1;
+}
+
 /* NtSecureConnectPort(h*, name, qos, ClientView*, sid, ServerView*, maxlen*, info*, infolen*)
  * NtConnectPort      (h*, name, qos, ClientView*,      ServerView*, maxlen*, info*, infolen*) */
 static uint64_t connect(uint64_t* a, int secure, const char* svc) {
@@ -94,7 +119,14 @@ static uint64_t connect(uint64_t* a, int secure, const char* svc) {
     }
     if (sv) *(uint64_t*)(uintptr_t)(sv + 8) = 0, *(uint64_t*)(uintptr_t)(sv + 0x10) = 0;
     if (ml) *(uint32_t*)(uintptr_t)ml = 0x148;
-    if (ci) {
+    if (ci && NATIVE64_NT6) {
+        uint8_t* c = (uint8_t*)(uintptr_t)ci;
+        if (!nt6_shared()) return 0xC0000017u;
+        *(uint64_t*)(c + 0x08) = g_shared_base;                            /* SharedSectionBase */
+        *(uint64_t*)(c + 0x10) = g_shared_base + 0x100;                    /* SharedStaticServerData */
+        *(uint64_t*)(c + 0x18) = g_shared_base + 0x1000;                   /* SharedSectionHeap */
+        *(uint64_t*)(c + 0x28) = GetCurrentProcessId();                    /* ServerProcessId (NT 6 x64: +0x28 of 0x30) */
+    } else if (ci) {
         uint8_t* c = (uint8_t*)(uintptr_t)ci;
         if (!g_static[1]) g_static[1] = base_static_server_data();
         uint8_t* shared = (uint8_t*)VirtualAlloc(NULL, 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -186,6 +218,26 @@ static uint64_t ovr_request(uint64_t* a) {
         *(COORD*)(d + 0x22) = i.dwMaximumWindowSize;
         break;
     }
+    case 0x20226:      /* NT 6 consrv GetConsoleTitle { ConsoleHandle; TitleLength +8 (in: the buffer's
+                        * bytes, out: the title's); Title +0x10 (captured); Unicode +0x18 }: the host's */
+        if (NATIVE64_NT6) {
+            wchar_t t[1024] = L"";
+            uint8_t* buf = (uint8_t*)(uintptr_t)*(uint64_t*)(d + 0x10);
+            uint32_t n = *(uint32_t*)(d + 8);
+            GetConsoleTitleW(t, 1023);
+            if (!buf || !n) { st = 0xC000000Du; break; }
+            if (*(uint8_t*)(d + 0x18)) {
+                uint32_t k = (uint32_t)wcslen(t) * 2;
+                if (k + 2 > n) k = (n - 2) & ~1u;
+                memcpy(buf, t, k), *(uint16_t*)(buf + k) = 0, *(uint32_t*)(d + 8) = k;
+            } else {
+                int k = WideCharToMultiByte(CP_OEMCP, 0, t, -1, (char*)buf, (int)n, NULL, NULL);
+                *(uint32_t*)(d + 8) = k > 0 ? (uint32_t)k - 1 : 0;
+            }
+            break;
+        }
+        fprintf(stderr, "[csr] api %X: answered empty\n", api);
+        break;
     case 0x2023F:      /* consrv GetConsoleCP { ConsoleHandle; CodePage +8; Output +0xC } */
         *(uint32_t*)(d + 8) = 437;   /* ponytail: XP's OEM page, whatever the host console's */
         break;

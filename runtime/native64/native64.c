@@ -16,6 +16,7 @@ static __declspec(thread) CPU* t_cpu;     /* this thread's guest registers */
 static __declspec(thread) jmp_buf* t_top; /* NtContinue lands here */
 int64_t g_image_delta;                    /* every module sits at its own base */
 uint64_t native64_peb;
+unsigned native64_build = 3790;
 int native64_trace;
 
 #define ST_SUCCESS 0
@@ -489,6 +490,11 @@ static uint64_t ovr_open_section(uint64_t* a) {
     wchar_t p[256];
     int named = oa_path(a[2], p, 256);
     if (named && !_wcsnicmp(p, L"\\KnownDlls", 10)) return ST_NAME_NOT_FOUND;
+    if (named && wcslen(p) > 22 && !_wcsicmp(p + wcslen(p) - 22, L"\\Windows\\SharedSection")) {
+        /* NT 6: ntdll maps csrss's shared section itself (csr64.c) */
+        *(HANDLE*)(uintptr_t)a[0] = csr64_shared_section();
+        return *(HANDLE*)(uintptr_t)a[0] ? ST_SUCCESS : 0xC0000017u;
+    }
     if (named && !_wcsnicmp(p, L"\\NLS\\NlsSection", 15)) {
         /* basesrv's NLS sections: the guest's own .nls files, read-only */
         static const wchar_t* map[][2] = { { L"Unicode", L"unicode.nls" }, { L"Locale", L"locale.nls" },
@@ -654,6 +660,58 @@ static uint64_t ovr_no_process(uint64_t* a) { (void)a; return ST_ACCESS_DENIED; 
 static uint64_t ovr_denied(uint64_t* a) { (void)a; return 0xC0000061u; }   /* STATUS_PRIVILEGE_NOT_HELD */
 
 /* ---- process start -------------------------------------------------------- */
+static void* load_file(const wchar_t* dir, const wchar_t* name);
+
+/* ---- NT 6 NLS: the guest's own locale.nls and code pages, not the host's --
+ * Vista's kernel32 maps locale.nls by NtInitializeNlsFiles(&base, &lcid,
+ * &casing size) and each code page by NtGetNlsSectionPtr(11, cp, 0, &base,
+ * &size) (native32's syscall32.c answer); the host's would be Windows 11's. */
+static uint32_t file_size_of(const wchar_t* name) {
+    wchar_t p[MAX_PATH];
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    _snwprintf(p, MAX_PATH - 1, L"%ls\\%ls", g_sys, name), p[MAX_PATH - 1] = 0;
+    return GetFileAttributesExW(p, GetFileExInfoStandard, &fa) ? fa.nFileSizeLow : 0;
+}
+static uint64_t ovr_init_nls(uint64_t* a) {
+    static void* loc;
+    if (!loc) loc = load_file(g_sys, L"locale.nls");
+    if (!loc) return ST_NAME_NOT_FOUND;
+    if (a[0]) *(uint64_t*)(uintptr_t)a[0] = (uint64_t)(uintptr_t)loc;
+    if (a[1]) *(uint32_t*)(uintptr_t)a[1] = GetUserDefaultLCID();
+    if (a[2]) *(uint64_t*)(uintptr_t)a[2] = file_size_of(L"l_intl.nls");
+    return ST_SUCCESS;
+}
+/* NtGetNlsSectionPtr(type, id, unused, &base, &size) */
+static uint64_t ovr_nls_section(uint64_t* a) {
+    wchar_t name[64];
+    void* p;
+    if (a[0] == 11) _snwprintf(name, 63, L"c_%u.nls", (unsigned)a[1]);
+    else if (a[0] == 12) wcscpy(name, L"normnfc.nls");   /* ponytail: one form */
+    else { fprintf(stderr, "[nt] NtGetNlsSectionPtr type %u id %u: none\n", (unsigned)a[0], (unsigned)a[1]); return ST_NAME_NOT_FOUND; }
+    if (!(p = load_file(g_sys, name))) return ST_NAME_NOT_FOUND;
+    *(uint64_t*)(uintptr_t)a[3] = (uint64_t)(uintptr_t)p;
+    if (a[4]) *(uint32_t*)(uintptr_t)a[4] = file_size_of(name);
+    return ST_SUCCESS;
+}
+/* NtQueryVirtualMemory(h, va, class, info, len, retlen): MemoryRegionInformation
+ * (3) is shorter on NT 6.0 { AllocationBase, AllocationProtect, RegionType,
+ * RegionSize: 0x18 }; the host's longer one starts the same */
+static uint64_t ovr_query_vm(uint64_t* a) {
+    if (a[2] == 3 && a[4] < 0x30) {
+        uint8_t b[0x80] = { 0 };
+        uint64_t t[16] = { a[0], a[1], 3, (uint64_t)(uintptr_t)b, sizeof b, 0 };
+        uint64_t r = native64_forward("NtQueryVirtualMemory", t);
+        if ((uint32_t)r) return r;
+        if (a[4] < 0x18) return 0xC0000004u;
+        /* a lifted module is an image to the guest (the loader's exception lookup asks) */
+        for (int i = 0; i < g_nmod; i++) if (*(uint64_t*)b == g_mod[i].base) *(uint32_t*)(b + 0xC) = MEM_IMAGE;
+        memcpy((void*)(uintptr_t)a[3], b, (size_t)a[4]);
+        if (a[5]) *(uint64_t*)(uintptr_t)a[5] = a[4];
+        return ST_SUCCESS;
+    }
+    return native64_forward("NtQueryVirtualMemory", a);
+}
+
 static void* load_file(const wchar_t* dir, const wchar_t* name) {
     wchar_t p[MAX_PATH];
     _snwprintf(p, MAX_PATH - 1, L"%ls\\%ls", dir, name);
@@ -757,7 +815,10 @@ static DWORD WINAPI boot_thread(LPVOID unused) {
      * thread's initial CONTEXT, as the kernel queues it; it ends in
      * NtContinue(Context) to kernel32's BaseProcessStart(entry). */
     uint64_t k32 = native64_module("kernel32.dll");
-    uint64_t start = k32 ? native64_export(k32, "BaseProcessStart") : 0;
+    /* NT 6: no BaseProcessStart; the thread starts in ntdll's RtlUserThreadStart(entry, PEB),
+     * which calls kernel32's BaseThreadInitThunk; LdrInitializeThunk(Context, ntdll) the same */
+    uint64_t start = NATIVE64_NT6 ? native64_export(g_boot.ntdll, "RtlUserThreadStart")
+                                  : k32 ? native64_export(k32, "BaseProcessStart") : 0;
     IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(uintptr_t)(g_boot.exe + *(uint32_t*)(uintptr_t)(g_boot.exe + 0x3C));
     uint64_t entry = g_boot.exe + nt->OptionalHeader.AddressOfEntryPoint;
     uint64_t sp = (top - 0x100) & ~(uint64_t)15;
@@ -768,6 +829,7 @@ static DWORD WINAPI boot_thread(LPVOID unused) {
     *(uint32_t*)(ctx + 0x34) = 0x1F80;    /* MxCsr */
     *(uint32_t*)(ctx + 0x44) = 0x200;     /* EFlags: IF */
     *(uint64_t*)(ctx + 0x80) = entry;     /* Rcx: BaseProcessStart's argument */
+    if (NATIVE64_NT6) *(uint64_t*)(ctx + 0x88) = native64_peb;   /* Rdx: RtlUserThreadStart's second */
     *(uint64_t*)(ctx + 0x98) = (top - 0x28) & ~(uint64_t)15 | 8;   /* Rsp, as after a call */
     *(uint64_t*)(ctx + 0xF8) = start;     /* Rip */
     c->rsp = sp - 8;
@@ -780,6 +842,7 @@ static DWORD WINAPI boot_thread(LPVOID unused) {
 int native64_boot(const native64_module_t* mods, int n, const native64_boot_t* b) {
     wchar_t p[MAX_PATH];
     native64_trace = getenv("NATIVE64_SYSCALLS") != NULL;
+    if (b->build) native64_build = b->build;
     g_ring_at = getenv("NATIVE64_RING_AT");
     wcsncpy(g_sys, b->sysdir, MAX_PATH - 1);
     wcsncpy(g_box, b->box, MAX_PATH - 1);
@@ -842,6 +905,11 @@ int native64_boot(const native64_module_t* mods, int n, const native64_boot_t* b
     native64_override("NtRaiseHardError", ovr_denied);
     native64_override("NtQueryDebugFilterState", ovr_debug_filter);
     native64_override("NtRegisterThreadTerminatePort", ovr_terminate_port);
+    if (NATIVE64_NT6) {
+        native64_override("NtInitializeNlsFiles", ovr_init_nls);
+        native64_override("NtGetNlsSectionPtr", ovr_nls_section);
+        native64_override("NtQueryVirtualMemory", ovr_query_vm);
+    }
     csr64_install();
     csr64_profile();
     w32k64_install();
@@ -863,9 +931,9 @@ int native64_boot(const native64_module_t* mods, int n, const native64_boot_t* b
     *(uint64_t*)(peb + 0xE0) = 0x1000;                             /* HeapDeCommitFreeBlockThreshold */
     *(uint32_t*)(peb + 0xEC) = 16;                                 /* MaximumNumberOfHeaps */
     *(uint64_t*)(peb + 0xF0) = (uint64_t)(uintptr_t)(peb + 0x800); /* ProcessHeaps */
-    *(uint32_t*)(peb + 0x118) = 5;                                 /* 5.2.3790: XP x64 is NT 5.2 */
-    *(uint32_t*)(peb + 0x11C) = 2;
-    *(uint16_t*)(peb + 0x120) = 3790;
+    *(uint32_t*)(peb + 0x118) = NATIVE64_NT6 ? 6 : 5;              /* XP x64 is NT 5.2.3790, Vista 6.0 */
+    *(uint32_t*)(peb + 0x11C) = NATIVE64_NT6 ? 0 : 2;
+    *(uint16_t*)(peb + 0x120) = (uint16_t)native64_build;
     *(uint16_t*)(peb + 0x122) = b->csd;
     *(uint32_t*)(peb + 0x124) = 2;                                 /* VER_PLATFORM_WIN32_NT */
     *(uint32_t*)(peb + 0x128) = ent->OptionalHeader.Subsystem;
@@ -914,6 +982,15 @@ int native64_boot(const native64_module_t* mods, int n, const native64_boot_t* b
     ustr(pp + 0xC0, L"WinSta0\\Default", &pool, 0);                /* DesktopInfo */
     ustr(pp + 0xD0, L"", &pool, 0);
     ustr(pp + 0xE0, L"", &pool, 0);
+    if (NATIVE64_NT6) {
+        /* NT 6's loader copies the parameters (Length bytes, RtlpInitParameterBlock) and
+         * rebases their strings: they lie within it, as the kernel makes them;
+         * EnvironmentSize (+0x3F0) is the environment block's bytes */
+        const wchar_t* e = *(const wchar_t**)(pp + 0x80), *o = e;
+        while (*o) o += wcslen(o) + 1;
+        *(uint64_t*)(pp + 0x3F0) = (uint64_t)(o + 1 - e) * 2;
+        *(uint32_t*)(pp + 0x00) = *(uint32_t*)(pp + 0x04) = (uint32_t)(pool - pp);
+    }
 
     /* The guest runs on a host thread with room for a deep lifted call chain. */
     HANDLE t = CreateThread(NULL, 256u << 20, boot_thread, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);

@@ -42,6 +42,7 @@ typedef struct {
     const wchar_t* image;      /* the program, under sysdir */
     const wchar_t* cmdline;
     uint16_t csd;              /* service pack << 8 */
+    uint16_t build;            /* the guest's NT build: 0 is XP x64's 3790; >= 6000 is NT 6 */
 } native64_boot_t;
 
 /* Map the modules at their bases, build the PEB, the process parameters and
@@ -53,6 +54,8 @@ uint64_t native64_export(uint64_t base, const char* name);
 uint64_t native64_module(const char* file);  /* a lifted module's base, or 0 */
 const wchar_t* native64_sysdir(void);        /* the guest's system folder */
 extern uint64_t native64_peb;
+extern unsigned native64_build;                   /* the guest's NT build (3790, 6000, ...) */
+#define NATIVE64_NT6 (native64_build >= 6000)
 extern int native64_trace;                        /* NATIVE64_SYSCALLS=1 */
 
 /* Run guest code at va on this thread's CPU with up to 4 arguments. */
@@ -68,6 +71,7 @@ void native64_w32k(const char* name, native64_syscall_fn fn);
 
 /* csr64.c: \Windows\ApiPort answered here */
 void csr64_install(void);
+void* csr64_shared_section(void);   /* NT 6: \Sessions\N\Windows\SharedSection */
 void csr64_profile(void);   /* win.ini reads: the default (after the modules are mapped) */
 void w32k64_install(void);
 extern void (*native64_win32k_pre)(const char* name);   /* before each win32k service */   /* w32k64.c: the first win32k services */

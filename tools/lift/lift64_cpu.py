@@ -1047,6 +1047,8 @@ class Lifter:
         if m[0] == 'f' and m not in ('fs',):
             return [_todo(ea, '%s %s (x87 not modelled)' % (m, insn.op_str))]
 
+        if m in ('lfence', 'mfence', 'sfence'):
+            return ['/* %s: one guest thread, program order */' % m]
         if self.is_sse(insn):
             return self.sse(insn)
 
