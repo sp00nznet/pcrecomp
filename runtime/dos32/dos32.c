@@ -566,6 +566,7 @@ void dos32_mouse_move(double dx, double dy, int buttons) {
 static int vmode = 3;
 static int vw = 80, vh = 25, vpitch = 80;
 static int vesa_lfb;
+static int xw;                        /* mode X / 12h: the plane in the window */
 static uint32_t vbank;                /* current 64 KB bank in banked modes */
 static uint8_t* vram;                 /* host copy of video memory past the window */
 static uint8_t dac[256][3];
@@ -586,7 +587,11 @@ void dos32_vesa_custom(int w, int h) { vesa_modes[4].w = (uint16_t)w; vesa_modes
 static void set_mode(int mode, int clear) {
     EnterCriticalSection(&video_lock);
     vmode = mode; vbank = 0; vesa_lfb = 0;
-    if (mode == 0x13) { vw = 320; vh = 200; vpitch = 320; seq[2] = 15; seq[4] = 0x0E; crtc[0x0C] = crtc[0x0D] = 0; crtc[0x13] = 40; gc[5] = 0x40; }
+    if (mode == 0x12) {   /* 640x480, 16 colours: four planes, as mode X (Syndicate's missions) */
+        vw = 640; vh = 480; vpitch = 80; seq[2] = 15; gc[5] = 0; crtc[0x0C] = crtc[0x0D] = 0; xw = 0;
+        memset(vram, 0, 0x40000);
+    }
+    else if (mode == 0x13) { vw = 320; vh = 200; vpitch = 320; seq[2] = 15; seq[4] = 0x0E; crtc[0x0C] = crtc[0x0D] = 0; crtc[0x13] = 40; gc[5] = 0x40; }
     else if (mode < 0x100) { vw = 80; vh = 25; vpitch = 80; }
     else {
         for (int i = 0; i < NVESA; i++)
@@ -619,8 +624,11 @@ static void set_bank(uint32_t bank) {
  * or the one read). Write mode 1 copies (the latches) come in through
  * recomp_vga_movs. A byte written with its old value under a multi-plane mask
  * reaches only plane xw: a known ceiling, rare in practice. */
-static int xw;                                     /* the plane in the window */
-#define MODEX (vmode == 0x13 && !(seq[4] & 8))
+/* Mode 12h (640x480x16) keeps its four planes the same way; only the frame
+ * reads them differently. ponytail: write mode 0 with all bits and plain
+ * Map Mask writes only (no set/reset, no bit mask), and the attribute
+ * palette taken as identity: what Syndicate does. */
+#define MODEX ((vmode == 0x13 && !(seq[4] & 8)) || vmode == 0x12)
 #define PLANE(p) (vram + (uint32_t)(p) * 0x10000u)
 
 static void modex_flush(void) {
@@ -658,7 +666,7 @@ int recomp_vga_movs(uint32_t edi, uint32_t esi, uint32_t n, uint32_t esz, int df
 }
 
 int dos32_frame(uint32_t* out, int maxw, int maxh, int* w, int* h) {
-    if (vmode < 0x13) return 0;
+    if (vmode < 0x12) return 0;
     uint32_t pal[256];
     for (int i = 0; i < 256; i++) {
         uint32_t r = dac[i][0] & 63, g = dac[i][1] & 63, b = dac[i][2] & 63;
@@ -672,7 +680,17 @@ int dos32_frame(uint32_t* out, int maxw, int maxh, int* w, int* h) {
         uint32_t off = (uint32_t)y * vpitch;
         for (int x = 0; x < fw; x++, off++) {
             uint8_t p;
-            if (modex) {
+            if (vmode == 0x12) {
+                uint32_t a = (start + (uint32_t)y * 80u + (x >> 3)) & 0xFFFF;
+                int bit = 7 - (x & 7);
+                uint8_t wv = R8(0xA0000 + a);
+                p = 0;
+                for (int pl = 0; pl < 4; pl++) {
+                    uint8_t b = (pl == xw || ((seq[2] >> pl & 1) && wv != PLANE(xw)[a])) ? wv : PLANE(pl)[a];
+                    p |= (uint8_t)((b >> bit & 1) << pl);
+                }
+            }
+            else if (modex) {
                 /* what the program last wrote: the window for plane xw, and
                  * for the other masked planes where it differs from xw's copy */
                 uint32_t a = (start + (uint32_t)y * xpitch + (x >> 2)) & 0xFFFF;
@@ -732,7 +750,8 @@ static void poll_input(void) {
          * program set with int 33h 7/8 (Theme Park asks for 640x400 in mode
          * 13h and halves it), which is where a real driver's mickeys would
          * have taken the cursor. */
-        int sw = vmode <= 0x13 ? 320 : vw, sh = vmode <= 0x13 ? 200 : vh;
+        int lo = vmode <= 0x13 && vmode != 0x12;   /* 320x200 modes; 12h is 640x480 */
+        int sw = lo ? 320 : vw, sh = lo ? 200 : vh;
         int vx = mouse.minx + px * (mouse.maxx - mouse.minx + 1) / sw;
         int vy = mouse.miny + py * (mouse.maxy - mouse.miny + 1) / sh;
         int mx = vx - mouse.x, my = vy - mouse.y;
@@ -920,6 +939,8 @@ static int guest_clock(struct tm* t) {   /* returns hundredths of a second */
 }
 
 double dos32_kbhit_idle;
+int (*dos32_on_exec)(const char* path, const char* tail);
+static int child_rc;
 
 /* ---- int 21h ------------------------------------------------------------ */
 static void int21(regs_t* r) {
@@ -1034,6 +1055,20 @@ static void int21(regs_t* r) {
         SET16(r->eax, sel_alloc(a, size - 1)); OK(r); break; }
     case 0x49: arena_free(&heap, sel_base(r->es)); OK(r); break;
     case 0x4A: OK(r); break;
+    case 0x4B: {   /* exec: the host runs the child (Syndicate's system("intro")) */
+        guest_str(dsdx(r), name, sizeof name);
+        char tail[130] = "";
+        if (!r->rm && AL(r) == 0) {   /* DOS/4GW block: dd env off, dw env sel, dd tail off, dw tail sel */
+            uint32_t b = es_ptr(r, r->ebx), t = sel_base(R16(b + 10)) + R32(b + 6);
+            uint8_t n = R8(t);
+            for (int i = 0; i < n && i < 127; i++) tail[i] = (char)R8(t + 1 + i);
+            tail[n < 127 ? n : 127] = 0;
+        }
+        LOG("dos32: exec %s [%s]\n", name, tail);
+        int rc = dos32_on_exec ? dos32_on_exec(name, tail) : -1;
+        if (rc < 0) { FAIL(r, 2); break; }
+        child_rc = rc; OK(r); break; }
+    case 0x4D: SET16(r->eax, child_rc); OK(r); break;
     case 0x4C: exit_code = AL(r); longjmp(exit_jmp, 1);
     case 0x4E: case 0x4F: {
         static intptr_t fhandle = -1;
@@ -1164,7 +1199,7 @@ static void int16(regs_t* r) {
 static void mouse_ranges(void) {
     mouse.minx = 0; mouse.miny = 0;
     mouse.maxx = vmode == 0x13 || vmode < 0x13 ? 639 : vw - 1;
-    mouse.maxy = vmode == 0x13 ? 199 : vmode < 0x13 ? 199 : vh - 1;
+    mouse.maxy = vmode == 0x13 || vmode < 0x12 ? 199 : vh - 1;
 }
 
 static void int33(regs_t* r) {
@@ -1757,6 +1792,7 @@ int dos32_run(const dos32_config* cfg) {
     uint32_t e = 0;
     put_str(e, "PATH=C:\\"); e += 9;
     put_str(e, "DOS4G=QUIET"); e += 12;
+    put_str(e, "COMSPEC=C:\\COMMAND.COM"); e += 23;   /* system() runs it: dos32_on_exec */
     R8(e++) = 0;
     R16(e) = 1; e += 2;
     put_str(e, cfg->progname); e += (uint32_t)strlen(cfg->progname) + 1;
@@ -1804,4 +1840,13 @@ int dos32_run(const dos32_config* cfg) {
             if (port_reads[i]) fprintf(stderr, "dos32: port %03X read %u times%c", i, port_reads[i], 10);
     fflush(stdout);
     return exit_code;
+}
+
+/* For a host's debug command: the VGA state in one line. */
+void dos32_vga_dump(void) {
+    int dn = 0, pn[4] = { 0 };
+    for (int i = 0; i < 256; i++) dn += dac[i][0] | dac[i][1] | dac[i][2] ? 1 : 0;
+    for (int p = 0; p < 4; p++) for (int i = 0; i < 0x10000; i++) pn[p] += PLANE(p)[i] != 0;
+    printf("[vga] mode %02X start %04X seq2 %X seq4 %X gc5 %X xw %d dac %d planes %d %d %d %d\n", vmode,
+           crtc[0x0C] << 8 | crtc[0x0D], seq[2], seq[4], gc[5], xw, dn, pn[0], pn[1], pn[2], pn[3]);
 }

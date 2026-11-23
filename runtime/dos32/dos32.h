@@ -108,6 +108,12 @@ void dos32_advance(double seconds);
 int dos32_state_save(const char* path, uint32_t where);
 int dos32_state_load(const char* path, uint32_t where);
 
+/* int 21h 4Bh: the program runs another (a DOS path and its command tail,
+ * e.g. "C:\COMMAND.COM", "/c intro"). The host runs it and returns its exit
+ * code, or -1 for "not found". NULL: every exec fails. */
+void dos32_vga_dump(void);   /* debug: the VGA state on stdout */
+extern int (*dos32_on_exec)(const char* path, const char* tail);
+
 /* Called on the guest thread at every retrace the program waits for:
  * frame capture for --record, scripted input. May be NULL. */
 extern void (*dos32_on_retrace)(void);
