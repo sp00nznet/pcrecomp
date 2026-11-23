@@ -818,7 +818,11 @@ static uint32_t ovr_create_section(uint32_t* a) {
         /* also the host's device installer (setupapi: cfgmgr32, the real
          * devices) and link tracking (linkinfo: real volumes and shares),
          * which shell32 delay-loads for a folder window */
-        if (leaf && (!_wcsicmp(leaf + 1, L"mpr.dll") || !_wcsicmp(leaf + 1, L"setupapi.dll") || !_wcsicmp(leaf + 1, L"linkinfo.dll"))) {
+        /* and the host's directory and authorization APIs (ntdsapi, authz: real
+         * domains and tokens), which Whistler 2296's netapi32 and userenv delay-load
+         * and handle failing (explorer's wtsapi32 load has no failure path: proxied) */
+        if (leaf && (!_wcsicmp(leaf + 1, L"mpr.dll") || !_wcsicmp(leaf + 1, L"setupapi.dll") || !_wcsicmp(leaf + 1, L"linkinfo.dll") ||
+                     !_wcsicmp(leaf + 1, L"ntdsapi.dll") || !_wcsicmp(leaf + 1, L"authz.dll"))) {
             fprintf(stderr, "[guard] %ls: host network/device/volume DLL: not mapped\n", path);
             return 0xC0000022u;
         }
