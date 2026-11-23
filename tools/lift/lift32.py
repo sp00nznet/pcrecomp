@@ -1580,8 +1580,9 @@ class Lifter:
             lines.append(f"PUSH32(esp, 0x{insn.address + insn.size:08X}u); RECOMP_FLAGS_OUT();"
                          f" RECOMP_ITAIL(0x{target:08X}u); return; {comment}")
 
-        elif m == 'call' and not self.dos and bytes(insn.bytes) == b'\xff\x12' and \
-                getattr(self, '_prev_bytes', None) == b'\xba\x00\x03\xfe\x7f':
+        elif m == 'call' and not self.dos and bytes(insn.bytes) in (b'\xff\x12', b'\xff\xd2') and \
+                getattr(self, '_prev_bytes', None) in (b'\xba\x00\x03\xfe\x7f', b'\xba\xe0\x02\xfe\x7f'):
+            # (Whistler beta 1, 2296: `mov edx, 7FFE02E0h; call edx`, code in the shared page)
             # Windows XP SP2+'s system call stub: `mov eax, N; mov edx, 7FFE0300h;
             # call [edx]` goes through KUSER_SHARED_DATA's SystemCall to
             # KiFastSystemCall's sysenter. The host's shared page has no such

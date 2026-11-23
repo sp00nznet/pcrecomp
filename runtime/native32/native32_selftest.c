@@ -51,6 +51,19 @@ static uint32_t call(void* fn, int n, const uint32_t* args, uint32_t* esp_after)
 int main(void) {
     /* XP layouts by version: 2000 (5.0.2195) and Neptune (5.50.5111) keep 2000's */
     CHECK(!nt_ver_xp(5, 0) && !nt_ver_xp(5, 50) && nt_ver_xp(5, 1) && nt_ver_xp(5, 2) && nt_ver_xp(6, 0));
+    {   /* Whistler beta 1 (5.1.2296): XP's line with its own tables; XP (2600) is not it */
+        static uint32_t peb[0x40];
+        uint32_t p = (uint32_t)(uintptr_t)peb;
+        peb[0xA4 / 4] = 5, peb[0xA8 / 4] = 1, peb[0xAC / 4] = 2296;
+        CHECK(nt_guest_xp(p) && nt_guest_whistler(p) && !nt_guest_neptune(p));
+        CHECK(nt_cb(p, 74) == 75 && nt_cb(p, 9) == 10 && nt_si(p, 0x6E8) == 0x784 && nt_si(p, 0x59C) == 0x630 &&
+              nt_si(p, 0xE48) == 0xEF4 && nt_routine(p, 0x19) == 0x16 && nt_routine(p, 0x1D) == 0xFFFF);
+        peb[0xAC / 4] = 2600;
+        CHECK(nt_guest_xp(p) && !nt_guest_whistler(p) && nt_cb(p, 74) == 76 && nt_si(p, 0x6E8) == 0x7A0);
+        {   uint8_t stub[16] = { 0xB8, 0x18, 0, 0, 0, 0xBA, 0xE0, 0x02, 0xFE, 0x7F, 0xFF, 0xD2, 0xC2, 0x04, 0x00 };
+            uint32_t svc; uint8_t argc;
+            CHECK(ntstub_parse(stub, &svc, &argc) && svc == 0x18 && argc == 1); }
+    }
     native32_init();
     mach_enter();                       /* a guest stack and TIB for this thread */
     uint32_t esp0 = g_esp, after, eax = 0;

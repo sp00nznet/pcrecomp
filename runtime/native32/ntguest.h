@@ -18,6 +18,8 @@ static inline int ntstub_parse(const uint8_t* b, uint32_t* svc, uint8_t* argc) {
     if (b[0] != 0xB8) return 0;
     if (b[5] == 0x8D && b[6] == 0x54 && b[7] == 0x24 && b[8] == 0x04 && b[9] == 0xCD && b[10] == 0x2E) r = 11;
     else if (b[5] == 0xBA && b[6] == 0x00 && b[7] == 0x03 && b[8] == 0xFE && b[9] == 0x7F && b[10] == 0xFF && b[11] == 0x12) r = 12;
+    /* Whistler beta 1 (5.1.2296): mov edx, 7FFE02E0h / call edx (code in the shared page) */
+    else if (b[5] == 0xBA && b[6] == 0xE0 && b[7] == 0x02 && b[8] == 0xFE && b[9] == 0x7F && b[10] == 0xFF && b[11] == 0xD2) r = 12;
     else return 0;
     *svc = *(const uint32_t*)(b + 1);
     *argc = b[r] == 0xC2 ? (uint8_t)(*(const uint16_t*)(b + r + 1) / 4) : 0;
@@ -49,6 +51,15 @@ static inline int nt_guest_xp(uint32_t peb) {
 /* Neptune's 5.50 line: 2000's layouts but for what differs below */
 static inline int nt_guest_neptune(uint32_t peb) {
     return peb && *(const uint32_t*)NTGUEST_VA(peb + 0xA4) == 5 && *(const uint32_t*)NTGUEST_VA(peb + 0xA8) >= 50;
+}
+
+/* Whistler's pre-release builds (NT 5.1 before XP's 2600: beta 1 is 5.1.2296,
+ * Oct 2000): XP's line and mostly XP's layouts, but its own service numbers
+ * (the NT ones go by name; win32k's by the build's names file) and a few
+ * tables of its own below (whistler-recomp docs/survey.md) */
+static inline int nt_guest_whistler(uint32_t peb) {
+    return peb && *(const uint32_t*)NTGUEST_VA(peb + 0xA4) == 5 && *(const uint32_t*)NTGUEST_VA(peb + 0xA8) == 1 &&
+           *(const uint16_t*)NTGUEST_VA(peb + 0xAC) < 2600;
 }
 
 /* kernel32 reads the user's NLS settings out of BASE_STATIC_SERVER_DATA (csr32.c)
@@ -89,8 +100,14 @@ static inline uint32_t nt_ci(uint32_t peb, uint32_t o) {
  * hold 0x1F colours, not 0x1D; +0xC8 after them. */
 static inline uint32_t nt_si(uint32_t peb, uint32_t o) {
     if (!nt_guest_xp(peb) || o < 0x10) return o;
-    return o < 0x1A0 ? o + 0xC : o < 0x1D4 ? o + 0x20 : o < 0x6E8 ? o + 0x24
-         : o < 0x75C ? o + 0xB8 : o < 0x7D0 ? o + 0xC0 : o + 0xC8;
+    o = o < 0x1A0 ? o + 0xC : o < 0x1D4 ? o + 0x20 : o < 0x6E8 ? o + 0x24
+      : o < 0x75C ? o + 0xB8 : o < 0x7D0 ? o + 0xC0 : o + 0xC8;
+    /* Whistler 2296, from XP's: +8 below aiSysMet (XP 0x5C0, 2296 0x630), +0x70
+     * from there, -0x1C from argbSystem (XP 0x7A0, 2296 0x784) on; paired field by
+     * field in the functions both user32 PDBs name (whistler-recomp work/an/sipair.py).
+     * ponytail: XP 0x780..0x7A0 has no 2296 match; nothing the layer writes is there */
+    if (nt_guest_whistler(peb)) o = o < 0x5C0 ? o + 8 : o < 0x7A0 ? o + 0x70 : o - 0x1C;
+    return o;
 }
 /* (an array's element i: nt_si(peb, start) + 4 * i, since XP's arrays are longer) */
 static inline int nt_ncolors(uint32_t peb) { return nt_guest_xp(peb) ? 0x1F : 0x1D; }
@@ -104,7 +121,12 @@ static inline uint32_t nt_shared_defmsgs(uint32_t peb) { return nt_guest_xp(peb)
  * __ClientLoadMenu (2000's 65, XP's 67) */
 static inline uint32_t nt_cb(uint32_t peb, uint32_t i) {
     if (!nt_guest_xp(peb) || i < 3) return i;
-    return i < 62 ? i + 1 : i + 2;
+    i = i < 62 ? i + 1 : i + 2;
+    /* Whistler 2296 has 96, not XP's 98: no __ClientGetMessageMPH (XP's 64),
+     * __ClientWaitMessageExMPH (81), __ClientWOWTask16SchedNotify (83); and
+     * __fnWTSSESSIONCHANGE at 93 (its user32.pdb's apfnDispatch against XP's) */
+    if (nt_guest_whistler(peb)) i = i < 64 ? i : i < 81 ? i - 1 : i < 83 ? i - 2 : i < 96 ? i - 3 : i - 2;
+    return i;
 }
 /* NtUserCall* routine indexes, XP's to Windows 2000's: anchors read off the
  * user32 exports that pass each (both builds), the indexes between two
@@ -118,15 +140,26 @@ static inline uint32_t nt_routine(uint32_t peb, uint32_t x) {
         { 0x4A, 0x3E }, { 0x4B, 0x3F }, { 0x4E, 0x42 }, { 0x51, 0x45 }, { 0x54, 0x47 }, { 0x55, 0x48 }, { 0x5B, 0x4D },
         { 0x5E, 0x50 }, { 0x60, 0x53 }, { 0x62, 0x55 }, { 0x63, 0x56 }, { 0x65, 0x57 }, { 0x69, 0x5B }, { 0x6A, 0x5C },
         { 0x6E, 0x5E }, { 0x6F, 0x5F }, { 0x70, 0x60 } };
+    /* Whistler 2296's, to 2000's: the same way (whistler-recomp work/an/routines.py) */
+    static const uint16_t w[][2] = {
+        { 0x00, 0x00 }, { 0x01, 0x01 }, { 0x03, 0x02 }, { 0x06, 0x04 }, { 0x07, 0x05 }, { 0x0B, 0x08 }, { 0x16, 0x12 },
+        { 0x19, 0x16 }, { 0x1C, 0x19 }, { 0x1E, 0x1A }, { 0x20, 0x1C }, { 0x23, 0x1F }, { 0x24, 0x33 }, { 0x25, 0x20 },
+        { 0x26, 0x37 }, { 0x28, 0x21 }, { 0x29, 0x22 }, { 0x2B, 0x24 }, { 0x2D, 0x26 }, { 0x2F, 0x27 }, { 0x33, 0x29 },
+        { 0x36, 0x2C }, { 0x38, 0x30 }, { 0x39, 0x34 }, { 0x3A, 0x2D }, { 0x3C, 0x2F }, { 0x3F, 0x39 }, { 0x42, 0x3C },
+        { 0x44, 0x3E }, { 0x45, 0x3F }, { 0x48, 0x42 }, { 0x4B, 0x45 }, { 0x4D, 0x47 }, { 0x4E, 0x48 }, { 0x54, 0x4D },
+        { 0x57, 0x50 }, { 0x5A, 0x53 }, { 0x5C, 0x55 }, { 0x5D, 0x56 }, { 0x5E, 0x57 }, { 0x62, 0x5B }, { 0x63, 0x5C },
+        { 0x67, 0x5E }, { 0x68, 0x5F }, { 0x69, 0x60 } };
+    const uint16_t (*t)[2] = a;
     int n = (int)(sizeof a / sizeof a[0]);
+    if (nt_guest_whistler(peb)) t = w, n = (int)(sizeof w / sizeof w[0]);
     /* Neptune: one routine fewer than 2000 between 0x12 (ClientThreadSetup's, both)
      * and Neptune's 0x15 (BeginDeferWindowPos's, 2000's 0x16); 0x13/0x14 unmatched */
     if (nt_guest_neptune(peb)) return x <= 0x12 ? x : x >= 0x15 ? x + 1 : 0xFFFF;
     if (!nt_guest_xp(peb)) return x;
     for (int i = 0; i < n; i++) {
-        if (a[i][0] == x) return a[i][1];
-        if (i + 1 < n && a[i][0] < x && x < a[i + 1][0] &&
-            a[i][0] - a[i][1] == a[i + 1][0] - a[i + 1][1]) return x - (a[i][0] - a[i][1]);
+        if (t[i][0] == x) return t[i][1];
+        if (i + 1 < n && t[i][0] < x && x < t[i + 1][0] &&
+            t[i][0] - t[i][1] == t[i + 1][0] - t[i + 1][1]) return x - (t[i][0] - t[i][1]);
     }
     return 0xFFFF;
 }
