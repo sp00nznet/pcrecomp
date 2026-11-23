@@ -775,7 +775,6 @@ static uint16_t seg_of(uint16_t sel) {
      * name, the same code): entering one after the other was bound points the lifted
      * segments' SEG_n (its DGROUP constant) back at this instance */
     if (g_alias[i] && g_rbsel[i] && g_w16_segsel[g_alias[i]] != (uint16_t)(sel | 7)
-        && sel_owner(sel) != sel_owner(g_w16_segsel[g_alias[i]])
         && !w16_rebind(sel, 0)) g_alias[i] = g_rbsel[i] = 0;   /* another instance; or a freed selector KERNEL gave to a module not lifted (a driver) */
     if (!g_alias[i]) {
         uint32_t b = recomp_sel_base(sel);

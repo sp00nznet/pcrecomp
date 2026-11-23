@@ -234,6 +234,7 @@ static void disp_realize(CPU *c) {
         } else {
             pbrush_t *b = (pbrush_t *)farptr(out);
             b->style = *(const uint16_t *)li; b->color = rgb565(*(const uint32_t *)(li + 2));
+            if (getenv("W16_BRDBG")) fprintf(stderr, "[drv] brush style %u color %08X\n", b->style, *(const uint32_t *)(li + 2));
             b->hatch = *(const uint16_t *)(li + 6); b->bk = 0xFFFF;
             for (int i = 0; i < 64; i++) b->pat[i] = b->color;
             if (b->style == 3) {   /* BS_PATTERN: GDI passes a far pointer to the bitmap's PBITMAP where the
@@ -270,7 +271,7 @@ static void disp_realize(CPU *c) {
  * the BITMAPINFO copy deBitmapInfo points at (GDI's CreateCompatibleBitmap on a DIB-section DC,
  * seg010_0DB3, clones it; the caller's own block is gone by then).
  * ponytail: 256 PDEVICE addresses, one selector each, never freed */
-static struct { uint32_t dev; int npal; uint16_t sel; uint16_t pal[256]; uint8_t bi[40 + 1024]; } g_dibpal[256];
+static struct { uint32_t dev; int npal; uint16_t sel; uint16_t pal[256]; uint8_t bi[40 + 1024]; uint8_t bpp; uint32_t bits; } g_dibpal[256];   /* bpp, bits: a WinG bitmap's (wing_createbitmap) */
 static uint16_t *dib_pal(uint32_t dev) {
     for (int i = 0; i < 256 && g_dibpal[i].dev; i++) if (g_dibpal[i].dev == dev) return g_dibpal[i].npal ? g_dibpal[i].pal : NULL;
     return NULL;
@@ -296,20 +297,32 @@ static int surf_of(uint32_t lp, surf_t *s) {
     if (*(const uint16_t *)b) { s->bits = (uint8_t *)g_fb; s->w = FB_W; s->h = FB_H; s->pitch = FB_W * 2; s->bpp = 16; return 1; }
     s->w = *(const int16_t *)(b + 2); s->h = *(const int16_t *)(b + 4); s->pitch = *(const uint16_t *)(b + 6);
     s->bpp = b[9] * b[8]; s->bits = (uint8_t *)farptr(*(const uint32_t *)(b + 10));
+    if (s->bpp == 16 && s->bits && !memcmp(s->bits, "WNGB", 4) && s->bits[5] == 0xA5) {   /* a WinG bitmap (wing_createbitmap) */
+        int k = s->bits[4];
+        s->bpp = 8; s->pal = g_dibpal[k].pal;
+        s->pitch = *(const int32_t *)g_dibpal[k].bi; s->w = *(const int32_t *)(g_dibpal[k].bi + 4); s->h = *(const int32_t *)(g_dibpal[k].bi + 8);
+        s->bits = (uint8_t *)(uintptr_t)g_dibpal[k].bits;
+        if (!g_dibpal[k].sel) { s->bits += (size_t)s->pitch * (s->h - 1); s->pitch = -s->pitch; }   /* bottom-up */
+        return 1;
+    }
     return s->bpp == 16 || s->bpp == 1;
+
 }
 /* A pixel in a 1-bpp bitmap is 1 where the color is white (the background), as GDI's mono rule. */
 static void surf_put(surf_t *s, int x, int y, uint16_t col) {
     if (x < 0 || y < 0 || x >= s->w || y >= s->h) return;
     if (s->bpp == 16) { *(uint16_t *)(s->bits + y * s->pitch + x * 2) = col; return; }
-    if (s->pal) {   /* a palettized DIB: the nearest entry. ponytail: a linear search per pixel */
+    if (s->pal) {   /* a palettized DIB: the nearest entry, remembered per color (a WinG frame's fills) */
+        static const uint16_t *lpal; static uint16_t lcol; static uint32_t lbest;
         uint32_t c = rgb_of(col), best = 0, bd = 0xFFFFFFFFu;
-        for (uint32_t i = 0; i < (1u << s->bpp); i++) {
+        if (lpal == s->pal && lcol == col) { bd = 0; best = lbest; }
+        for (uint32_t i = 0; bd && i < (1u << s->bpp); i++) {
             uint32_t e = rgb_of(s->pal[i]);
             int dr = (int)(c & 0xFF) - (int)(e & 0xFF), dg = (int)(c >> 8 & 0xFF) - (int)(e >> 8 & 0xFF), db = (int)(c >> 16 & 0xFF) - (int)(e >> 16 & 0xFF);
             uint32_t d = (uint32_t)(dr * dr + dg * dg + db * db);
             if (d < bd) { bd = d; best = i; if (!d) break; }
         }
+        lpal = s->pal; lcol = col; lbest = best;
         uint8_t *q = s->bits + y * s->pitch + (x * s->bpp >> 3);
         int sh = 8 - s->bpp - (x * s->bpp & 7);
         *q = (uint8_t)((*q & ~(((1 << s->bpp) - 1) << sh)) | best << sh);
@@ -452,6 +465,14 @@ static void disp_bitblt(CPU *c) {
             if (f) { fprintf(f, "P6 %d %d 255\n", s.w, s.h); for (int y = 0; y < s.h; y++) for (int x = 0; x < s.w; x++) { uint32_t v = rgb_of(surf_get(&s, x, y)); fputc((int)(v & 255), f); fputc((int)(v >> 8 & 255), f); fputc((int)(v >> 16 & 255), f); } fclose(f); }
             fprintf(stderr, "[drv] dumped %s (bpp %d pitch %d) for blit %d,%d<-%d,%d %dx%d rop %02X\n", fn, s.bpp, s.pitch, dx, dy, sx, sy, w, h, code);
         }
+    }
+    if (hs && code == 0xCC && s.bpp == 8 && d.bpp == 8 && s.pal && d.pal && !memcmp(s.pal, d.pal, 512)) {   /* WinG to WinG: the indices */
+        for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
+            int px = dx + x, py = dy + y, qx = sx + x, qy = sy + y;
+            if (px >= 0 && py >= 0 && px < d.w && py < d.h && qx >= 0 && qy >= 0 && qx < s.w && qy < s.h)
+                d.bits[py * d.pitch + px] = s.bits[qy * s.pitch + qx];
+        }
+        c->ax = 1; ret_far(c, 32); return;
     }
     if (hs) {   /* the source block, as destination-format pixels */
         tmp = (uint16_t *)malloc((size_t)(w > 0 ? w : 1) * (h > 0 ? h : 1) * 2);
@@ -1039,9 +1060,10 @@ static void disp_enumobj(CPU *c) { c->ax = 1; c->dx = 0; ret_far(c, 14); }
  * KERNEL, called through their exports: a WinG DC is a memory DC, a WinG bitmap's
  * bits are GlobalAlloc'd guest memory (huge, tiled), and a blit is
  * SetDIBitsToDevice / StretchDIBits from those bits.
- * A blit reads the bits of the bitmap selected into the source DC.
- * ponytail: GDI drawing into a WinG DC does not reach the bits; 64 bitmaps, never
- * freed (no DeleteObject hook). */
+ * A WinG bitmap is a DIB-engine surface over its bits, so GDI drawing into a WinG
+ * DC lands in them (wing_createbitmap).
+ * ponytail: 64 bitmaps, never freed (no DeleteObject hook); the color table is the
+ * one given at creation (no WinGSetDIBColorTable yet). */
 #include "mem_layout.h"
 extern uint16_t g_w16_segsel[];
 int w16_call(CPU *r);
@@ -1081,7 +1103,7 @@ static uint32_t w16_farcall_n(CPU *c, uint32_t fn, int n, const uint16_t *w) {
     return (uint32_t)r.dx << 16 | r.ax;
 }
 #define GCALL(mod, ord, ...) w16_farcall_n(c, w16_export(mod, ord), (int)(sizeof((uint16_t[]){ __VA_ARGS__ }) / 2), (uint16_t[]){ __VA_ARGS__ })
-static struct { uint16_t hdc, hbm; uint32_t bits, bi, tmp, tbi; } g_wing[64];
+static struct { uint16_t hdc, hbm; uint32_t bits, bi, tmp, tbi; int de; } g_wing[64];
 static uint16_t g_wing_probe;   /* a 1x1 bitmap to learn which bitmap a DC holds */
 static void *gptr(uint32_t p) { return farptr(p); }
 static uint32_t galloc(CPU *c, uint32_t n) {   /* KERNEL.15 GlobalAlloc(GMEM_FIXED|GMEM_ZEROINIT), .18 GlobalLock */
@@ -1102,14 +1124,37 @@ static void wing_createbitmap(CPU *c) {
     int32_t w = *(const int32_t *)(bi + 4), h = *(const int32_t *)(bi + 8); uint16_t bpp = *(const uint16_t *)(bi + 14);
     uint32_t ah = (uint32_t)(h < 0 ? -h : h), size = (uint32_t)(((w * bpp + 31) / 32) * 4) * ah;
     int i = 0; while (i < 63 && g_wing[i].hbm) i++;
-    g_wing[i].hdc = hdc; g_wing[i].tmp = g_wing[i].tbi = 0;
+    g_wing[i].hdc = hdc; g_wing[i].tmp = g_wing[i].tbi = 0; g_wing[i].de = 0;
     g_wing[i].bits = galloc(c, size);
     g_wing[i].bi = galloc(c, 40 + 1024);
     memcpy(gptr(g_wing[i].bi), bi, bpp <= 8 ? 40 + 4u * (1u << bpp) : 40);
     *(uint32_t *)gptr(g_wing[i].bi) = 40;
-    g_wing[i].hbm = (uint16_t)GCALL("GDI", 48, (uint16_t)w, (uint16_t)ah, 1, 1, 0, 0);   /* CreateBitmap(w, h, 1, 1, NULL): a handle to select */
+    /* A bitmap GDI will select into a display-compatible DC (1 plane, 16 bpp), its first
+     * pixels marked "WNGB" + slot through SetBitmapBits (GDI 106): when the display driver
+     * meets that bitmap (surf_of), it draws into and reads from the 8-bit WinG bits instead,
+     * with this bitmap's color table, so GDI's BitBlt/PatBlt/text land in the bits. */
+    g_wing[i].hbm = (uint16_t)GCALL("GDI", 48, (uint16_t)w, (uint16_t)ah, 1, 16, 0, 0);
+    for (int j = 0; j < 64; j++)   /* a handle GDI reuses: the deleted bitmap's slot is gone */
+        if (j != i && g_wing[j].hbm == g_wing[i].hbm) g_wing[j].hbm = 0;
+    if (g_wing[i].hbm && bpp == 8) {
+        int32_t stride = ((w * bpp + 31) / 32) * 4;
+        uint32_t flat = (uint32_t)(uintptr_t)gptr(g_wing[i].bits);
+        int k = 0; while (k < 255 && g_dibpal[k].dev) k++;
+        g_dibpal[k].dev = 0xFFFFFFFFu; g_dibpal[k].bpp = 8; g_dibpal[k].bits = flat; g_dibpal[k].npal = 256;
+        g_dibpal[k].sel = (uint16_t)(h < 0 ? 1 : 0);   /* top-down (WinG's own preference) */
+        *(int32_t *)g_dibpal[k].bi = stride; *(int32_t *)(g_dibpal[k].bi + 4) = w; *(int32_t *)(g_dibpal[k].bi + 8) = (int32_t)ah;
+        const uint8_t *q = bi + *(const uint32_t *)bi;
+        uint32_t n = *(const uint32_t *)(bi + 32); if (!n || n > 256) n = 256;
+        if (getenv("W16_WINGDBG")) fprintf(stderr, "[wing] %dx%d hdr %u clr %u: %08X %08X %08X %08X %08X\n", w, h, *(const uint32_t *)bi, *(const uint32_t *)(bi + 32),
+                                           ((const uint32_t *)q)[0], ((const uint32_t *)q)[1], ((const uint32_t *)q)[10], ((const uint32_t *)q)[100], ((const uint32_t *)q)[255]);
+        for (uint32_t e = 0; e < 256; e++) g_dibpal[k].pal[e] = e < n ? rgb565((uint32_t)q[4 * e + 2] | (uint32_t)q[4 * e + 1] << 8 | (uint32_t)q[4 * e] << 16) : 0;
+        uint32_t mk = galloc(c, 16);
+        uint8_t *m = gptr(mk); memcpy(m, "WNGB", 4); m[4] = (uint8_t)k; m[5] = 0xA5;
+        GCALL("GDI", 106, g_wing[i].hbm, 0, 8, (uint16_t)(mk >> 16), (uint16_t)mk);   /* SetBitmapBits(hbm, 8L, mk) */
+        g_wing[i].de = 1;
+    }
     if (pp) *(uint32_t *)gptr(pp) = g_wing[i].bits;
-    if (getenv("W16_TRACE") || h < 0) fprintf(stderr, "[wing] CreateBitmap(%04X) %dx%d %u bpp -> %04X bits %08X%s\n", hdc, w, h, bpp, g_wing[i].hbm, g_wing[i].bits, h < 0 ? " (top-down: not blitted right yet)" : "");
+    if (getenv("W16_TRACE") || getenv("W16_WINGDBG") || !g_wing[i].hbm) fprintf(stderr, "[wing] CreateBitmap(%04X) %dx%d %u bpp -> %04X bits %08X%s\n", hdc, w, h, bpp, g_wing[i].hbm, g_wing[i].bits, !g_wing[i].hbm ? " (GDI made no bitmap)" : "");
     c->ax = g_wing[i].hbm; c->dx = 0; ret_far(c, 10);
 }
 /* WinGStretchBlt(hdcDst, xd, yd, wd, hd, hdcSrc, xs, ys, ws, hs) */
@@ -1122,7 +1167,10 @@ static void wing_stretchblt(CPU *c) {
     GCALL("GDI", 45, src, cur);
     int i = 0; while (i < 64 && (!g_wing[i].hbm || g_wing[i].hbm != cur)) i++;
     c->ax = 0;
-    if (i < 64 && g_wing[i].bits) {
+    if (i < 64 && g_wing[i].de) {   /* GDI BitBlt (34) / StretchBlt (35) from the WinG DC, SRCCOPY */
+        if (ws == wd && hs == hd) c->ax = (uint16_t)GCALL("GDI", 34, dst, xd, yd, wd, hd, src, xs, ys, 0x00CC, 0x0020);
+        else c->ax = (uint16_t)GCALL("GDI", 35, dst, xd, yd, wd, hd, src, xs, ys, ws, hs, 0x00CC, 0x0020);
+    } else if (i < 64 && g_wing[i].bits) {
         /* Windows 3.1's GDI hands the display driver the DC's clip, not the blit's rectangle,
          * and the driver draws the whole DIB: so the source rectangle is copied out (bottom-up)
          * into a DIB of its own size and that is blitted whole. ponytail: 8 bpp and up */

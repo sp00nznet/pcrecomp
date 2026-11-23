@@ -84,13 +84,14 @@ def main():
                     help='directory of hand-written Win16 shims (repeatable)')
     ap.add_argument('--stack', type=lambda v: int(v, 0), default=0,
                     help='see gen_image.py --stack; only for a DLL-only program')
-    ap.add_argument('--selector-step', type=int, default=1,
+    ap.add_argument('--selector-step', type=int, default=None,
                     help='selector delta per 64 KB tile of a huge block: 1 (the '
                          'default host model) or 8, as Windows does, for a game '
                          'whose own code steps huge pointers by 8 (pair with '
                          'RecompGame.selector_step)')
     args = ap.parse_args()
-    win16.SELECTOR_STEP = args.selector_step
+    # Win16 identity mode: the lifted KRNL386 tiles huge blocks 8 apart, as Windows does
+    win16.SELECTOR_STEP = args.selector_step or (8 if os.environ.get("NE_IDENTITY_SEL") else 1)
 
     src = os.path.join(args.work, 'src')
     rt = os.path.join(args.work, 'runtime')
