@@ -200,10 +200,11 @@ buffers and whole-page outputs:
   in the image) and transforms it in **8-byte blocks** — a helper whose tail at
   `0x426490..0x4264A7` stores two dwords (`[ebp-8]`,`[ebp-0xC]`) per call and is
   called **512 times per page** (512×8 = 4096). Its arguments are
-  `(P_dest, 0x435A60, 0x400000, 0x70000024)`. **`0x435A60` is an RC4-style S-box**:
-  256 bytes, identity-initialised (`00 01 02 03 …`), read ~65536 times during a page,
-  and it sits `0x10` below the stage-2 accumulator `K` at `0x435A70`. So stage 1 is a
-  keyed stream/block transform whose key state is this evolving S-box.
+  `(P_dest, 0x435A60, 0x400000, 0x70000024)`. `0x435A60` is a 256-byte stage-1
+  **context/state table** (sparse — ~26 distinct bytes, a `00 01 02 … 0F` prefix;
+  *not* a full RC4 permutation), sitting `0x10` below the stage-2 accumulator `K` at
+  `0x435A70`. So stage 1 is a keyed block transform whose state is this table plus the
+  surrounding `.data`; the exact round function is still to be reversed.
 
 Why this is a **hard wall** for black-box work, with the evidence:
 
@@ -221,11 +222,11 @@ Why this is a **hard wall** for black-box work, with the evidence:
   CPU** — a Unicorn semantics edge (an obfuscated `aad`/`aam`/BCD, a flag or
   segment or `rep` corner), or S-box state silently clobbered between pages. The only
   oracle available headless is the final `shell.bin`, which cannot by itself localise
-  a single wrong instruction deep inside 512×(RC4 schedule) of obfuscated code.
+  a single wrong instruction deep inside 512 blocks of obfuscated stage-1 code.
 
 Two ways past the wall, for whoever picks it up:
 
-1. **Reverse stage 1 fully** (RC4 KSA + PRGA + the per-block round at/above
+1. **Reverse stage 1 fully** (the per-block round function at/above
    `0x426490`) into a standalone reference, run it over page 1's known-correct inputs,
    and compare to the emulator's per-instruction state to find the first divergence.
 2. **A known-good x86 reference** to diff instruction semantics against the emulator

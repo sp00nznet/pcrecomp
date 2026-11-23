@@ -16,8 +16,8 @@ passes and pages* -- it is not reseeded from the page index.
 
 This is **stage 2** of a two-stage per-page scheme. `mask` is the mapped `.txt2`
 section (cleartext, one page per `.txt` page) and is correct by construction;
-`cipher` is the `P` intermediate produced by **stage 1** -- an RC4-keyed 8-byte
-block transform (helper tail `0x426490`, S-box at `0x435A60`, 512 blocks/page).
+`cipher` is the `P` intermediate produced by **stage 1** -- a keyed 8-byte
+block transform (helper tail `0x426490`, state table at `0x435A60`, 512 blocks/page).
 
 This module is the reference for the stage-2 primitive and a self-test against
 the real decrypted shell. It is NOT the whole unwrapper. Page 0 reconstructs
