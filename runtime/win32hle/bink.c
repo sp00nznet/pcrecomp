@@ -477,14 +477,29 @@ static void k_SetVolume(void) {                          /* (bink, volume) 32768
     if (b->stream >= 0 && !b->paused) hle_audio_stream_gain(b->stream, b->volume);
     RETV(2);
 }
-static void k_Goto(void) {                               /* (bink, frame, flags): back to the start, then forward */
+/* BinkGoto(bink, frame, flags): back to the start, then forward. The start by
+ * the demuxer's own seek, to its first key frame: AVSEEK_FLAG_BYTE would go
+ * round it and leave its frame count where it was, at the end after a whole
+ * movie, with nothing more to read. The sound queued from before the seek is
+ * dropped, as is what the frames passed over bring. */
+static void k_Goto(void) {
     bink_t *b = (bink_t *)APTR(0);
     uint32_t to = A32(1) ? A32(1) : 1;
-    av_seek_frame(b->fmt, b->vs, 0, AVSEEK_FLAG_BACKWARD | AVSEEK_FLAG_BYTE);
+    int stream = -1;
+    if (av_seek_frame(b->fmt, b->vs, 0, AVSEEK_FLAG_BACKWARD) < 0) g_error = "cannot seek in the movie";
     avcodec_flush_buffers(b->vdec);
+    if (b->adec) avcodec_flush_buffers(b->adec);
+    if (b->stream >= 0) {
+        hle_audio_stream_close(b->stream);
+        stream = hle_audio_stream_open(b->adec->sample_rate, b->adec->ch_layout.nb_channels > 1 ? 2 : 1);
+        if (stream >= 0) hle_audio_stream_gain(stream, b->paused ? 0.0f : b->volume);
+    }
+    b->stream = -1;
     b->done = 0, b->FrameNum = 1;
     while (b->FrameNum < to && decode_frame(b)) b->FrameNum++;
-    b->start_ms = hle_ticks_ms() - (uint32_t)((uint64_t)(b->FrameNum - 1) * 1000u * b->FrameRateDiv / b->FrameRate);
+    b->stream = stream;
+    b->start_ms = b->paused_at = hle_ticks_ms();
+    b->start_ms -= (uint32_t)((uint64_t)(b->FrameNum - 1) * 1000u * b->FrameRateDiv / b->FrameRate);
     RETV(3);
 }
 
