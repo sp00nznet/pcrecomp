@@ -11,6 +11,8 @@
  *     DIGDD_PEEK flushes them;
  *   - a read without a count to read up to is DIERR_INVALIDPARAM, and leaves
  *     the queue alone;
+ *   - DIPROP_AXISMODE: relative (1) axes report movement, absolute (0) ones
+ *     where the cursor is; GetProperty says which;
  *   - a buffered keyboard reports a key's DIK code going down and up.
  */
 #include <stdint.h>
@@ -64,6 +66,19 @@ static uint32_t data(uint32_t dev, dod_t *buf, uint32_t *io, uint32_t flags) {
     return call("IDirectInputDeviceA::GetDeviceData", 5, a);
 }
 
+/* DIPROP_AXISMODE set (the device let go first: Windows refuses it acquired),
+ * then read back. */
+static uint32_t axis_mode(uint32_t dev, uint32_t mode) {
+    uint32_t *prop = (uint32_t *)hle_alloc(20), p[3] = { dev, 2, A(prop) };
+    prop[0] = 20, prop[1] = 16, prop[2] = 0, prop[3] = 0, prop[4] = mode;
+    call("IDirectInputDeviceA::Unacquire", 1, &dev);
+    ok("SetProperty(DIPROP_AXISMODE)", call("IDirectInputDeviceA::SetProperty", 3, p) == 0);
+    prop[4] = 99;
+    ok("GetProperty(DIPROP_AXISMODE)", call("IDirectInputDeviceA::GetProperty", 3, p) == 0);
+    call("IDirectInputDeviceA::Acquire", 1, &dev);
+    return prop[4];
+}
+
 int main(void) {
     recomp_host_init();
     uint32_t *out = (uint32_t *)hle_alloc(4);
@@ -103,6 +118,19 @@ int main(void) {
     ok("a flush says how many went", data(mouse, NULL, io, 0) == 0 && *io == 2);
     *io = INFINITE;
     ok("...and none are left", data(mouse, NULL, io, DIGDD_PEEK) == 0 && *io == 0);
+
+    /* the axes, relative then absolute: DIMOUSESTATE's lX and lY */
+    int32_t *st = (int32_t *)hle_alloc(16);
+    uint32_t sa[3] = { mouse, 16, A(st) };
+    ok("relative axes say so", axis_mode(mouse, 1) == 1);
+    hle_input_mouse(WM_MOUSEMOVE, 30, 25);
+    ok("...and report movement", call("IDirectInputDeviceA::GetDeviceState", 3, sa) == 0 && st[0] == 20 && st[1] == 20);
+    ok("...once", call("IDirectInputDeviceA::GetDeviceState", 3, sa) == 0 && st[0] == 0 && st[1] == 0);
+    hle_input_mouse(WM_MOUSEMOVE, 23, 24);
+    ok("...backwards too", call("IDirectInputDeviceA::GetDeviceState", 3, sa) == 0 && st[0] == -7 && st[1] == -1);
+    ok("absolute axes say so", axis_mode(mouse, 0) == 0);
+    ok("...and report the place", call("IDirectInputDeviceA::GetDeviceState", 3, sa) == 0 && st[0] == 23 && st[1] == 24);
+    ok("...again", call("IDirectInputDeviceA::GetDeviceState", 3, sa) == 0 && st[0] == 23 && st[1] == 24);
 
     /* the keyboard: a key down and up, by its DIK code */
     uint32_t keyboard = device(di, 0x6F1D2B61u, 256, 256);

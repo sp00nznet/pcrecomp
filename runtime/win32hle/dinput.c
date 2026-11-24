@@ -196,7 +196,7 @@ static void dv_GetProperty(void) {                       /* (this, guid or id, D
     dev_t_ *d = DEV(A32(0));
     uint32_t id = A32(1), h = A32(2);
     if (id == 1) { MEM32(h + 16) = d->buffer; RET(DI_OK, 3); }          /* DIPROP_BUFFERSIZE */
-    if (id == 2) { MEM32(h + 16) = (uint32_t)d->absolute; RET(DI_OK, 3); }   /* DIPROP_AXISMODE */
+    if (id == 2) { MEM32(h + 16) = !d->absolute; RET(DI_OK, 3); }   /* DIPROP_AXISMODE: ABS 0, REL 1 */
     RET(DIERR_UNSUPPORTED, 3);
 }
 static void dv_SetProperty(void) {
@@ -204,7 +204,7 @@ static void dv_SetProperty(void) {
     uint32_t id = A32(1), h = A32(2);
     T("SetProperty %u = %u\n", id, h ? MEM32(h + 16) : 0);
     if (id == 1) d->buffer = MEM32(h + 16) > QUEUE ? QUEUE : MEM32(h + 16);
-    else if (id == 2) d->absolute = MEM32(h + 16) == 1, relative();   /* DIPROPAXISMODE_ABS */
+    else if (id == 2) d->absolute = MEM32(h + 16) == 0, relative();   /* DIPROPAXISMODE_ABS is 0, _REL 1 */
     RET(DI_OK, 3);
 }
 static void dv_Acquire(void) {
