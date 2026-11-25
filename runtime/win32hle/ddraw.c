@@ -373,8 +373,29 @@ static void dd_GetDisplayMode(void) {                    /* (this, &desc) */
 static void dd_GetFourCCCodes(void) { if (A32(1)) MEM32(A32(1)) = 0; RET(DD_OK, 3); }
 static void dd_GetGDISurface(void) { if (!g_primary) RET(DDERR_NOTFOUND, 2); MEM32(A32(1)) = g_primary->self; MEM32(g_primary->self + 4)++; RET(DD_OK, 2); }
 static void dd_GetMonitorFrequency(void) { if (A32(1)) MEM32(A32(1)) = 60; RET(DD_OK, 2); }
-static void dd_GetScanLine(void) { if (A32(1)) MEM32(A32(1)) = (hle_ticks_ms() * 29) % (uint32_t)g_mode_h; RET(DD_OK, 2); }
-static void dd_GetVerticalBlankStatus(void) { if (A32(1)) MEM32(A32(1)) = (hle_ticks_ms() % 16) == 0; RET(DD_OK, 2); }
+
+/* Pacing diagnostics (GTA_TRACE): how a guest's frame loop waits and flips,
+ * once a second. A loop that waits N vblanks and flips should show N waits
+ * per flip; a loss between the two is the host's overhead per tick. */
+static uint32_t g_pace_wait, g_pace_status, g_pace_scan, g_pace_flip, g_pace_flip_at, g_pace_flip_gap, g_pace_tick;
+static void pace_note_flip(void) {
+    uint32_t now = hle_ticks_ms();
+    g_pace_flip++;
+    if (g_pace_flip_at) {
+        uint32_t gap = now - g_pace_flip_at;
+        if (gap > g_pace_flip_gap) g_pace_flip_gap = gap;
+    }
+    g_pace_flip_at = now;
+    if ((int32_t)(now - g_pace_tick) >= 1000 && getenv("GTA_TRACE")) {
+        fprintf(stderr, "[pace] %u flips, %u vblank waits, %u status polls, %u scanlines (worst gap %u ms)\n",
+                g_pace_flip, g_pace_wait, g_pace_status, g_pace_scan, g_pace_flip_gap);
+        g_pace_tick = now;
+        g_pace_wait = g_pace_status = g_pace_scan = 0;
+    }
+}
+
+static void dd_GetScanLine(void) { if (A32(1)) MEM32(A32(1)) = (hle_ticks_ms() * 29) % (uint32_t)g_mode_h; g_pace_scan++; RET(DD_OK, 2); }
+static void dd_GetVerticalBlankStatus(void) { if (A32(1)) MEM32(A32(1)) = (hle_ticks_ms() % 16) == 0; g_pace_status++; RET(DD_OK, 2); }
 static void dd_Initialize(void) { RET(DD_OK, 2); }
 static void dd_RestoreDisplayMode(void) { RET(DD_OK, 1); }
 static void dd_SetCooperativeLevel(void) { if (trace()) fprintf(stderr, "[ddraw] SetCooperativeLevel(0x%X)\n", A32(2)); RET(DD_OK, 3); }
@@ -391,6 +412,7 @@ static void dd_WaitForVerticalBlank(void) {              /* (this, flags, event)
     struct timespec ts = { 0, (long)wait * 1000000L };
     nanosleep(&ts, NULL);
     hle_block_end();
+    g_pace_wait++;
     RET(DD_OK, 3);
 }
 static void dd2_GetAvailableVidMem(void) {               /* (this, &caps, &total, &free) */
@@ -617,6 +639,7 @@ static void sf_Flip(void) {                              /* (this, target, flags
         mark(s);
         g_flipping = 0;
     }
+    pace_note_flip();
     RET(DD_OK, 3);
 }
 static void sf_GetAttachedSurface(void) {                /* (this, &caps, &out) */
@@ -869,8 +892,15 @@ static void x_DirectDrawEnumerateA(void) {               /* (callback, ctx): the
     if (A32(0)) hle_call_guest(A32(0), 4, a);
     RET(DD_OK, 2);
 }
+static void x_DirectDrawCreateClipper(void) {            /* (flags, &out, outer) */
+    vtables();
+    uint32_t o = hle_com_new(g_vt_clip, 12);
+    MEM32(A32(1)) = o;
+    RET(DD_OK, 3);
+}
 
 const win32hle_shim win32hle_ddraw[] = {
     { "DirectDrawCreate", x_DirectDrawCreate }, { "DirectDrawEnumerateA", x_DirectDrawEnumerateA },
+    { "DirectDrawCreateClipper", x_DirectDrawCreateClipper },
     { 0, 0 }
 };
