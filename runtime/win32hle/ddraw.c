@@ -80,8 +80,8 @@ static int trace(void) { if (g_trace < 0) g_trace = getenv("HLE_DDTRACE") != NUL
 typedef struct { uint32_t entries[256]; int refs; } pal_t;   /* PALETTEENTRY: r, g, b, flags */
 
 static surf_t *g_primary;
-static uint32_t g_vt_dd, g_vt_dd2, g_vt_dd4, g_vt_surf, g_vt_pal, g_vt_clip;
-static uint32_t g_dd, g_dd2, g_dd4;                      /* the one DirectDraw object, all three faces */
+static uint32_t g_vt_dd, g_vt_dd2, g_vt_dd4, g_vt_dd7, g_vt_surf, g_vt_pal, g_vt_clip;
+static uint32_t g_dd, g_dd2, g_dd4, g_dd7;                      /* the one DirectDraw object, all three faces */
 static volatile unsigned g_frame_seq;                    /* bumped when the primary may have changed */
 static int g_flipping;                                   /* marking the primary for a Flip */
 int hle_dd_flipping(void) { return g_flipping; }
@@ -126,6 +126,11 @@ surf_t *hle_dd_surf(uint32_t obj) {
     return S(obj);
 }
 void hle_dd_mark(surf_t *s) { s->gen++; if (s == g_primary) { g_frame_seq++; if (hle_dd_primary_hook) hle_dd_primary_hook(); } }
+
+/* The host wrote the primary's pixels itself (win32hle's bink.c, blitting a
+ * movie into it for a DirectDraw game): mark it as any guest blit would,
+ * so the presenter shows the new frame. */
+void hle_dd_touch(void) { if (g_primary) hle_dd_mark(g_primary); }
 void hle_dd_mode(int *w, int *h, int *bpp) { *w = g_mode_w, *h = g_mode_h, *bpp = g_mode_bpp; }
 
 static void masks(int bpp, uint32_t *r, uint32_t *g, uint32_t *b) {
@@ -208,6 +213,7 @@ static void dd_QueryInterface(void) {                    /* (this, iid, &out) */
     if (d1 == 0x6C14DB80u || d1 == 0x00000000u) { MEM32(A32(2)) = g_dd, MEM32(g_dd + 4)++; RET(DD_OK, 3); }    /* IDirectDraw, IUnknown */
     if (d1 == 0xB3A6F3E0u) { MEM32(A32(2)) = g_dd2, MEM32(g_dd2 + 4)++; RET(DD_OK, 3); }                       /* IDirectDraw2 */
     if (d1 == 0x9C59509Au) { MEM32(A32(2)) = g_dd4, MEM32(g_dd4 + 4)++; RET(DD_OK, 3); }                       /* IDirectDraw4 */
+    if (d1 == 0x15E65EC0u) { MEM32(A32(2)) = g_dd7, MEM32(g_dd7 + 4)++; RET(DD_OK, 3); }                       /* IDirectDraw7: its own object (the 4's slots plus its two new ones) */
     {                                                    /* Direct3D (d3d.c) */
         uint32_t hle_d3d_query(const uint8_t *iid), out = hle_d3d_query(iid);
         if (out) { MEM32(A32(2)) = out; RET(DD_OK, 3); }
@@ -373,8 +379,29 @@ static void dd_GetDisplayMode(void) {                    /* (this, &desc) */
 static void dd_GetFourCCCodes(void) { if (A32(1)) MEM32(A32(1)) = 0; RET(DD_OK, 3); }
 static void dd_GetGDISurface(void) { if (!g_primary) RET(DDERR_NOTFOUND, 2); MEM32(A32(1)) = g_primary->self; MEM32(g_primary->self + 4)++; RET(DD_OK, 2); }
 static void dd_GetMonitorFrequency(void) { if (A32(1)) MEM32(A32(1)) = 60; RET(DD_OK, 2); }
-static void dd_GetScanLine(void) { if (A32(1)) MEM32(A32(1)) = (hle_ticks_ms() * 29) % (uint32_t)g_mode_h; RET(DD_OK, 2); }
-static void dd_GetVerticalBlankStatus(void) { if (A32(1)) MEM32(A32(1)) = (hle_ticks_ms() % 16) == 0; RET(DD_OK, 2); }
+
+/* Pacing diagnostics (GTA_TRACE): how a guest's frame loop waits and flips,
+ * once a second. A loop that waits N vblanks and flips should show N waits
+ * per flip; a loss between the two is the host's overhead per tick. */
+static uint32_t g_pace_wait, g_pace_status, g_pace_scan, g_pace_flip, g_pace_flip_at, g_pace_flip_gap, g_pace_tick;
+static void pace_note_flip(void) {
+    uint32_t now = hle_ticks_ms();
+    g_pace_flip++;
+    if (g_pace_flip_at) {
+        uint32_t gap = now - g_pace_flip_at;
+        if (gap > g_pace_flip_gap) g_pace_flip_gap = gap;
+    }
+    g_pace_flip_at = now;
+    if ((int32_t)(now - g_pace_tick) >= 1000 && getenv("GTA_TRACE")) {
+        fprintf(stderr, "[pace] %u flips, %u vblank waits, %u status polls, %u scanlines (worst gap %u ms)\n",
+                g_pace_flip, g_pace_wait, g_pace_status, g_pace_scan, g_pace_flip_gap);
+        g_pace_tick = now;
+        g_pace_wait = g_pace_status = g_pace_scan = 0;
+    }
+}
+
+static void dd_GetScanLine(void) { if (A32(1)) MEM32(A32(1)) = (hle_ticks_ms() * 29) % (uint32_t)g_mode_h; g_pace_scan++; RET(DD_OK, 2); }
+static void dd_GetVerticalBlankStatus(void) { if (A32(1)) MEM32(A32(1)) = (hle_ticks_ms() % 16) == 0; g_pace_status++; RET(DD_OK, 2); }
 static void dd_Initialize(void) { RET(DD_OK, 2); }
 static void dd_RestoreDisplayMode(void) { RET(DD_OK, 1); }
 static void dd_SetCooperativeLevel(void) { if (trace()) fprintf(stderr, "[ddraw] SetCooperativeLevel(0x%X)\n", A32(2)); RET(DD_OK, 3); }
@@ -391,6 +418,7 @@ static void dd_WaitForVerticalBlank(void) {              /* (this, flags, event)
     struct timespec ts = { 0, (long)wait * 1000000L };
     nanosleep(&ts, NULL);
     hle_block_end();
+    g_pace_wait++;
     RET(DD_OK, 3);
 }
 static void dd2_GetAvailableVidMem(void) {               /* (this, &caps, &total, &free) */
@@ -606,17 +634,31 @@ static void sf_EnumAttachedSurfaces(void) {              /* (this, ctx, callback
     RET(DD_OK, 3);
 }
 static void sf_EnumOverlayZOrders(void) { RET(DD_OK, 4); }
-static void sf_Flip(void) {                              /* (this, target, flags): swap front and back pixels */
+/* Flip(target): the target's pixels become the front's, the front's go to
+ * the target -- the next back buffer when there is no target. A target that
+ * is the front itself is already showing: nothing moves. SciTech MGL (GTA1)
+ * flips by page this way, Flip(page 1's surface) then Flip(page 0's -- the
+ * primary), drawing the second page straight into the front; swapping on
+ * that second Flip put the page from two frames before back on the screen,
+ * every other frame -- the picture stuttering back and forth. */
+static void sf_Flip(void) {                              /* (this, target, flags) */
     ACCESS();
-    surf_t *s = S(A32(0));
-    if (s->back) {
+    surf_t *s = S(A32(0)), *to = s->back;
+    if (A32(1)) {
+        surf_t *t = hle_dd_surf(A32(1));
+        if (t) to = t == s ? NULL : t;
+    }
+    if (to) {
         uint8_t *t = s->px;
-        s->px = s->back->px, s->back->px = t;
-        if (hle_dd_flip_hook) hle_dd_flip_hook(s, s->back);
+        s->px = to->px, to->px = t;
+        if (hle_dd_flip_hook) hle_dd_flip_hook(s, to);
+    }
+    if (s->back || to) {
         g_flipping = 1;                                  /* the presenter shows every flip (screen.c) */
         mark(s);
         g_flipping = 0;
     }
+    pace_note_flip();
     RET(DD_OK, 3);
 }
 static void sf_GetAttachedSurface(void) {                /* (this, &caps, &out) */
@@ -767,6 +809,9 @@ static void cl_SetClipList(void) { RET(DD_OK, 3); }
 static void cl_SetHWnd(void) { MEM32(A32(0) + 8) = A32(2); RET(DD_OK, 3); }
 static void cl_Initialize(void) { RET(DD_OK, 3); }
 
+static void dd7_StartModeTests(void) { RET(DDERR_UNSUPPORTED, 2); }
+static void dd7_EvaluateMode(void) { RET(DDERR_UNSUPPORTED, 3); }
+
 static void vtables(void) {
     if (g_vt_dd) return;
 #define DD_COMMON(I) \
@@ -847,12 +892,23 @@ static void vtables(void) {
     g_vt_dd = hle_com_vtable(dd);
     g_vt_dd2 = hle_com_vtable(dd2);
     g_vt_dd4 = hle_com_vtable(dd4);
+    /* IDirectDraw7: the 4's table plus its two new methods at the
+     * end (StartModeTests, EvaluateMode, answered as never tested): a
+     * DirectX 7 game handed QueryInterface the 7's GUID, and its slots
+     * past the 4's 26 read past the vtable (GTA2's dmavideo.dll calls
+     * slot 27 as it sets its menu up). */
+    static const win32hle_shim dd7[] = {
+        { "IDirectDraw7::StartModeTests", dd7_StartModeTests },
+        { "IDirectDraw7::EvaluateMode", dd7_EvaluateMode },
+        { 0, 0 } };
+    g_vt_dd7 = hle_com_vtable7(dd4, dd7);
     g_vt_surf = hle_com_vtable(sf);
     g_vt_pal = hle_com_vtable(pl);
     g_vt_clip = hle_com_vtable(cl);
     g_dd = hle_com_new(g_vt_dd, 12);
     g_dd2 = hle_com_new(g_vt_dd2, 12);
     g_dd4 = hle_com_new(g_vt_dd4, 12);
+    g_dd7 = hle_com_new(g_vt_dd7, 12);
     MEM32(g_dd + 4) = MEM32(g_dd2 + 4) = MEM32(g_dd4 + 4) = 0;   /* held by nobody until DirectDrawCreate: the last Release is 0 */
 }
 
@@ -869,8 +925,15 @@ static void x_DirectDrawEnumerateA(void) {               /* (callback, ctx): the
     if (A32(0)) hle_call_guest(A32(0), 4, a);
     RET(DD_OK, 2);
 }
+static void x_DirectDrawCreateClipper(void) {            /* (flags, &out, outer) */
+    vtables();
+    uint32_t o = hle_com_new(g_vt_clip, 12);
+    MEM32(A32(1)) = o;
+    RET(DD_OK, 3);
+}
 
 const win32hle_shim win32hle_ddraw[] = {
     { "DirectDrawCreate", x_DirectDrawCreate }, { "DirectDrawEnumerateA", x_DirectDrawEnumerateA },
+    { "DirectDrawCreateClipper", x_DirectDrawCreateClipper },
     { 0, 0 }
 };

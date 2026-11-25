@@ -53,7 +53,7 @@ typedef struct {
     uint32_t event;                                      /* SetEventNotification's */
 } dev_t_;
 
-static uint32_t g_vt_di, g_vt_dev, g_seq;
+static uint32_t g_vt_di, g_vt_di8, g_vt_dev, g_seq;
 /* The devices made, so input arriving can reach them. */
 #define MAX_DEV 16
 static uint32_t g_devs[MAX_DEV];
@@ -351,6 +351,12 @@ static void di_EnumDevices(void) {                       /* (this, type, callbac
 static void di_GetDeviceStatus(void) { RET(DI_OK, 2); }
 static void di_FindDevice(void) { RET(DIERR_DEVICENOTREG, 4); }
 
+/* IDirectInput8's three slots past Initialize (FindDevice at 8 again,
+ * EnumDevicesBySemantics at 9, ConfigureDevices at 10): FindDevice has no
+ * device to find, the other two succeed with nothing enumerated. */
+static void di8_semantics(void) { RET(DI_OK, 7); }
+static void di8_configure(void)  { RET(DI_OK, 6); }
+
 static void vtables(void) {
     if (g_vt_di) return;
     static const win32hle_shim di[] = {
@@ -359,6 +365,16 @@ static void vtables(void) {
         { "IDirectInputA::EnumDevices", di_EnumDevices }, { "IDirectInputA::GetDeviceStatus", di_GetDeviceStatus },
         { "IDirectInputA::RunControlPanel", dv_ok3 }, { "IDirectInputA::Initialize", dv_ok3 },
         { "IDirectInput2A::FindDevice", di_FindDevice }, { 0, 0 } };
+    /* DirectInput8: the same eight, then its own three. The device vtable is
+     * the older one's, which a DirectX 8 game's calls stay inside. */
+    static const win32hle_shim di8[] = {
+        { "IDirectInput8A::QueryInterface", di_QueryInterface }, { "IDirectInput8A::AddRef", hle_com_AddRef },
+        { "IDirectInput8A::Release", di_Release }, { "IDirectInput8A::CreateDevice", di_CreateDevice },
+        { "IDirectInput8A::EnumDevices", di_EnumDevices }, { "IDirectInput8A::GetDeviceStatus", di_GetDeviceStatus },
+        { "IDirectInput8A::RunControlPanel", dv_ok3 }, { "IDirectInput8A::Initialize", dv_ok3 },
+        { "IDirectInput8A::FindDevice", di_FindDevice },
+        { "IDirectInput8A::EnumDevicesBySemantics", di8_semantics },
+        { "IDirectInput8A::ConfigureDevices", di8_configure }, { 0, 0 } };
     static const win32hle_shim dv[] = {
         { "IDirectInputDeviceA::QueryInterface", dv_QueryInterface }, { "IDirectInputDeviceA::AddRef", hle_com_AddRef },
         { "IDirectInputDeviceA::Release", dv_Release }, { "IDirectInputDeviceA::GetCapabilities", dv_GetCapabilities },
@@ -377,6 +393,7 @@ static void vtables(void) {
         { "IDirectInputDevice2A::EnumCreatedEffectObjects", dv_ok4 }, { "IDirectInputDevice2A::Escape", dv_no2 },
         { "IDirectInputDevice2A::Poll", dv_none1 }, { "IDirectInputDevice2A::SendDeviceData", dv_no5 }, { 0, 0 } };
     g_vt_di = hle_com_vtable(di);
+    g_vt_di8 = hle_com_vtable(di8);
     g_vt_dev = hle_com_vtable(dv);
     (void)dv_ok2;
 }
@@ -388,7 +405,22 @@ static void x_DirectInputCreateA(void) {                 /* (hinst, version, &ou
     RET(DI_OK, 4);
 }
 
+/* DirectInput8Create(hinst, version, iid, &out, outer): the interface whose
+ * first eight slots (IUnknown, CreateDevice, EnumDevices, GetDeviceStatus,
+ * RunControlPanel, Initialize) are the older IDirectInput2's, so an object
+ * with the 8-shaped vtable (the same handlers, plus its own three slots)
+ * serves it. The devices it hands out are the same too: a DirectX 8 game's
+ * device calls stay inside the layout the older interface's vtable covers
+ * (GetCapabilities .. SetCooperativeLevel, slot 13). GTA2 boots on this. */
+static void x_DirectInput8Create(void) {                  /* (hinst, version, iid, &out, outer) */
+    vtables();
+    T("DirectInput8Create version %X\n", A32(1));
+    MEM32(A32(3)) = hle_com_new(g_vt_di8, 12);
+    RET(DI_OK, 5);
+}
+
 const win32hle_shim win32hle_dinput[] = {
     { "DirectInputCreateA", x_DirectInputCreateA }, { "DirectInputCreate", x_DirectInputCreateA },
+    { "DirectInput8Create", x_DirectInput8Create },
     { 0, 0 }
 };

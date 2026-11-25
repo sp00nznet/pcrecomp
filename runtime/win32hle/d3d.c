@@ -142,20 +142,31 @@ static void d3_QueryInterface(void) {
 }
 static void d3_Release(void) { uint32_t n = MEM32(A32(0) + 4) ? --MEM32(A32(0) + 4) : 0; RET(n, 1); }
 static const uint8_t IID_HAL[16] = { 0xE0, 0x3D, 0xE6, 0x84, 0xAA, 0x46, 0xCF, 0x11, 0x81, 0x6F, 0x00, 0x00, 0xC0, 0x20, 0x15, 0x6E };
+static const uint8_t IID_RGB[16] = { 0x60, 0x5C, 0x66, 0xA4, 0x73, 0x26, 0xCF, 0x11, 0xA3, 0x1A, 0x00, 0xAA, 0x00, 0xB9, 0x33, 0x56 };
+/* Windows lists the software "RGB Emulation" device before the HAL, and a
+ * game may count on that order: GTA2's d3ddll.dll asks for "the second
+ * device its callback accepted", which on any Windows is the HAL. So two
+ * are enumerated, as there: RGB Emulation (a HEL description, an empty HAL
+ * one), then the HAL. Both create the same device here. */
 static void d3_EnumDevices(void) {                       /* (this, callback, ctx) */
-    static uint32_t guid, desc, name;
-    if (!guid) {
-        guid = hle_va(hle_alloc(16)), memcpy(hle_ptr(guid), IID_HAL, 16);
-        desc = hle_guest_strdup("Direct3D HAL"), name = hle_guest_strdup("Direct3D HAL");
+    static uint32_t guid[2], name[2];
+    if (!guid[0]) {
+        guid[0] = hle_va(hle_alloc(16)), memcpy(hle_ptr(guid[0]), IID_RGB, 16);
+        guid[1] = hle_va(hle_alloc(16)), memcpy(hle_ptr(guid[1]), IID_HAL, 16);
+        name[0] = hle_guest_strdup("RGB Emulation"), name[1] = hle_guest_strdup("Direct3D HAL");
     }
-    uint32_t mark = hle_scratch_mark(), hal = hle_scratch(252), hel = hle_scratch(252);
-    MEM32(hal) = MEM32(hel) = 252;
-    put_devdesc(hal, 1);
-    put_devdesc(hel, 0);
-    uint32_t a[6] = { guid, desc, name, hal, hel, A32(2) };
     T("EnumDevices -> 0x%08X\n", A32(1));
-    hle_call_guest(A32(1), 6, a);
-    hle_scratch_release(mark);
+    for (int i = 0; i < 2; i++) {
+        uint32_t mark = hle_scratch_mark(), hal = hle_scratch(252), hel = hle_scratch(252);
+        MEM32(hal) = MEM32(hel) = 252;
+        put_devdesc(hal, i == 1);
+        put_devdesc(hel, i == 0);
+        if (i == 0) MEM32(hel + 12) &= ~0x00080000u;     /* RGB Emulation: no hardware rasterisation */
+        uint32_t a[6] = { guid[i], name[i], name[i], hal, hel, A32(2) };
+        uint32_t more = hle_call_guest(A32(1), 6, a);
+        hle_scratch_release(mark);
+        if (!more) break;                                /* D3DENUMRET_CANCEL */
+    }
     RET(D3D_OK, 3);
 }
 static void d3_FindDevice(void) {                        /* (this, search, result) */

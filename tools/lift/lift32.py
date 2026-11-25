@@ -970,6 +970,12 @@ class Lifter:
         elif m in ('popad', 'popal'):      # Capstone spells POPAD as 'popal' in 32-bit
             lines.append(f"POPAD(); {comment}")
 
+        elif m == 'pushaw':                # 66 60: eight words
+            lines.append(f"PUSHAW(); {comment}")
+
+        elif m == 'popaw':                 # 66 61: eight words, the low halves
+            lines.append(f"POPAW(); {comment}")
+
         elif m in ('pushfd', 'pushf'):
             # Pushing a constant 0 was observable: the CRT's CPU detection
             # toggles a bit in the saved EFLAGS and reads it back to decide
