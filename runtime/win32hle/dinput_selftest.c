@@ -32,6 +32,7 @@ const uint32_t recomp_dispatch_count = 0;
 #define WM_LBUTTONUP   0x0202u
 #define INFINITE       0xFFFFFFFFu
 #define DIGDD_PEEK     1u
+#define DI_NOEFFECT    1u
 #define DIERR_INVALIDPARAM 0x80070057u
 
 typedef struct { uint32_t ofs, data, time, seq; } dod_t;   /* DIDEVICEOBJECTDATA */
@@ -103,6 +104,15 @@ int main(void) {
     ok("a flush says how many went", data(mouse, NULL, io, 0) == 0 && *io == 2);
     *io = INFINITE;
     ok("...and none are left", data(mouse, NULL, io, DIGDD_PEEK) == 0 && *io == 0);
+
+    /* Acquire / Unacquire: DI_NOEFFECT (S_FALSE) when already in that state */
+    hle_input_mouse(WM_MOUSEMOVE, 14, 5);
+    ok("Acquire when already acquired is DI_NOEFFECT", call("IDirectInputDeviceA::Acquire", 1, &mouse) == DI_NOEFFECT);
+    *io = INFINITE;
+    ok("...and leaves queued events alone", data(mouse, NULL, io, 0) == 0 && *io == 1);
+    ok("Unacquire when acquired is DI_OK", call("IDirectInputDeviceA::Unacquire", 1, &mouse) == 0);
+    ok("Unacquire when already unacquired is DI_NOEFFECT", call("IDirectInputDeviceA::Unacquire", 1, &mouse) == DI_NOEFFECT);
+    ok("Acquire after Unacquire is DI_OK", call("IDirectInputDeviceA::Acquire", 1, &mouse) == 0);
 
     /* the keyboard: a key down and up, by its DIK code */
     uint32_t keyboard = device(di, 0x6F1D2B61u, 256, 256);
