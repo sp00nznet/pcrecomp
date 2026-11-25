@@ -364,6 +364,14 @@ int hle_screen_relative(void);
 void hle_screen_title(const char *title);
 extern int (*hle_screen_cursor_hook)(void);   /* nonzero: show the cursor the guest set (its Win32 menus); unset: the game draws its own */
 extern void (*hle_screen_frame_hook)(const uint8_t *px, int w, int h, int pitch, int bpp);   /* each shown frame */
+/* A host that knows its game's frame boundary presents there: hle_screen_hold(ms)
+ * leaves the screen to it for that long (flips and the pump present nothing,
+ * so a frame the game writes in passes is never shown half-drawn, and the
+ * cadence is the game's clock, not wherever the pump happened to run), and
+ * hle_screen_present() shows the primary now. Let lapse, presenting is as
+ * before -- a menu that does not reach the boundary is unaffected. */
+void hle_screen_hold(uint32_t ms);
+void hle_screen_present(void);
 extern int (*hle_screen_compose_hook)(const uint8_t *px16, int pitch, int w, int h, uint32_t *out);   /* a 2x picture */
 /* Preferred over compose_hook when set: the presenter scales the 1x frame and
  * blends this 2w x 2h ARGB8888 overlay (units' 2x pixels, transparent

@@ -634,13 +634,26 @@ static void sf_EnumAttachedSurfaces(void) {              /* (this, ctx, callback
     RET(DD_OK, 3);
 }
 static void sf_EnumOverlayZOrders(void) { RET(DD_OK, 4); }
-static void sf_Flip(void) {                              /* (this, target, flags): swap front and back pixels */
+/* Flip(target): the target's pixels become the front's, the front's go to
+ * the target -- the next back buffer when there is no target. A target that
+ * is the front itself is already showing: nothing moves. SciTech MGL (GTA1)
+ * flips by page this way, Flip(page 1's surface) then Flip(page 0's -- the
+ * primary), drawing the second page straight into the front; swapping on
+ * that second Flip put the page from two frames before back on the screen,
+ * every other frame -- the picture stuttering back and forth. */
+static void sf_Flip(void) {                              /* (this, target, flags) */
     ACCESS();
-    surf_t *s = S(A32(0));
-    if (s->back) {
+    surf_t *s = S(A32(0)), *to = s->back;
+    if (A32(1)) {
+        surf_t *t = hle_dd_surf(A32(1));
+        if (t) to = t == s ? NULL : t;
+    }
+    if (to) {
         uint8_t *t = s->px;
-        s->px = s->back->px, s->back->px = t;
-        if (hle_dd_flip_hook) hle_dd_flip_hook(s, s->back);
+        s->px = to->px, to->px = t;
+        if (hle_dd_flip_hook) hle_dd_flip_hook(s, to);
+    }
+    if (s->back || to) {
         g_flipping = 1;                                  /* the presenter shows every flip (screen.c) */
         mark(s);
         g_flipping = 0;

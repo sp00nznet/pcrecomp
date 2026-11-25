@@ -46,6 +46,8 @@ static SDL_Texture *g_tex;
 static int g_tex_w, g_tex_h, g_tex_fmt;
 static unsigned g_shown_seq = ~0u;
 static uint32_t g_last_present;
+static uint32_t g_hold_until;                        /* hle_screen_hold: the host presents until then */
+static int held(void) { return g_hold_until && (int32_t)(hle_ticks_ms() - g_hold_until) < 0; }
 static int g_headless, g_fullscreen;
 static SDL_Rect g_dst;                                   /* where the picture is in the window */
 /* GL mode (hle_screen_gl set before hle_screen_open): the window is made for
@@ -933,8 +935,14 @@ void hle_screen_pump(void) {
         }
     }
     if (hle_screen_poll_hook) hle_screen_poll_hook();
-    present(0);
+    if (!held()) present(0);
     confine_update();
+}
+
+void hle_screen_hold(uint32_t ms) { g_hold_until = hle_ticks_ms() + (ms ? ms : 1); }
+void hle_screen_present(void) {
+    if (g_ren && !pthread_equal(pthread_self(), g_video_thread)) return;
+    present(1);
 }
 
 static void present_gdi(void) { present(0); }
@@ -955,7 +963,7 @@ static void warp(int x, int y) {
  * (macOS's spinning cursor). The events wait in SDL's queue for the pump. */
 static void primary_changed(void) {
     static uint32_t last_events;
-    if (!g_ren || !pthread_equal(pthread_self(), g_video_thread)) return;
+    if (!g_ren || !pthread_equal(pthread_self(), g_video_thread) || held()) return;
     uint32_t now = hle_ticks_ms();
     int flip = hle_dd_flipping();
     if (!flip && now - g_last_present < 15) return;
