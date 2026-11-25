@@ -417,6 +417,25 @@ static inline uint16_t _pop16_ss(uint32_t *sp) { uint16_t v = MEM16(SS_BASE + *s
     ebx = POP32_VAL(esp); edx = POP32_VAL(esp); ecx = POP32_VAL(esp); eax = POP32_VAL(esp); \
 } while(0)
 
+/* PUSHA and POPA with an operand-size prefix (66 60, 66 61): eight words,
+ * 16 bytes, and POPAW sets only the low halves. GTA2 reads the TSC with
+ * `pushaw; rdtsc; mov [esp+1Ch], eax; mov [esp+20h], edx; popaw`: dropping
+ * the pair moved those stores 16 bytes up, onto its caller's saved esi and
+ * ebx. */
+#define PUSHAW() do { \
+    uint32_t _tmp_esp = esp; \
+    PUSH16(esp, eax); PUSH16(esp, ecx); PUSH16(esp, edx); PUSH16(esp, ebx); \
+    PUSH16(esp, _tmp_esp); PUSH16(esp, ebp); PUSH16(esp, esi); PUSH16(esp, edi); \
+} while(0)
+
+#define POPAW() do { \
+    edi = (edi & 0xFFFF0000u) | POP16_VAL(esp); esi = (esi & 0xFFFF0000u) | POP16_VAL(esp); \
+    ebp = (ebp & 0xFFFF0000u) | POP16_VAL(esp); \
+    esp += 2; /* skip saved SP */ \
+    ebx = (ebx & 0xFFFF0000u) | POP16_VAL(esp); edx = (edx & 0xFFFF0000u) | POP16_VAL(esp); \
+    ecx = (ecx & 0xFFFF0000u) | POP16_VAL(esp); eax = (eax & 0xFFFF0000u) | POP16_VAL(esp); \
+} while(0)
+
 /* ============================================================
  * Condition Macros
  *
