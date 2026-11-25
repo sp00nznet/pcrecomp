@@ -209,11 +209,18 @@ static void dv_SetProperty(void) {
 }
 static void dv_Acquire(void) {
     dev_t_ *d = DEV(A32(0));
-    if (!d->acquired) baseline(d), d->acquired = 1;
+    int was = d->acquired;
+    if (!was) baseline(d), d->acquired = 1;
     relative();
-    RET(DI_OK, 1);
+    RET(was ? DI_NOEFFECT : DI_OK, 1);
 }
-static void dv_Unacquire(void) { DEV(A32(0))->acquired = 0; relative(); RET(DI_OK, 1); }
+static void dv_Unacquire(void) {
+    dev_t_ *d = DEV(A32(0));
+    int was = d->acquired;
+    d->acquired = 0;
+    relative();
+    RET(was ? DI_OK : DI_NOEFFECT, 1);
+}
 static void dv_GetDeviceState(void) {                    /* (this, size, data) */
     dev_t_ *d = DEV(A32(0));
     uint32_t n = A32(1), p = A32(2);
