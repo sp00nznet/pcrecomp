@@ -524,7 +524,9 @@ typedef struct {
     uint32_t ClientOffsetX, ClientOffsetY, ScreenWidth, ScreenHeight, ScreenDepth;
     uint32_t pad[48];
     int destx, desty;                                    /* ours */
+    int to_dd;                                           /* ours: BinkBufferSetDDPrimary */
 } binkbuf_t;
+static int g_bink_to_dd;                                 /* BinkBufferSetDDPrimary before any buffer exists: GTA2 */
 static void k_BufferOpen(void) {                         /* (hwnd, width, height, flags) */
     binkbuf_t *b = (binkbuf_t *)hle_alloc(sizeof *b);   /* the game reads its fields */
     int sw, sh;
@@ -533,6 +535,7 @@ static void k_BufferOpen(void) {                         /* (hwnd, width, height
     b->SurfaceType = 3;                                  /* BINKSURFACE32 */
     b->BufferPitch = (int32_t)(b->Width * 4);
     b->Buffer = hle_va(hle_alloc((b->Width * b->Height + 1) * 4u));
+    b->to_dd = g_bink_to_dd;                             /* a SetDDPrimary before the open, as GTA2 does it */
     if (hle_gdi_window_frame(&px, &sw, &sh, &pitch, &bpp, NULL)) b->ScreenWidth = (uint32_t)sw, b->ScreenHeight = (uint32_t)sh, b->ScreenDepth = (uint32_t)bpp;
     RETP(b, 4);
 }
@@ -548,10 +551,48 @@ static void k_BufferSetOffset(void) {                    /* (buf, x, y) */
     if (b) b->destx = (int)A32(1), b->desty = (int)A32(2);
     RET(1, 3);
 }
+/* BinkBufferSetDDPrimary(buf, lpDD): a DirectDraw game's movie is to land on
+ * the DirectDraw primary (GTA2). The game may call it before its buffer
+ * exists (GTA2 does: SetDDPrimary, then BufferOpen), so the flag is the
+ * module's and the next-opened buffer inherits it. The buffer's blit then
+ * targets the primary, in place of a GDI window frame that a DirectDraw
+ * game has none of. */
+static void k_BufferSetDDPrimary(void) {
+    binkbuf_t *b = (binkbuf_t *)APTR(0);
+    if (b) b->to_dd = 1;
+    g_bink_to_dd = 1;
+    RET(1, 1);
+}
+static void k_BufferCheckWinPos(void) { RET(1, 3); }
 static void k_BufferBlit(void) {                         /* (buf, rects, n): the whole picture, whatever changed */
     binkbuf_t *b = (binkbuf_t *)APTR(0);
     const uint8_t *px;
     int sw, sh, pitch, bpp;
+    if (b && b->to_dd) {                                 /* a DirectDraw game: into the primary */
+        int dw, dh, dpitch, dbpp;
+        const uint32_t *pal;
+        unsigned seq;
+        if (b->Buffer && hle_dd_frame(&px, &dw, &dh, &dpitch, &dbpp, &pal, &seq)) {
+            const uint32_t *src0 = (const uint32_t *)hle_ptr(b->Buffer);
+            for (int y = 0; y < (int)b->Height; y++) {
+                int ty = b->desty + y;
+                if (ty < 0 || ty >= dh) continue;
+                const uint32_t *src = src0 + (size_t)y * b->Width;
+                uint8_t *row = (uint8_t *)px + (size_t)ty * dpitch;   /* hle_dd_frame hands a host pointer */
+                for (int x = 0; x < (int)b->Width; x++) {
+                    int tx = b->destx + x;
+                    if (tx < 0 || tx >= dw) continue;
+                    uint32_t p = src[x];
+                    int r = (p >> 16) & 255, g = (p >> 8) & 255, bl = p & 255;
+                    if (dbpp == 16) ((uint16_t *)row)[tx] = (uint16_t)((r >> 3) << 11 | (g >> 2) << 5 | bl >> 3);
+                    else if (dbpp == 8) row[tx] = (uint8_t)((r * 30 + g * 59 + bl * 11) / 100);
+                    else ((uint32_t *)row)[tx] = 0xFF000000u | (p >> 8 & 0xFF00u) | (p & 0xFFu) << 16 | p >> 16 & 0xFFu;
+                }
+            }
+            hle_dd_touch();                              /* as a guest blit: the presenter shows it */
+        }
+        RET(1, 3);
+    }
     if (b && hle_gdi_window_frame(&px, &sw, &sh, &pitch, &bpp, NULL) && bpp == 32) {
         for (int y = 0; y < (int)b->Height; y++) {
             int ty = b->desty + y;
@@ -573,6 +614,7 @@ const win32hle_shim win32hle_bink[] = {
     { "_BinkBufferOpen@16", k_BufferOpen }, { "_BinkBufferClose@4", k_BufferClose },
     { "_BinkBufferLock@4", k_BufferLock }, { "_BinkBufferUnlock@4", k_BufferUnlock },
     { "_BinkBufferSetOffset@12", k_BufferSetOffset }, { "_BinkBufferBlit@12", k_BufferBlit },
+    { "_BinkBufferSetDDPrimary@4", k_BufferSetDDPrimary }, { "_BinkBufferCheckWinPos@12", k_BufferCheckWinPos },
     { "_BinkGetRects@8", k_GetRects }, { "_BinkSetIOSize@4", k_SetIOSize },
     { "_BinkOpen@8", k_Open }, { "_BinkClose@4", k_Close }, { "_BinkDoFrame@4", k_DoFrame },
     { "_BinkNextFrame@4", k_NextFrame }, { "_BinkWait@4", k_Wait }, { "_BinkCopyToBuffer@28", k_CopyToBuffer },

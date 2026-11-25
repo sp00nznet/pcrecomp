@@ -326,6 +326,7 @@ extern const win32hle_shim win32hle_dinput[];         /* DirectInput: the system
  * when its pixels or palette may have. */
 int  hle_dd_frame(const uint8_t **px, int *w, int *h, int *pitch, int *bpp, const uint32_t **palette, unsigned *seq);
 void hle_dd_mode(int *w, int *h, int *bpp);
+void hle_dd_touch(void);                 /* the host wrote the primary: mark it as a guest blit would */
 extern void (*hle_dd_primary_hook)(void);            /* the primary's pixels or palette changed (a blit, an Unlock, a Flip) */
 int  hle_dd_flipping(void);                          /* 1 inside that hook for a Flip: a frame to show, each one */
 int  hle_dd_surface_pixels(uint32_t obj, uint8_t **px, int *w, int *h, int *pitch, int *bpp);   /* 0: not a surface */
@@ -409,6 +410,9 @@ void hle_reg_load(const char *file);
  * is `this`); an object is its vtable pointer, a count at +4, then host state.
  * hle_com_QueryInterface/AddRef/Release are an IUnknown for such objects. */
 uint32_t hle_com_vtable(const win32hle_shim *methods);
+/* Two tables concatenated: an interface that extends another's, its own
+ * slots last (DirectDraw7 on DirectDraw4's). */
+uint32_t hle_com_vtable7(const win32hle_shim *base, const win32hle_shim *ext);
 uint32_t hle_com_new(uint32_t vtable, uint32_t size);
 void     hle_com_free(uint32_t obj);                  /* the last Release of an hle_com_new object */
 void     hle_com_register_class(const uint8_t *clsid, uint32_t (*create)(const uint8_t *iid, uint32_t *out));

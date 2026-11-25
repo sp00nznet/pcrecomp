@@ -58,6 +58,20 @@ uint32_t hle_com_vtable(const win32hle_shim *methods) {
     for (int i = 0; i < n; i++) vt[i] = hle_resolve(methods[i].name);
     return hle_va(vt);
 }
+/* A vtable from two shim tables concatenated: an interface that extends
+ * another's, its own slots last (DirectDraw7 on DirectDraw4's). */
+uint32_t hle_com_vtable7(const win32hle_shim *base, const win32hle_shim *ext) {
+    int n = 0, m = 0;
+    while (base[n].name) n++;
+    while (ext[m].name) m++;
+    win32hle_shim *all = (win32hle_shim *)hle_alloc((uint32_t)(n + m + 1) * sizeof *all);
+    memcpy(all, base, (size_t)n * sizeof *all);
+    memcpy(all + n, ext, (size_t)m * sizeof *all);
+    all[n + m].name = NULL, all[n + m].fn = NULL;
+    uint32_t vt = hle_com_vtable(all);
+    hle_free(all);
+    return vt;
+}
 /* An object: the vtable pointer, a reference count, then `size` - 8 bytes of
  * the host's own state. */
 uint32_t hle_com_new(uint32_t vtable, uint32_t size) {
