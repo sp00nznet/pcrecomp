@@ -19,11 +19,16 @@ from generate import LinearInstruction
 from lift32 import Lifter
 
 
-def emit(encoding, dos=True):
+def decode(encoding):
     md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
     md.detail = True
-    insn = LinearInstruction(next(iter(md.disasm(encoding, 0x1000))))   # as generate.py hands it over
-    return " ".join(Lifter(dos=dos).lift_instruction(insn))
+    return LinearInstruction(next(iter(md.disasm(encoding, 0x1000))))   # as generate.py hands it over
+
+
+def emit(encoding, dos=True, ds_fn=False):
+    lifter = Lifter(dos=dos)
+    lifter._seg_fn = ds_fn          # what generate.py sets for a function that loads ds
+    return " ".join(lifter.lift_instruction(decode(encoding)))
 
 
 def main():
@@ -69,7 +74,30 @@ def main():
     if "recomp_int" in emit(b"\xcd\x21", dos=False):
         print("FAIL: int lifted to a hook without dos=True")
         bad += 1
-    print("%d/%d passed" % (len(cases) + 1 - bad, len(cases) + 1))
+    # A function that loads ds (Watcom's movedata, peek/poke) addresses its
+    # default-ds operands and string sources through DS_BASE; the rest stay flat.
+    ds_cases = [
+        (b"\x8e\xd8", False, "recomp_set_seg(3, eax)"),               # mov ds, ax
+        (b"\x1f", False, "recomp_set_seg(3, POP32_VAL(esp))"),        # pop ds
+        (b"\x8b\x06", True, "MEM32(DS_BASE + (esi))"),                # mov eax, [esi]
+        (b"\x8b\x45\x08", True, "MEM32(ebp + 0x8)"),                  # mov eax, [ebp+8]: the stack is flat
+        (b"\xf3\xa5", True, "recomp_rep_movs(ES_BASE + edi, DS_BASE + esi"),
+        (b"\x8b\x06", False, "MEM32(esi)"),                           # elsewhere: flat, as before
+        # lds esi, [eax]: offset and selector both read through the old ds
+        (b"\xc5\x30", True, "uint32_t _o = MEM32(DS_BASE + (eax)); "
+                            "uint16_t _s = MEM16(DS_BASE + (eax) + 4); esi = _o; recomp_set_seg(3, _s);"),
+    ]
+    for enc, ds_fn, want in ds_cases:
+        got = emit(enc, ds_fn=ds_fn)
+        if want not in got:
+            print("FAIL %s: want %r in %r" % (enc.hex(), want, got))
+            bad += 1
+    loads = [Lifter.ds_function([decode(e)]) for e in (b"\x8e\xd8", b"\x1f", b"\xc5\x30", b"\x8b\x06", b"\x8e\xc0")]
+    if loads != [True, True, True, False, False]:   # mov ds / pop ds / lds load it; mov eax, [esi] / mov es don't
+        print("FAIL: ds_function %r" % loads)
+        bad += 1
+    n = len(cases) + 1 + len(ds_cases) + 1
+    print("%d/%d passed" % (n - bad, n))
     return 1 if bad else 0
 
 
