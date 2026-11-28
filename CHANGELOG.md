@@ -7,6 +7,12 @@ versions follow [SemVer](https://semver.org/).
 
 ### Added
 
+- dos32: the Miles Sound System's music (AIL 3.x MDI and XMIDI sequence API) answered by
+  the host, `runtime/dos32/mss_xmidi.c`: XMIDI played on an emulated OPL3 (ymfm,
+  `third_party/ymfm`, BSD-3-Clause) with the game's own Global Timbre Library, as one mixer
+  voice made as it is mixed (`audio_play_gen`); `dos32_host_path` for host code that reads a
+  program's files. Opt-in through run_lift.py OVERRIDES; `MSS_XMIDI_SILENT` builds it without
+  the synth. Pilot: Warcraft: Orcs & Humans (#202).
 - dos32: int 21h 4Bh runs a child through the host (`dos32_on_exec`) and
   4Dh returns its exit code; `COMSPEC` is in the environment, so a Watcom
   `system()` reaches it. Mode 12h (640x480x16) keeps four planes as mode X
