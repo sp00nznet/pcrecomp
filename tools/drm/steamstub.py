@@ -50,6 +50,21 @@ section, the AES-256 key, an ECB-encrypted IV and the code's first 16 bytes
 the section. The layout was read from the stub's own code and checked by
 decrypting: the OEP disassembles to the MSVC CRT start.
 
+Two more 3.x forms (V3_LAYOUTS, V3_COPY_LOOP), from the Steam builds of the
+X-Wing games:
+
+  - A 0xD0-byte header with signature 0xC0DEC0DE and 32-bit fields (X-Wing vs
+    TIE Fighter, Balance of Power, X-Wing Alliance). Its layout was read from
+    the stub's code and the steamdrm.dll it decrypts (XTEA, the key at +0x88):
+    the stub returns to base + [+0x1C]; the DLL's export checks the signature
+    and skips the code step when flag 4 of [+0x34] is set, and otherwise
+    decrypts base + [+0x40], [+0x44] bytes with the 32-byte key at +0x48,
+    feeding the 32 bytes at +0x68 (the encrypted IV, then the stolen first
+    block) ahead of the section: the same scheme as above, at other offsets.
+  - An unoptimized build of the stub (X-Wing and TIE Fighter), whose header is
+    the 0xF0-byte one but is copied by a byte loop from `mov ecx, [ebp+8];
+    sub ecx, size` instead of `push size; lea eax, [ebx-size]`.
+
 emu_unpack.py is the
 fallback for a wrapper this cannot parse: it gets as far as SteamAPI_Init.
 """
@@ -198,77 +213,118 @@ def unwrap_v20(raw, pe, entry_bytes):
 
 
 # The 3.x x86 stub: `call $+5; push eax..ebp; mov eax, [esp+0x1C]; sub eax, 5`,
-# so eax is its own entry VA. It then copies the header from just below that
-# (`push size; lea eax, [ebx - size]`). The header's first dword seeds the same
-# running XOR over the rest. Read from Shadows of the Empire's stub (app 560170).
+# so eax is its own entry VA, which it hands to its main function. That copies
+# the header from just below the entry, and the header's first dword seeds the
+# same running XOR over the rest. Two copies are known: an optimized
+# build's `push size; lea eax, [ebx-size]; push eax` (Shadows of the Empire,
+# app 560170; X-Wing vs TIE Fighter) and an unoptimized build's byte loop from
+# `mov ecx, [ebp+8]; sub ecx, size` (X-Wing, TIE Fighter).
 V3_PROLOGUE = bytes.fromhex('e800000000505351525657558b44241c2d05000000')
-V3_COPY = re.compile(rb'\x68(.{4})\x8D\x83(.{4})\x50', re.S)  # push size; lea eax, [ebx-size]; push eax
-V3_SIGNATURE = 0xC0DEC0DF
-V3_IMAGE_BASE, V3_OEP, V3_APPID, V3_FLAGS = 0x08, 0x20, 0x38, 0x3C
-V3_CODE_VA, V3_CODE_SIZE = 0x48, 0x50           # RVA and size of the encrypted section
-V3_AES_KEY, V3_AES_IV, V3_FIRST_BLOCK = 0x58, 0x78, 0x88   # 32, 16 and 16 bytes
+V3_COPY = re.compile(rb'\x68(.{4})\x8D\x83(.{4})\x50', re.S)      # push size; lea eax, [ebx-size]; push eax
+V3_COPY_LOOP = re.compile(rb'\x8B\x4D\x08\x81\xE9(.{4})', re.S)     # mov ecx, [ebp+8]; sub ecx, size
+
+# The header's fields, by its signature (offsets into the decoded header; the
+# OEP and the code section are RVAs). Each layout was read from a stub's code.
+V3_LAYOUTS = {
+    # 0xF0 bytes: Shadows of the Empire, X-Wing, TIE Fighter.
+    0xC0DEC0DF: dict(size=0xF0, image_base=0x08, oep=0x20, appid=0x38, flags=0x3C, code_va=0x48,
+                     code_size=0x50, aes_key=0x58, aes_iv=0x78, first_block=0x88, plain_flag=None),
+    # 0xD0 bytes, 32-bit fields: X-Wing vs TIE Fighter, Balance of Power, X-Wing
+    # Alliance. The stub returns to base + [+0x1C]; steamdrm.dll's export skips
+    # the code step when flag 4 of [+0x34] is set, else decrypts base + [+0x40],
+    # [+0x44] bytes with the key at +0x48 and the 32 bytes at +0x68 ahead of them.
+    0xC0DEC0DE: dict(size=0xD0, image_base=0x08, oep=0x1C, appid=0x30, flags=0x34, code_va=0x40,
+                     code_size=0x44, aes_key=0x48, aes_iv=0x68, first_block=0x78, plain_flag=4),
+}
 
 
-def v3_decrypt_code(hdr, enc, size):
+def v3_decrypt_code(hdr, enc, size, lay=V3_LAYOUTS[0xC0DEC0DF]):
     """The code section, decrypted: AES-256-CBC over the header's stolen first
     block followed by the section, IV ECB-decrypted from the header, PKCS#7."""
-    key = hdr[V3_AES_KEY:V3_AES_KEY + 32]
-    iv = Cipher(algorithms.AES(key), modes.ECB()).decryptor().update(hdr[V3_AES_IV:V3_AES_IV + 16])
+    key = hdr[lay['aes_key']:lay['aes_key'] + 32]
+    iv = Cipher(algorithms.AES(key), modes.ECB()).decryptor().update(hdr[lay['aes_iv']:lay['aes_iv'] + 16])
     plain = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor().update(
-        hdr[V3_FIRST_BLOCK:V3_FIRST_BLOCK + 16] + enc[:size])
+        hdr[lay['first_block']:lay['first_block'] + 16] + enc[:size])
     pad = plain[-1]
     if not 1 <= pad <= 16 or plain[-pad:] != bytes([pad]) * pad or len(plain) - pad != size:
         raise StubError('code section did not decrypt (bad padding): wrong key or layout')
     return plain[:-pad]
 
 
+def v3_header_size(entry_bytes):
+    """The header size the 3.x stub copies, from either known copy."""
+    m = V3_COPY.search(entry_bytes, 0x80, 0xC0) or V3_COPY.search(entry_bytes)
+    if m:
+        size, neg = struct.unpack('<I', m.group(1))[0], struct.unpack('<i', m.group(2))[0]
+    else:
+        m = V3_COPY_LOOP.search(entry_bytes)
+        if not m:
+            raise StubError('3.x stub does not copy its header the known way')
+        size = struct.unpack('<I', m.group(1))[0]
+        neg = -size
+    if not 0x40 <= size <= 0x400 or neg != -size:
+        raise StubError('3.x header size 0x%X / 0x%X is not plausible' % (size, -neg))
+    return size
+
+
 def unwrap_v3(raw, pe, entry_bytes):
     """(unwrapped file bytes, info dict) for the 3.x stub, or None if it is not one."""
     if not entry_bytes.startswith(V3_PROLOGUE):
         return None
-    m = V3_COPY.search(entry_bytes, 0x80, 0xC0) or V3_COPY.search(entry_bytes)
-    if not m:
-        raise StubError('3.x stub does not copy its header the known way')
-    size, neg = struct.unpack('<I', m.group(1))[0], struct.unpack('<i', m.group(2))[0]
-    if not 0x40 <= size <= 0x400 or neg != -size:
-        raise StubError('3.x header size 0x%X / 0x%X is not plausible' % (size, -neg))
+    size = v3_header_size(entry_bytes)
     base = pe.OPTIONAL_HEADER.ImageBase
     ep = pe.OPTIONAL_HEADER.AddressOfEntryPoint
     off = pe.get_offset_from_rva(ep - size)
     seed = struct.unpack_from('<I', raw, off)[0]
     hdr = struct.pack('<I', seed) + xor_chain(raw[off + 4:off + size], seed)
     word = lambda o: struct.unpack_from('<I', hdr, o)[0]   # noqa: E731
-    if word(4) != V3_SIGNATURE:
-        raise StubError('3.x header signature 0x%08X is not 0x%08X' % (word(4), V3_SIGNATURE))
-    if word(V3_IMAGE_BASE) != base:
-        raise StubError('3.x header image base 0x%08X is not the PE\'s' % word(V3_IMAGE_BASE))
-    f = {k: word(o) for k, o in (('flags', V3_FLAGS), ('appid', V3_APPID), ('code_size', V3_CODE_SIZE))}
-    f['oep'], f['code_va'] = base + word(V3_OEP), base + word(V3_CODE_VA)
-    code = next((s for s in pe.sections if s.VirtualAddress == word(V3_CODE_VA)), None)
+    lay = V3_LAYOUTS.get(word(4))
+    if lay is None:
+        raise StubError('3.x header signature 0x%08X is none of %s' % (
+            word(4), ', '.join('0x%08X' % s for s in V3_LAYOUTS)))
+    if size != lay['size']:
+        raise StubError('3.x header with signature 0x%08X is 0x%X bytes, not 0x%X' % (word(4), size, lay['size']))
+    if word(lay['image_base']) != base:
+        raise StubError('3.x header image base 0x%08X is not the PE\'s' % word(lay['image_base']))
+    f = {k: word(lay[k]) for k in ('flags', 'appid', 'code_size')}
+    f['oep'], f['code_va'] = base + word(lay['oep']), base + word(lay['code_va'])
+    code = next((s for s in pe.sections if s.VirtualAddress == word(lay['code_va'])), None)
     if code is None:
         raise StubError('code VA 0x%08X is not the start of a section' % f['code_va'])
     if not f['code_va'] <= f['oep'] < f['code_va'] + code.Misc_VirtualSize:
         raise StubError('OEP 0x%08X is outside the code section' % f['oep'])
     if f['code_size'] > code.SizeOfRawData:
         raise StubError('code size 0x%X is larger than the section on disk' % f['code_size'])
-    # ponytail: the flags are not decoded; every 3.x file seen so far is encrypted,
-    # and the padding check refuses one that is not. Add the flag bit when one turns up.
+    # ponytail: the 0xF0 layout's flags are not decoded (no unencrypted file has
+    # turned up; the padding check refuses one). The 0xD0 layout's code-step flag
+    # was read from its steamdrm.dll.
+    encrypted = not (lay['plain_flag'] and f['flags'] & lay['plain_flag'])
     lo = code.PointerToRawData
     out = bytearray(raw)
-    out[lo:lo + f['code_size']] = v3_decrypt_code(hdr, raw[lo:lo + f['code_size']], f['code_size'])
+    if encrypted:
+        out[lo:lo + f['code_size']] = v3_decrypt_code(hdr, raw[lo:lo + f['code_size']], f['code_size'], lay)
     finish(out, pe, f['oep'])
-    return bytes(out), dict(f, variant='3.x', header_va=base + ep - size, encryption='AES-256-CBC',
-                            section=code.Name.rstrip(b'\0').decode())
+    return bytes(out), dict(f, variant='3.x', signature=word(4), header_va=base + ep - size,
+                            encryption='AES-256-CBC' if encrypted else None, section=code.Name.rstrip(b'\0').decode())
 
 
 def finish(out, pe, oep):
-    """Point the entry at the OEP and drop .bind when nothing follows it in the file:
-    left in, it is an executable section full of dead stub for every later tool."""
+    """Point the entry at the OEP and drop .bind when nothing follows it in the file
+    but, at most, the certificate table: left in, .bind is an executable section
+    full of dead stub for every later tool. The certificate (Authenticode) signed
+    the wrapped file, so it cannot match this one; it goes with .bind, and so
+    does its directory entry (which holds a file offset, not an RVA)."""
     opt = pe.OPTIONAL_HEADER.get_file_offset()
     struct.pack_into('<I', out, opt + 16, oep - pe.OPTIONAL_HEADER.ImageBase)   # AddressOfEntryPoint
     struct.pack_into('<I', out, opt + 64, 0)                                    # CheckSum: stale now
     bind = pe.sections[-1]
-    if bind.Name.rstrip(b'\0') == b'.bind' and bind.PointerToRawData + bind.SizeOfRawData >= len(out):
+    end = bind.PointerToRawData + bind.SizeOfRawData
+    dirs = pe.OPTIONAL_HEADER.DATA_DIRECTORY
+    cert = dirs[4] if len(dirs) > 4 else None       # IMAGE_DIRECTORY_ENTRY_SECURITY
+    signed = bool(cert and cert.Size and cert.VirtualAddress == end and end + cert.Size >= len(out))
+    if bind.Name.rstrip(b'\0') == b'.bind' and (end >= len(out) or signed):
+        if signed:
+            struct.pack_into('<II', out, cert.get_file_offset(), 0, 0)
         hdr = bind.get_file_offset()
         out[hdr:hdr + 40] = bytes(40)
         struct.pack_into('<H', out, pe.FILE_HEADER.get_file_offset() + 2, len(pe.sections) - 1)
@@ -405,18 +461,29 @@ def selftest():
     assert m and struct.unpack('<2I', m.group(1) + m.group(2)) == (0x10964380, 0xDD)
     assert not V20_COPY.match(stub, len(STUB_PROLOGUE))     # KotOR's stub is not the older one
 
-    # 3.x: the header copy from Shadows of the Empire's stub, and the code
-    # layout as a round trip (stolen first block + section, PKCS#7).
-    m = V3_COPY.search(bytes.fromhex('68f00000008d8310ffffff50'))
-    assert m and struct.unpack('<Ii', m.group(1) + m.group(2)) == (0xF0, -0xF0)
+    # 3.x: both header copies, as the stubs of Shadows of the Empire (and X-Wing
+    # vs TIE Fighter, with 0xD0) and of X-Wing hold them, 0x80 into the entry
+    # bytes where the stub's main function starts; then each layout's code as a
+    # round trip (stolen first block + section, PKCS#7).
+    pad = bytes(0x80 - len(V3_PROLOGUE))
+    assert v3_header_size(V3_PROLOGUE + pad + bytes.fromhex('558bec81ece404000053' '68f00000008d8310ffffff50')) == 0xF0
+    assert v3_header_size(V3_PROLOGUE + pad + bytes.fromhex('558bec81ece404000053' '68d00000008d8330ffffff50')) == 0xD0
+    assert v3_header_size(V3_PROLOGUE + pad + bytes.fromhex(
+        '558bec81ec4008000056c785c0fefffff00000008d8540faffff898588fdffff8b4d0881e9f0000000')) == 0xF0
+    try:
+        v3_header_size(V3_PROLOGUE + bytes(0x100))
+        raise AssertionError('found a header copy in zeros')
+    except StubError:
+        pass
     key, iv = bytes(range(32)), bytes(range(16, 32))
     code = bytes(range(256)) * 2 + b'\xc3' * 16
     enc_iv = Cipher(algorithms.AES(key), modes.ECB()).encryptor().update(iv)
     ct = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor().update(code + b'\x10' * 16)
-    hdr = bytearray(0xF0)
-    hdr[V3_AES_KEY:V3_AES_KEY + 32], hdr[V3_AES_IV:V3_AES_IV + 16] = key, enc_iv
-    hdr[V3_FIRST_BLOCK:V3_FIRST_BLOCK + 16] = ct[:16]
-    assert v3_decrypt_code(bytes(hdr), ct[16:], len(code)) == code
+    for sig, lay in V3_LAYOUTS.items():
+        hdr = bytearray(lay['size'])
+        hdr[lay['aes_key']:lay['aes_key'] + 32], hdr[lay['aes_iv']:lay['aes_iv'] + 16] = key, enc_iv
+        hdr[lay['first_block']:lay['first_block'] + 16] = ct[:16]
+        assert v3_decrypt_code(bytes(hdr), ct[16:], len(code), lay) == code, hex(sig)
     print('steamstub selftest: ok')
 
 
@@ -436,7 +503,8 @@ def main():
         print('SteamStub 2.x: app %d, header 0x%08X, steamdrm.dll 0x%08X (0x%X bytes)'
               % (info['appid'], info['header_va'], info['drm_va'], info['drm_size']))
     else:
-        print('SteamStub %s: app %d, header 0x%08X' % (info['variant'], info['appid'], info['header_va']))
+        sig = ' (signature 0x%08X)' % info['signature'] if 'signature' in info else ''
+        print('SteamStub %s%s: app %d, header 0x%08X' % (info['variant'], sig, info['appid'], info['header_va']))
     print('  %s 0x%08X+0x%X %s; OEP 0x%08X' % (
         info['section'], info['code_va'], info['code_size'],
         'decrypted (%s)' % info['encryption'] if info['encryption'] else 'not encrypted', info['oep']))
