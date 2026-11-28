@@ -745,6 +745,10 @@ From #9. Found bringing Nocturne (Terminal Reality, Watcom C/C++32) in game.
 
 ### Fixed
 
+- win32hle dinput: `DIPROP_AXISMODE` had its values the wrong way about
+  (`DIPROPAXISMODE_ABS` is 0, `_REL` 1), setting and getting: a game that asked
+  for relative axes got the cursor's place, every read. Jurassic Park:
+  Operation Genesis's pointer ran away. `dinput_selftest.c` covers both modes.
 - win32hle screen: the mouse reaches the picture's right and bottom edges.
   It is held to the points wholly inside the picture, and unless the picture
   is a whole number of pixels a point (a full-screen window below a MacBook's
