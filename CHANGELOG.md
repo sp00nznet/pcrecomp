@@ -7,6 +7,13 @@ versions follow [SemVer](https://semver.org/).
 
 ### Added
 
+- dos32: int 21h 4Bh runs a child through the host (`dos32_on_exec`) and
+  4Dh returns its exit code; `COMSPEC` is in the environment, so a Watcom
+  `system()` reaches it. Mode 12h (640x480x16) keeps four planes as mode X
+  does and `dos32_frame` draws it; the absolute mouse scales it as 640x480;
+  `dos32_vga_dump` for a host's debug command. Found on Syndicate, whose
+  MAIN.EXE runs the intro with `system()` and whose missions are mode 12h
+  (#206).
 - dos32: `DOS32_EPOCH=<unix seconds>` pins the time the DOS clock starts
   from, so a program that seeds from the clock makes the same choices every
   run; `dos32_kbhit_idle` gives each int 21h AH=0Bh keyboard poll the time it
