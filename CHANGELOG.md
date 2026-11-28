@@ -7,6 +7,13 @@ versions follow [SemVer](https://semver.org/).
 
 ### Added
 
+- lift32: `LIFT32_ABI`, the callee-saved register plan (after XRC's `x_abi_plan`).
+  Opt-in, and the output is identical to before when unset. One lift records
+  which registers each function keeps (`generate.py`), and the next skips
+  reloading those after calls to it. A run-time checker catches a wrongly trusted
+  callee (`test_abi_keep.py`). Red Alert 2: clean build 18% faster, exe 3% smaller,
+  36/36 playtests. Notes and the XRC comparison are in `docs/notes/xrc-comparison.md`
+  (#197).
 - `runtime/replay/`: input record and replay keyed to the game's own frames
   or timer ticks, not wall time (`--record`, `--replay`, `--keys f<frame>:...`),
   with screenshot/hash checkpoints; Win16 hosts take the flags in `main.c`.
