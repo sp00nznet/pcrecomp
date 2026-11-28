@@ -751,6 +751,10 @@ From #9. Found bringing Nocturne (Terminal Reality, Watcom C/C++32) in game.
   notch, any window), the last of them mapped a game pixel or two short of
   the edge: Red Alert 2, which scrolls at its screen's last pixel, scrolled up
   and left but never right or down. That point is now the last pixel.
+- win32hle bink: `BinkGoto` found no frames after a whole movie. It sought by
+  bytes, round the Bink demuxer's own seek, whose frame count stayed at the
+  end. It now seeks with the demuxer, flushes the sound's decoder too, and
+  drops the sound queued from before the seek or of the frames passed over.
 - native32 regbox32: the guest OS's own keys are never read from the host,
   whether or not the box has them: HKCU `...\CurrentVersion\Explorer` and
   `Policies`, `Environment`, `Volatile Environment`; HKLM `Explorer\Shell
