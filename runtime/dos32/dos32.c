@@ -178,6 +178,9 @@ xmm_t    g_xmm[8];
 uint32_t g_mxcsr = 0x1F80;
 uint16_t g_seg_cs, g_seg_ds, g_seg_es, g_seg_fs, g_seg_gs, g_seg_ss;
 uint32_t g_fs_base, g_gs_base, g_es_base, g_cs_base;
+/* ds's base, for the lifted functions that load ds (lift32 ds_function: Watcom's movedata and
+ * peek/poke copy through a selector in ds); the rest address flat. */
+uint32_t g_ds_base;
 ptrdiff_t g_mem_base;
 uint32_t g_cur_func;
 uint32_t g_icall_trace[ICALL_TRACE_SIZE], g_icall_from[ICALL_TRACE_SIZE];
@@ -186,6 +189,7 @@ uint32_t g_icall_trace_idx, g_icall_count;
 double dos32_speed = 1.0;
 volatile int dos32_quit;
 void (*dos32_on_retrace)(void);
+void (*dos32_on_poll)(void);
 
 /* ---- layout ------------------------------------------------------------- */
 #define HEAP_LO      0x01000000u
@@ -264,6 +268,7 @@ void recomp_set_seg(int sreg, uint32_t s) {
     s &= 0xFFFF;
     switch (sreg) {
     case 0: g_seg_es = (uint16_t)s; g_es_base = sel_base(s); break;
+    case 3: g_seg_ds = (uint16_t)s; g_ds_base = sel_base(s); break;
     case 4: g_seg_fs = (uint16_t)s; g_fs_base = sel_base(s); break;
     case 5: g_seg_gs = (uint16_t)s; g_gs_base = sel_base(s); break;
     }
@@ -403,7 +408,7 @@ typedef struct {
     uint32_t eax, ebx, ecx, edx, esi, edi, ebp, esp;
     uint32_t fk, fa, fb, fcf;
     uint16_t ds, es, fs, gs;
-    uint32_t es_base, fs_base, gs_base, cs_base, cur;
+    uint32_t ds_base, es_base, fs_base, gs_base, cs_base, cur;
     double st[8]; int top; uint16_t cw;
 } saved_t;
 
@@ -412,7 +417,8 @@ static void save(saved_t* s) {
     s->esi = g_esi; s->edi = g_edi; s->ebp = g_ebp; s->esp = g_esp;
     s->fk = g_flag_k; s->fa = g_flag_a; s->fb = g_flag_b; s->fcf = g_flag_cf;
     s->ds = g_seg_ds; s->es = g_seg_es; s->fs = g_seg_fs; s->gs = g_seg_gs;
-    s->es_base = g_es_base; s->fs_base = g_fs_base; s->gs_base = g_gs_base; s->cs_base = g_cs_base;
+    s->ds_base = g_ds_base; s->es_base = g_es_base; s->fs_base = g_fs_base; s->gs_base = g_gs_base;
+    s->cs_base = g_cs_base;
     s->cur = g_cur_func;
     memcpy(s->st, g_st, sizeof g_st); s->top = g_fp_top; s->cw = g_fpu_cw;
 }
@@ -422,7 +428,8 @@ static void restore(const saved_t* s) {
     g_esi = s->esi; g_edi = s->edi; g_ebp = s->ebp; g_esp = s->esp;
     g_flag_k = s->fk; g_flag_a = s->fa; g_flag_b = s->fb; g_flag_cf = s->fcf;
     g_seg_ds = s->ds; g_seg_es = s->es; g_seg_fs = s->fs; g_seg_gs = s->gs;
-    g_es_base = s->es_base; g_fs_base = s->fs_base; g_gs_base = s->gs_base; g_cs_base = s->cs_base;
+    g_ds_base = s->ds_base; g_es_base = s->es_base; g_fs_base = s->fs_base; g_gs_base = s->gs_base;
+    g_cs_base = s->cs_base;
     g_cur_func = s->cur;
     memcpy(g_st, s->st, sizeof g_st); g_fp_top = s->top; g_fpu_cw = s->cw;
 }
@@ -442,6 +449,7 @@ static void call_guest(uint32_t va, int as_irq) {
     recomp_set_seg(5, 0);
     g_cs_base = 0;
     g_seg_ds = SEL_DATA;
+    g_ds_base = 0;
     g_flag_k = FK_EFLAGS; g_flag_a = 0x202; g_flag_b = 0; g_flag_cf = 0;
     fn();
 }
@@ -453,6 +461,27 @@ static void irq(int v) {
     call_guest(pmvec[v].off, 1);
     in_irq--;
     restore(&s);
+}
+
+/* A cdecl call into the guest from host code on the guest thread (an override, or
+ * dos32_on_poll): the registers are kept, the return value is eax. */
+uint32_t dos32_call(uint32_t va, int n, const uint32_t* args) {
+    recomp_func_t fn = recomp_lookup(va);
+    saved_t s;
+    uint32_t r;
+    if (!fn) { once("guest function not lifted", va, 0); return 0; }
+    save(&s);
+    in_irq++;
+    g_esp = (g_esp - 64) & ~3u;          /* below anything the caller still uses */
+    for (int i = n - 1; i >= 0; i--) push32(args[i]);
+    push32(RECOMP_RETADDR);
+    recomp_set_seg(0, SEL_DATA);
+    g_cs_base = 0; g_seg_ds = SEL_DATA; g_ds_base = 0;
+    fn();
+    r = g_eax;
+    in_irq--;
+    restore(&s);
+    return r;
 }
 
 /* ---- timer -------------------------------------------------------------- */
@@ -801,6 +830,7 @@ static void dos32_poll(void) {
         if (t >= pit_next) pit_next = t + period;   /* fell behind: drop, don't storm */
     }
     poll_input();
+    if (dos32_on_poll && g_if) dos32_on_poll();
 }
 
 static void yield_hook(void) { dos32_poll(); }
@@ -1204,6 +1234,7 @@ static void int31(regs_t* r) {
     case 0x0006: { uint32_t b = sel_base(BX(r)); SET16(r->ecx, b >> 16); SET16(r->edx, b); OK(r); break; }
     case 0x0007: sel_set(BX(r), (uint32_t)CX(r) << 16 | DX(r), sel[(BX(r) >> 3) & (NSEL - 1)].limit);
         if ((BX(r) | 7) == (g_seg_es | 7)) g_es_base = sel_base(BX(r));
+        if ((BX(r) | 7) == (g_seg_ds | 7)) g_ds_base = sel_base(BX(r));
         if ((BX(r) | 7) == (g_seg_fs | 7)) g_fs_base = sel_base(BX(r));
         if ((BX(r) | 7) == (g_seg_gs | 7)) g_gs_base = sel_base(BX(r));
         OK(r); break;
@@ -1284,7 +1315,116 @@ static void int31(regs_t* r) {
     }
 }
 
+/* MSCDEX: one CD drive, D:, whose files are the game folder like every drive (host_path drops the
+ * letter). Enough for a game that checks its CD is in before it runs (Warcraft II), and for its CD
+ * audio: the host gives the tracks (dos32_cd_tracks) and plays what is asked (dos32_cd_play). The
+ * playing position is kept by the guest clock, at 75 sectors a second. Other requests are answered
+ * "done" and reported once. */
+#define CD_DRIVE 3
+void (*dos32_cd_play)(int track, uint32_t offset, uint32_t count);
+static uint32_t cd_start[101];   /* each track's first sector; [cd_n + 1] is the lead-out */
+static int cd_n = 1;
+static int cd_playing, cd_paused;
+static uint32_t cd_from, cd_end;  /* the play, or the one to resume */
+static double cd_t0;
+
+void dos32_cd_tracks(int n, const uint32_t* sectors) {
+    if (n > 99) n = 99;
+    cd_n = n < 1 ? 1 : n;
+    cd_start[1] = 0;
+    for (int t = 1; t <= cd_n; t++) cd_start[t + 1] = cd_start[t] + (t <= n ? sectors[t - 1] : 1);
+}
+
+static uint32_t cd_msf0(uint32_t f) { return f / 4500 << 16 | f / 75 % 60 << 8 | f % 75; }
+static uint32_t cd_msf(uint32_t lba) { return cd_msf0(lba + 150); }
+static int cd_track_of(uint32_t lba) { int t = 1; while (t < cd_n && lba >= cd_start[t + 1]) t++; return t; }
+static uint32_t cd_pos(void) {
+    if (!cd_playing) return cd_from;
+    uint32_t p = cd_from + (uint32_t)((gtime() - cd_t0) * 75);
+    if (p < cd_end) return p;
+    cd_playing = 0; cd_from = cd_end;
+    return cd_end;
+}
+static void cd_start_play(void) {
+    int t = cd_track_of(cd_from);
+    cd_playing = 1; cd_paused = 0; cd_t0 = gtime();
+    if (dos32_cd_play) dos32_cd_play(t, cd_from - cd_start[t], cd_end - cd_from);
+}
+static void cd_stop(void) {
+    if (cd_playing) { cd_from = cd_pos(); cd_playing = 0; cd_paused = 1; }   /* a stop while playing pauses */
+    else cd_paused = 0;                                                      /* and a second one resets */
+    if (dos32_cd_play) dos32_cd_play(0, 0, 0);
+}
+
+static void cd_ioctl_input(uint32_t cb) {
+    uint32_t pos;
+    int t;
+    switch (R8(cb)) {
+    case 4: memcpy(LIN(cb + 1), "\0\xFF\1\xFF\2\0\3\0", 8); break;   /* channels 0, 1 at full volume */
+    case 6: R32(cb + 1) = 0x00000210u; break;   /* status: door closed, plays audio, Red Book */
+    case 9: R8(cb + 1) = 1; break;              /* media changed: no */
+    case 10: R8(cb + 1) = 1; R8(cb + 2) = (uint8_t)cd_n; R32(cb + 3) = cd_msf(cd_start[cd_n + 1]); break;
+    case 11:
+        t = R8(cb + 1);
+        if (t < 1 || t > cd_n) t = 1;
+        R32(cb + 2) = cd_msf(cd_start[t]);
+        R8(cb + 6) = t == 1 ? 0x41 : 0x01;      /* track 1 is the data */
+        break;
+    case 12:   /* Q channel: where it is playing */
+        pos = cd_pos(); t = cd_track_of(pos);
+        R8(cb + 1) = t == 1 ? 0x41 : 0x01; R8(cb + 2) = (uint8_t)t; R8(cb + 3) = 1;
+        { uint32_t m = cd_msf0(pos - cd_start[t]);   /* within the track, then on the disc */
+          R8(cb + 4) = (uint8_t)(m >> 16); R8(cb + 5) = (uint8_t)(m >> 8); R8(cb + 6) = (uint8_t)m; R8(cb + 7) = 0;
+          m = cd_msf(pos); R8(cb + 8) = (uint8_t)(m >> 16); R8(cb + 9) = (uint8_t)(m >> 8); R8(cb + 10) = (uint8_t)m; }
+        break;
+    case 15: cd_pos(); R16(cb + 1) = (uint16_t)cd_paused; R32(cb + 3) = cd_from; R32(cb + 7) = cd_end; break;
+    default: once("MSCDEX IOCTL input", R8(cb), 0); break;
+    }
+}
+
+static void int2f_cd(regs_t* r) {
+    switch (AX(r)) {
+    case 0x1500: SET16(r->ebx, 1); SET16(r->ecx, CD_DRIVE); break;
+    case 0x1501: {   /* drive device list: subunit 0, and a device header (at 0060:0000, unused low memory) */
+        uint32_t p = es_ptr(r, r->rm ? BX(r) : r->ebx), h = 0x600;
+        memset(LIN(h), 0, 18);
+        R32(h) = 0xFFFFFFFFu;          /* next: none */
+        R16(h + 4) = 0xC800;           /* character device, IOCTL supported */
+        memcpy(LIN(h + 10), "MSCD001 ", 8);
+        R8(h + 20) = CD_DRIVE + 1;     /* drive letter (1 = A:) */
+        R8(h + 21) = 1;                /* units */
+        R8(p) = 0;
+        R32(p + 1) = (h >> 4) << 16;
+        break; }
+    case 0x150B: SET16(r->eax, CX(r) == CD_DRIVE ? 0x5AD8 : 0); SET16(r->ebx, 0xADAD); break;
+    case 0x150C: SET16(r->ebx, 0x0215); break;   /* 2.21: a game sends device requests only from 2.10 */
+    case 0x150D: R8(es_ptr(r, r->rm ? BX(r) : r->ebx)) = CD_DRIVE; break;
+    case 0x1510: {
+        uint32_t q = es_ptr(r, r->rm ? BX(r) : r->ebx);
+        uint8_t cmd = R8(q + 2);
+        uint32_t xfer = R32(q + 14), cb = (xfer >> 16) * 16u + (xfer & 0xFFFF);   /* real-mode far */
+        if (getenv("DOS32_CDLOG")) fprintf(stderr, "[cd] req %#x code %#x\n", cmd, (cmd == 3 || cmd == 12) ? R8(cb) : 0);
+        if (cmd == 3) cd_ioctl_input(cb);   /* IOCTL input: the control block says what */
+        else if (cmd == 12) {               /* IOCTL output: 3, the channels' volume, is let be */
+            if (R8(cb) != 3) once("MSCDEX IOCTL output", R8(cb), 0);
+        } else if (cmd == 0x84) {           /* play: from a sector (HSG, or Red Book), so many */
+            uint32_t s = R32(q + 14), n = R32(q + 18);
+            if (R8(q + 13)) s = (s >> 16 & 0xFF) * 4500 + (s >> 8 & 0xFF) * 75 + (s & 0xFF) - 150;
+            if (cd_playing) cd_stop();
+            cd_from = s; cd_end = s + n;
+            if (n) cd_start_play();
+            fprintf(stderr, "[cd] play %u +%u (track %d)\n", s, n, cd_track_of(s));
+        } else if (cmd == 0x85) cd_stop();
+        else if (cmd == 0x88) { if (cd_paused) cd_start_play(); }
+        else once("MSCDEX device request", cmd, 0);
+        R16(q + 3) = cd_pos() < cd_end && cd_playing ? 0x0300 : 0x0100;   /* done; busy while it plays */
+        break; }
+    default: once("int 2Fh (MSCDEX)", AX(r), 0); break;
+    }
+}
+
 static void int2f(regs_t* r) {
+    if (AH(r) == 0x15) { int2f_cd(r); return; }
     switch (AX(r)) {
     case 0x1680: Sleep(0); SET8L(r->eax, 0); break;
     case 0x1600: SET8L(r->eax, 0); break;
@@ -1563,7 +1703,7 @@ static void put_str(uint32_t at, const char* s) { while (*s) R8(at++) = (uint8_t
     X(g_eax) X(g_ecx) X(g_edx) X(g_esp) X(g_ebx) X(g_esi) X(g_edi) X(g_ebp) \
     X(g_st) X(g_fp_top) X(g_fpu_cw) X(g_mm) X(g_flag_k) X(g_flag_a) X(g_flag_b) X(g_flag_cf) \
     X(g_seg_cs) X(g_seg_ds) X(g_seg_es) X(g_seg_fs) X(g_seg_gs) X(g_seg_ss) \
-    X(g_fs_base) X(g_gs_base) X(g_es_base) X(g_cs_base) X(mod_load) \
+    X(g_fs_base) X(g_gs_base) X(g_es_base) X(g_cs_base) X(g_ds_base) X(mod_load) \
     X(sel) X(heap) X(conv) X(pmvec) X(rmvec) X(pic_mask) \
     X(pit_div) X(pit_latch) X(pit_lohi) X(pit_mode_byte) X(shift_flags) \
     X(vmode) X(vw) X(vh) X(vpitch) X(vesa_lfb) X(vbank) \

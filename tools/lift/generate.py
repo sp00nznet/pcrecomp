@@ -332,7 +332,8 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
     lines.append('')
 
     lifter._flag_state = None
-    lifter._seg_fn = lifter.seg_function(instructions)   # LIFT32_W9X: reloads ds/es
+    lifter._seg_fn = (lifter.seg_function(instructions)   # LIFT32_W9X: reloads ds/es
+                      or (lifter.dos and lifter.ds_function(instructions)))   # DOS: loads ds
     # LIFT32_W9X: every function addresses its stack through ss's base, not
     # only those that load ss: kernel32's 16->32 dispatcher (0xBFF71903) runs
     # its first pushes on the 16-bit caller's stack and loads ss in a block

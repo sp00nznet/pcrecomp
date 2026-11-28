@@ -411,6 +411,8 @@ class Lifter:
                 return f"_st[{r - X86_REG_ST0}] = {value}"
             if W9X and r == X86_REG_SS:
                 return f"recomp_set_seg(2, {value})"
+            if self.dos and r == X86_REG_DS:
+                return f"recomp_set_seg(3, {value})"
             if (self.dos and r in DOS_SEG_IDX) or (W9X and r in (X86_REG_ES, X86_REG_DS, X86_REG_FS, X86_REG_GS)):
                 if W9X and r == X86_REG_DS:
                     return f"recomp_set_seg(3, {value})"
@@ -958,7 +960,7 @@ class Lifter:
                     if ops[0].type == X86_OP_REG:
                         r = reg_name(ops[0].reg)
                         lines[-1] = f"{r} = POP32_VAL(esp); {comment}"
-                        if W9X and ops[0].reg == X86_REG_DS:
+                        if (W9X or self.dos) and ops[0].reg == X86_REG_DS:
                             lines[-1] = f"recomp_set_seg(3, POP32_VAL(esp)); {comment}"
                         elif (self.dos and ops[0].reg in DOS_SEG_IDX) or (W9X and ops[0].reg in (X86_REG_ES, X86_REG_FS, X86_REG_GS)):
                             lines[-1] = (f"recomp_set_seg({DOS_SEG_IDX[ops[0].reg]}, POP32_VAL(esp));"
@@ -2329,6 +2331,9 @@ class Lifter:
                     lines.append(f"{{ uint32_t _o = {'MEM16' if w else 'MEM32'}({addr}); "
                                  f"uint16_t _s = MEM16({addr} + {2 if w else 4}); {dst}; "
                                  f"recomp_set_seg({idx}, _s); }} {comment}")
+                elif self.dos and m == 'lds':
+                    lines.append(f"recomp_set_seg(3, MEM16({addr} + 4)); "
+                                 f"{self._fmt_write(ops[0], f'MEM32({addr})')}; {comment}")
                 elif self.dos and seg:
                     lines.append(f"recomp_set_seg({DOS_SEG_IDX[seg]}, MEM16({addr} + 4)); "
                                  f"{self._fmt_write(ops[0], f'MEM32({addr})')}; {comment}")
@@ -2534,6 +2539,15 @@ class Lifter:
                            for i in instructions)
 
     @staticmethod
+    def ds_function(instructions) -> bool:
+        """DOS: a function that loads ds (a DOS extender's far-memory helpers: Watcom's
+        movedata and peek/poke load a selector into ds and copy through it). Its default-ds
+        operands and string ops go through DS_BASE; every other function stays flat."""
+        return any(i.mnemonic == 'lds' or
+                   (i.mnemonic in ('mov', 'pop') and i.op_str.split(',')[0].strip() == 'ds')
+                   for i in instructions)
+
+    @staticmethod
     def seg_function(instructions) -> bool:
         """LIFT32_W9X: a function that loads ds or es addresses through them
         (kernel32 copies the DOS environment with ds = its selector). The rest
@@ -2561,7 +2575,7 @@ class Lifter:
         lines.append(f"")
 
         _ins = [i for b in func.blocks.values() for i in b.instructions]
-        self._seg_fn = self.seg_function(_ins)
+        self._seg_fn = self.seg_function(_ins) or (self.dos and self.ds_function(_ins))
         self._ss_fn = self.ss_function(_ins)
 
         # Emit blocks in address order
