@@ -221,11 +221,27 @@ extern unsigned g_ds_run;
 #ifdef RECOMP_W16_IDENTITY
 uint32_t recomp_sel_base(uint32_t sel);
 uint32_t recomp_sel_access_base(uint32_t sel);   /* a not-present selector raises #NP first (vxd32.c) */
+#ifdef RECOMP_W16_BASED
+/* Based identity (RECOMP_W16_BASED, a host with no fixed low addresses: the 3DS, or any
+ * 64-bit one): guest linear L is host g_w16_mem + L, one arena the host owns from L 0 up
+ * (identity/host.c). cpu->mem is g_w16_mem, so lifted code is unchanged; the host converts
+ * with W16_P (guest -> host pointer) and W16_A (host pointer -> guest address). */
+extern uint8_t *g_w16_mem;
+#define g_w16_low g_w16_mem
+static inline uint32_t w16_lin(uint32_t a) { return a; }
+#define W16_P(a) ((void *)(g_w16_mem + (uint32_t)(a)))
+#define W16_A(p) ((uint32_t)((const uint8_t *)(p) - g_w16_mem))
+#define W16_MEMBASE g_w16_mem
+#else
 /* Linear 0-FFFFh (IVT, BIOS data, what Win98 keeps at 1000h) cannot be
  * mapped in a Win11 process: those addresses go to a host block instead
  * (identity.c g_w16_low). */
 extern uint8_t g_w16_low[0x10000];
 static inline uint32_t w16_lin(uint32_t a) { return a < 0x10000u ? (uint32_t)(uintptr_t)(g_w16_low + a) : a; }
+#define W16_P(a) ((void *)(uintptr_t)w16_lin(a))
+#define W16_A(p) ((uint32_t)(uintptr_t)(p))
+#define W16_MEMBASE NULL
+#endif
 #define W16_SEL_BASE(cpu, sel) ((void)(cpu), recomp_sel_access_base(sel))
 #define W16_LIN(a) w16_lin(a)
 #else

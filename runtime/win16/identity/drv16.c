@@ -10,8 +10,29 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
 #include "cpu.h"
+#ifdef RECOMP_W16_BASED
+/* The portable host (identity/host.c): one thread, no Windows. Input, the tick and the
+ * system timers are delivered from drv16_poll, which the host calls when the guest idles. */
+typedef unsigned UINT;
+typedef uint32_t DWORD;
+#define MAX_PATH 260
+#ifdef _MSC_VER
+#define strcasecmp _stricmp
+#else
+#include <strings.h>
+#endif
+#define _stricmp strcasecmp
+uint32_t w16_host_ms(void);
+uint32_t w16_host_alloc(uint32_t n);
+#define GetTickCount w16_host_ms
+#define max(a, b) ((a) > (b) ? (a) : (b))
+#define min(a, b) ((a) < (b) ? (a) : (b))
+#define SLASH "/"
+#else
+#include <windows.h>
+#define SLASH "\\"
+#endif
 
 uint32_t recomp_sel_base(uint32_t selector);
 uint8_t *native32_w9x_desc(uint16_t sel);
@@ -29,11 +50,15 @@ static void ret_far(CPU *c, int argbytes) { c->ret_ip = mem_read16(c, c->ss, c->
 static void libentry(CPU *c) { c->ax = 1; ret_far(c, 0); }   /* LibEntry: success, nothing to set up */
 
 static uint32_t argfar(CPU *c, int i) { return (uint32_t)arg16(c, i + 1) << 16 | arg16(c, i); }
-static char *farptr(uint32_t p) { return (char *)(uintptr_t)(recomp_sel_base(p >> 16) + (p & 0xFFFF)); }
+static char *farptr(uint32_t p) { return (char *)W16_P(recomp_sel_base(p >> 16) + (p & 0xFFFF)); }
 
 /* Code-page conversion between the guest's ANSI (1252) and OEM (437) sets: Win98 SE US.
  * ponytail: both fixed; read them off system.ini [boot.description]/the keyboard's tables if another locale turns up. */
 static void cp_convert(const char *src, char *dst, int n, UINT from, UINT to) {
+#ifdef RECOMP_W16_BASED
+    (void)from; (void)to;   /* ponytail: 1252 <-> 437 as the identity; only bytes over 7Fh differ */
+    memmove(dst, src, (size_t)n);
+#else
     WCHAR w[1024];
     while (n > 0) {
         int k = n > 1024 ? 1024 : n;
@@ -41,6 +66,7 @@ static void cp_convert(const char *src, char *dst, int n, UINT from, UINT to) {
         WideCharToMultiByte(to, 0, w, k, dst, k, NULL, NULL);
         src += k; dst += k; n -= k;
     }
+#endif
 }
 /* KEYBOARD.5 AnsiToOem(LPCSTR src, LPSTR dst) / .6 OemToAnsi: KRNL386 seg1 A5C2 (OpenFile's path)
  * calls them through DGROUP:1250 once the keyboard is loaded; pascal, TRUE back. */
@@ -69,8 +95,10 @@ static void kb_sysreq(CPU *c) { c->ax = 0; ret_far(c, 2); }
  * sites as each is reached. ponytail: 800x600x16 (5-6-5), no palette (RC_PALETTE
  * off, so no SetPalette/translate traffic); a host window shows g_fb later. */
 int g_drv_win31;   /* the host boots Windows 3.1's USER/GDI (w311host sets it) */
+#ifndef FB_W   /* the host may ask for another size (the 3DS: 640x480) */
 #define FB_W 800
 #define FB_H 600
+#endif
 static uint16_t g_fb[FB_W * FB_H];
 static void fb_window(void);
 static void put16(char *p, int off, int v) { *(uint16_t *)(p + off) = (uint16_t)v; }
@@ -161,10 +189,13 @@ static void disp_colorinfo(CPU *c) {
  * out as a FNT 3.0 FONTINFO that ExtTextOut and GetCharWidth already read.
  * ponytail: Marlett only, chars 20h..7Fh, mono, no other TrueType face. */
 static char g_fontdir[512];
+#ifdef RECOMP_W16_BASED
+static int marlett_build(int lfh, uint8_t *fi) { (void)lfh; (void)fi; return 0; }   /* Win98's only */
+#else
 static HANDLE g_marlett;
 static int marlett_build(int lfh, uint8_t *fi) {
     if (!g_marlett) {
-        char p[600]; snprintf(p, sizeof p, "%s\\MARLETT.TT_", g_fontdir);
+        char p[600]; snprintf(p, sizeof p, "%s" SLASH "MARLETT.TT_", g_fontdir);
         FILE *f = fopen(p, "rb"); if (!f) return 0;
         static uint8_t ttf[64 * 1024]; DWORD n = (DWORD)fread(ttf, 1, sizeof ttf, f), cnt = 0; fclose(f);
         g_marlett = AddFontMemResourceEx(ttf, n, NULL, &cnt);   /* private to this process */
@@ -214,6 +245,7 @@ static int marlett_build(int lfh, uint8_t *fi) {
     SelectObject(dc, of); DeleteObject(hf); DeleteDC(dc);
     return size;
 }
+#endif
 
 typedef struct { uint8_t *bits; int w, h, pitch, bpp; const uint16_t *pal; } surf_t;
 static int surf_of(uint32_t lp, surf_t *s);
@@ -285,10 +317,10 @@ static int surf_of(uint32_t lp, surf_t *s) {
         {   /* GDI's own bits are flat (the 32-bit caller writes them): an offset past 64 KB is
              * the address, whatever the selector word holds. ponytail: read from one case */
             uint32_t off = *(const uint32_t *)(b + 0x16);
-            s->bits = (uint8_t *)(uintptr_t)(off > 0xFFFF ? off : recomp_sel_base(*(const uint16_t *)(b + 0x1A)) + off);
+            s->bits = (uint8_t *)W16_P(off > 0xFFFF ? off : recomp_sel_base(*(const uint16_t *)(b + 0x1A)) + off);
         }
         if (s->pitch < 0) s->bits -= s->pitch * (s->h - 1);
-        s->pal = dib_pal((uint32_t)(uintptr_t)b);
+        s->pal = dib_pal(W16_A(b));
         if (getenv("W16_DIBDBG")) fprintf(stderr, "[dib] surf %08X: %dx%d bpp %d bits %04X:%08X delta %d own %08X base %08X lim %08X\n", lp, s->w, s->h, s->bpp, *(const uint16_t *)(b + 0x1A), *(const uint32_t *)(b + 0x16), s->pitch, *(const uint32_t *)(b + 0x2C), recomp_sel_base(*(const uint16_t *)(b + 0x1A)), *(const uint32_t *)native32_w9x_desc(*(const uint16_t *)(b + 0x1A)), *(const uint32_t *)(b + 0x0A), *(const uint32_t *)(b + 0x48), *(const uint32_t *)(b + 0x50), *(const uint32_t *)(b + 0x54), *(const uint32_t *)(b + 0x58));
         return s->bits && (s->bpp == 15 || s->bpp == 24 || s->bpp == 32 || (s->pal && (s->bpp == 1 || s->bpp == 4 || s->bpp == 8)));
     }
@@ -530,6 +562,9 @@ static void disp_pixel(CPU *c) {
     c->ax = v; c->dx = 0; ret_far(c, 16);
 }
 
+/* The framebuffer, for a host that shows it (the portable host's presenter). */
+const uint16_t *drv16_fb(int *w, int *h) { *w = FB_W; *h = FB_H; return g_fb; }
+#ifndef RECOMP_W16_BASED
 /* ---- the host window: g_fb shown 1:1, repainted on a timer; no input yet ---- */
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_TIMER) { InvalidateRect(h, NULL, FALSE); return 0; }
@@ -558,11 +593,12 @@ static DWORD WINAPI fb_thread(LPVOID unused) {
     while (GetMessageA(&msg, NULL, 0, 0) > 0) DispatchMessageA(&msg);
     return 0;
 }
+#endif
 /* ponytail: a window only when asked (W16_WINDOW), so check_w16 and plain runs stay headless */
 /* W16_SHOT=T1,T2,... (seconds from the display's Enable): the guest's own
  * framebuffer, g_fb, written as W16_SHOT_OUT_<T>.bmp (24-bit). The screenshot
  * comes from inside the guest, not from a host window or the real desktop. */
-static void fb_save(const char *path) {
+void drv16_save(const char *path) {
     FILE *f = fopen(path, "wb");
     if (!f) return;
     uint8_t h[54] = { 'B', 'M' };
@@ -582,6 +618,7 @@ static void fb_save(const char *path) {
     }
     fclose(f);
 }
+#ifndef RECOMP_W16_BASED
 static DWORD WINAPI shot_thread(LPVOID unused) {
     (void)unused;
     DWORD t0 = GetTickCount();
@@ -592,7 +629,7 @@ static DWORD WINAPI shot_thread(LPVOID unused) {
         if (at > now) Sleep(at - now);
         char p[600];
         snprintf(p, sizeof p, "%s_%g.bmp", out, t);
-        fb_save(p);
+        drv16_save(p);
         s = strchr(s, ',') ? strchr(s, ',') + 1 : "";
     }
     return 0;
@@ -602,11 +639,15 @@ static void fb_window(void) {
     if (!up && getenv("W16_WINDOW")) { up = 1; CloseHandle(CreateThread(NULL, 0, fb_thread, NULL, 0, NULL)); }
     if (!shots && getenv("W16_SHOT")) { shots = 1; CloseHandle(CreateThread(NULL, 0, shot_thread, NULL, 0, NULL)); }
 }
+#else
+static uint32_t g_fb_t0;   /* the display's Enable: W16_SHOT and W16_INPUT times count from it (drv16_poll) */
+static void fb_window(void) { if (!g_fb_t0) g_fb_t0 = w16_host_ms() | 1; }
+#endif
 
 /* Cursor entries (USER): 101 Inquire(lpCursorInfo) -> its size, {dpXRate, dpYRate} (seg072_3714 wants 4);
  * 102 SetCursor(lpShape), 103 MoveCursor(x, y), 104 CheckCursor(). ponytail: the shape and
  * position are kept, not drawn (the host window shows the host's arrow). */
-static int16_t g_cur_x, g_cur_y;
+int16_t g_cur_x, g_cur_y;   /* the host draws the pointer there (drv16_cursor) */
 static void disp_inquire(CPU *c) { put16(farptr(argfar(c, 0)), 0, 1); put16(farptr(argfar(c, 0)), 2, 1); c->ax = 4; ret_far(c, 4); }
 static void disp_setcursor(CPU *c) { c->ax = 1; ret_far(c, 4); }
 static void disp_movecursor(CPU *c) { g_cur_y = (int16_t)arg16(c, 0); g_cur_x = (int16_t)arg16(c, 1); ret_far(c, 4); }
@@ -733,9 +774,60 @@ static void kb_enable(CPU *c) { g_kb_proc = argfar(c, 2); c->ax = 1; ret_far(c, 
 /* KEYBOARD.4 ToAscii(vk, scan, lpKeyState, lpChar, flags) -> chars written; 131 MapVirtualKey(code, type).
  * Through the host's own (pure) translation with the guest's key state.
  * ponytail: the host's layout stands in for KEYBOARD.DRV's tables (US here). */
+#ifdef RECOMP_W16_BASED
+/* A US keyboard: virtual key <-> set-1 scan code, and the characters each makes. */
+static const struct { uint8_t vk, scan; char lo, hi; } g_us[] = {
+    { 0x1B, 0x01, 27, 27 }, { 0x08, 0x0E, 8, 8 }, { 0x09, 0x0F, 9, 9 }, { 0x0D, 0x1C, 13, 13 }, { 0x20, 0x39, ' ', ' ' },
+    { '1', 0x02, '1', '!' }, { '2', 0x03, '2', '@' }, { '3', 0x04, '3', '#' }, { '4', 0x05, '4', '$' }, { '5', 0x06, '5', '%' },
+    { '6', 0x07, '6', '^' }, { '7', 0x08, '7', '&' }, { '8', 0x09, '8', '*' }, { '9', 0x0A, '9', '(' }, { '0', 0x0B, '0', ')' },
+    { 0xBD, 0x0C, '-', '_' }, { 0xBB, 0x0D, '=', '+' }, { 0xDB, 0x1A, '[', '{' }, { 0xDD, 0x1B, ']', '}' }, { 0xBA, 0x27, ';', ':' },
+    { 0xDE, 0x28, '\'', '"' }, { 0xC0, 0x29, '`', '~' }, { 0xDC, 0x2B, '\\', '|' }, { 0xBC, 0x33, ',', '<' }, { 0xBE, 0x34, '.', '>' },
+    { 0xBF, 0x35, '/', '?' }, { 0x10, 0x2A, 0, 0 }, { 0x11, 0x1D, 0, 0 }, { 0x12, 0x38, 0, 0 }, { 0x14, 0x3A, 0, 0 },
+    { 0x25, 0x4B, 0, 0 }, { 0x26, 0x48, 0, 0 }, { 0x27, 0x4D, 0, 0 }, { 0x28, 0x50, 0, 0 }, { 0x24, 0x47, 0, 0 }, { 0x23, 0x4F, 0, 0 },
+    { 0x21, 0x49, 0, 0 }, { 0x22, 0x51, 0, 0 }, { 0x2D, 0x52, 0, 0 }, { 0x2E, 0x53, 0, 0 },
+    { 0x6A, 0x37, '*', '*' }, { 0x6B, 0x4E, '+', '+' }, { 0x6D, 0x4A, '-', '-' },
+};
+static const char g_us_letters[] = "QWERTYUIOP\0ASDFGHJKL\0ZXCVBNM";   /* scans 10h, 1Eh, 2Ch on */
+static unsigned us_scan(unsigned vk) {
+    for (unsigned i = 0; i < sizeof g_us / sizeof *g_us; i++) if (g_us[i].vk == vk) return g_us[i].scan;
+    for (unsigned i = 0; i < sizeof g_us_letters; i++) if ((unsigned char)g_us_letters[i] == vk) return (i < 11 ? 0x10 + i : i < 21 ? 0x1E + i - 11 : 0x2C + i - 21);
+    if (vk >= 0x70 && vk <= 0x79) return 0x3B + vk - 0x70;   /* F1-F10 */
+    return 0;
+}
+static unsigned us_vk(unsigned scan) {
+    for (unsigned v = 1; v < 256; v++) if (us_scan(v) == scan) return v;
+    return 0;
+}
+static int ToAscii(unsigned vk, unsigned scan, const uint8_t *ks, uint16_t *ch, unsigned fl) {
+    (void)scan; (void)fl;
+    int shift = (ks[0x10] & 0x80) != 0, ctrl = (ks[0x11] & 0x80) != 0, caps = ks[0x14] & 1;
+    if (vk >= 'A' && vk <= 'Z') { *ch = (uint16_t)(ctrl ? vk - 'A' + 1 : (shift ^ caps) ? vk : vk + 32); return 1; }
+    if (vk >= 0x60 && vk <= 0x69) { *ch = (uint16_t)('0' + vk - 0x60); return 1; }
+    for (unsigned i = 0; i < sizeof g_us / sizeof *g_us; i++)
+        if (g_us[i].vk == vk && g_us[i].lo) { *ch = (uint16_t)(uint8_t)(shift ? g_us[i].hi : g_us[i].lo); return 1; }
+    return 0;
+}
+static unsigned MapVirtualKeyA(unsigned code, unsigned type) {
+    if (type == 0) return us_scan(code);
+    if (type == 1) return us_vk(code);
+    if (type == 2) { uint8_t ks[256] = { 0 }; uint16_t ch = 0; return ToAscii(code, 0, ks, &ch, 0) ? ch : 0; }
+    return 0;
+}
+/* A character's key and whether it is shifted (VkKeyScan). */
+static unsigned us_vkscan(char k, int *shift) {
+    *shift = 0;
+    if (k >= 'a' && k <= 'z') return (unsigned)(k - 32);
+    if (k >= 'A' && k <= 'Z') { *shift = 1; return (unsigned)k; }
+    for (unsigned i = 0; i < sizeof g_us / sizeof *g_us; i++) {
+        if (g_us[i].lo == k && g_us[i].vk < 0x60) return g_us[i].vk;
+        if (g_us[i].hi == k && g_us[i].vk < 0x60) { *shift = 1; return g_us[i].vk; }
+    }
+    return 0;
+}
+#endif
 static void kb_toascii(CPU *c) {
-    WORD ch = 0;
-    int n = ToAscii(arg16(c, 6), arg16(c, 5), (const BYTE *)farptr(argfar(c, 3)), &ch, arg16(c, 0));
+    uint16_t ch = 0;
+    int n = ToAscii(arg16(c, 6), arg16(c, 5), (const uint8_t *)farptr(argfar(c, 3)), &ch, arg16(c, 0));
     if (n > 0) put16(farptr(argfar(c, 1)), 0, ch);
     c->ax = (uint16_t)n; ret_far(c, 14);
 }
@@ -763,10 +855,11 @@ int w16_call(CPU *r);
 void mach_enter(void);
 void mach_leave(void);
 uint16_t native32_w9x_alloc_sel(uint32_t base, uint32_t limit);
+#ifndef RECOMP_W16_BASED
 static DWORD WINAPI input_thread(LPVOID unused) {
     (void)unused;
     DWORD t0 = GetTickCount();
-    uint16_t ss = native32_w9x_alloc_sel((uint32_t)(uintptr_t)VirtualAlloc(NULL, 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE), 0x1FFF);
+    uint16_t ss = native32_w9x_alloc_sel(W16_A(VirtualAlloc(NULL, 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)), 0x1FFF);
     for (const char *s = getenv("W16_INPUT"); s && *s; s = strchr(s, ';') ? strchr(s, ';') + 1 : "") {
         int x, y; double t; char k;
         extern int g_fncount;
@@ -803,7 +896,7 @@ static DWORD WINAPI input_thread(LPVOID unused) {
         if (sscanf(s, " mem %u:%x@%lf", &ms, &mo, &t) == 3) {   /* "mem N:OFF@T": 16 words of global segment N at OFF */
             while (GetTickCount() - t0 < (DWORD)(t * 1000)) Sleep(20);
             extern uint16_t g_w16_segsel[];
-            const uint8_t *u = (const uint8_t *)(uintptr_t)recomp_sel_base(g_w16_segsel[ms]);
+            const uint8_t *u = (const uint8_t *)W16_P(recomp_sel_base(g_w16_segsel[ms]));
             fprintf(stderr, "[drv] mem %u:%04X:", ms, mo);
             for (int i = 0; u && i < 16; i++) fprintf(stderr, " %04X", *(const uint16_t *)(u + mo + 2 * i));
             fprintf(stderr, "\n");
@@ -812,7 +905,7 @@ static DWORD WINAPI input_thread(LPVOID unused) {
         if (sscanf(s, " wnd %u:%x@%lf", &ms, &mo, &t) == 3) {   /* "wnd N:HWND@T": USER's WND (N its DGROUP), via the table at 10000h */
             while (GetTickCount() - t0 < (DWORD)(t * 1000)) Sleep(20);
             extern uint16_t g_w16_segsel[];
-            const uint8_t *u = (const uint8_t *)(uintptr_t)recomp_sel_base(g_w16_segsel[ms]);
+            const uint8_t *u = (const uint8_t *)W16_P(recomp_sel_base(g_w16_segsel[ms]));
             uint32_t pw = u ? *(const uint32_t *)(u + 0x10000 + mo) : 0;
             fprintf(stderr, "[drv] wnd %04X @%08X:", mo, pw);
             for (int i = 0; pw >= 0x10000 && i < 40; i++) fprintf(stderr, " %04X", *(const uint16_t *)(u + pw + 2 * i));
@@ -842,10 +935,13 @@ static DWORD WINAPI input_thread(LPVOID unused) {
     }
     return 0;
 }
+#endif
 static void ms_enable(CPU *c) {
     g_ms_proc = argfar(c, 0);
     if (getenv("W16_INPUT")) fprintf(stderr, "[drv] MOUSE.Enable %08X\n", g_ms_proc);
+#ifndef RECOMP_W16_BASED
     if (g_ms_proc && getenv("W16_INPUT")) CloseHandle(CreateThread(NULL, 0, input_thread, NULL, 0, NULL));
+#endif
     c->ax = 1; ret_far(c, 4);
 }
 /* USER imports MOUSE statically, so its lifted calls name these (not the
@@ -875,9 +971,10 @@ static void sys_inquire(CPU *c) {
 static volatile DWORD *g_tick;
 static uint16_t g_tick_sel;
 static struct { uint32_t proc; DWORD rate, next; } g_tmr[8];
+#ifndef RECOMP_W16_BASED
 static DWORD WINAPI tick_thread(LPVOID unused) {
     (void)unused;
-    uint16_t ss = native32_w9x_alloc_sel((uint32_t)(uintptr_t)VirtualAlloc(NULL, 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE), 0x1FFF);
+    uint16_t ss = native32_w9x_alloc_sel(W16_A(VirtualAlloc(NULL, 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)), 0x1FFF);
     for (;;) {
         DWORD now = GetTickCount();
         *g_tick = now;
@@ -895,15 +992,135 @@ static DWORD WINAPI tick_thread(LPVOID unused) {
         Sleep(5);
     }
 }
+#endif
 uint16_t drv16_tick_sel(void) {
     if (!g_tick_sel) {
+#ifdef RECOMP_W16_BASED
+        g_tick = (volatile DWORD *)W16_P(w16_host_alloc(0x1000));
+#else
         g_tick = (volatile DWORD *)VirtualAlloc(NULL, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#endif
         *g_tick = GetTickCount();
-        g_tick_sel = native32_w9x_alloc_sel((uint32_t)(uintptr_t)g_tick, 0xFFF);
+        g_tick_sel = native32_w9x_alloc_sel(W16_A(g_tick), 0xFFF);
+#ifndef RECOMP_W16_BASED
         CloseHandle(CreateThread(NULL, 0, tick_thread, NULL, 0, NULL));
+#endif
     }
     return g_tick_sel;
 }
+#ifdef RECOMP_W16_BASED
+/* ---- the portable host's interrupts: drv16_poll, from the guest's idle points ----
+ * The tick dword, each SYSTEM timer that is due, the host's queued input (drv16_mouse,
+ * drv16_key) and the W16_INPUT / W16_SHOT scripts (as the Windows host's threads read them,
+ * times from the display's Enable), each proc called on a private stack as its interrupt
+ * would. Not re-entered: a proc that idles does not take the next event inside itself. */
+static uint16_t g_isr_ss;
+static void isr_call(uint32_t proc, uint16_t ax, uint16_t bx, uint16_t cx, uint16_t dx) {
+    if (!proc) return;
+    if (!g_isr_ss) g_isr_ss = native32_w9x_alloc_sel(w16_host_alloc(0x2000), 0x1FFF);
+    CPU r; cpu_init(&r);
+    r.ax = ax; r.bx = bx; r.cx = cx; r.dx = dx;
+    r.cs = (uint16_t)(proc >> 16); r.ip = (uint16_t)proc; r.ss = r.ds = r.es = g_isr_ss; r.sp = 0x1FF0;
+    if (!w16_call(&r)) fprintf(stderr, "[drv] proc %04X:%04X is no lifted function\n", r.cs, r.ip);
+}
+#define NEV 256
+static struct { uint32_t at; uint8_t mouse; uint16_t a, x, y; } g_ev[NEV];   /* mouse: a = status; key: a = vk (|8000h up) */
+static unsigned g_ev_head, g_ev_tail;
+static void ev_put(uint32_t at, int mouse, unsigned a, int x, int y) {
+    if (g_ev_tail - g_ev_head >= NEV) return;
+    unsigned i = g_ev_tail++ % NEV;
+    g_ev[i].at = at; g_ev[i].mouse = (uint8_t)mouse; g_ev[i].a = (uint16_t)a; g_ev[i].x = (uint16_t)x; g_ev[i].y = (uint16_t)y;
+}
+/* The host's pointer at x,y (0..799, 0..599), buttons bit 0 left, bit 1 right. */
+void drv16_mouse(int x, int y, int buttons) {
+    static int lx = -1, ly = -1, lb;
+    unsigned st = 0x8000;
+    if (x != lx || y != ly) st |= 1;
+    if ((buttons & 1) && !(lb & 1)) st |= 2;
+    if (!(buttons & 1) && (lb & 1)) st |= 4;
+    if ((buttons & 2) && !(lb & 2)) st |= 8;
+    if (!(buttons & 2) && (lb & 2)) st |= 0x10;
+    if (st == 0x8000) return;
+    lx = x; ly = y; lb = buttons;
+    ev_put(GetTickCount(), 1, st, x, y);
+}
+void drv16_key(unsigned vk, int down) { ev_put(GetTickCount(), 0, vk | (down ? 0 : 0x8000), 0, 0); }
+/* Text as its keys, shifted ones under a Shift press (the 3DS's system keyboard). */
+void drv16_type(const char *s) {
+    uint32_t at = GetTickCount();
+    for (; *s; s++) {
+        int sh; unsigned vk = us_vkscan(*s, &sh);
+        if (!vk) continue;
+        if (sh) ev_put(at, 0, 0x10, 0, 0);
+        ev_put(at, 0, vk, 0, 0); ev_put(at, 0, vk | 0x8000, 0, 0);
+        if (sh) ev_put(at, 0, 0x8010, 0, 0);
+    }
+}
+/* W16_INPUT, as input_thread reads it: click, drag, key, text; each event 60 ms after the last. */
+static void script_load(uint32_t t0) {
+    uint32_t last = 0;
+    for (const char *s = getenv("W16_INPUT"); s && *s; s = strchr(s, ';') ? strchr(s, ';') + 1 : "") {
+        int x, y, x2, y2; double t; char k, txt[128] = "";
+        if (sscanf(s, " key %c@%lf", &k, &t) == 2) txt[0] = k, txt[1] = 0;
+        else if (sscanf(s, " text %127[^@]@%lf", txt, &t) != 2) txt[0] = 0;
+        uint32_t at = t0 + (uint32_t)(t * 1000);
+        if (at < last) at = last;
+        if (txt[0]) {
+            for (const char *q = txt; *q; q++) {
+                int sh; unsigned vk = us_vkscan(*q, &sh);
+                if (sh) { ev_put(at, 0, 0x10, 0, 0); at += 60; }
+                ev_put(at, 0, vk, 0, 0); at += 60;
+                ev_put(at, 0, vk | 0x8000, 0, 0); at += 60;
+                if (sh) { ev_put(at, 0, 0x8010, 0, 0); at += 60; }
+            }
+            last = at; continue;
+        }
+        int drag = sscanf(s, " drag %d,%d,%d,%d@%lf", &x, &y, &x2, &y2, &t) == 5;
+        if (!drag && sscanf(s, " click %d,%d@%lf", &x, &y, &t) != 3) { fprintf(stderr, "[drv] W16_INPUT: cannot read \"%s\"\n", s); break; }
+        at = t0 + (uint32_t)(t * 1000); if (at < last) at = last;
+        if (!drag) x2 = x, y2 = y;
+        for (int i = 0; i < (drag ? 11 : 3); i++, at += 60) {
+            int end = i == (drag ? 10 : 2), step = drag && i >= 2 && !end ? i - 1 : end ? 8 : 0;
+            ev_put(at, 1, i == 0 ? 0x8001 : i == 1 ? 0x8002 : end ? 0x8004 : 0x8001, x + (x2 - x) * step / 8, y + (y2 - y) * step / 8);
+        }
+        last = at;
+    }
+}
+void drv16_poll(void) {
+    static int busy, loaded;
+    static const char *shots = (const char *)-1;
+    if (busy) return;
+    busy = 1;
+    uint32_t now = GetTickCount();
+    if (g_tick) *g_tick = now;
+    if (g_fb_t0 && !loaded) { loaded = 1; script_load(g_fb_t0); }
+    if (shots == (const char *)-1) shots = getenv("W16_SHOT");
+    while (g_fb_t0 && shots && *shots && now - g_fb_t0 >= (uint32_t)(atof(shots) * 1000)) {
+        char p[600];
+        snprintf(p, sizeof p, "%s_%g.bmp", getenv("W16_SHOT_OUT") ? getenv("W16_SHOT_OUT") : "shot", atof(shots));
+        drv16_save(p);
+        fprintf(stderr, "[drv] shot %s\n", p);
+        shots = strchr(shots, ',') ? strchr(shots, ',') + 1 : "";
+    }
+    for (int i = 0; i < 8; i++) {
+        if (!g_tmr[i].proc || (int)(now - g_tmr[i].next) < 0) continue;
+        g_tmr[i].next = now + g_tmr[i].rate;
+        isr_call(g_tmr[i].proc, 0, 0, 0, 0);
+    }
+    while (g_ev_head != g_ev_tail && (int)(now - g_ev[g_ev_head % NEV].at) >= 0) {
+        unsigned i = g_ev_head++ % NEV;
+        if (g_ev[i].mouse) {
+            if (getenv("W16_INPUT")) fprintf(stderr, "[drv] mouse event %04X at %d,%d\n", g_ev[i].a, g_ev[i].x, g_ev[i].y);
+            g_cur_x = (int16_t)g_ev[i].x; g_cur_y = (int16_t)g_ev[i].y;
+            isr_call(g_ms_proc, g_ev[i].a, (uint16_t)(g_ev[i].x * 0xFFFFu / (FB_W - 1)), (uint16_t)(g_ev[i].y * 0xFFFFu / (FB_H - 1)), 2);
+        } else {
+            if (getenv("W16_INPUT")) fprintf(stderr, "[drv] key event %04X\n", g_ev[i].a);
+            isr_call(g_kb_proc, g_ev[i].a, (uint16_t)us_scan(g_ev[i].a & 0xFF), 0, 0);
+        }
+    }
+    busy = 0;
+}
+#endif
 /* SYSTEM.2 CreateSystemTimer(wRate ms, lpProc) -> a handle (index + 1), 0 if full; 3 KillSystemTimer(h) -> 0 */
 static void sys_createtimer(CPU *c) {
     uint32_t proc = argfar(c, 0); DWORD rate = arg16(c, 2);
@@ -987,8 +1204,8 @@ static void dib_createpdevice(CPU *c) {
         *(uint16_t *)(d + 0x1A) = (uint16_t)(bits >> 16);
         {   /* the slot: color table as 5-6-5, the BITMAPINFO copy (header and table or masks) */
             int i = 0;
-            while (i < 255 && g_dibpal[i].dev && g_dibpal[i].dev != (uint32_t)(uintptr_t)d) i++;
-            g_dibpal[i].dev = (uint32_t)(uintptr_t)d; g_dibpal[i].npal = 0;
+            while (i < 255 && g_dibpal[i].dev && g_dibpal[i].dev != W16_A(d)) i++;
+            g_dibpal[i].dev = W16_A(d); g_dibpal[i].npal = 0;
             uint32_t n = *(const uint32_t *)(bi + 32), hs = *(const uint32_t *)bi, comp = *(const uint32_t *)(bi + 16);
             if (bpp <= 8 && (!n || n > (1u << bpp))) n = 1u << bpp;
             const uint8_t *q = bi + hs;
@@ -1000,7 +1217,7 @@ static void dib_createpdevice(CPU *c) {
             if (hs > 40) hs = 40;
             memcpy(g_dibpal[i].bi, bi, hs); memcpy(g_dibpal[i].bi + hs, q, tab);
             *(uint32_t *)g_dibpal[i].bi = hs;
-            uint32_t base = (uint32_t)(uintptr_t)g_dibpal[i].bi;
+            uint32_t base = W16_A(g_dibpal[i].bi);
             if (!g_dibpal[i].sel) g_dibpal[i].sel = native32_w9x_alloc_sel(base, sizeof g_dibpal[i].bi - 1);
             *(uint32_t *)(d + 0x20) = (uint32_t)g_dibpal[i].sel << 16;   /* deBitmapInfo */
         }
@@ -1159,7 +1376,7 @@ void w16_drv_write(const char *sysdir) {
     snprintf(g_fontdir, sizeof g_fontdir, "%s", sysdir);
     for (int i = 0; i < NDRV; i++) {
         char path[512];
-        snprintf(path, sizeof path, "%s\\%s.%s", sysdir, g_drv[i].name, strcmp(g_drv[i].name, "DIBENG") ? "DRV" : "DLL");
+        snprintf(path, sizeof path, "%s" SLASH "%s.%s", sysdir, g_drv[i].name, strcmp(g_drv[i].name, "DIBENG") ? "DRV" : "DLL");
         size_t n = ne_build(i);
         FILE *f = fopen(path, "wb");
         if (!f) { fprintf(stderr, "[drv] cannot write %s\n", path); continue; }
@@ -1172,7 +1389,7 @@ void w16_drv_write(const char *sysdir) {
 int w16_drv_far(CPU *c, uint16_t sel, uint16_t off) {
     extern uint8_t *native32_w9x_desc(uint16_t);
     if (!(sel & 4) || !(native32_w9x_desc(sel)[5] & 0x80)) return 0;   /* ours are present; a not-present base is no address */
-    const uint8_t *b = (const uint8_t *)(uintptr_t)recomp_sel_base(sel);
+    const uint8_t *b = (const uint8_t *)W16_P(recomp_sel_base(sel));
     if (!b || memcmp(b, "PCRD", 4) || b[4] >= NDRV) return 0;
     drv_t *d = &g_drv[b[4]];
     if (getenv("W16_TRACE")) fprintf(stderr, "[drv] %s %04X:%04X\n", d->name, sel, off);
