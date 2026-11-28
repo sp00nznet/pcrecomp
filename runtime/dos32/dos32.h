@@ -15,6 +15,7 @@
  * docs: pcrecomp docs/DOS32.md
  */
 #pragma once
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -55,6 +56,11 @@ int dos32_run(const dos32_config* cfg);
  * linear, like the standard ones): for a host that has a program draw at a
  * size of its choosing. Up to 4 MB of pixels; 0x0 takes it away again. */
 void dos32_vesa_custom(int w, int h);
+
+/* The host file a DOS path names, as the program's own opens find it (the
+ * drive letter dropped, relative to the current directory, under root). For
+ * host code that reads a program's files: a sound driver's data. */
+void dos32_host_path(const char* dos, char* out, size_t n);
 
 /* Guest memory, for the platform layer (game-specific readers, mods). */
 uint8_t* dos32_mem(uint32_t va);

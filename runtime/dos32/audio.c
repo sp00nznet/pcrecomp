@@ -41,6 +41,8 @@ typedef struct {
     int vol, pan;                 /* 0..127, 0..127 (64 = centre) */
     int paused;
     int id;                       /* 0 = free */
+    void (*gen)(int16_t*, int, void*);   /* a synthesizer's voice: its frames, made as mixed */
+    void* user;
 } voice_t;
 
 static voice_t voices[NVOICE];
@@ -63,6 +65,12 @@ static void mix(int16_t* out, int frames) {
     for (int k = 0; k < NVOICE; k++) {
         voice_t* v = &voices[k];
         if (!v->id || v->paused) continue;
+        if (v->gen) {
+            static int16_t g[BLOCK * 2];
+            v->gen(g, frames, v->user);
+            for (int i = 0; i < frames * 2; i++) acc[i] += g[i] * v->vol / 127;
+            continue;
+        }
         int gl = v->vol * (127 - v->pan) / 64, gr = v->vol * v->pan / 64;   /* 0..254 each */
         if (gl > 127) gl = 127;
         if (gr > 127) gr = 127;
@@ -207,9 +215,10 @@ int audio_play_ch(const void* data, uint32_t bytes, int bits, int is_signed, int
     EnterCriticalSection(&lock);
     int k = 0;
     for (; k < NVOICE && voices[k].id; k++) {}
-    if (k == NVOICE) {   /* all busy: take the oldest */
-        int oldest = 0;
-        for (int j = 1; j < NVOICE; j++) if (voices[j].id < voices[oldest].id) oldest = j;
+    if (k == NVOICE) {   /* all busy: take the oldest sound (never a synthesizer) */
+        int oldest = -1;
+        for (int j = 0; j < NVOICE; j++)
+            if (!voices[j].gen && (oldest < 0 || voices[j].id < voices[oldest].id)) oldest = j;
         k = oldest;
     }
     voice_t* v = &voices[k];
@@ -222,6 +231,23 @@ int audio_play_ch(const void* data, uint32_t bytes, int bits, int is_signed, int
     v->is_signed = is_signed; v->loop = loop;
     v->vol = vol < 0 ? 0 : vol > 127 ? 127 : vol;
     v->pan = pan < 0 ? 0 : pan > 127 ? 127 : pan;
+    v->id = next_id++;
+    if (next_id <= 0) next_id = 1;
+    int id = v->id;
+    LeaveCriticalSection(&lock);
+    return id;
+}
+
+int audio_play_gen(void (*gen)(int16_t* stereo, int frames, void* user), void* user, int vol) {
+    if (!gen) return 0;
+    EnterCriticalSection(&lock);
+    int k = 0;
+    for (; k < NVOICE && voices[k].id; k++) {}
+    if (k == NVOICE) { LeaveCriticalSection(&lock); return 0; }   /* never in place of a sound */
+    voice_t* v = &voices[k];
+    memset(v, 0, sizeof *v);
+    v->gen = gen; v->user = user;
+    v->vol = vol < 0 ? 0 : vol > 127 ? 127 : vol;
     v->id = next_id++;
     if (next_id <= 0) next_id = 1;
     int id = v->id;

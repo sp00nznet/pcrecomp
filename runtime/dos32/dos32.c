@@ -901,6 +901,8 @@ static void host_path(const char* dos, char* out, size_t n) {
 #endif
 }
 
+void dos32_host_path(const char* dos, char* out, size_t n) { host_path(dos, out, n); }
+
 static void guest_str(uint32_t va, char* out, size_t n) {
     size_t i = 0;
     for (; i + 1 < n && R8(va + i); i++) out[i] = (char)R8(va + i);

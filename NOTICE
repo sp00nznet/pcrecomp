@@ -4,3 +4,4 @@ licence texts are in LICENSES/. Everything else is MIT (LICENSE).
 | Path | Upstream | Version | Licence |
 |---|---|---|---|
 | tools/assets/is3extract.py (the PKWARE DCL explode section) | zlib contrib/blast/blast.c, Mark Adler (https://github.com/madler/zlib) | 1.3, 24 Aug 2013 (zlib 1.3.1) | zlib licence: LICENSES/blast-zlib.txt. A Python port, altered from the original |
+| third_party/ymfm/ (ymfm.h, ymfm_fm.*, ymfm_opl.*, ymfm_adpcm.*, ymfm_pcm.*) | ymfm, Aaron Giles (https://github.com/aaronsgiles/ymfm) | upstream as vendored in stunts-recomp (third_party/ymfm, unmodified) | BSD-3-Clause: LICENSES/ymfm-BSD-3-Clause.txt. Used by runtime/dos32/opl3.cpp |
