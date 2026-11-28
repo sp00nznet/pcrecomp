@@ -13,6 +13,10 @@ void audio_render(int16_t* stereo, int frames);
  * first play, -1 for ever. */
 int  audio_play_ch(const void* data, uint32_t bytes, int bits, int is_signed, int ch, int rate,
                    int vol, int pan, int loop);
+/* A voice whose frames a function makes as they are mixed (a synthesizer), stereo at
+ * audio_rate(). gen runs on the mixer's thread with the mixer locked: it must not call
+ * audio_*. Plays until audio_stop. */
+int  audio_play_gen(void (*gen)(int16_t* stereo, int frames, void* user), void* user, int vol);
 /* What the voice plays when it reaches its end (a stream's next buffer): 0 when one is
  * queued already or the voice has ended. */
 int  audio_queue(int id, const void* data, uint32_t bytes);
