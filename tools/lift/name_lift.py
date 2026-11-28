@@ -59,7 +59,7 @@ MARK = '/* Functions named by name_lift.py */'
 FUNC_DEF = re.compile(r'^void (sub_[0-9A-F]{8})\(void\) \{', re.M)
 CONST = re.compile(r'\b0x([0-9A-F]{8})u\b')
 VTABLE_STORE = re.compile(r'MEM32\((?:e[abcd]x|e[sd]i|ebp)\) = 0x([0-9A-F]{8})u;')
-CALL = re.compile(r'RECOMP_CALL\((sub_[0-9A-F]{8})\)')
+CALL = re.compile(r'RECOMP_CALL(?:_K)?\((sub_[0-9A-F]{8})[,)]')   # _K: generate.py LIFT32_ABI
 WINDOWS_CALL = re.compile(r'/\* call \[[^\]]+\]([A-Za-z_][A-Za-z0-9_@]*) \*/')
 IMPORT_CALL = re.compile(r'RECOMP_ICALL\(MEM32\(0x([0-9A-F]+)\)\)')   # call [__imp_X]
 # MSVC's scalar deleting destructor: tests bit 0 of its one argument (free the

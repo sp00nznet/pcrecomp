@@ -270,6 +270,149 @@ def entry_reads_flags(instructions):
     return False
 
 
+# ---- LIFT32_ABI: the callee-saved register plan (after XRC's x_abi_plan) ----
+# RECOMP_CALL reloads all eight registers from the globals after the callee
+# returns. Compiled code keeps ebx esi edi ebp for its caller, and where that
+# is proven the caller keeps its own locals for them instead (RECOMP_CALL_K):
+# four loads fewer a call, and the C compiler knows their values across it.
+#
+# LIFT32_ABI=<file>: every body lift_function_linear sees is scanned and the
+# scans are written to <file> at exit; when <file> already exists (a previous
+# run of the same lift), its plan is used. So: lift twice. A body keeps r when,
+# on every path from its entry, r is pushed before it is written and popped
+# back at most once (a must-analysis over its own CFG), and every direct
+# callee and tail target keeps r too: a greatest fixpoint, as XRC's (which
+# also lets a push around the call excuse its callee; not here, since an
+# argument push looks the same). Indirect calls and jumps are trusted, as there.
+# A target nothing scanned keeps nothing. RECOMP_ABI_CHECK checks every claim
+# at run time (native32 recomp_abi_violation).
+_ABI_PATH = os.environ.get('LIFT32_ABI')
+_ABI_REGS = {'ebx': 1, 'esi': 2, 'edi': 4, 'ebp': 8}
+_ABI_REC = {}            # this run: va -> [own, [callee, ...], [tail, ...], hash]
+_ABI_KEEP = {}           # the plan: va -> mask
+_ABI_HASH = {}
+_ABI_STALE = []
+
+
+def _abi_fixpoint(rec):
+    keep = {va: r[0] for va, r in rec.items()}
+    changed = True
+    while changed:
+        changed = False
+        for va, (own, calls, tails, _h) in rec.items():
+            k = keep[va]
+            for c in calls:
+                k &= keep.get(c, 0)
+            for t in tails:
+                k &= keep.get(t, 0)
+            if k != keep[va]:
+                keep[va], changed = k, True
+    return keep
+
+
+if _ABI_PATH and os.path.exists(_ABI_PATH):
+    _rec = {int(k): v for k, v in json.load(open(_ABI_PATH)).items()}
+    _ABI_KEEP = {va: k for va, k in _abi_fixpoint(_rec).items() if k}
+    _ABI_HASH = {va: r[3] for va, r in _rec.items()}
+    del _rec
+
+
+def _abi_write():
+    json.dump({str(k): v for k, v in _ABI_REC.items()}, open(_ABI_PATH, 'w'))
+    print('[*] LIFT32_ABI: %d bodies scanned, %d keep a callee-saved register (plan %s)'
+          % (len(_ABI_REC), sum(1 for m in _abi_fixpoint(_ABI_REC).values() if m), _ABI_PATH))
+    if _ABI_STALE:
+        print('[!] LIFT32_ABI: %d bodies changed since the plan was made (first 0x%08X): lift again'
+              % (len(_ABI_STALE), _ABI_STALE[0]))
+
+
+if _ABI_PATH:
+    import atexit
+    atexit.register(_abi_write)
+
+
+def _abi_writes(insn):
+    """The callee-saved registers an instruction writes (bits as _ABI_REGS)."""
+    m = insn.mnemonic.split()[-1]
+    w = 0
+    for op in insn.operands:
+        if op.type == 1 and op.access & 2:          # X86_OP_REG, CS_AC_WRITE
+            w |= _ABI_REGS.get(lift32.reg_name(op.reg), 0)
+    if m[:4] in ('movs', 'stos', 'lods', 'scas', 'cmps') or m[:3] in ('ins', 'out'):
+        w |= 6
+    if m == 'cpuid':
+        w |= 1
+    if m == 'enter':
+        w |= 8
+    return w
+
+
+def abi_scan(instructions, va, leaders=()):
+    """[own, calls, tails, hash] for one body: see LIFT32_ABI."""
+    import hashlib
+    idx = {i.address: k for k, i in enumerate(instructions)}
+    local = [idx[a] for a in set(leaders) | {t for i in instructions if i.is_jump
+                                              for t in [i.get_branch_target()] if t is not None} if a in idx]
+    calls, tails, own = [], set(), 0xF
+    state = {}                      # k -> registers pushed (and not yet popped) on every path to it
+    work = [(idx[va], 0)] if va in idx else []
+    while work:
+        k, p = work.pop()
+        if k in state:
+            if state[k] & p == state[k]:
+                continue
+            p &= state[k]
+        state[k] = p
+        i = instructions[k]
+        m = i.mnemonic.split()[-1]
+        r = _ABI_REGS.get(i.op_str.strip())
+        if m == 'push' and r:
+            p |= r
+        elif m == 'pushal' or m == 'pushad':
+            p |= 0xF
+        elif m == 'pop' and r:
+            own &= ~(r & ~p)
+            p &= ~r
+        elif m in ('popal', 'popad'):
+            own &= p
+            p = 0
+        elif m == 'leave':
+            own &= ~(8 & ~p)
+            p &= ~8
+        elif (m == 'mov' and i.op_str.split(', ')[:1] * 2 == i.op_str.split(', ')) or (
+                m == 'lea' and i.op_str == '%s, [%s]' % ((i.op_str.split(',')[0],) * 2)):
+            pass                                    # mov edi, edi / lea esi, [esi]: no-ops
+        else:
+            own &= ~(_abi_writes(i) & ~p)
+        succ = []
+        tgt = i.get_branch_target() if (i.is_jump or i.is_call) else None
+        if i.is_ret or m in ('int3', 'hlt', 'ud2'):
+            pass
+        elif i.is_call:
+            if tgt is not None:
+                calls.append(tgt)
+            succ.append(i.end_address)
+        elif i.is_uncond_jump:
+            if tgt is None and i.operands and i.operands[0].type == X86_OP_MEM and \
+                    i.operands[0].mem.base == 0 and i.operands[0].mem.index == 0:
+                tails.add(0)                        # jmp [import]: an import thunk keeps nothing
+            elif tgt is None:                       # (w2k calc's jmp [_EH_prolog] set ebp)
+                succ += [instructions[j].address for j in local]   # a switch: trusted, as XRC
+            else:
+                succ.append(tgt)
+        else:
+            if i.is_cond_jump and tgt is not None:
+                succ.append(tgt)
+            succ.append(i.end_address)
+        for a in succ:
+            if a in idx:
+                work.append((idx[a], p))
+            else:
+                tails.add(a)                        # leaves the body: a tail call
+    h = hashlib.md5(b''.join(i.address.to_bytes(4, 'little') + i.bytes for i in instructions)).hexdigest()[:12]
+    return [own, sorted(set(calls)), sorted(tails), h]
+
+
 def lift_function_linear(lifter, name, instructions, leaders, func_start,
                          indirect_targets=None, eh_resume=None, alias_entries=None,
                          eh_off=None):
@@ -393,6 +536,12 @@ def lift_function_linear(lifter, name, instructions, leaders, func_start,
     # xor's static state: a .lnk file's pidl was classed "Directory".
     targets |= {a for a in gaps.values() if a in addrs}
     body_addrs = addrs
+
+    if _ABI_PATH and not lift32.W9X:
+        scan = _ABI_REC[va] = abi_scan(instructions, va, leaders)
+        if va in _ABI_HASH and _ABI_HASH[va] != scan[3]:
+            _ABI_STALE.append(va)
+        lifter.abi_keep = _ABI_KEEP
 
     # LIFT32_W9X: `push L; ...; ret` with L in this body is a jump to L, not a
     # return (Windows 98 kernel32 runs an inline finally that way: 0xBFF850F4

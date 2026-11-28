@@ -331,6 +331,10 @@ class Lifter:
         self._flag_state = None  # (setter_mnemonic, operands_str)
         self._flag_seq = 0       # bumped whenever the flags are written
         self._fp_depth = 0  # FPU stack depth tracking
+        # generate.py LIFT32_ABI: callee VA -> the callee-saved registers it
+        # keeps (1 ebx, 2 esi, 4 edi, 8 ebp); a direct call to one does not
+        # reload those (RECOMP_CALL_K).
+        self.abi_keep = {}
 
     def _branch_to(self, target: int) -> str:
         """The statement for a taken branch to `target`: a goto when the target
@@ -1603,6 +1607,9 @@ class Lifter:
                     lines.append(f"RECOMP_CALL(recomp_{self.func_names[target]}); {comment}")
                 elif self.lifted is not None and target not in self.lifted:
                     lines.append(f"RECOMP_ICALL(0x{target:08X}u); {comment} /* not lifted */")
+                elif self.abi_keep.get(target) and not self._ss_fn:
+                    # generate.py LIFT32_ABI: the callee keeps these for us
+                    lines.append(f"RECOMP_CALL_K(sub_{target:08X}, 0x{self.abi_keep[target]:X}u); {comment}")
                 else:
                     lines.append(f"RECOMP_CALL(sub_{target:08X}); {comment}")
             else:
