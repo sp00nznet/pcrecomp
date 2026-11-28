@@ -7,6 +7,12 @@ versions follow [SemVer](https://semver.org/).
 
 ### Added
 
+- dos32: `DOS32_EPOCH=<unix seconds>` pins the time the DOS clock starts
+  from, so a program that seeds from the clock makes the same choices every
+  run; `dos32_kbhit_idle` gives each int 21h AH=0Bh keyboard poll the time it
+  took on a period machine (default 0: none); int 1Ah AH=02h/04h read the
+  guest clock as the CMOS time and date, and int 21h 2Bh/2Dh are accepted.
+  Found on X-COM: UFO Defense (#205).
 - dos32: MSCDEX (one drive, D:) with Red Book audio played by the host
   (`dos32_cd_tracks`, `dos32_cd_play`); `dos32_call`, a cdecl call into the
   program from host code, and `dos32_on_poll`, host work where interrupts are
