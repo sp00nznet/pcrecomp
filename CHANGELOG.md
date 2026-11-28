@@ -745,6 +745,13 @@ From #9. Found bringing Nocturne (Terminal Reality, Watcom C/C++32) in game.
 
 ### Fixed
 
+- lift32 (`dos=True`): a function that loads ds (`mov ds`, `pop ds`, `lds`)
+  takes its default-ds operands and string sources through `DS_BASE`, and its
+  ds loads set ds's base (`recomp_set_seg(3)`); dos32 keeps `g_ds_base`.
+  Watcom's `movedata` and `peek`/`poke` copy through a selector in ds, and
+  lifted they read and wrote the flat address. Every other function lifts as
+  before. Found on Warcraft and Warcraft II; Theme Park conformance 6/6 before
+  and after (#203).
 - win32hle screen: the mouse reaches the picture's right and bottom edges.
   It is held to the points wholly inside the picture, and unless the picture
   is a whole number of pixels a point (a full-screen window below a MacBook's
