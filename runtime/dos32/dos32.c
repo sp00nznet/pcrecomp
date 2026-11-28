@@ -189,6 +189,7 @@ uint32_t g_icall_trace_idx, g_icall_count;
 double dos32_speed = 1.0;
 volatile int dos32_quit;
 void (*dos32_on_retrace)(void);
+void (*dos32_on_poll)(void);
 
 /* ---- layout ------------------------------------------------------------- */
 #define HEAP_LO      0x01000000u
@@ -460,6 +461,27 @@ static void irq(int v) {
     call_guest(pmvec[v].off, 1);
     in_irq--;
     restore(&s);
+}
+
+/* A cdecl call into the guest from host code on the guest thread (an override, or
+ * dos32_on_poll): the registers are kept, the return value is eax. */
+uint32_t dos32_call(uint32_t va, int n, const uint32_t* args) {
+    recomp_func_t fn = recomp_lookup(va);
+    saved_t s;
+    uint32_t r;
+    if (!fn) { once("guest function not lifted", va, 0); return 0; }
+    save(&s);
+    in_irq++;
+    g_esp = (g_esp - 64) & ~3u;          /* below anything the caller still uses */
+    for (int i = n - 1; i >= 0; i--) push32(args[i]);
+    push32(RECOMP_RETADDR);
+    recomp_set_seg(0, SEL_DATA);
+    g_cs_base = 0; g_seg_ds = SEL_DATA; g_ds_base = 0;
+    fn();
+    r = g_eax;
+    in_irq--;
+    restore(&s);
+    return r;
 }
 
 /* ---- timer -------------------------------------------------------------- */
@@ -808,6 +830,7 @@ static void dos32_poll(void) {
         if (t >= pit_next) pit_next = t + period;   /* fell behind: drop, don't storm */
     }
     poll_input();
+    if (dos32_on_poll && g_if) dos32_on_poll();
 }
 
 static void yield_hook(void) { dos32_poll(); }
@@ -1292,7 +1315,116 @@ static void int31(regs_t* r) {
     }
 }
 
+/* MSCDEX: one CD drive, D:, whose files are the game folder like every drive (host_path drops the
+ * letter). Enough for a game that checks its CD is in before it runs (Warcraft II), and for its CD
+ * audio: the host gives the tracks (dos32_cd_tracks) and plays what is asked (dos32_cd_play). The
+ * playing position is kept by the guest clock, at 75 sectors a second. Other requests are answered
+ * "done" and reported once. */
+#define CD_DRIVE 3
+void (*dos32_cd_play)(int track, uint32_t offset, uint32_t count);
+static uint32_t cd_start[101];   /* each track's first sector; [cd_n + 1] is the lead-out */
+static int cd_n = 1;
+static int cd_playing, cd_paused;
+static uint32_t cd_from, cd_end;  /* the play, or the one to resume */
+static double cd_t0;
+
+void dos32_cd_tracks(int n, const uint32_t* sectors) {
+    if (n > 99) n = 99;
+    cd_n = n < 1 ? 1 : n;
+    cd_start[1] = 0;
+    for (int t = 1; t <= cd_n; t++) cd_start[t + 1] = cd_start[t] + (t <= n ? sectors[t - 1] : 1);
+}
+
+static uint32_t cd_msf0(uint32_t f) { return f / 4500 << 16 | f / 75 % 60 << 8 | f % 75; }
+static uint32_t cd_msf(uint32_t lba) { return cd_msf0(lba + 150); }
+static int cd_track_of(uint32_t lba) { int t = 1; while (t < cd_n && lba >= cd_start[t + 1]) t++; return t; }
+static uint32_t cd_pos(void) {
+    if (!cd_playing) return cd_from;
+    uint32_t p = cd_from + (uint32_t)((gtime() - cd_t0) * 75);
+    if (p < cd_end) return p;
+    cd_playing = 0; cd_from = cd_end;
+    return cd_end;
+}
+static void cd_start_play(void) {
+    int t = cd_track_of(cd_from);
+    cd_playing = 1; cd_paused = 0; cd_t0 = gtime();
+    if (dos32_cd_play) dos32_cd_play(t, cd_from - cd_start[t], cd_end - cd_from);
+}
+static void cd_stop(void) {
+    if (cd_playing) { cd_from = cd_pos(); cd_playing = 0; cd_paused = 1; }   /* a stop while playing pauses */
+    else cd_paused = 0;                                                      /* and a second one resets */
+    if (dos32_cd_play) dos32_cd_play(0, 0, 0);
+}
+
+static void cd_ioctl_input(uint32_t cb) {
+    uint32_t pos;
+    int t;
+    switch (R8(cb)) {
+    case 4: memcpy(LIN(cb + 1), "\0\xFF\1\xFF\2\0\3\0", 8); break;   /* channels 0, 1 at full volume */
+    case 6: R32(cb + 1) = 0x00000210u; break;   /* status: door closed, plays audio, Red Book */
+    case 9: R8(cb + 1) = 1; break;              /* media changed: no */
+    case 10: R8(cb + 1) = 1; R8(cb + 2) = (uint8_t)cd_n; R32(cb + 3) = cd_msf(cd_start[cd_n + 1]); break;
+    case 11:
+        t = R8(cb + 1);
+        if (t < 1 || t > cd_n) t = 1;
+        R32(cb + 2) = cd_msf(cd_start[t]);
+        R8(cb + 6) = t == 1 ? 0x41 : 0x01;      /* track 1 is the data */
+        break;
+    case 12:   /* Q channel: where it is playing */
+        pos = cd_pos(); t = cd_track_of(pos);
+        R8(cb + 1) = t == 1 ? 0x41 : 0x01; R8(cb + 2) = (uint8_t)t; R8(cb + 3) = 1;
+        { uint32_t m = cd_msf0(pos - cd_start[t]);   /* within the track, then on the disc */
+          R8(cb + 4) = (uint8_t)(m >> 16); R8(cb + 5) = (uint8_t)(m >> 8); R8(cb + 6) = (uint8_t)m; R8(cb + 7) = 0;
+          m = cd_msf(pos); R8(cb + 8) = (uint8_t)(m >> 16); R8(cb + 9) = (uint8_t)(m >> 8); R8(cb + 10) = (uint8_t)m; }
+        break;
+    case 15: cd_pos(); R16(cb + 1) = (uint16_t)cd_paused; R32(cb + 3) = cd_from; R32(cb + 7) = cd_end; break;
+    default: once("MSCDEX IOCTL input", R8(cb), 0); break;
+    }
+}
+
+static void int2f_cd(regs_t* r) {
+    switch (AX(r)) {
+    case 0x1500: SET16(r->ebx, 1); SET16(r->ecx, CD_DRIVE); break;
+    case 0x1501: {   /* drive device list: subunit 0, and a device header (at 0060:0000, unused low memory) */
+        uint32_t p = es_ptr(r, r->rm ? BX(r) : r->ebx), h = 0x600;
+        memset(LIN(h), 0, 18);
+        R32(h) = 0xFFFFFFFFu;          /* next: none */
+        R16(h + 4) = 0xC800;           /* character device, IOCTL supported */
+        memcpy(LIN(h + 10), "MSCD001 ", 8);
+        R8(h + 20) = CD_DRIVE + 1;     /* drive letter (1 = A:) */
+        R8(h + 21) = 1;                /* units */
+        R8(p) = 0;
+        R32(p + 1) = (h >> 4) << 16;
+        break; }
+    case 0x150B: SET16(r->eax, CX(r) == CD_DRIVE ? 0x5AD8 : 0); SET16(r->ebx, 0xADAD); break;
+    case 0x150C: SET16(r->ebx, 0x0215); break;   /* 2.21: a game sends device requests only from 2.10 */
+    case 0x150D: R8(es_ptr(r, r->rm ? BX(r) : r->ebx)) = CD_DRIVE; break;
+    case 0x1510: {
+        uint32_t q = es_ptr(r, r->rm ? BX(r) : r->ebx);
+        uint8_t cmd = R8(q + 2);
+        uint32_t xfer = R32(q + 14), cb = (xfer >> 16) * 16u + (xfer & 0xFFFF);   /* real-mode far */
+        if (getenv("DOS32_CDLOG")) fprintf(stderr, "[cd] req %#x code %#x\n", cmd, (cmd == 3 || cmd == 12) ? R8(cb) : 0);
+        if (cmd == 3) cd_ioctl_input(cb);   /* IOCTL input: the control block says what */
+        else if (cmd == 12) {               /* IOCTL output: 3, the channels' volume, is let be */
+            if (R8(cb) != 3) once("MSCDEX IOCTL output", R8(cb), 0);
+        } else if (cmd == 0x84) {           /* play: from a sector (HSG, or Red Book), so many */
+            uint32_t s = R32(q + 14), n = R32(q + 18);
+            if (R8(q + 13)) s = (s >> 16 & 0xFF) * 4500 + (s >> 8 & 0xFF) * 75 + (s & 0xFF) - 150;
+            if (cd_playing) cd_stop();
+            cd_from = s; cd_end = s + n;
+            if (n) cd_start_play();
+            fprintf(stderr, "[cd] play %u +%u (track %d)\n", s, n, cd_track_of(s));
+        } else if (cmd == 0x85) cd_stop();
+        else if (cmd == 0x88) { if (cd_paused) cd_start_play(); }
+        else once("MSCDEX device request", cmd, 0);
+        R16(q + 3) = cd_pos() < cd_end && cd_playing ? 0x0300 : 0x0100;   /* done; busy while it plays */
+        break; }
+    default: once("int 2Fh (MSCDEX)", AX(r), 0); break;
+    }
+}
+
 static void int2f(regs_t* r) {
+    if (AH(r) == 0x15) { int2f_cd(r); return; }
     switch (AX(r)) {
     case 0x1680: Sleep(0); SET8L(r->eax, 0); break;
     case 0x1600: SET8L(r->eax, 0); break;

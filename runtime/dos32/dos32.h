@@ -105,6 +105,24 @@ void dos32_advance(double seconds);
 int dos32_state_save(const char* path, uint32_t where);
 int dos32_state_load(const char* path, uint32_t where);
 
+/* CD audio for MSCDEX's play requests. The host gives the disc's tracks as
+ * sector counts (track 1 first, the data track; the rest audio, 2352 bytes a
+ * sector), and plays what the program asks for: from `offset` sectors into
+ * `track` (1-based), `count` sectors; track 0 stops. Called on the guest
+ * thread. NULL plays nothing (the program still sees the disc playing). */
+void dos32_cd_tracks(int n, const uint32_t* sectors);
+extern void (*dos32_cd_play)(int track, uint32_t offset, uint32_t count);
+
+/* Called on the guest thread where interrupts are delivered (interrupts on,
+ * none in progress), as often as the timer's: for host work that calls back
+ * into the program, as a sound driver's interrupt would. May be NULL. */
+extern void (*dos32_on_poll)(void);
+
+/* A cdecl call into the program, from host code on the guest thread (an
+ * override, or dos32_on_poll): `n` dword arguments; returns its eax. The
+ * registers are as they were after. */
+uint32_t dos32_call(uint32_t va, int n, const uint32_t* args);
+
 /* Called on the guest thread at every retrace the program waits for:
  * frame capture for --record, scripted input. May be NULL. */
 extern void (*dos32_on_retrace)(void);

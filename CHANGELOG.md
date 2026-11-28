@@ -7,6 +7,14 @@ versions follow [SemVer](https://semver.org/).
 
 ### Added
 
+- dos32: MSCDEX (one drive, D:) with Red Book audio played by the host
+  (`dos32_cd_tracks`, `dos32_cd_play`); `dos32_call`, a cdecl call into the
+  program from host code, and `dos32_on_poll`, host work where interrupts are
+  delivered; `audio.c`, Theme Park's mixer with queued stream buffers and
+  pause; and `mss.c`, the Miles Sound System's digital API (AIL 3.x) answered
+  on that mixer. `audio.c` and `mss.c` are opt-in and need a `compat.h` on
+  the include path. Found on Warcraft and Warcraft II, which play their Miles
+  sound on it (#204).
 - lift32: `LIFT32_ABI`, the callee-saved register plan (after XRC's `x_abi_plan`).
   Opt-in, and the output is identical to before when unset. One lift records
   which registers each function keeps (`generate.py`), and the next skips
