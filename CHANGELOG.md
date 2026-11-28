@@ -7,6 +7,13 @@ versions follow [SemVer](https://semver.org/).
 
 ### Added
 
+- `tools/drm/steamstub.py`: SteamStub 3.x's 0xD0-byte header (signature
+  0xC0DEC0DE, 32-bit fields), its layout read from the stub's code and the
+  steamdrm.dll it carries, and the unoptimized stub's header copy (a byte loop
+  from `mov ecx, [ebp+8]; sub ecx, size`). `.bind` also goes when only the
+  certificate table follows it, and the security directory entry is cleared.
+  Found on the Steam builds of X-Wing, TIE Fighter, X-Wing vs TIE Fighter
+  (and Balance of Power) and X-Wing Alliance (#207).
 - dos32: int 21h 4Bh runs a child through the host (`dos32_on_exec`) and
   4Dh returns its exit code; `COMSPEC` is in the environment, so a Watcom
   `system()` reaches it. Mode 12h (640x480x16) keeps four planes as mode X
